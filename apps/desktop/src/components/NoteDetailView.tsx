@@ -1,0 +1,235 @@
+import { useCallback, useMemo } from "react";
+import { useAppStore } from "@/stores/appStore";
+import { SessionHeader } from "@/components/SessionHeader";
+import { ChatView } from "@/components/ChatView";
+import { NoteEditor } from "@/components/NoteEditor";
+import { FloatingChatBar } from "@/components/FloatingChatBar";
+import { AIContextProvider } from "@/components/AIContextProvider";
+import { AudioPlayer } from "@/components/AudioPlayer";
+import {
+  ResizablePanelGroup,
+  ResizablePanel,
+  ResizableHandle,
+} from "@/components/ui/resizable";
+import { getSession, updateSessionWavPath } from "@/lib/db";
+import {
+  createSessionSources,
+  createSessionTools,
+  createSessionSystemPromptBuilder,
+} from "@/lib/ai-context";
+import { getActionsForSession } from "@/lib/ai-actions";
+import { getToolEffects } from "@/lib/ai-tools";
+import { convertFileSrc } from "@tauri-apps/api/core";
+
+/** Build a URL for the custom audio-stream:// protocol registered in Rust. */
+function audioStreamUrl(filePath: string): string {
+  return convertFileSrc(filePath, "audio-stream");
+}
+
+export function NoteDetailView() {
+  const selectedSessionId = useAppStore((s) => s.selectedSessionId);
+  const activeSessionId = useAppStore((s) => s.activeSessionId);
+  const activeSessionSegments = useAppStore((s) => s.activeSessionSegments);
+  const viewSession = useAppStore((s) => s.viewSession);
+  const viewSessionSegments = useAppStore((s) => s.viewSessionSegments);
+  const activeSession = useAppStore(
+    (s) => s.activeSessionId
+      ? s.sessions.find((x) => x.id === s.activeSessionId) ?? null
+      : null,
+  );
+  const backfillActive = useAppStore((s) => s.backfillActive);
+  const playbackTime = useAppStore((s) => s.playbackTime);
+  const setPlaybackTime = useAppStore((s) => s.setPlaybackTime);
+  const setIsPlaying = useAppStore((s) => s.setIsPlaying);
+  const noteRefreshCounter = useAppStore((s) => s.noteRefreshCounter);
+  const loadSessions = useAppStore((s) => s.loadSessions);
+  const incrementNoteRefresh = useAppStore((s) => s.incrementNoteRefresh);
+
+  const isActiveSession = selectedSessionId === activeSessionId;
+
+  const session = isActiveSession ? activeSession : viewSession;
+
+  const segments = isActiveSession ? activeSessionSegments : viewSessionSegments;
+
+  // AI Context setup
+  const sources = useMemo(
+    () => selectedSessionId
+      ? createSessionSources(selectedSessionId, segments.length, session?.session_type ?? "recording")
+      : [],
+    [selectedSessionId, segments.length, session?.session_type],
+  );
+  const tools = useMemo(
+    () => selectedSessionId ? createSessionTools(selectedSessionId) : { availableToolIds: [], getToolContext: null },
+    [selectedSessionId],
+  );
+  const buildSystemPrompt = useMemo(
+    () => selectedSessionId ? createSessionSystemPromptBuilder(selectedSessionId) : async () => "",
+    [selectedSessionId],
+  );
+  const sessionActions = useMemo(
+    () => getActionsForSession(session?.session_type ?? "recording"),
+    [session?.session_type],
+  );
+  const handleToolsExecuted = useCallback(
+    async (names: string[]) => {
+      if (!selectedSessionId) return;
+      const effects = getToolEffects(names);
+      if (effects.has("session-meta")) {
+        await loadSessions();
+        const refreshed = await getSession(selectedSessionId);
+        if (refreshed) {
+          useAppStore.setState({ viewSession: refreshed });
+        }
+      }
+      if (effects.has("notes")) {
+        incrementNoteRefresh();
+      }
+    },
+    [selectedSessionId, loadSessions, incrementNoteRefresh],
+  );
+
+  const handleSeek = useCallback(
+    (time: number) => {
+      setPlaybackTime(time);
+      const audioEl = document.querySelector<
+        HTMLAudioElement & { seekTo?: (t: number) => void }
+      >("audio[data-session-audio]");
+      if (audioEl) {
+        audioEl.currentTime = time;
+        if (audioEl.paused) {
+          audioEl.play().catch(() => { });
+        }
+      }
+    },
+    [setPlaybackTime],
+  );
+
+  const handleDurationResolved = useCallback(
+    async (d: number) => {
+      if (!session) return;
+      const dbDuration = session.wav_duration_seconds ?? 0;
+      if (dbDuration === 0 && session.wav_file_path && d > 0) {
+        await updateSessionWavPath(session.id, session.wav_file_path, d);
+        const refreshed = await getSession(session.id);
+        if (refreshed) {
+          useAppStore.setState({ viewSession: refreshed });
+        }
+      }
+    },
+    [session],
+  );
+
+  if (!session) {
+    return (
+      <div className="flex flex-1 items-center justify-center">
+        <p className="text-sm text-muted-foreground">Session not found</p>
+      </div>
+    );
+  }
+  const isEditable = isActiveSession || session.status === "completed";
+  const isManual = session.session_type === "manual";
+  const isTranscription = !isManual;
+  const hasWav = !!session.wav_file_path;
+  const wavDuration = session.wav_duration_seconds ?? 0;
+  const wavSrc = hasWav ? audioStreamUrl(session.wav_file_path!) : "";
+
+  const chatBar = selectedSessionId ? (
+    <AIContextProvider
+      contextKey={selectedSessionId}
+      sources={sources}
+      tools={tools}
+      actions={sessionActions}
+      segments={segments}
+      buildSystemPrompt={buildSystemPrompt}
+      isSessionContext={true}
+      sessionId={selectedSessionId}
+      onToolsExecuted={handleToolsExecuted}
+    >
+      <FloatingChatBar />
+    </AIContextProvider>
+  ) : null;
+
+  // Manual notes: full-width editor
+  if (isManual) {
+    return (
+      <div className="relative flex flex-1 flex-col min-h-0 pb-16 view-enter">
+        <SessionHeader session={session} />
+        <NoteEditor sessionId={session.id} refreshKey={noteRefreshCounter} />
+        {chatBar}
+      </div>
+    );
+  }
+
+  // Active recording: split pane with transcript (left) + notes (right)
+  if (isActiveSession) {
+    return (
+      <div className="flex flex-1 flex-col min-h-0 view-enter">
+        <SessionHeader session={session} />
+        <ResizablePanelGroup orientation="horizontal" className="flex-1">
+          <ResizablePanel defaultSize="40%" minSize="20%">
+            <div className="flex flex-col h-full min-h-0">
+              <ChatView
+                segments={segments}
+                backfillActive={backfillActive}
+                isEditable={isEditable}
+                initialScrollToBottom={isActiveSession}
+              />
+            </div>
+          </ResizablePanel>
+          <ResizableHandle />
+          <ResizablePanel defaultSize="60%" minSize="25%">
+            <div className="relative flex flex-col h-full min-h-0 pb-24">
+              <NoteEditor sessionId={session.id} refreshKey={noteRefreshCounter} />
+              {chatBar}
+            </div>
+          </ResizablePanel>
+        </ResizablePanelGroup>
+      </div>
+    );
+  }
+
+  // Completed transcription: split pane with transcript (left) + notes (right)
+  if (isTranscription && isEditable) {
+    return (
+      <div className="flex flex-1 flex-col min-h-0 view-enter">
+        <SessionHeader session={session} />
+        {hasWav && (
+          <AudioPlayer
+            src={wavSrc}
+            duration={wavDuration}
+            onTimeUpdate={setPlaybackTime}
+            onPlayStateChange={setIsPlaying}
+            onDurationResolved={handleDurationResolved}
+          />
+        )}
+        <ResizablePanelGroup orientation="horizontal" className="flex-1">
+          <ResizablePanel defaultSize="40%" minSize="20%">
+            <div className="flex flex-col h-full min-h-0">
+              <ChatView
+                segments={segments}
+                isEditable={isEditable}
+                currentPlaybackTime={hasWav ? playbackTime : undefined}
+                onTimestampClick={hasWav ? handleSeek : undefined}
+              />
+            </div>
+          </ResizablePanel>
+          <ResizableHandle />
+          <ResizablePanel defaultSize="60%" minSize="25%">
+            <div className="relative flex flex-col h-full min-h-0 pb-24">
+              <NoteEditor sessionId={session.id} refreshKey={noteRefreshCounter} onSeekTime={hasWav ? handleSeek : undefined} />
+              {chatBar}
+            </div>
+          </ResizablePanel>
+        </ResizablePanelGroup>
+      </div>
+    );
+  }
+
+  // Fallback: transcript only
+  return (
+    <div className="flex flex-1 flex-col min-h-0 pb-16 view-enter">
+      <SessionHeader session={session} />
+      <ChatView segments={segments} />
+    </div>
+  );
+}

@@ -1,0 +1,168 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
+use cpal::traits::{DeviceTrait, StreamTrait};
+use cpal::StreamConfig;
+use tracing::info;
+
+use crate::device::resolve_input_device;
+use crate::error::AudioError;
+use crate::ring_buffer::AudioRingBuffer;
+use crate::stream::{build_capture_stream, SendStream};
+use crate::DeviceStreamConfig;
+
+type Result<T> = std::result::Result<T, AudioError>;
+
+pub struct MicrophoneCapture {
+    stream: Option<SendStream>,
+    is_running: bool,
+    stream_error: Arc<AtomicBool>,
+    /// The device ID used for the current/last capture session.
+    last_device_id: Option<String>,
+    /// The device name used for the current/last capture session.
+    /// Stored on successful start so restarts can target the same device.
+    last_device_name: Option<String>,
+}
+
+impl MicrophoneCapture {
+    pub fn new() -> Self {
+        Self {
+            stream: None,
+            is_running: false,
+            stream_error: Arc::new(AtomicBool::new(false)),
+            last_device_id: None,
+            last_device_name: None,
+        }
+    }
+
+    /// Queries the device's default input configuration without starting capture.
+    pub fn query_device_config(device_id: Option<&str>) -> Result<DeviceStreamConfig> {
+        let device = resolve_input_device(device_id, None)?;
+        let supported = device.default_input_config()?;
+        Ok(DeviceStreamConfig {
+            sample_rate: supported.sample_rate(),
+            channels: supported.channels(),
+        })
+    }
+
+    pub fn start(&mut self, device_id: Option<&str>, buffer: Arc<AudioRingBuffer>) -> Result<()> {
+        if self.is_running {
+            return Err(AudioError::AlreadyRunning);
+        }
+
+        let device = resolve_input_device(device_id, None)?;
+        let device_actual_name = device
+            .description()
+            .map(|d| d.name().to_string())
+            .unwrap_or_else(|_| "unknown".to_string());
+
+        let supported = device.default_input_config()?;
+
+        // Use the device's native config to avoid "unsupported configuration" errors.
+        let stream_config = StreamConfig {
+            channels: supported.channels(),
+            sample_rate: supported.sample_rate(),
+            buffer_size: cpal::BufferSize::Default,
+        };
+
+        info!(
+            "using device config: {}Hz, {}ch (device: {})",
+            stream_config.sample_rate, stream_config.channels, device_actual_name
+        );
+
+        self.stream_error.store(false, Ordering::Release);
+        let stream = build_capture_stream(
+            &device,
+            &supported,
+            &stream_config,
+            &buffer,
+            "microphone",
+            &self.stream_error,
+        )?;
+
+        stream.play()?;
+        info!(
+            "microphone capture started on device: {}",
+            device_actual_name
+        );
+
+        self.stream = Some(SendStream::new(stream));
+        self.is_running = true;
+        // Persist resolved device info so restarts can target the same device.
+        self.last_device_id = device.id().ok().map(|id| id.to_string());
+        self.last_device_name = Some(device_actual_name);
+
+        Ok(())
+    }
+
+    /// Returns the device ID used for the current/last capture session, if any.
+    pub fn last_device_id(&self) -> Option<&str> {
+        self.last_device_id.as_deref()
+    }
+
+    /// Returns the device name used for the current/last capture session, if any.
+    pub fn last_device_name(&self) -> Option<&str> {
+        self.last_device_name.as_deref()
+    }
+
+    pub fn stop(&mut self) -> Result<()> {
+        if !self.is_running {
+            return Ok(());
+        }
+
+        if let Some(stream) = self.stream.take() {
+            drop(stream);
+        }
+
+        self.is_running = false;
+        info!("microphone capture stopped");
+
+        Ok(())
+    }
+
+    pub fn is_running(&self) -> bool {
+        self.is_running
+    }
+
+    /// Returns `true` if the cpal error callback has fired (device disconnect, etc.).
+    pub fn has_stream_error(&self) -> bool {
+        self.stream_error.load(Ordering::Acquire)
+    }
+}
+
+impl Default for MicrophoneCapture {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_new_microphone_capture() {
+        let capture = MicrophoneCapture::new();
+        assert!(!capture.is_running());
+    }
+
+    #[test]
+    fn test_stop_when_not_running() {
+        let mut capture = MicrophoneCapture::new();
+        let result = capture.stop();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    #[ignore] // Requires audio hardware
+    fn test_start_stop_capture() {
+        let mut capture = MicrophoneCapture::new();
+        let buffer = Arc::new(AudioRingBuffer::with_duration(10.0, 16000, 1));
+
+        capture.start(None, buffer).unwrap();
+        assert!(capture.is_running());
+
+        capture.stop().unwrap();
+        assert!(!capture.is_running());
+    }
+}

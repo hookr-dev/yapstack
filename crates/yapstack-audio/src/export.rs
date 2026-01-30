@@ -1,0 +1,248 @@
+use std::fs::File;
+use std::io::BufWriter;
+use std::path::{Path, PathBuf};
+
+use hound::{SampleFormat, WavSpec, WavWriter};
+use tempfile::Builder;
+
+use crate::error::AudioError;
+
+type Result<T> = std::result::Result<T, AudioError>;
+
+/// Incrementally writes mono 16-bit PCM audio to a WAV file.
+///
+/// Designed for streaming session recording: call `write_samples()` periodically
+/// to append audio, then `finalize()` to flush and close the file. The WAV header
+/// is updated on `finalize()` to reflect the total data size.
+pub struct SessionWavWriter {
+    writer: WavWriter<BufWriter<File>>,
+    path: PathBuf,
+    sample_rate: u32,
+    samples_written: u64,
+}
+
+impl SessionWavWriter {
+    /// Creates a new WAV file at `path` for mono 16-bit PCM at the given sample rate.
+    pub fn new(path: PathBuf, sample_rate: u32) -> Result<Self> {
+        let spec = WavSpec {
+            channels: 1,
+            sample_rate,
+            bits_per_sample: 16,
+            sample_format: SampleFormat::Int,
+        };
+        let writer = WavWriter::create(&path, spec)?;
+        Ok(Self {
+            writer,
+            path,
+            sample_rate,
+            samples_written: 0,
+        })
+    }
+
+    /// Appends mono f32 samples (clamped to [-1.0, 1.0] and converted to i16).
+    pub fn write_samples(&mut self, samples: &[f32]) -> Result<()> {
+        for &sample in samples {
+            self.writer.write_sample(f32_to_i16(sample))?;
+        }
+        self.samples_written += samples.len() as u64;
+        Ok(())
+    }
+
+    /// Flushes and closes the WAV file, updating the header with the final data size.
+    /// Returns `(path, duration_seconds)`.
+    pub fn finalize(self) -> Result<(PathBuf, f32)> {
+        let duration = self.duration_seconds();
+        self.writer.finalize()?;
+        Ok((self.path, duration))
+    }
+
+    /// Returns the WAV file path.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Returns the total number of samples written so far.
+    pub fn samples_written(&self) -> u64 {
+        self.samples_written
+    }
+
+    /// Returns the duration of audio written so far in seconds.
+    pub fn duration_seconds(&self) -> f32 {
+        self.samples_written as f32 / self.sample_rate as f32
+    }
+}
+
+fn f32_to_i16(sample: f32) -> i16 {
+    let clamped = sample.clamp(-1.0, 1.0);
+    (clamped * i16::MAX as f32) as i16
+}
+
+/// Writes f32 audio samples to a WAV file as 16-bit signed PCM.
+pub fn write_wav(samples: &[f32], sample_rate: u32, channels: u16, path: &Path) -> Result<()> {
+    let spec = WavSpec {
+        channels,
+        sample_rate,
+        bits_per_sample: 16,
+        sample_format: SampleFormat::Int,
+    };
+
+    let mut writer = WavWriter::create(path, spec)?;
+
+    for &sample in samples {
+        writer.write_sample(f32_to_i16(sample))?;
+    }
+
+    writer.finalize()?;
+    Ok(())
+}
+
+/// Writes f32 audio samples to a temporary WAV file (16-bit signed PCM).
+///
+/// The file is persisted (not deleted on drop) so it outlives this function call.
+/// The caller is responsible for cleanup.
+pub fn write_wav_to_temp(samples: &[f32], sample_rate: u32, channels: u16) -> Result<PathBuf> {
+    let temp_file = Builder::new()
+        .prefix("yapstack_capture_")
+        .suffix(".wav")
+        .tempfile()?;
+
+    // Write WAV *before* calling keep() — if writing fails, the NamedTempFile
+    // handle will clean up the temp file on drop automatically.
+    write_wav(samples, sample_rate, channels, temp_file.path())?;
+
+    let (_, path) = temp_file
+        .keep()
+        .map_err(|e| AudioError::WavExport(e.to_string()))?;
+    Ok(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hound::WavReader;
+    use std::fs;
+
+    #[test]
+    fn test_write_wav_creates_valid_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.wav");
+        let samples = vec![0.0f32; 16000]; // 1 second of silence at 16kHz
+
+        write_wav(&samples, 16000, 1, &path).unwrap();
+
+        let reader = WavReader::open(&path).unwrap();
+        let spec = reader.spec();
+        assert_eq!(spec.channels, 1);
+        assert_eq!(spec.sample_rate, 16000);
+        assert_eq!(spec.bits_per_sample, 16);
+        assert_eq!(spec.sample_format, SampleFormat::Int);
+        assert_eq!(reader.len(), 16000);
+    }
+
+    #[test]
+    fn test_roundtrip_sample_verification() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test_roundtrip.wav");
+        let samples = vec![0.0, 0.5, -0.5, 1.0, -1.0];
+
+        write_wav(&samples, 16000, 1, &path).unwrap();
+
+        let mut reader = WavReader::open(&path).unwrap();
+        let read_samples: Vec<i16> = reader.samples::<i16>().map(|s| s.unwrap()).collect();
+        assert_eq!(read_samples.len(), 5);
+        assert_eq!(read_samples[0], 0);
+        // 0.5 * 32767 ≈ 16383
+        assert!((read_samples[1] - 16383).abs() <= 1);
+        assert!((read_samples[2] + 16383).abs() <= 1);
+        assert_eq!(read_samples[3], i16::MAX);
+        // -1.0 * 32767 = -32767
+        assert!((read_samples[4] + i16::MAX).abs() <= 1);
+    }
+
+    #[test]
+    fn test_temp_file_creation() {
+        let samples = vec![0.0f32; 1600];
+        let path = write_wav_to_temp(&samples, 16000, 1).unwrap();
+
+        assert!(path.exists());
+        assert!(path.to_string_lossy().contains("yapstack_capture_"));
+        assert!(path.extension().is_some_and(|ext| ext == "wav"));
+
+        // Cleanup
+        fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn test_clamping_out_of_range() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test_clamp.wav");
+        let samples = vec![2.0, -3.0, 1.5, -1.5];
+
+        write_wav(&samples, 16000, 1, &path).unwrap();
+
+        let mut reader = WavReader::open(&path).unwrap();
+        let read_samples: Vec<i16> = reader.samples::<i16>().map(|s| s.unwrap()).collect();
+        // Values should be clamped to i16::MAX / i16::MIN range
+        assert_eq!(read_samples[0], i16::MAX);
+        assert!((read_samples[1] + i16::MAX).abs() <= 1);
+        assert_eq!(read_samples[2], i16::MAX);
+        assert!((read_samples[3] + i16::MAX).abs() <= 1);
+    }
+
+    // --- SessionWavWriter tests ---
+
+    #[test]
+    fn test_session_wav_writer_creates_valid_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.wav");
+
+        let mut writer = SessionWavWriter::new(path.clone(), 48000).unwrap();
+        let samples = vec![0.0f32; 48000]; // 1 second at 48kHz
+        writer.write_samples(&samples).unwrap();
+        let (result_path, duration) = writer.finalize().unwrap();
+
+        assert_eq!(result_path, path);
+        assert!((duration - 1.0).abs() < 0.001);
+
+        let reader = WavReader::open(&path).unwrap();
+        let spec = reader.spec();
+        assert_eq!(spec.channels, 1);
+        assert_eq!(spec.sample_rate, 48000);
+        assert_eq!(spec.bits_per_sample, 16);
+        assert_eq!(reader.len(), 48000);
+    }
+
+    #[test]
+    fn test_session_wav_writer_incremental_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("incremental.wav");
+
+        let mut writer = SessionWavWriter::new(path.clone(), 16000).unwrap();
+        // Write 3 chunks of 0.5s each
+        let chunk = vec![0.5f32; 8000];
+        writer.write_samples(&chunk).unwrap();
+        assert!((writer.duration_seconds() - 0.5).abs() < 0.001);
+        writer.write_samples(&chunk).unwrap();
+        assert!((writer.duration_seconds() - 1.0).abs() < 0.001);
+        writer.write_samples(&chunk).unwrap();
+
+        let (_, duration) = writer.finalize().unwrap();
+        assert!((duration - 1.5).abs() < 0.001);
+
+        let reader = WavReader::open(&path).unwrap();
+        assert_eq!(reader.len(), 24000);
+    }
+
+    #[test]
+    fn test_session_wav_writer_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.wav");
+
+        let writer = SessionWavWriter::new(path.clone(), 48000).unwrap();
+        let (_, duration) = writer.finalize().unwrap();
+        assert!((duration - 0.0).abs() < f32::EPSILON);
+
+        let reader = WavReader::open(&path).unwrap();
+        assert_eq!(reader.len(), 0);
+    }
+}

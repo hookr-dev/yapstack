@@ -1,0 +1,110 @@
+{
+  "$schema": "https://raw.githubusercontent.com/tauri-apps/tauri/dev/crates/tauri-cli/schema.json",
+  "productName": "YapStack",
+  "version": "0.1.0",
+  "identifier": "dev.yapstack.app",
+  "build": {
+    "beforeDevCommand": "pnpm dev",
+    "devUrl": "http://localhost:5173",
+    "beforeBuildCommand": "pnpm build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "macOSPrivateApi": true,
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "title": "YapStack",
+        "width": 1100,
+        "height": 750,
+        "minWidth": 800,
+        "minHeight": 600,
+        "resizable": true,
+        "fullscreen": false,
+        "center": true,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true,
+        "acceptFirstMouse": true,
+        "trafficLightPosition": {
+          "x": 12,
+          "y": 20
+        }
+      },
+      {
+        "label": "dictation",
+        "title": "YapStack - Dictation",
+        "url": "index.html?window=dictation",
+        "width": 220,
+        "height": 64,
+        "visible": false,
+        "resizable": false,
+        "decorations": false,
+        "transparent": true,
+        "alwaysOnTop": true,
+        "visibleOnAllWorkspaces": true,
+        "skipTaskbar": true,
+        "focus": false,
+        "shadow": false
+      },
+      {
+        "label": "recording-indicator",
+        "title": "YapStack - Recording Indicator",
+        "url": "index.html?window=recording-indicator",
+        "width": 56,
+        "height": 120,
+        "visible": false,
+        "resizable": false,
+        "decorations": false,
+        "transparent": true,
+        "alwaysOnTop": true,
+        "visibleOnAllWorkspaces": true,
+        "skipTaskbar": true,
+        "focus": false,
+        "shadow": false
+      }
+    ],
+    "security": {
+      "csp": null,
+      "assetProtocol": {
+        "scope": {
+          "allow": ["$APPDATA/audio/**"]
+        }
+      }
+    }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEYxNDIyMUMwMTM5QkNEMEMKUldRTXpac1R3Q0ZDOGM4Q1BMdzB0NUVXUG9QWE5UV3Evbno5SUsvQlQwaFBCb3haL1FoMVdMOXYK",
+      "endpoints": [
+        "https://github.com/hookr-dev/YapStack/releases/latest/download/latest.json"
+      ]
+    }
+  },
+  "bundle": {
+    "createUpdaterArtifacts": "v1Compatible",
+    "active": true,
+    "targets": "all",
+    "externalBin": ["binaries/yapstack-sidecar"],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser"
+      }
+    },
+    "macOS": {
+      "entitlements": "./Entitlements.plist",
+      "minimumSystemVersion": "13.0",
+      "dmg": {
+        "windowSize": { "width": 660, "height": 400 },
+        "appPosition": { "x": 180, "y": 220 },
+        "applicationFolderPosition": { "x": 480, "y": 220 }
+      }
+    }
+  }
+}
