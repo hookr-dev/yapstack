@@ -1,0 +1,146 @@
+import { describe, it, expect } from "vitest";
+import {
+  SHORTCUTS,
+  SHORTCUT_MAP,
+  getBinding,
+  eventToBinding,
+  eventToGlobalBinding,
+} from "./shortcuts";
+
+describe("SHORTCUTS / SHORTCUT_MAP", () => {
+  it("has shortcuts defined", () => {
+    expect(SHORTCUTS.length).toBeGreaterThan(10);
+  });
+
+  it("looks up a known ID", () => {
+    const def = SHORTCUT_MAP.get("command-palette");
+    expect(def).toBeDefined();
+    expect(def!.defaultBinding).toBe("mod+k");
+  });
+
+  it("returns undefined for unknown ID", () => {
+    expect(SHORTCUT_MAP.get("nonexistent")).toBeUndefined();
+  });
+});
+
+describe("getBinding", () => {
+  it("returns default binding when no override", () => {
+    expect(getBinding("command-palette", {})).toBe("mod+k");
+  });
+
+  it("returns override when provided", () => {
+    expect(getBinding("command-palette", { "command-palette": "mod+l" })).toBe(
+      "mod+l",
+    );
+  });
+
+  it("returns empty string for unknown ID with no override", () => {
+    expect(getBinding("nonexistent", {})).toBe("");
+  });
+
+  it("returns override even for unknown ID", () => {
+    expect(getBinding("nonexistent", { nonexistent: "mod+x" })).toBe("mod+x");
+  });
+});
+
+describe("eventToBinding", () => {
+  const makeEvent = (
+    overrides: Partial<KeyboardEvent>,
+  ): KeyboardEvent =>
+    ({
+      key: "",
+      code: "",
+      metaKey: false,
+      ctrlKey: false,
+      shiftKey: false,
+      altKey: false,
+      ...overrides,
+    }) as KeyboardEvent;
+
+  it("returns empty string for modifier-only keypresses", () => {
+    expect(eventToBinding(makeEvent({ key: "Control" }))).toBe("");
+    expect(eventToBinding(makeEvent({ key: "Meta" }))).toBe("");
+    expect(eventToBinding(makeEvent({ key: "Shift" }))).toBe("");
+    expect(eventToBinding(makeEvent({ key: "Alt" }))).toBe("");
+  });
+
+  it("formats Ctrl+K (non-Mac uses ctrlKey as mod)", () => {
+    expect(
+      eventToBinding(makeEvent({ key: "k", ctrlKey: true })),
+    ).toBe("mod+k");
+  });
+
+  it("formats Ctrl+Shift+N", () => {
+    expect(
+      eventToBinding(
+        makeEvent({ key: "n", ctrlKey: true, shiftKey: true }),
+      ),
+    ).toBe("mod+shift+n");
+  });
+
+  it("formats Escape", () => {
+    expect(eventToBinding(makeEvent({ key: "Escape" }))).toBe("escape");
+  });
+
+  it("formats Alt+P", () => {
+    expect(eventToBinding(makeEvent({ key: "p", altKey: true }))).toBe(
+      "alt+p",
+    );
+  });
+
+  it("formats period key", () => {
+    expect(
+      eventToBinding(makeEvent({ key: ".", ctrlKey: true })),
+    ).toBe("mod+.");
+  });
+});
+
+describe("eventToGlobalBinding", () => {
+  const makeEvent = (
+    overrides: Partial<KeyboardEvent>,
+  ): KeyboardEvent =>
+    ({
+      key: "",
+      code: "",
+      metaKey: false,
+      ctrlKey: false,
+      shiftKey: false,
+      altKey: false,
+      ...overrides,
+    }) as KeyboardEvent;
+
+  it("formats KeyN+meta", () => {
+    expect(
+      eventToGlobalBinding(makeEvent({ code: "KeyN", metaKey: true })),
+    ).toBe("CommandOrControl+N");
+  });
+
+  it("formats Digit1+meta", () => {
+    expect(
+      eventToGlobalBinding(makeEvent({ code: "Digit1", metaKey: true })),
+    ).toBe("CommandOrControl+1");
+  });
+
+  it("formats F12", () => {
+    expect(
+      eventToGlobalBinding(makeEvent({ code: "F12" })),
+    ).toBe("F12");
+  });
+
+  it("returns empty string for modifier-only codes", () => {
+    expect(
+      eventToGlobalBinding(makeEvent({ code: "MetaLeft" })),
+    ).toBe("");
+    expect(
+      eventToGlobalBinding(makeEvent({ code: "ShiftRight" })),
+    ).toBe("");
+  });
+
+  it("formats shift+period", () => {
+    expect(
+      eventToGlobalBinding(
+        makeEvent({ code: "Period", metaKey: true, shiftKey: true }),
+      ),
+    ).toBe("CommandOrControl+Shift+.");
+  });
+});

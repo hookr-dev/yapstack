@@ -1,0 +1,433 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+
+@custom-variant dark (&:is(.dark *));
+
+@theme inline {
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+  --radius-2xl: calc(var(--radius) + 8px);
+  --radius-3xl: calc(var(--radius) + 12px);
+  --radius-4xl: calc(var(--radius) + 16px);
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
+  --color-chart-4: var(--chart-4);
+  --color-chart-5: var(--chart-5);
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-ring: var(--sidebar-ring);
+}
+
+:root {
+  --radius: 0.625rem;
+  --background: oklch(0.94 0.01 60);
+  --foreground: oklch(0.237 0.031 284.8);
+  --card: oklch(1 0 0);
+  --card-foreground: oklch(0.237 0.031 284.8);
+  --popover: oklch(1 0 0);
+  --popover-foreground: oklch(0.237 0.031 284.8);
+  --primary: oklch(0.237 0.031 284.8);
+  --primary-foreground: oklch(0.94 0.01 60);
+  --secondary: oklch(0.645 0.022 325.1 / 20%);
+  --secondary-foreground: oklch(0.237 0.031 284.8);
+  --muted: oklch(0.645 0.022 325.1 / 15%);
+  --muted-foreground: oklch(0.387 0.033 278.7);
+  --accent: oklch(0.645 0.022 325.1 / 15%);
+  --accent-foreground: oklch(0.237 0.031 284.8);
+  --destructive: oklch(0.577 0.245 27.325);
+  --border: oklch(0.645 0.022 325.1 / 30%);
+  --input: oklch(0.645 0.022 325.1 / 30%);
+  --ring: oklch(0.773 0.03 28.3);
+  --chart-1: oklch(0.237 0.031 284.8);
+  --chart-2: oklch(0.387 0.033 278.7);
+  --chart-3: oklch(0.645 0.022 325.1);
+  --chart-4: oklch(0.773 0.03 28.3);
+  --chart-5: oklch(0.94 0.01 60);
+  --sidebar: oklch(0.773 0.03 28.3 / 25%);
+  --sidebar-foreground: oklch(0.237 0.031 284.8);
+  --sidebar-primary: oklch(0.237 0.031 284.8);
+  --sidebar-primary-foreground: oklch(0.94 0.01 60);
+  --sidebar-accent: oklch(0.773 0.03 28.3 / 20%);
+  --sidebar-accent-foreground: oklch(0.237 0.031 284.8);
+  --sidebar-border: oklch(0.645 0.022 325.1 / 30%);
+  --sidebar-ring: oklch(0.773 0.03 28.3);
+}
+
+.dark {
+  --background: oklch(0.237 0.031 284.8);
+  --foreground: oklch(0.94 0.01 60);
+  --card: oklch(0.387 0.033 278.7);
+  --card-foreground: oklch(0.94 0.01 60);
+  --popover: oklch(0.387 0.033 278.7);
+  --popover-foreground: oklch(0.94 0.01 60);
+  --primary: oklch(0.773 0.03 28.3);
+  --primary-foreground: oklch(0.237 0.031 284.8);
+  --secondary: oklch(0.387 0.033 278.7);
+  --secondary-foreground: oklch(0.94 0.01 60);
+  --muted: oklch(0.387 0.033 278.7);
+  --muted-foreground: oklch(0.645 0.022 325.1);
+  --accent: oklch(0.387 0.033 278.7);
+  --accent-foreground: oklch(0.94 0.01 60);
+  --destructive: oklch(0.704 0.191 22.216);
+  --border: oklch(0.645 0.022 325.1 / 20%);
+  --input: oklch(0.645 0.022 325.1 / 25%);
+  --ring: oklch(0.773 0.03 28.3);
+  --chart-1: oklch(0.773 0.03 28.3);
+  --chart-2: oklch(0.645 0.022 325.1);
+  --chart-3: oklch(0.94 0.01 60);
+  --chart-4: oklch(0.387 0.033 278.7);
+  --chart-5: oklch(0.237 0.031 284.8);
+  --sidebar: oklch(0.312 0.032 281.8);
+  --sidebar-foreground: oklch(0.94 0.01 60);
+  --sidebar-primary: oklch(0.773 0.03 28.3);
+  --sidebar-primary-foreground: oklch(0.237 0.031 284.8);
+  --sidebar-accent: oklch(0.387 0.033 278.7);
+  --sidebar-accent-foreground: oklch(0.94 0.01 60);
+  --sidebar-border: oklch(0.645 0.022 325.1 / 20%);
+  --sidebar-ring: oklch(0.773 0.03 28.3);
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  html,
+  body {
+    overscroll-behavior: none;
+  }
+  body {
+    @apply bg-background text-foreground;
+  }
+}
+
+@layer components {
+  .tiptap-editor h1 {
+    font-size: 1.5rem;
+    font-weight: 700;
+    line-height: 1.3;
+    margin-top: 1.5rem;
+    margin-bottom: 0.5rem;
+  }
+  .tiptap-editor h2 {
+    font-size: 1.25rem;
+    font-weight: 600;
+    line-height: 1.35;
+    margin-top: 1.25rem;
+    margin-bottom: 0.375rem;
+  }
+  .tiptap-editor h3 {
+    font-size: 1.1rem;
+    font-weight: 500;
+    line-height: 1.35;
+    margin-top: 1rem;
+    margin-bottom: 0.25rem;
+  }
+  .tiptap-editor h4 {
+    font-size: 1rem;
+    font-weight: 500;
+    line-height: 1.4;
+    margin-top: 0.75rem;
+    margin-bottom: 0.25rem;
+  }
+  .tiptap-editor p {
+    margin-top: 0.5rem;
+    margin-bottom: 0.5rem;
+    line-height: 1.65;
+  }
+  .tiptap-editor ul,
+  .tiptap-editor ol {
+    padding-left: 1.5rem;
+    margin-top: 0.5rem;
+    margin-bottom: 0.5rem;
+  }
+  .tiptap-editor ul {
+    list-style-type: disc;
+  }
+  .tiptap-editor ol {
+    list-style-type: decimal;
+  }
+  .tiptap-editor li {
+    margin-top: 0.25rem;
+    margin-bottom: 0.25rem;
+  }
+  .tiptap-editor li > p {
+    margin: 0;
+  }
+  .tiptap-editor blockquote {
+    border-left: 3px solid var(--border);
+    padding-left: 1rem;
+    margin: 0.75rem 0;
+    color: var(--muted-foreground);
+    font-style: italic;
+  }
+  .tiptap-editor code {
+    background: var(--muted);
+    border-radius: 0.25rem;
+    padding: 0.125rem 0.375rem;
+    font-size: 0.85em;
+    font-family: ui-monospace, monospace;
+  }
+  .tiptap-editor pre {
+    background: var(--muted);
+    border-radius: 0.5rem;
+    padding: 0.75rem 1rem;
+    overflow-x: auto;
+    margin: 0.75rem 0;
+  }
+  .tiptap-editor pre code {
+    background: none;
+    padding: 0;
+    font-size: 0.875rem;
+  }
+  .tiptap-editor hr {
+    border-color: var(--border);
+    margin: 1.5rem 0;
+  }
+  .tiptap-editor ul[data-type="taskList"] {
+    list-style: none;
+    padding-left: 0;
+    margin-top: 0.5rem;
+    margin-bottom: 0.5rem;
+  }
+  .tiptap-editor ul[data-type="taskList"] li {
+    display: flex;
+    flex-direction: row;
+    align-items: flex-start;
+    gap: 0.5rem;
+  }
+  .tiptap-editor ul[data-type="taskList"] li > label {
+    flex-shrink: 0;
+    margin-top: 0.25rem;
+  }
+  .tiptap-editor ul[data-type="taskList"] li[data-checked="true"] > div > p {
+    text-decoration: line-through;
+    color: var(--muted-foreground);
+  }
+  .tiptap-editor mark {
+    background: oklch(0.9 0.1 95 / 50%);
+    border-radius: 0.125rem;
+    padding: 0 2px;
+  }
+  .dark .tiptap-editor mark {
+    background: oklch(0.65 0.12 85 / 30%);
+  }
+  .tiptap-editor a {
+    color: var(--primary);
+    text-decoration: underline;
+    cursor: pointer;
+  }
+  .tiptap-editor a:hover {
+    opacity: 0.8;
+  }
+  .tiptap-editor span[data-segment-ref] {
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+    background: var(--accent);
+    color: var(--accent-foreground);
+    border-radius: 0.25rem;
+    padding: 1px 4px;
+    font-size: 10px;
+    font-weight: 500;
+    cursor: pointer;
+    vertical-align: baseline;
+  }
+  .tiptap-editor span[data-segment-ref]:hover {
+    opacity: 0.8;
+  }
+  .tiptap-editor p.is-editor-empty:first-child::before {
+    color: var(--muted-foreground);
+    opacity: 0.5;
+  }
+
+  /* AI chat markdown formatting */
+  .ai-chat-markdown p {
+    margin: 0.375rem 0;
+    line-height: 1.6;
+  }
+  .ai-chat-markdown p:first-child {
+    margin-top: 0;
+  }
+  .ai-chat-markdown p:last-child {
+    margin-bottom: 0;
+  }
+  .ai-chat-markdown h1,
+  .ai-chat-markdown h2,
+  .ai-chat-markdown h3 {
+    font-weight: 600;
+    margin-top: 0.75rem;
+    margin-bottom: 0.25rem;
+    line-height: 1.3;
+  }
+  .ai-chat-markdown h1 {
+    font-size: 0.875rem;
+  }
+  .ai-chat-markdown h2 {
+    font-size: 0.8125rem;
+  }
+  .ai-chat-markdown h3 {
+    font-size: 0.75rem;
+  }
+  .ai-chat-markdown ul,
+  .ai-chat-markdown ol {
+    padding-left: 1.25rem;
+    margin: 0.375rem 0;
+  }
+  .ai-chat-markdown ul {
+    list-style-type: disc;
+  }
+  .ai-chat-markdown ol {
+    list-style-type: decimal;
+  }
+  .ai-chat-markdown li {
+    margin: 0.2rem 0;
+    line-height: 1.5;
+  }
+  .ai-chat-markdown li > p {
+    margin: 0;
+  }
+  .ai-chat-markdown strong {
+    font-weight: 600;
+  }
+  .ai-chat-markdown code {
+    background: var(--background);
+    border-radius: 0.25rem;
+    padding: 0.1rem 0.3rem;
+    font-size: 0.85em;
+    font-family: ui-monospace, monospace;
+  }
+  .ai-chat-markdown pre {
+    background: var(--background);
+    border-radius: 0.375rem;
+    padding: 0.5rem 0.75rem;
+    overflow-x: auto;
+    margin: 0.5rem 0;
+  }
+  .ai-chat-markdown pre code {
+    background: none;
+    padding: 0;
+  }
+  .ai-chat-markdown blockquote {
+    border-left: 2px solid var(--border);
+    padding-left: 0.75rem;
+    margin: 0.5rem 0;
+    color: var(--muted-foreground);
+    font-style: italic;
+  }
+  .ai-chat-markdown hr {
+    border-color: var(--border);
+    margin: 0.5rem 0;
+  }
+
+  .keybind-display {
+    font-family: -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+    letter-spacing: 0.05em;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .view-enter {
+    animation: viewFadeIn 0.15s ease-out;
+  }
+  @keyframes viewFadeIn {
+    from {
+      opacity: 0;
+      transform: translateY(4px);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+
+  /* FloatingChatBar collapsible animations */
+  [data-slot="collapsible-content"] {
+    overflow: hidden;
+  }
+  [data-slot="collapsible-content"][data-state="open"] {
+    animation: chatExpand 0.2s ease-out;
+  }
+  [data-slot="collapsible-content"][data-state="closed"] {
+    animation: chatCollapse 0.15s ease-out;
+  }
+  @keyframes chatExpand {
+    from {
+      height: 0;
+    }
+    to {
+      height: var(--radix-collapsible-content-height);
+    }
+  }
+  @keyframes chatCollapse {
+    from {
+      height: var(--radix-collapsible-content-height);
+    }
+    to {
+      height: 0;
+    }
+  }
+
+  /* Command palette scrollbar */
+  .command-list-scroll::-webkit-scrollbar { width: 6px; }
+  .command-list-scroll::-webkit-scrollbar-track { background: transparent; }
+  .command-list-scroll::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+  .command-list-scroll::-webkit-scrollbar-thumb:hover { background: var(--muted-foreground); }
+
+  /* Command palette selected item */
+  [cmdk-item][aria-selected="true"] {
+    background: oklch(0.55 0.02 280 / 12%);
+  }
+  .dark [cmdk-item][aria-selected="true"] {
+    background: oklch(0.75 0.02 280 / 15%);
+  }
+
+  /* Command palette search highlight */
+  .command-highlight { background: oklch(0.92 0.1 95 / 60%); border-radius: 2px; padding: 0 1px; color: inherit; }
+  .dark .command-highlight { background: oklch(0.55 0.12 85 / 40%); }
+
+  /* Command palette loading bar */
+  @keyframes commandLoading {
+    0% { transform: translateX(-100%); }
+    50% { transform: translateX(200%); }
+    100% { transform: translateX(-100%); }
+  }
+  .animate-command-loading { animation: commandLoading 1.5s ease-in-out infinite; }
+
+  /* Onboarding step transitions */
+  @keyframes onboardingSlideInRight {
+    from { opacity: 0; transform: translateX(24px); }
+    to { opacity: 1; transform: translateX(0); }
+  }
+  @keyframes onboardingSlideInLeft {
+    from { opacity: 0; transform: translateX(-24px); }
+    to { opacity: 1; transform: translateX(0); }
+  }
+  .onboarding-slide-forward { animation: onboardingSlideInRight 0.2s ease-out; }
+  .onboarding-slide-backward { animation: onboardingSlideInLeft 0.2s ease-out; }
+
+}

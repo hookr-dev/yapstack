@@ -1,0 +1,704 @@
+mod commands;
+mod db;
+
+const WINDOW_MAIN: &str = "main";
+#[cfg(target_os = "macos")]
+const WINDOW_DICTATION: &str = "dictation";
+#[cfg(target_os = "macos")]
+const WINDOW_RECORDING_INDICATOR: &str = "recording-indicator";
+
+use std::io::{Read as _, Seek, SeekFrom};
+use std::path::Path;
+use std::sync::Arc;
+use std::time::Duration;
+
+use tauri::{
+    menu::{Menu, MenuItemBuilder, PredefinedMenuItem, SubmenuBuilder},
+    tray::{TrayIcon, TrayIconBuilder},
+    AppHandle, Emitter, Manager, RunEvent,
+};
+#[cfg(target_os = "macos")]
+use tauri_nspanel::{CollectionBehavior, PanelLevel, StyleMask, WebviewWindowExt};
+use tokio::sync::{watch, Mutex};
+use yapstack_audio::AudioManager;
+use yapstack_transcription::ModelManager;
+
+// Lock ordering (acquire in this order to prevent deadlocks):
+//   1. AudioManagerState
+//   2. WhisperClientState
+//   3. LiveTranscriptionState
+//   4. ModelManagerState
+//   5. TrayState
+use commands::audio::{AudioManagerState, BufferStatusDto, CaptureStatusDto, RingBufferInfoDto};
+
+#[cfg(target_os = "macos")]
+tauri_nspanel::tauri_panel! {
+    panel!(OverlayPanel {
+        config: {
+            can_become_key_window: false,
+            is_floating_panel: true
+        }
+    })
+}
+
+/// Returns true if buffer info has meaningfully changed for UI purposes.
+/// Ignores `samples_written` and `available_samples` (change every poll but
+/// aren't displayed). Coarsens `available_seconds` to 1-second granularity.
+fn buffer_display_changed(
+    prev: &commands::audio::BufferStatusDto,
+    curr: &commands::audio::BufferStatusDto,
+) -> bool {
+    fn info_changed(
+        a: &Option<commands::audio::RingBufferInfoDto>,
+        b: &Option<commands::audio::RingBufferInfoDto>,
+    ) -> bool {
+        match (a, b) {
+            (Some(a), Some(b)) => {
+                a.available_seconds as u32 != b.available_seconds as u32
+                    || a.capacity_seconds != b.capacity_seconds
+                    || a.sample_rate != b.sample_rate
+                    || a.channels != b.channels
+            }
+            (None, None) => false,
+            _ => true,
+        }
+    }
+    info_changed(&prev.mic, &curr.mic) || info_changed(&prev.system, &curr.system)
+}
+
+fn build_tray_menu(
+    app: &AppHandle,
+    is_capturing: bool,
+    is_recording: bool,
+) -> tauri::Result<Menu<tauri::Wry>> {
+    let status_text = if is_recording {
+        "Status: Recording"
+    } else if is_capturing {
+        "Status: Listening"
+    } else {
+        "Status: Idle"
+    };
+    let status = MenuItemBuilder::with_id("status", status_text)
+        .enabled(false)
+        .build(app)?;
+
+    let sep1 = PredefinedMenuItem::separator(app)?;
+
+    let can_start_session = is_capturing && !is_recording;
+    let new_session = MenuItemBuilder::with_id("new_session", "New Session")
+        .enabled(can_start_session)
+        .build(app)?;
+
+    let backfill_submenu =
+        SubmenuBuilder::with_id(app, "backfill_submenu", "New Session with Rewind")
+            .enabled(can_start_session)
+            .item(
+                &MenuItemBuilder::with_id("new_session_bf_30", "30 Seconds")
+                    .enabled(can_start_session)
+                    .build(app)?,
+            )
+            .item(
+                &MenuItemBuilder::with_id("new_session_bf_60", "1 Minute")
+                    .enabled(can_start_session)
+                    .build(app)?,
+            )
+            .item(
+                &MenuItemBuilder::with_id("new_session_bf_120", "2 Minutes")
+                    .enabled(can_start_session)
+                    .build(app)?,
+            )
+            .item(
+                &MenuItemBuilder::with_id("new_session_bf_300", "5 Minutes")
+                    .enabled(can_start_session)
+                    .build(app)?,
+            )
+            .item(
+                &MenuItemBuilder::with_id("new_session_bf_all", "All Available")
+                    .enabled(can_start_session)
+                    .build(app)?,
+            )
+            .build()?;
+
+    let sep2 = PredefinedMenuItem::separator(app)?;
+
+    let open = MenuItemBuilder::with_id("open", "Open YapStack").build(app)?;
+    let sep3 = PredefinedMenuItem::separator(app)?;
+    let quit = MenuItemBuilder::with_id("quit", "Quit YapStack").build(app)?;
+
+    let mut items: Vec<&dyn tauri::menu::IsMenuItem<tauri::Wry>> = vec![&open, &sep1, &status];
+
+    let listen_toggle = if is_capturing {
+        MenuItemBuilder::with_id("stop_capture", "Stop Listening")
+            .enabled(!is_recording)
+            .build(app)?
+    } else {
+        MenuItemBuilder::with_id("start_capture", "Start Listening").build(app)?
+    };
+    items.push(&listen_toggle);
+
+    items.push(&sep2 as &dyn tauri::menu::IsMenuItem<tauri::Wry>);
+    items.push(&new_session);
+    items.push(&backfill_submenu);
+
+    // Conditionally add "Stop Session" only when recording
+    let stop_session;
+    if is_recording {
+        stop_session = MenuItemBuilder::with_id("stop_session", "Stop Session").build(app)?;
+        items.push(&stop_session);
+    }
+
+    items.extend([&sep3 as &dyn tauri::menu::IsMenuItem<tauri::Wry>, &quit]);
+
+    Menu::with_items(app, &items)
+}
+
+fn show_main_window(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window(WINDOW_MAIN) {
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+}
+
+type TrayState = Arc<Mutex<Option<TrayIcon>>>;
+type ShutdownSignal = Arc<watch::Sender<bool>>;
+
+fn update_tray_menu(app: &AppHandle, is_capturing: bool, is_recording: bool) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let tray_state = app.state::<TrayState>();
+        let tray_guard = tray_state.lock().await;
+        if let Some(tray) = tray_guard.as_ref() {
+            if let Ok(menu) = build_tray_menu(&app, is_capturing, is_recording) {
+                let _ = tray.set_menu(Some(menu));
+            }
+        }
+    });
+}
+
+fn is_allowed_audio_path(audio_base_dir: &Path, abs_path: &Path) -> bool {
+    let resolved = match std::fs::canonicalize(abs_path) {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    let canonical_base = match std::fs::canonicalize(audio_base_dir) {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    resolved.starts_with(canonical_base)
+}
+
+fn read_file_range(path: &Path, start: u64, end: u64) -> std::io::Result<Vec<u8>> {
+    let length = end
+        .checked_sub(start)
+        .and_then(|v| v.checked_add(1))
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid range"))?;
+
+    let mut file = std::fs::File::open(path)?;
+    file.seek(SeekFrom::Start(start))?;
+    let mut buf = vec![0u8; length as usize];
+    file.read_exact(&mut buf)?;
+    Ok(buf)
+}
+
+pub fn run() {
+    let specta_builder =
+        tauri_specta::Builder::<tauri::Wry>::new().commands(tauri_specta::collect_commands![
+            commands::health_check,
+            commands::audio::list_audio_devices,
+            commands::audio::get_default_input_device,
+            commands::audio::start_capture,
+            commands::audio::stop_capture,
+            commands::audio::get_capture_status,
+            commands::audio::check_system_audio_permission,
+            commands::audio::snapshot_mic_audio,
+            commands::audio::snapshot_system_audio,
+            commands::audio::get_buffer_info,
+            commands::audio::peek_capture_energy,
+            commands::capture::trigger_instant_capture,
+            commands::capture::start_session,
+            commands::capture::end_session,
+            commands::capture::get_session_status,
+            commands::capture::export_session_wav,
+            commands::capture::delete_session_wav,
+            commands::transcription::get_available_models,
+            commands::transcription::download_model,
+            commands::transcription::delete_model,
+            commands::transcription::transcribe_audio,
+            commands::transcription::init_whisper_client,
+            commands::transcription::shutdown_whisper_client,
+            commands::live_transcription::start_live_transcription,
+            commands::live_transcription::stop_live_transcription,
+            commands::live_transcription::get_live_transcription_status,
+            commands::dictation::clipboard_paste,
+            commands::get_autostart_enabled,
+            commands::set_autostart_enabled,
+            commands::show_overlay_panel,
+            commands::hide_overlay_panel,
+        ]);
+
+    #[cfg(debug_assertions)]
+    specta_builder
+        .export(
+            specta_typescript::Typescript::default()
+                .header("// @ts-nocheck")
+                .bigint(specta_typescript::BigIntExportBehavior::Number)
+                .formatter(specta_typescript::formatter::prettier),
+            "../src/lib/types.ts",
+        )
+        .expect("failed to export specta types");
+
+    let mut builder = tauri::Builder::default();
+    #[cfg(target_os = "macos")]
+    {
+        builder = builder.plugin(tauri_nspanel::init());
+    }
+    builder = builder
+        .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_fs::init())
+        .plugin(tauri_plugin_global_shortcut::Builder::new().build())
+        .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            None,
+        ))
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
+        .plugin(
+            tauri_plugin_sql::Builder::default()
+                .add_migrations("sqlite:yapstack.db", db::migrations())
+                .build(),
+        );
+
+    // Only init Aptabase when the key was provided at compile time (prod builds)
+    if let Some(key) = option_env!("APTABASE_KEY") {
+        builder = builder.plugin(tauri_plugin_aptabase::Builder::new(key).build());
+    }
+
+    builder
+        .register_uri_scheme_protocol("audio-stream", |ctx, request| {
+            let uri_path = request.uri().path();
+            let raw_path = uri_path.trim_start_matches('/');
+
+            // URL-decode the path to handle encoded slashes/spaces
+            let decoded_path = percent_encoding::percent_decode_str(raw_path).decode_utf8_lossy();
+
+            // Security: only serve .wav files
+            if !decoded_path.ends_with(".wav") {
+                return tauri::http::Response::builder()
+                    .status(400)
+                    .body(Vec::new())
+                    .unwrap();
+            }
+
+            // If the decoded path is absolute, use it directly (custom save location)
+            // after verifying it resolves within the app data audio directory.
+            // Otherwise, resolve relative to the default audio directory.
+            let file_path = if std::path::Path::new(decoded_path.as_ref()).is_absolute() {
+                let abs_path = std::path::PathBuf::from(decoded_path.as_ref());
+                // Defense-in-depth: verify absolute paths resolve within app data dir
+                let app_data_dir = match ctx.app_handle().path().app_data_dir() {
+                    Ok(d) => d,
+                    Err(_) => {
+                        return tauri::http::Response::builder()
+                            .status(500)
+                            .body(Vec::new())
+                            .unwrap()
+                    }
+                };
+                let base = app_data_dir.join("audio");
+                if !is_allowed_audio_path(&base, &abs_path) {
+                    return tauri::http::Response::builder()
+                        .status(403)
+                        .body(Vec::new())
+                        .unwrap();
+                }
+                abs_path
+            } else {
+                // No path traversal in relative filenames
+                if decoded_path.contains('/')
+                    || decoded_path.contains('\\')
+                    || decoded_path.contains("..")
+                {
+                    return tauri::http::Response::builder()
+                        .status(400)
+                        .body(Vec::new())
+                        .unwrap();
+                }
+                let app_data_dir = match ctx.app_handle().path().app_data_dir() {
+                    Ok(d) => d,
+                    Err(_) => {
+                        return tauri::http::Response::builder()
+                            .status(500)
+                            .body(Vec::new())
+                            .unwrap()
+                    }
+                };
+                app_data_dir.join("audio").join(decoded_path.as_ref())
+            };
+            let file_len = match std::fs::metadata(&file_path) {
+                Ok(m) => m.len(),
+                Err(_) => {
+                    return tauri::http::Response::builder()
+                        .status(404)
+                        .body(Vec::new())
+                        .unwrap()
+                }
+            };
+
+            // Parse Range header for seeking support
+            let range_header = request
+                .headers()
+                .get("range")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.strip_prefix("bytes="));
+
+            if let Some(range_spec) = range_header {
+                // Parse "start-end" or "start-"
+                let parts: Vec<&str> = range_spec.splitn(2, '-').collect();
+                let start: u64 = parts[0].parse().unwrap_or(0);
+                let end: u64 = if parts.len() > 1 && !parts[1].is_empty() {
+                    parts[1].parse().unwrap_or(file_len - 1)
+                } else {
+                    file_len - 1
+                };
+
+                let start = start.min(file_len.saturating_sub(1));
+                let end = end.min(file_len.saturating_sub(1));
+
+                if end < start {
+                    return tauri::http::Response::builder()
+                        .status(416)
+                        .body(Vec::new())
+                        .unwrap();
+                }
+
+                let length = end - start + 1;
+                let buf = match read_file_range(&file_path, start, end) {
+                    Ok(data) => data,
+                    Err(_) => {
+                        return tauri::http::Response::builder()
+                            .status(500)
+                            .body(Vec::new())
+                            .unwrap()
+                    }
+                };
+
+                tauri::http::Response::builder()
+                    .status(206)
+                    .header("Content-Type", "audio/wav")
+                    .header("Content-Length", length)
+                    .header("Content-Range", format!("bytes {start}-{end}/{file_len}"))
+                    .header("Accept-Ranges", "bytes")
+                    .body(buf)
+                    .unwrap()
+            } else {
+                // Full file response
+                let data = match std::fs::read(&file_path) {
+                    Ok(d) => d,
+                    Err(_) => {
+                        return tauri::http::Response::builder()
+                            .status(500)
+                            .body(Vec::new())
+                            .unwrap()
+                    }
+                };
+
+                tauri::http::Response::builder()
+                    .status(200)
+                    .header("Content-Type", "audio/wav")
+                    .header("Content-Length", file_len)
+                    .header("Accept-Ranges", "bytes")
+                    .body(data)
+                    .unwrap()
+            }
+        })
+        .manage(Arc::new(Mutex::new(AudioManager::new())) as commands::audio::AudioManagerState)
+        .manage(Arc::new(Mutex::new(None::<TrayIcon>)) as TrayState)
+        .manage(Arc::new(Mutex::new(None)) as commands::live_transcription::LiveTranscriptionState)
+        .manage({
+            let (tx, _) = watch::channel(false);
+            Arc::new(tx) as ShutdownSignal
+        })
+        .invoke_handler(specta_builder.invoke_handler())
+        .setup(move |app| {
+            specta_builder.mount_events(app);
+
+            // Initialize model manager with app data directory
+            let app_data_dir = app
+                .path()
+                .app_data_dir()
+                .expect("failed to resolve app data directory");
+            let model_manager = ModelManager::new(app_data_dir);
+            app.manage(
+                Arc::new(Mutex::new(model_manager)) as commands::transcription::ModelManagerState
+            );
+
+            // Initialize whisper client state (starts as None)
+            app.manage(Arc::new(Mutex::new(None)) as commands::transcription::WhisperClientState);
+
+            let menu = build_tray_menu(app.handle(), false, false)?;
+
+            let tray_icon =
+                tauri::image::Image::from_bytes(include_bytes!("../icons/tray-icon.png"))?;
+
+            let tray = TrayIconBuilder::new()
+                .icon(tray_icon)
+                .icon_as_template(true)
+                .menu(&menu)
+                .on_menu_event(|app, event| match event.id.as_ref() {
+                    "start_capture" => {
+                        let app = app.clone();
+                        tauri::async_runtime::spawn(async move {
+                            let state = app.state::<commands::audio::AudioManagerState>();
+                            let mut manager = state.lock().await;
+                            if manager
+                                .start_capture(yapstack_common::types::CaptureSource::MicOnly, None)
+                                .is_ok()
+                            {
+                                drop(manager);
+                                update_tray_menu(&app, true, false);
+                            }
+                        });
+                    }
+                    "stop_capture" => {
+                        let app = app.clone();
+                        tauri::async_runtime::spawn(async move {
+                            let state = app.state::<commands::audio::AudioManagerState>();
+                            let mut manager = state.lock().await;
+                            if manager.stop_all().is_ok() {
+                                drop(manager);
+                                update_tray_menu(&app, false, false);
+                            }
+                        });
+                    }
+                    "new_session" => {
+                        let _ = app.emit("tray:new-session", 0u32);
+                        show_main_window(app);
+                    }
+                    "new_session_bf_30" => {
+                        let _ = app.emit("tray:new-session", 30u32);
+                        show_main_window(app);
+                    }
+                    "new_session_bf_60" => {
+                        let _ = app.emit("tray:new-session", 60u32);
+                        show_main_window(app);
+                    }
+                    "new_session_bf_120" => {
+                        let _ = app.emit("tray:new-session", 120u32);
+                        show_main_window(app);
+                    }
+                    "new_session_bf_300" => {
+                        let _ = app.emit("tray:new-session", 300u32);
+                        show_main_window(app);
+                    }
+                    "new_session_bf_all" => {
+                        let _ = app.emit("tray:new-session-all", ());
+                        show_main_window(app);
+                    }
+                    "stop_session" => {
+                        let _ = app.emit("tray:stop-session", ());
+                    }
+                    "open" => {
+                        show_main_window(app);
+                    }
+                    "quit" => {
+                        let shutdown = app.state::<ShutdownSignal>();
+                        let _ = shutdown.send(true);
+                        app.exit(0);
+                    }
+                    _ => {}
+                })
+                .build(app)?;
+
+            // Store tray handle for later menu updates
+            let tray_state = app.state::<TrayState>();
+            let tray_state_clone = tray_state.inner().clone();
+            tauri::async_runtime::spawn(async move {
+                let mut guard = tray_state_clone.lock().await;
+                *guard = Some(tray);
+            });
+
+            // Spawn background event emitter for capture status + buffer info + tray updates
+            // Only emits when values actually change to avoid flooding the webview.
+            let audio_state = app.state::<AudioManagerState>().inner().clone();
+            let live_state = app
+                .state::<commands::live_transcription::LiveTranscriptionState>()
+                .inner()
+                .clone();
+            let handle = app.handle().clone();
+            let mut shutdown_rx = app.state::<ShutdownSignal>().subscribe();
+            tauri::async_runtime::spawn(async move {
+                let mut prev_status: Option<CaptureStatusDto> = None;
+                let mut prev_buffer: Option<BufferStatusDto> = None;
+                let mut prev_capturing: Option<bool> = None;
+                let mut prev_recording: Option<bool> = None;
+                loop {
+                    let should_stop = tokio::select! {
+                        _ = tokio::time::sleep(Duration::from_millis(500)) => false,
+                        _ = shutdown_rx.changed() => true,
+                    };
+                    if should_stop {
+                        break;
+                    }
+                    let manager = audio_state.lock().await;
+                    let status: CaptureStatusDto = manager.status().into();
+                    let buffer_info = BufferStatusDto {
+                        mic: manager.mic_buffer_info().map(RingBufferInfoDto::from),
+                        system: manager.system_buffer_info().map(RingBufferInfoDto::from),
+                    };
+                    drop(manager);
+
+                    let is_capturing =
+                        matches!(status.state, commands::audio::CaptureStateDto::Capturing);
+                    let is_recording = {
+                        let guard = live_state.lock().await;
+                        guard.as_ref().is_some_and(|c| c.is_running())
+                    };
+
+                    if prev_status.as_ref() != Some(&status) {
+                        let _ = handle.emit("capture-status", &status);
+                        prev_status = Some(status);
+                    }
+                    if prev_buffer
+                        .as_ref()
+                        .is_none_or(|prev| buffer_display_changed(prev, &buffer_info))
+                    {
+                        let _ = handle.emit("buffer-info", &buffer_info);
+                        prev_buffer = Some(buffer_info);
+                    }
+                    if prev_capturing != Some(is_capturing) || prev_recording != Some(is_recording)
+                    {
+                        update_tray_menu(&handle, is_capturing, is_recording);
+                        prev_capturing = Some(is_capturing);
+                        prev_recording = Some(is_recording);
+                    }
+                }
+            });
+
+            // Remove native decorations on Windows (titleBarStyle: "Overlay" is macOS-only)
+            #[cfg(target_os = "windows")]
+            {
+                if let Some(window) = app.get_webview_window(WINDOW_MAIN) {
+                    let _ = window.set_decorations(false);
+                }
+            }
+
+            // Convert overlay windows to NSPanels for fullscreen visibility
+            #[cfg(target_os = "macos")]
+            for label in [WINDOW_DICTATION, WINDOW_RECORDING_INDICATOR] {
+                if let Some(window) = app.get_webview_window(label) {
+                    let panel = window
+                        .to_panel::<OverlayPanel>()
+                        .expect("failed to convert overlay window to panel");
+                    panel.set_level(PanelLevel::MainMenu.value());
+                    panel.set_style_mask(StyleMask::empty().nonactivating_panel().into());
+                    panel.set_collection_behavior(
+                        CollectionBehavior::new()
+                            .can_join_all_spaces()
+                            .full_screen_auxiliary()
+                            .into(),
+                    );
+                }
+            }
+
+            Ok(())
+        })
+        .build(tauri::generate_context!())
+        .unwrap_or_else(|e| {
+            eprintln!("Fatal: failed to build tauri application: {e}");
+            std::process::exit(1);
+        })
+        .run(|_app, event| match event {
+            #[cfg(target_os = "macos")]
+            RunEvent::Reopen {
+                has_visible_windows,
+                ..
+            } => {
+                if !has_visible_windows {
+                    show_main_window(_app);
+                }
+            }
+            RunEvent::Exit => {
+                // The aptabase plugin's own on_event handler calls flush_blocking()
+                // on exit, which now uses tauri::async_runtime::block_on (fork fix).
+                // No manual flush needed here.
+            }
+            _ => {}
+        });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn test_temp_dir() -> PathBuf {
+        let unique = format!(
+            "yapstack_lib_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("unix epoch")
+                .as_nanos()
+        );
+        let dir = std::env::temp_dir().join(unique);
+        std::fs::create_dir_all(&dir).expect("create temp test dir");
+        dir
+    }
+
+    #[test]
+    fn allowed_audio_path_rejects_outside_base() {
+        let dir = test_temp_dir();
+        let base = dir.join("audio");
+        std::fs::create_dir_all(&base).expect("create base");
+
+        let outside = dir.join("outside.wav");
+        std::fs::write(&outside, b"wav").expect("write outside");
+        assert!(!is_allowed_audio_path(&base, &outside));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn allowed_audio_path_accepts_inside_base() {
+        let dir = test_temp_dir();
+        let base = dir.join("audio");
+        std::fs::create_dir_all(&base).expect("create base");
+
+        let inside = base.join("clip.wav");
+        std::fs::write(&inside, b"wav").expect("write inside");
+        assert!(is_allowed_audio_path(&base, &inside));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn allowed_audio_path_fails_closed_when_base_missing() {
+        let dir = test_temp_dir();
+        let base = dir.join("audio");
+        let outside = dir.join("outside.wav");
+        std::fs::write(&outside, b"wav").expect("write outside");
+
+        assert!(!is_allowed_audio_path(&base, &outside));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_file_range_reads_exact_window() {
+        let dir = test_temp_dir();
+        let path = dir.join("bytes.bin");
+        std::fs::write(&path, [1u8, 2, 3, 4, 5]).expect("write file");
+
+        let data = read_file_range(&path, 1, 3).expect("read range");
+        assert_eq!(data, vec![2, 3, 4]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_file_range_rejects_invalid_bounds() {
+        let dir = test_temp_dir();
+        let path = dir.join("bytes.bin");
+        std::fs::write(&path, [1u8, 2, 3]).expect("write file");
+        assert!(read_file_range(&path, 3, 1).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

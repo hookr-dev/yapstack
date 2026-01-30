@@ -1,0 +1,110 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## Build & Test Commands
+
+```bash
+# Full verification (run before committing)
+pnpm check                                       # Rust build + test + fmt + clippy + TS typecheck + ESLint + vitest
+
+# Test
+pnpm test                                        # Rust + frontend tests
+pnpm test:frontend                               # frontend only (vitest)
+pnpm test:rust                                   # Rust only (cargo test --all)
+pnpm test:watch                                  # frontend watch mode
+
+# Targeted Rust tests
+cargo test -p yapstack-audio                        # single crate
+cargo test -p yapstack-audio -- ring_buffer         # specific module
+cargo test -p yapstack-audio -- --ignored           # hardware-dependent tests
+
+# Lint
+pnpm lint                                        # Rust fmt + clippy + ESLint
+pnpm typecheck                                   # TypeScript type checking
+
+# Feature-flag builds
+cargo build -p yapstack-sidecar --features whisper  # requires cmake
+cargo build -p yapstack-sidecar --features metal    # Metal acceleration (macOS)
+
+# Sidecar release build (copies to apps/desktop/src-tauri/binaries/)
+./scripts/build-sidecar.sh
+
+# Frontend only
+pnpm --filter @yapstack/desktop dev                 # vite dev server
+
+# Full app
+pnpm tauri dev
+pnpm tauri build
+
+# DMG packaging
+./scripts/build-dmg.sh                           # standard build
+```
+
+## Architecture
+
+Tauri v2 desktop app for real-time audio capture and transcription. Rust backend, React 19 + TypeScript frontend. Sessions, segments, notes, and folders persisted to SQLite via `tauri-plugin-sql`.
+
+### Crate structure
+
+- **yapstack-common** — Shared types, config, `deinterleave_to_mono()`, and sidecar IPC protocol. No business logic. All other crates depend on this.
+- **yapstack-audio** — Audio capture engine. Lock-free SPSC ring buffers (`UnsafeCell` + atomics), mic/system capture via `cpal`, audio mixing, WAV export (16-bit PCM via `hound`), `SessionWavWriter` for incremental streaming WAV, session-based and instant capture modes. Position-based extraction API for live transcription (`buffer_positions`, `extract_since`, `extract_sources_since`, `peek_energy_rms`). Stream error detection via `Arc<AtomicBool>` in cpal error callbacks, stream restart without buffer loss.
+- **yapstack-transcription** — Model management (download ggml models from HuggingFace, SHA-256 verification) and `WhisperClient` that spawns and communicates with the sidecar via JSON-line IPC over stdin/stdout.
+- **yapstack-sidecar** — Standalone binary. Reads JSON-line requests from stdin, converts audio to 16kHz mono (resampling + channel averaging), runs Whisper inference (behind `whisper` feature flag) with flash attention, filters hallucinations, writes responses to stdout. Logging goes to stderr. Without the `whisper` feature, it compiles but returns error responses.
+- **yapstack-desktop** (`apps/desktop/src-tauri`) — Tauri command layer. Thin wrappers converting domain types to DTOs that derive `specta::Type` for TypeScript generation. Unified `CommandError` type (`commands/error.rs`) for all commands. Live transcription controller with per-source VAD, backfill, prompt context windowing, streaming session WAV, stream health monitoring with auto-restart.
+
+### Key patterns
+
+**DTO boundary**: Domain types in library crates use only `serde`. Tauri commands in `apps/desktop/src-tauri/src/commands/` define separate DTO structs deriving `specta::Type` with `From<DomainType>` impls. This keeps `specta`/`tauri` deps out of library crates.
+
+**Ring buffer**: `AudioRingBuffer` is SPSC with a monotonic `write_pos` counter (never resets). Producer uses `Release` ordering, consumer uses `Acquire`. `snapshot_since(pos)` enables session tracking — `start_session()` records `write_pos`, `end_session()` snapshots the delta.
+
+**Sidecar IPC**: Tagged JSON unions via `#[serde(tag = "type")]`. Request types: `transcribe` (with optional `initial_prompt`), `load_model`, `shutdown`. Response types: `transcription`, `model_loaded`, `error`, `progress`. Each request has a `u64` ID for correlation.
+
+**State management (backend)**: Four `Arc<Mutex<T>>` states in Tauri — `AudioManagerState`, `ModelManagerState`, `WhisperClientState`, `LiveTranscriptionState`. The `WhisperClientState` wraps `Option<WhisperClient>` (None until `init_whisper_client` is called). The `LiveTranscriptionState` wraps `Option<LiveTranscriptionController>` (None until live transcription starts).
+
+**State management (frontend)**: Zustand store (`appStore.ts`) with persisted settings (version 16, with migrations). SQLite via `tauri-plugin-sql` for session/segment/note/folder/chat-message/dictation-history persistence (`lib/db.ts`). Segment writes serialized via a promise queue to prevent backfill/live race conditions. Navigation model: views `"note-list" | "note-detail" | "settings"` with `ListFilter { type: "all" | "pinned" | "folder" | "dictation", folderId? }`. DB schema at migration v10 (sessions, segments, folders, notes, note_versions, shares, chat_messages, session_folders, dictation_history).
+
+**Audio playback**: Custom `audio-stream://` URI scheme protocol (registered in `lib.rs`) serves WAV files from `$APP_DATA_DIR/audio/` with HTTP range request support for seeking.
+
+**Frontend UI**: Notes-first model with `AppSidebar` + main content area. Completed transcriptions show split pane (`react-resizable-panels`) with transcript left and Tiptap rich text editor right. Drag-and-drop via `@dnd-kit`, search via `cmdk` (Cmd+K).
+
+**AI chat & tool calling**: `FloatingChatBar` provides per-session AI chat using OpenAI-compatible APIs with function/tool calling. Modular tool registry in `lib/ai-tools.ts` — each tool is a self-contained `ToolDefinition` (schema + executor + undo). Three tools: `update_title`, `save_to_notes`, `pin_session`. `streamChatWithTools()` yields typed `StreamEvent`s (token, tool_calls, done). Tool mutations auto-apply with 10s undo window. Transcript segments include IDs for AI citations (`[[seg:ID]]` rendered as clickable timestamp chips). Markdown→HTML via `marked`. Prompts use `**bold**` not `#` headings for Tiptap compat. Adding a new tool only requires a `registerTool()` call in `ai-tools.ts`.
+
+**Analytics**: Privacy-first usage analytics via Aptabase (`tauri-plugin-aptabase` + `@aptabase/tauri`). ~34 events covering app lifecycle, sessions, dictation, AI chat, navigation, shortcuts, model/engine, settings, and stream health. All calls go through `src/lib/analytics.ts` — typed fire-and-forget wrappers. No content is ever tracked (no transcript text, no notes, no AI messages). Booleans sent as 0/1 (Aptabase constraint). Error strings truncated to 100 chars. `APTABASE_KEY` env var required at compile time — sourced from `.env` (local) or GitHub Secrets (CI). Adding a new event: add a typed export to `analytics.ts` + one call at the integration point.
+
+**Feature flags**: `whisper` on yapstack-sidecar (whisper-rs, requires cmake) and `metal` on yapstack-sidecar (Metal acceleration via whisper-rs). System audio capture is always available on macOS via cpal loopback (output device capture) — not behind a feature flag. Default builds work without any feature flags.
+
+### Live transcription
+
+The core real-time feature. `commands/live_transcription.rs` runs an async loop:
+1. **Whisper client extraction** — On start, `WhisperClient` is taken from shared `WhisperClientState` and held privately in `TranscriptionContext.whisper_client`. Zero contention with other commands. Returned to shared state on exit (even after panics via `AssertUnwindSafe`).
+2. **Streaming session WAV** — If `config.session_id` is set, creates `SessionWavWriter` at `$APP_DATA_DIR/audio/{session_id}.wav`. Every 300ms the loop extracts new audio via `extract_since()` and appends it. WAV writes happen outside the AudioManager lock. On stop, finalize + emit `"session-wav-ready"` event. No audio lost regardless of session length.
+3. **Backfill** — On start, rewinds cursors by `backfill_seconds`, extracts historical audio, transcribes concurrently with the live loop. Emits segments with `is_backfill: true`. Emits `backfill-complete` event when done.
+4. **Per-source VAD** — `SourceVadState` tracks mic and system audio independently. RMS energy checked via `peek_energy_rms()` (zero-alloc) every 300ms. Speech/silence transitions trigger chunking after `silence_duration_ms` of silence or `max_chunk_seconds` of continuous speech.
+5. **Prompt context** — Two-tier prompting: each source maintains `accumulated_text` (up to 1000 chars internally), which is truncated to `prompt_context_chars` (default 350) and fed as `initial_prompt` to Whisper for continuity.
+6. **Prompt decay** — After `prompt_decay_silence_seconds` (default 5.0, 0 to disable) of all-source silence, both `shared_prompt` and per-source `accumulated_text` are cleared via `check_prompt_decay()`. Prevents stale context from causing hallucination after long pauses. Backfill seeding is one-shot (`prompt_seeded_from_backfill` guard prevents re-seeding after decay). When speech resumes, the prompt rebuilds naturally from new transcription.
+7. **Hallucination filtering** — Sidecar's `should_include_segment()` filters empty text, special tokens (`[BLANK_AUDIO]`, `[MUSIC]`), low-confidence segments (< 0.4), and known hallucination patterns ("thank you", "thanks for watching", etc.) at marginal confidence (< 0.6).
+8. **Silence trimming** — `trim_leading_silence()` scans in 50ms windows, keeps 200ms pad before first energy.
+9. **Stream health monitoring** — Two-layer detection: cpal error callback flag (instant) + `write_pos` stall watchdog (2s threshold). Up to 3 restart attempts per source, reusing existing ring buffer. Emits `"stream-health"` events with status (`restarted`, `restart_failed`, `restart_abandoned`).
+
+Shared `TranscriptionContext` (immutable clone of whisper client, app handle, config, start time) is passed to both backfill and live processing.
+
+### Audio defaults
+
+`AudioConfig` has a single field: `capture_history_seconds` (Rust default 180.0, but the frontend passes `bufferMaxSeconds` which defaults to 300). Each buffer is created with its device's native sample rate and channel count (typically 48kHz mono for mic, 48kHz stereo for system audio on macOS). All extraction methods read each buffer's `sample_rate()` / `channels()` and deinterleave to mono via `yapstack_common::audio::deinterleave_to_mono()` before mixing or WAV export. WAV files are always single-channel. The sidecar resamples to 16kHz mono before Whisper inference. WAV export clamps f32 to [-1.0, 1.0] before i16 conversion. Temp WAV files use prefix `yapstack_capture_` and persist after creation (caller cleans up). Mixed-source capture fails with `SampleRateMismatch` if mic and system buffers have different sample rates.
+
+### Capture source routing
+
+`AudioManager::start_capture(source, mic_device_name)` dispatches based on `CaptureSource`: `MicOnly` → `start_mic()`, `SystemOnly` → `start_system_audio()` (hard error if unavailable), `Mixed` → `start_all()` (degrades to mic-only with error message if system audio fails). The Tauri `start_capture` command takes a `CaptureSourceDto` parameter (not a boolean).
+
+### whisper-rs v0.15 API
+
+The API differs from older examples: `full_n_segments()` returns `c_int` (not Result), segments accessed via `state.get_segment(i) -> Option<WhisperSegment>`, timestamps are in centiseconds (×10 for ms), confidence approximated via `1.0 - segment.no_speech_probability()`. Flash attention enabled via `ctx_params.flash_attn(true)`. Additional params: `suppress_blank`, `suppress_nst`, `no_context`, `temperature_inc(0.2)`.
+
+## Detailed docs
+
+- **`docs/ARCHITECTURE.md`** — Data flow between crates, ring buffer design, sidecar IPC protocol, live transcription pipeline, frontend component tree, platform support matrix. Start here for cross-cutting concerns.
+- **`docs/API_REFERENCE.md`** — Exact function signatures, struct fields, error variants, Tauri command args/returns. Read before adding or modifying any public API.
+- **`docs/DEVELOPMENT.md`** — Build issues, feature flags, sidecar compilation, test infrastructure, model/temp file paths, frontend dependencies.
+- **`docs/IMPLEMENTATION_LOG.md`** — Context on *why* something was built a certain way, what trade-offs were made, phase-by-phase build history.

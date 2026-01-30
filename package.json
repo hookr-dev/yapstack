@@ -1,0 +1,19 @@
+{
+  "name": "yapstack",
+  "private": true,
+  "scripts": {
+    "dev": "pnpm --filter @yapstack/desktop build:sidecar:dev && pnpm --filter @yapstack/desktop dev:tauri",
+    "dev:frontend": "pnpm --filter @yapstack/desktop dev",
+    "build": "pnpm --filter @yapstack/desktop build:all",
+    "build:sidecar": "pnpm --filter @yapstack/desktop build:sidecar",
+    "build:dmg": "pnpm --filter @yapstack/desktop build:dmg",
+    "build:tauri": "pnpm --filter @yapstack/desktop build:tauri",
+    "test": "cargo test --all && pnpm --filter @yapstack/desktop test",
+    "test:frontend": "pnpm --filter @yapstack/desktop test",
+    "test:rust": "cargo test --all",
+    "test:watch": "pnpm --filter @yapstack/desktop test:watch",
+    "lint": "cargo fmt --all -- --check && cargo clippy --all -- -D warnings && pnpm --filter @yapstack/desktop lint",
+    "typecheck": "pnpm --filter @yapstack/desktop typecheck",
+    "check": "cargo build --all && cargo test --all && cargo fmt --all -- --check && cargo clippy --all -- -D warnings && pnpm --filter @yapstack/desktop check"
+  }
+}

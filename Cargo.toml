@@ -1,0 +1,30 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/yapstack-common",
+    "crates/yapstack-audio",
+    "crates/yapstack-transcription",
+    "crates/yapstack-sidecar",
+    "apps/desktop/src-tauri",
+]
+
+[profile.release]
+strip = "symbols"
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+
+[workspace.dependencies]
+cpal = "0.17"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tracing = "0.1"
+hound = "3.5"
+tempfile = "3"
+reqwest = { version = "0.12", features = ["stream"] }
+sha2 = "0.10"
+futures-util = "0.3"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rubato = "0.16"
