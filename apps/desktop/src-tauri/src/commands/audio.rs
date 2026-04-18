@@ -296,16 +296,20 @@ pub async fn start_capture(
         manager.set_config(config);
     }
 
-    manager
-        .start_capture(capture_source.into(), mic_device_id.as_deref())
-        .map_err(|e| {
-            if matches!(e, yapstack_audio::AudioError::AlreadyRunning) {
-                warn!("start_capture: already running");
-            } else {
-                error!("start_capture failed: {}", e);
-            }
-            CommandError::from(e)
-        })
+    // Idempotent: treat "already running" as success. A Vite HMR remount or
+    // StrictMode double-mount will re-fire autoSetup → startCapture, and
+    // surfacing AlreadyRunning as an error corrupts the UI's capture status.
+    match manager.start_capture(capture_source.into(), mic_device_id.as_deref()) {
+        Ok(()) => Ok(()),
+        Err(yapstack_audio::AudioError::AlreadyRunning) => {
+            warn!("start_capture: already running, treating as no-op");
+            Ok(())
+        }
+        Err(e) => {
+            error!("start_capture failed: {}", e);
+            Err(CommandError::from(e))
+        }
+    }
 }
 
 #[tauri::command]

@@ -218,6 +218,18 @@ pub async fn init_whisper_client(
     info!(size = ?size, "initializing whisper client");
     let model_size: ModelSize = size.into();
 
+    // Idempotent: if a client is already live, don't respawn. A concurrent
+    // caller (Vite HMR remount, React StrictMode double-mount, rapid UI
+    // clicks) that races through the check-and-spawn window would otherwise
+    // leave two sidecar processes with the old one orphaned.
+    {
+        let client_guard = whisper_state.lock().await;
+        if client_guard.is_some() {
+            info!("whisper client already initialized, skipping respawn");
+            return Ok(());
+        }
+    }
+
     // Extract paths under lock, then drop lock before the potentially slow spawn
     let (model_path, sidecar_path, vad_model_path) = {
         let manager = model_manager_state.lock().await;
@@ -251,7 +263,14 @@ pub async fn init_whisper_client(
             CommandError::from(e)
         })?;
 
+    // Re-check under the write lock — a racing caller may have spawned one
+    // while we were awaiting the sidecar boot. Drop ours if so.
     let mut client_guard = whisper_state.lock().await;
+    if client_guard.is_some() {
+        info!("whisper client was spawned concurrently, dropping duplicate");
+        drop(client);
+        return Ok(());
+    }
     *client_guard = Some(client);
 
     info!("whisper client initialized");
@@ -270,6 +289,28 @@ pub async fn shutdown_whisper_client(
     }
     *client_guard = None;
     Ok(())
+}
+
+#[derive(Debug, Clone, serde::Serialize, specta::Type)]
+pub struct WhisperStatusDto {
+    pub initialized: bool,
+}
+
+/// Reports whether the Whisper sidecar has been initialized.
+///
+/// The frontend uses this on mount to decide whether to call `init_whisper_client`
+/// again. Without it, a Vite HMR remount re-runs autoSetup and respawns the sidecar
+/// even when the backend is already warm, leaving `enginePhase: "initializing"`
+/// long enough for dictation to fail the readiness check.
+#[tauri::command]
+#[specta::specta]
+pub async fn get_whisper_status(
+    state: tauri::State<'_, WhisperClientState>,
+) -> Result<WhisperStatusDto, CommandError> {
+    let client_guard = state.lock().await;
+    Ok(WhisperStatusDto {
+        initialized: client_guard.is_some(),
+    })
 }
 
 /// Locates the sidecar binary relative to the current executable.
