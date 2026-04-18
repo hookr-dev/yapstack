@@ -184,6 +184,22 @@ async shutdownWhisperClient() : Promise<Result<null, CommandError>> {
     else return { status: "error", error: e  as any };
 }
 },
+/**
+ * Reports whether the Whisper sidecar has been initialized.
+ * 
+ * The frontend uses this on mount to decide whether to call `init_whisper_client`
+ * again. Without it, a Vite HMR remount re-runs autoSetup and respawns the sidecar
+ * even when the backend is already warm, leaving `enginePhase: "initializing"`
+ * long enough for dictation to fail the readiness check.
+ */
+async getWhisperStatus() : Promise<Result<WhisperStatusDto, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("get_whisper_status") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async startLiveTranscription(config: LiveTranscriptionConfig) : Promise<Result<LiveTranscriptionStartResult, CommandError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("start_live_transcription", { config }) };
@@ -337,6 +353,7 @@ export type SessionStatusDto = { active: boolean; elapsed_seconds: number | null
 export type SessionWavResultDto = { file_path: string; duration_seconds: number }
 export type TranscriptSegmentDto = { start_ms: number; end_ms: number; text: string; confidence: number }
 export type TranscriptionResultDto = { text: string; segments: TranscriptSegmentDto[]; duration_ms: number }
+export type WhisperStatusDto = { initialized: boolean }
 
 /** tauri-specta globals **/
 
