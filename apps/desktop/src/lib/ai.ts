@@ -83,7 +83,7 @@ export const DEFAULT_AI_SETTINGS: AISettings = {
     custom: {
       apiKey: "",
       model: "",
-      baseUrl: "http://localhost:1234/v1",
+      baseUrl: "http://127.0.0.1:8080/v1",
     },
   },
 };
@@ -156,13 +156,31 @@ export function createAIClient(settings: AISettings): OpenAI {
     headers["X-Title"] = "YapStack";
   }
 
+  // Local OpenAI-compatible servers (llama.cpp, LM Studio, Ollama) don't require a key,
+  // but the OpenAI SDK refuses to construct without one. Substitute a placeholder.
+  const apiKey =
+    settings.activeProvider === "custom" && !config.apiKey
+      ? "sk-no-key-required"
+      : config.apiKey;
+
   return new OpenAI({
-    apiKey: config.apiKey,
+    apiKey,
     baseURL: config.baseUrl,
     // Intentional: desktop app — API key is stored locally, never leaves the device
     dangerouslyAllowBrowser: true,
     defaultHeaders: Object.keys(headers).length > 0 ? headers : undefined,
   });
+}
+
+export async function fetchCustomModels(baseUrl: string): Promise<string[]> {
+  const url = baseUrl.replace(/\/$/, "") + "/models";
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const json = (await res.json()) as { data?: Array<{ id?: unknown }> };
+  if (!Array.isArray(json.data)) throw new Error("Unexpected response shape");
+  return json.data
+    .map((m) => (typeof m.id === "string" ? m.id : null))
+    .filter((id): id is string => !!id);
 }
 
 export function getActiveConfig(settings: AISettings): AIProviderConfig {

@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect, vi, afterEach } from "vitest";
 
 // Mock db.ts to prevent Tauri import chain
 vi.mock("@/lib/db", () => ({}));
@@ -13,6 +13,7 @@ import {
   assembleTranscriptContext,
   assembleNoteContext,
   markdownToBasicHtml,
+  fetchCustomModels,
   type ChatContext,
 } from "./ai";
 
@@ -206,5 +207,71 @@ describe("markdownToBasicHtml", () => {
     const html = markdownToBasicHtml("**safe** and *italic*");
     expect(html).toContain("<strong>safe</strong>");
     expect(html).toContain("<em>italic</em>");
+  });
+});
+
+describe("fetchCustomModels", () => {
+  const originalFetch = globalThis.fetch;
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  it("appends /models to baseUrl and returns string ids", async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        data: [
+          { id: "qwen2.5-7b" },
+          { id: "llama-3.1-8b" },
+        ],
+      }),
+    }) as unknown as typeof fetch;
+
+    const ids = await fetchCustomModels("http://127.0.0.1:8080/v1");
+    expect(ids).toEqual(["qwen2.5-7b", "llama-3.1-8b"]);
+    expect(globalThis.fetch).toHaveBeenCalledWith("http://127.0.0.1:8080/v1/models");
+  });
+
+  it("strips trailing slash before appending /models", async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ data: [] }),
+    }) as unknown as typeof fetch;
+
+    await fetchCustomModels("http://127.0.0.1:8080/v1/");
+    expect(globalThis.fetch).toHaveBeenCalledWith("http://127.0.0.1:8080/v1/models");
+  });
+
+  it("throws HTTP status on non-OK response", async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      ok: false,
+      status: 404,
+    }) as unknown as typeof fetch;
+
+    await expect(fetchCustomModels("http://x/v1")).rejects.toThrow("HTTP 404");
+  });
+
+  it("throws on unexpected response shape", async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ models: [] }),
+    }) as unknown as typeof fetch;
+
+    await expect(fetchCustomModels("http://x/v1")).rejects.toThrow(
+      "Unexpected response shape",
+    );
+  });
+
+  it("filters out entries without a string id", async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        data: [{ id: "a" }, { id: 42 }, { notId: "x" }, { id: "b" }],
+      }),
+    }) as unknown as typeof fetch;
+
+    const ids = await fetchCustomModels("http://x/v1");
+    expect(ids).toEqual(["a", "b"]);
   });
 });
