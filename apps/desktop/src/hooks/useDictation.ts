@@ -426,14 +426,21 @@ export function useDictation() {
         }
 
         stateRef.current = "done";
-        emitBubbleState(resultState);
-        // Briefly show bubble with result, then hide
-        await showBubble();
-        const hideDelay = resultState === "error" ? 1200 : 600;
-        setTimeout(() => {
-          hideBubble();
+        if (resultState === "error") {
+          // Surface only failures to the user — success is implied by the
+          // paste/copy/note action itself, so don't add an extra "Done" popup.
+          emitBubbleState("error");
+          await showBubble();
+          setTimeout(() => {
+            hideBubble();
+            setIdle();
+          }, 1200);
+        } else {
+          // Success: hide immediately. Paste path already hid the bubble
+          // pre-paste for focus transfer; copy/note paths hide it here.
+          await hideBubble();
           setIdle();
-        }, hideDelay);
+        }
       } catch (err) {
         if (abort.signal.aborted) return;
         console.error("Dictation failed:", err);

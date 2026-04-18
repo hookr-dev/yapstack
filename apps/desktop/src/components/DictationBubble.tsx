@@ -90,12 +90,12 @@ export function DictationBubble() {
     <div className="flex h-screen w-screen items-center justify-center bg-transparent">
       <div className="flex items-center gap-2 rounded-full bg-background p-2 shadow-2xl border border-white/[0.08]">
         <div
-          className={`flex items-center justify-center rounded-full p-1 ring-2 ${config.ringColor} ${config.glow} ${config.animate ?? ""} transition-all duration-300`}
+          className={`flex h-5 w-5 shrink-0 items-center justify-center rounded-full ring-2 ${config.ringColor} ${config.glow} ${config.animate ?? ""} transition-all duration-300`}
         >
           <YapStackIcon className="h-3 w-3 text-white" />
         </div>
         <span
-          className={`text-[11px] font-medium ${config.textColor} whitespace-nowrap pr-0.5 transition-colors duration-300`}
+          className={`text-[11px] font-medium leading-none ${config.textColor} whitespace-nowrap pr-0.5 transition-colors duration-300`}
         >
           {label}
         </span>
