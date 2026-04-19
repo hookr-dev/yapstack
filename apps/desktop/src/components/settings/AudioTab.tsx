@@ -16,7 +16,10 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { ChevronsUpDown } from "lucide-react";
+import { ChevronsUpDown, Folder, RotateCcw } from "lucide-react";
+import { open } from "@tauri-apps/plugin-dialog";
+import { revealItemInDir } from "@tauri-apps/plugin-opener";
+import { appDataDir } from "@tauri-apps/api/path";
 import type { CaptureSourceDto } from "@/lib/tauri";
 
 export function AudioTab() {
@@ -24,11 +27,28 @@ export function AudioTab() {
   const selectedMicDeviceId = useAppStore((s) => s.settings.selectedMicDeviceId);
   const bufferMaxSeconds = useAppStore((s) => s.settings.bufferMaxSeconds);
   const mixConfig = useAppStore((s) => s.settings.mixConfig);
+  const audioSaveLocation = useAppStore((s) => s.settings.audioSaveLocation);
+  const audioExportFormat = useAppStore((s) => s.settings.audioExportFormat);
+  const mp3Bitrate = useAppStore((s) => s.settings.mp3Bitrate);
   const devices = useAppStore((s) => s.devices);
   const updateSettings = useAppStore((s) => s.updateSettings);
   const [showAdvanced, setShowAdvanced] = useState(false);
 
   const inputDevices = devices.filter((d) => d.device_type === "Input");
+
+  const handlePickFolder = async () => {
+    const selected = await open({ directory: true, multiple: false });
+    if (selected) {
+      updateSettings({ audioSaveLocation: selected });
+    }
+  };
+
+  const handleOpenFolder = async () => {
+    const folder = audioSaveLocation ?? (await appDataDir()) + "/audio";
+    revealItemInDir(folder).catch((e) =>
+      console.error("Failed to reveal folder:", e),
+    );
+  };
 
   return (
     <>
@@ -106,6 +126,107 @@ export function AudioTab() {
         <p className="text-[10px] text-muted-foreground/60">
           Maximum audio history kept in memory for rewind
         </p>
+      </div>
+
+      <Separator />
+
+      {/* Export Format */}
+      <div className="space-y-2">
+        <Label className="text-xs text-muted-foreground">Export Format</Label>
+        <div className="flex gap-1.5">
+          <Button
+            size="sm"
+            variant={audioExportFormat === "mp3" ? "default" : "outline"}
+            className="flex-1 text-xs"
+            onClick={() => updateSettings({ audioExportFormat: "mp3" })}
+          >
+            MP3
+          </Button>
+          <Button
+            size="sm"
+            variant={audioExportFormat === "wav" ? "default" : "outline"}
+            className="flex-1 text-xs"
+            onClick={() => updateSettings({ audioExportFormat: "wav" })}
+          >
+            WAV
+          </Button>
+        </div>
+        <p className="text-[10px] text-muted-foreground/60">
+          {audioExportFormat === "mp3"
+            ? "Compressed — significantly smaller files"
+            : "Uncompressed — larger files, lossless quality"}
+        </p>
+      </div>
+
+      {/* MP3 Quality */}
+      {audioExportFormat === "mp3" && (
+        <div className="space-y-2">
+          <Label className="text-xs text-muted-foreground">MP3 Quality</Label>
+          <div className="flex gap-1.5">
+            {([
+              { kbps: 16, label: "16 kbps" },
+              { kbps: 32, label: "32 kbps" },
+              { kbps: 64, label: "64 kbps" },
+              { kbps: 128, label: "128 kbps" },
+              { kbps: 192, label: "192 kbps" },
+            ] as const).map(({ kbps, label }) => (
+              <Button
+                key={kbps}
+                size="sm"
+                variant={mp3Bitrate === kbps ? "default" : "outline"}
+                className="flex-1 text-xs"
+                onClick={() => updateSettings({ mp3Bitrate: kbps })}
+              >
+                {label}
+              </Button>
+            ))}
+          </div>
+          <p className="text-[10px] text-muted-foreground/60">
+            {mp3Bitrate <= 16
+              ? "Very low — smallest files, noticeable artifacts"
+              : mp3Bitrate <= 32
+                ? "Minimum — small files, reduced clarity"
+              : mp3Bitrate <= 64
+                ? "Best for speech — small files"
+                : mp3Bitrate <= 128
+                  ? "Balanced quality and file size"
+                  : "Higher quality — larger files"}
+          </p>
+        </div>
+      )}
+
+      <Separator />
+
+      {/* Save Location */}
+      <div className="space-y-2">
+        <Label className="text-xs text-muted-foreground">
+          Save Location
+        </Label>
+        <div className="flex items-center gap-2">
+          <div className="flex-1 min-w-0 rounded-md border bg-muted/50 px-2.5 py-1.5">
+            <p className="truncate text-xs text-muted-foreground">
+              {audioSaveLocation ?? "Default (App Data)"}
+            </p>
+          </div>
+          <Button size="sm" variant="ghost" className="shrink-0 px-2" onClick={handleOpenFolder} aria-label="Open folder">
+            <Folder className="h-3.5 w-3.5" />
+          </Button>
+          <Button size="sm" variant="outline" className="text-xs shrink-0" onClick={handlePickFolder}>
+            Change
+          </Button>
+        </div>
+        {audioSaveLocation && (
+          <div className="flex items-center gap-2">
+            <Button
+              variant="inline"
+              size="inline"
+              onClick={() => updateSettings({ audioSaveLocation: null })}
+            >
+              <RotateCcw className="h-3 w-3" />
+              Reset to default
+            </Button>
+          </div>
+        )}
       </div>
 
       <Separator />

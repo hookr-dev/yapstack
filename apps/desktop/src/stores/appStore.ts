@@ -128,6 +128,8 @@ export interface Settings {
   ai: AISettings;
   shortcutBindings: Record<string, string>;
   audioSaveLocation: string | null;
+  audioExportFormat: "wav" | "mp3";
+  mp3Bitrate: number;
   dictation: DictationSettings;
   showRecordingIndicator: boolean;
   onboarding: OnboardingState;
@@ -313,6 +315,8 @@ const defaultSettings: Settings = {
   ai: DEFAULT_AI_SETTINGS,
   shortcutBindings: {},
   audioSaveLocation: null,
+  audioExportFormat: "mp3",
+  mp3Bitrate: 64,
   dictation: DEFAULT_DICTATION_SETTINGS,
   showRecordingIndicator: true,
   onboarding: { completedFlows: {} },
@@ -666,6 +670,8 @@ function createAppStore() {
               : null,
           session_id: sessionId,
           audio_save_location: settings.audioSaveLocation,
+          audio_export_format: settings.audioExportFormat,
+          mp3_bitrate: settings.audioExportFormat === "mp3" ? settings.mp3Bitrate : null,
         };
 
         const result = await commands.startLiveTranscription(config);
@@ -1320,7 +1326,7 @@ function createAppStore() {
     }),
     {
       name: "yapstack-settings",
-      version: 20,
+      version: 21,
       partialize: (state) => ({
         settings: state.settings,
       }),
@@ -1473,6 +1479,11 @@ function createAppStore() {
           // Reset to null (system default) — user re-picks once on upgrade.
           delete old.selectedMicDevice;
           old.selectedMicDeviceId = null;
+        }
+        if (version < 21 && state.settings) {
+          const old = state.settings as Record<string, unknown>;
+          if (old.audioExportFormat === undefined) old.audioExportFormat = "mp3";
+          if (old.mp3Bitrate === undefined) old.mp3Bitrate = 64;
         }
         return state as unknown as { settings: Settings };
       },

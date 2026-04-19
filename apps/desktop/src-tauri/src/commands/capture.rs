@@ -94,6 +94,7 @@ pub async fn get_session_status(
 
 #[tauri::command]
 #[specta::specta]
+#[allow(clippy::too_many_arguments)]
 pub async fn export_session_wav(
     state: tauri::State<'_, AudioManagerState>,
     app_handle: tauri::AppHandle,
@@ -102,6 +103,8 @@ pub async fn export_session_wav(
     duration_seconds: f32,
     mix_config: Option<MixConfigDto>,
     audio_save_location: Option<String>,
+    audio_export_format: Option<String>,
+    mp3_bitrate: Option<u16>,
 ) -> Result<SessionWavResultDto, CommandError> {
     validate_session_id(&session_id)?;
     info!(session_id = %session_id, duration = duration_seconds, "exporting session WAV");
@@ -170,8 +173,16 @@ pub async fn export_session_wav(
     yapstack_audio::export::write_wav(&samples, captured.sample_rate, 1, &wav_path)
         .map_err(CommandError::from)?;
 
+    let use_mp3 = audio_export_format.as_deref().unwrap_or("mp3") != "wav";
+    let final_path = if use_mp3 {
+        yapstack_audio::export::convert_wav_to_mp3(&wav_path, mp3_bitrate.unwrap_or(64))
+            .map_err(CommandError::from)?
+    } else {
+        wav_path
+    };
+
     Ok(SessionWavResultDto {
-        file_path: wav_path.to_string_lossy().into_owned(),
+        file_path: final_path.to_string_lossy().into_owned(),
         duration_seconds: duration,
     })
 }
@@ -195,8 +206,12 @@ pub async fn delete_session_wav(
             })?;
         app_data_dir.join("audio")
     };
+    let mp3_path = audio_dir.join(format!("{session_id}.mp3"));
     let wav_path = audio_dir.join(format!("{session_id}.wav"));
 
+    if mp3_path.exists() {
+        std::fs::remove_file(&mp3_path)?;
+    }
     if wav_path.exists() {
         std::fs::remove_file(&wav_path)?;
     }

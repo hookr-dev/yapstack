@@ -120,9 +120,9 @@ async getSessionStatus() : Promise<Result<SessionStatusDto, CommandError>> {
     else return { status: "error", error: e  as any };
 }
 },
-async exportSessionWav(sessionId: string, source: CaptureSourceDto, durationSeconds: number, mixConfig: MixConfigDto | null, audioSaveLocation: string | null) : Promise<Result<SessionWavResultDto, CommandError>> {
+async exportSessionWav(sessionId: string, source: CaptureSourceDto, durationSeconds: number, mixConfig: MixConfigDto | null, audioSaveLocation: string | null, audioExportFormat: string | null, mp3Bitrate: number | null) : Promise<Result<SessionWavResultDto, CommandError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("export_session_wav", { sessionId, source, durationSeconds, mixConfig, audioSaveLocation }) };
+    return { status: "ok", data: await TAURI_INVOKE("export_session_wav", { sessionId, source, durationSeconds, mixConfig, audioSaveLocation, audioExportFormat, mp3Bitrate }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -340,7 +340,15 @@ session_id: string | null;
 /**
  * Custom directory for saving WAV files. If None, uses `$APP_DATA_DIR/audio/`.
  */
-audio_save_location: string | null }
+audio_save_location: string | null; 
+/**
+ * Audio export format: "wav" or "mp3". Default: "mp3".
+ */
+audio_export_format: string | null; 
+/**
+ * MP3 bitrate in kbps (e.g. 64, 128, 192). Only used when format is "mp3".
+ */
+mp3_bitrate: number | null }
 export type LiveTranscriptionPhase = "Running" | "Stopped" | "Error"
 export type LiveTranscriptionStartResult = { effective_start_epoch_ms: number }
 export type LiveTranscriptionStatus = { phase: LiveTranscriptionPhase; chunks_processed: number; total_audio_seconds: number; error_message: string | null; session_id: string | null; effective_start_epoch_ms: number | null }

@@ -28,3 +28,4 @@ sha2 = "0.10"
 futures-util = "0.3"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rubato = "0.16"
+mp3lame-encoder = "0.2"

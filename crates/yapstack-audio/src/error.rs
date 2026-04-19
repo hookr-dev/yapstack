@@ -46,6 +46,9 @@ pub enum AudioError {
 
     #[error("no buffer available")]
     NoBufferAvailable,
+
+    #[error("MP3 encoding failed: {0}")]
+    Mp3Encode(String),
 }
 
 impl From<cpal::DevicesError> for AudioError {

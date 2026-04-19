@@ -18,10 +18,7 @@ import {
 } from "@/components/ui/alert-dialog";
 import { Switch } from "@/components/ui/switch";
 import { Progress } from "@/components/ui/progress";
-import { Folder, RotateCcw, PlayCircle, RefreshCw, Download, Loader2 } from "lucide-react";
-import { open } from "@tauri-apps/plugin-dialog";
-import { revealItemInDir } from "@tauri-apps/plugin-opener";
-import { appDataDir } from "@tauri-apps/api/path";
+import { PlayCircle, RefreshCw, Download, Loader2 } from "lucide-react";
 import { getVersion } from "@tauri-apps/api/app";
 import { toast } from "sonner";
 import { checkForUpdate, downloadAndInstallUpdate } from "@/lib/updater";
@@ -31,7 +28,6 @@ import { trackUpdateInstallStarted, trackUpdateInstallFailed } from "@/lib/analy
 export function GeneralTab() {
   const theme = useAppStore((s) => s.settings.theme);
   const showRecordingIndicator = useAppStore((s) => s.settings.showRecordingIndicator);
-  const audioSaveLocation = useAppStore((s) => s.settings.audioSaveLocation);
   const updateSettings = useAppStore((s) => s.updateSettings);
   const clearAllSessions = useAppStore((s) => s.clearAllSessions);
   const isRecording = useAppStore((s) => s.liveTranscriptionActive);
@@ -117,21 +113,6 @@ export function GeneralTab() {
     } catch {
       // revert on failure
     }
-  };
-
-  const handlePickFolder = async () => {
-    const selected = await open({ directory: true, multiple: false });
-    if (selected) {
-      updateSettings({ audioSaveLocation: selected });
-    }
-  };
-
-  const handleOpenFolder = async () => {
-    const folder = audioSaveLocation
-      ?? (await appDataDir()) + "/audio";
-    revealItemInDir(folder).catch((e) =>
-      console.error("Failed to reveal folder:", e),
-    );
   };
 
   return (
@@ -268,40 +249,6 @@ export function GeneralTab() {
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
-
-      <Separator />
-
-      {/* Storage */}
-      <div className="space-y-2">
-        <Label className="text-xs text-muted-foreground">
-          Audio Save Location
-        </Label>
-        <div className="flex items-center gap-2">
-          <div className="flex-1 min-w-0 rounded-md border bg-muted/50 px-2.5 py-1.5">
-            <p className="truncate text-xs text-muted-foreground">
-              {audioSaveLocation ?? "Default (App Data)"}
-            </p>
-          </div>
-          <Button size="sm" variant="ghost" className="shrink-0 px-2" onClick={handleOpenFolder} aria-label="Open folder">
-            <Folder className="h-3.5 w-3.5" />
-          </Button>
-          <Button size="sm" variant="outline" className="text-xs shrink-0" onClick={handlePickFolder}>
-            Change
-          </Button>
-        </div>
-        {audioSaveLocation && (
-          <div className="flex items-center gap-2">
-            <Button
-              variant="inline"
-              size="inline"
-              onClick={() => updateSettings({ audioSaveLocation: null })}
-            >
-              <RotateCcw className="h-3 w-3" />
-              Reset to default
-            </Button>
-          </div>
-        )}
-      </div>
 
       <Separator />
 
