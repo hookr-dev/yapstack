@@ -226,6 +226,7 @@ pub fn run() {
             commands::transcription::transcribe_audio,
             commands::transcription::init_whisper_client,
             commands::transcription::shutdown_whisper_client,
+            commands::transcription::get_whisper_status,
             commands::live_transcription::start_live_transcription,
             commands::live_transcription::stop_live_transcription,
             commands::live_transcription::get_live_transcription_status,

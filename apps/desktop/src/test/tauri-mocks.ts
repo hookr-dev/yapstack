@@ -141,6 +141,10 @@ export const tauriCommandsMock = () => ({
     shutdownWhisperClient: vi
       .fn()
       .mockResolvedValue({ status: "ok", data: null }),
+    getWhisperStatus: vi.fn().mockResolvedValue({
+      status: "ok",
+      data: { initialized: false },
+    }),
     startLiveTranscription: vi
       .fn()
       .mockResolvedValue({ status: "ok", data: null }),

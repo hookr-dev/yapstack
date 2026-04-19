@@ -357,9 +357,10 @@ function deriveFolderState(folders: DbFolder[]) {
   };
 }
 
-export const useAppStore = create<AppState>()(
-  persist(
-    (set, get) => ({
+function createAppStore() {
+  return create<AppState>()(
+    persist(
+      (set, get) => ({
       // Initial state
       enginePhase: "idle",
       engineError: null,
@@ -808,23 +809,47 @@ export const useAppStore = create<AppState>()(
       autoSetup: async () => {
         const { settings } = get();
 
-        // Track 1 — Start capture (fire and forget, errors surface via capture-status events)
-        commands
-          .startCapture(
-            settings.selectedMicDeviceId,
-            settings.captureSource,
-            settings.bufferMaxSeconds,
-          )
-          .then((result) => {
-            if (result.status === "error") {
-              // Eagerly fetch status so the UI reflects the error immediately
-              // instead of waiting for the next poll tick
-              commands.getCaptureStatus().then((r) => {
-                if (r.status === "ok") get().setCaptureStatus(r.data);
-              });
-            }
-          })
-          .catch(() => {});
+        // Rehydrate frontend store from the backend's actual state BEFORE
+        // issuing any start/init commands. In dev, Vite HMR remounts the
+        // frontend while the Rust host keeps its AudioManager and WhisperClient
+        // warm — blindly re-issuing startCapture/initWhisperClient either
+        // errors with AlreadyRunning or respawns the sidecar, leaving
+        // enginePhase stuck in "initializing" long enough for dictation to
+        // fail its readiness check.
+        const [captureStatusResult, whisperStatusResult] = await Promise.all([
+          commands.getCaptureStatus(),
+          commands.getWhisperStatus(),
+        ]);
+        const backendCapturing =
+          captureStatusResult.status === "ok" &&
+          captureStatusResult.data.state === "Capturing";
+        const backendWhisperReady =
+          whisperStatusResult.status === "ok" &&
+          whisperStatusResult.data.initialized;
+
+        if (captureStatusResult.status === "ok") {
+          get().setCaptureStatus(captureStatusResult.data);
+        }
+
+        // Track 1 — Start capture only if the backend isn't already capturing.
+        if (!backendCapturing) {
+          commands
+            .startCapture(
+              settings.selectedMicDeviceId,
+              settings.captureSource,
+              settings.bufferMaxSeconds,
+            )
+            .then((result) => {
+              if (result.status === "error") {
+                // Eagerly fetch status so the UI reflects the error immediately
+                // instead of waiting for the next poll tick
+                commands.getCaptureStatus().then((r) => {
+                  if (r.status === "ok") get().setCaptureStatus(r.data);
+                });
+              }
+            })
+            .catch(() => {});
+        }
 
         // Track 2 — Engine setup
         try {
@@ -837,6 +862,13 @@ export const useAppStore = create<AppState>()(
           const modelsResult = await commands.getAvailableModels();
           if (modelsResult.status === "ok") {
             set({ models: modelsResult.data });
+          }
+
+          // Fast path: backend already has a Whisper client running. Trust it
+          // and mark the engine ready without respawning the sidecar.
+          if (backendWhisperReady) {
+            set({ enginePhase: "ready", engineError: null });
+            return;
           }
 
           const models = get().models;
@@ -1473,3 +1505,28 @@ export const useAppStore = create<AppState>()(
     },
   ),
 );
+}
+
+// Pin the store into import.meta.hot.data so Vite HMR preserves runtime state
+// (enginePhase, captureStatus, active session, etc.) across module reloads.
+// Without this, every HMR tick resets enginePhase to "idle" until autoSetup's
+// backend probe completes, causing dictation and other engine-gated features
+// to flicker. See the HMR rehydration research notes for context.
+const HMR_STORE_KEY = "__yapstack_app_store__";
+type HmrStore = ReturnType<typeof createAppStore>;
+
+function getOrCreateAppStore(): HmrStore {
+  // In vitest, import.meta.hot exists but .data may be undefined. Fall back
+  // to a fresh store in that case — HMR-persistence is a dev-server concern
+  // that doesn't apply to test isolation.
+  const hot = import.meta.hot?.data as
+    | Record<string, HmrStore>
+    | undefined;
+  if (!hot) return createAppStore();
+  if (!hot[HMR_STORE_KEY]) {
+    hot[HMR_STORE_KEY] = createAppStore();
+  }
+  return hot[HMR_STORE_KEY];
+}
+
+export const useAppStore = getOrCreateAppStore();
