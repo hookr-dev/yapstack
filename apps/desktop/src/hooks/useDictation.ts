@@ -218,6 +218,8 @@ export function useDictation() {
         prompt_decay_silence_seconds: 0,
         session_id: dictationIdRef.current,
         audio_save_location: null,
+        audio_export_format: s.settings.audioExportFormat,
+        mp3_bitrate: s.settings.audioExportFormat === "mp3" ? s.settings.mp3Bitrate : null,
       });
 
       if (result.status === "error") {

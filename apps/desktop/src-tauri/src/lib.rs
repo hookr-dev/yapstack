@@ -285,8 +285,8 @@ pub fn run() {
             // URL-decode the path to handle encoded slashes/spaces
             let decoded_path = percent_encoding::percent_decode_str(raw_path).decode_utf8_lossy();
 
-            // Security: only serve .wav files
-            if !decoded_path.ends_with(".wav") {
+            // Security: only serve audio files
+            if !decoded_path.ends_with(".wav") && !decoded_path.ends_with(".mp3") {
                 return tauri::http::Response::builder()
                     .status(400)
                     .body(Vec::new())
@@ -338,6 +338,12 @@ pub fn run() {
                 };
                 app_data_dir.join("audio").join(decoded_path.as_ref())
             };
+            let content_type = if file_path.extension().is_some_and(|e| e == "mp3") {
+                "audio/mpeg"
+            } else {
+                "audio/wav"
+            };
+
             let file_len = match std::fs::metadata(&file_path) {
                 Ok(m) => m.len(),
                 Err(_) => {
@@ -388,7 +394,7 @@ pub fn run() {
 
                 tauri::http::Response::builder()
                     .status(206)
-                    .header("Content-Type", "audio/wav")
+                    .header("Content-Type", content_type)
                     .header("Content-Length", length)
                     .header("Content-Range", format!("bytes {start}-{end}/{file_len}"))
                     .header("Accept-Ranges", "bytes")
@@ -408,7 +414,7 @@ pub fn run() {
 
                 tauri::http::Response::builder()
                     .status(200)
-                    .header("Content-Type", "audio/wav")
+                    .header("Content-Type", content_type)
                     .header("Content-Length", file_len)
                     .header("Accept-Ranges", "bytes")
                     .body(data)

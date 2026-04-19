@@ -52,6 +52,10 @@ pub struct LiveTranscriptionConfig {
     pub session_id: Option<String>,
     /// Custom directory for saving WAV files. If None, uses `$APP_DATA_DIR/audio/`.
     pub audio_save_location: Option<String>,
+    /// Audio export format: "wav" or "mp3". Default: "mp3".
+    pub audio_export_format: Option<String>,
+    /// MP3 bitrate in kbps (e.g. 64, 128, 192). Only used when format is "mp3".
+    pub mp3_bitrate: Option<u16>,
 }
 
 #[derive(Debug, Clone, Serialize, Type)]
@@ -1455,8 +1459,8 @@ async fn live_transcription_loop(
                 ws.session_id
             );
             let wav_path = ws.writer.path().to_path_buf();
-            // Finalize to release file handle, then delete
-            let _ = ws.writer.finalize();
+            // Finalize WAV only (no MP3 conversion) to release file handle, then delete
+            let _ = ws.writer.finalize_wav_only();
             let _ = std::fs::remove_file(&wav_path);
             let _ = ctx.app_handle.emit(
                 "session-wav-error",
@@ -1466,7 +1470,14 @@ async fn live_transcription_loop(
                 },
             );
         } else {
-            match ws.writer.finalize() {
+            let use_mp3 = ctx.config.audio_export_format.as_deref().unwrap_or("mp3") != "wav";
+            let result = if use_mp3 {
+                ws.writer
+                    .finalize_as_mp3(ctx.config.mp3_bitrate.unwrap_or(64))
+            } else {
+                ws.writer.finalize_wav_only()
+            };
+            match result {
                 Ok((path, duration)) => {
                     info!(
                         "session WAV finalized: {} ({:.1}s)",

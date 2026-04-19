@@ -57,7 +57,8 @@ export function DictationFeedEntry({ entry }: { entry: DbDictationHistory }) {
       setPlaying(false);
       return;
     }
-    const audio = new Audio(`audio-stream://localhost/${entry.id}.wav`);
+    const ext = entry.wav_file_path?.endsWith(".mp3") ? "mp3" : "wav";
+    const audio = new Audio(`audio-stream://localhost/${entry.id}.${ext}`);
     audio.onended = () => {
       setPlaying(false);
       audioRef.current = null;
