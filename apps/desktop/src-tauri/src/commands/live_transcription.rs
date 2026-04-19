@@ -632,6 +632,116 @@ fn should_stall_restart(label: &AudioSourceLabel) -> bool {
     true
 }
 
+/// Window used by the pre-flight health check to observe whether `write_pos`
+/// is advancing. Must be long enough to see at least one cpal callback
+/// (typical buffer periods are 5–20 ms) and short enough to not add noticeable
+/// latency to the hotkey → dictation-start flow.
+const PREFLIGHT_SAMPLE_WINDOW_MS: u64 = 80;
+
+/// Pre-flight stream health check. Run before the live-transcription loop
+/// starts to catch silently-stalled cpal streams — device changes, Bluetooth
+/// disconnects, OS wake-from-sleep — that don't raise an error callback. The
+/// in-loop watchdog only fires after `STREAM_STALL_THRESHOLD_SECS` (2 s), by
+/// which point the first transcribed chunk has already been extracted from
+/// stale buffer data, producing wildly inaccurate or empty transcriptions
+/// after long idle periods.
+///
+/// Strategy: snapshot each relevant source's `write_pos`, wait briefly, check
+/// again. If any source has its error flag set or failed to advance, restart
+/// it before spawning the live loop. A failed restart on a user-requested
+/// source propagates as an error; a failed system-audio restart in mixed mode
+/// is logged but allowed to proceed (the loop will degrade to mic-only).
+async fn preflight_stream_health(
+    audio_state: &AudioManagerState,
+    source: &CaptureSource,
+    app_handle: &AppHandle,
+) -> Result<(), CommandError> {
+    let check_mic = matches!(source, CaptureSource::MicOnly | CaptureSource::Mixed);
+    let check_system = matches!(source, CaptureSource::SystemOnly | CaptureSource::Mixed);
+
+    if !check_mic && !check_system {
+        return Ok(());
+    }
+
+    let (mic_initial, sys_initial, mic_err, sys_err) = {
+        let m = audio_state.lock().await;
+        (
+            m.mic_write_pos(),
+            m.system_write_pos(),
+            m.mic_has_stream_error(),
+            m.system_has_stream_error(),
+        )
+    };
+
+    tokio::time::sleep(Duration::from_millis(PREFLIGHT_SAMPLE_WINDOW_MS)).await;
+
+    let mut manager = audio_state.lock().await;
+    let mut restarted: Vec<AudioSourceLabel> = Vec::new();
+
+    if check_mic {
+        let mic_now = manager.mic_write_pos();
+        let stalled = mic_now == mic_initial && should_stall_restart(&AudioSourceLabel::Mic);
+        if mic_err || stalled {
+            warn!(
+                "preflight: mic stream needs restart (error={}, stalled={})",
+                mic_err, stalled
+            );
+            match manager.restart_mic() {
+                Ok(()) => restarted.push(AudioSourceLabel::Mic),
+                Err(e) => {
+                    error!("preflight: mic restart failed: {}", e);
+                    return Err(CommandError::from(e));
+                }
+            }
+        }
+    }
+
+    if check_system {
+        let sys_now = manager.system_write_pos();
+        let stalled = sys_now == sys_initial && should_stall_restart(&AudioSourceLabel::System);
+        if sys_err || stalled {
+            warn!(
+                "preflight: system stream needs restart (error={}, stalled={})",
+                sys_err, stalled
+            );
+            match manager.restart_system_audio() {
+                Ok(()) => restarted.push(AudioSourceLabel::System),
+                Err(e) => {
+                    error!("preflight: system restart failed: {}", e);
+                    if matches!(source, CaptureSource::SystemOnly) {
+                        return Err(CommandError::from(e));
+                    }
+                    // Mixed mode: degrade to mic-only, surface a health event.
+                    let _ = app_handle.emit(
+                        "stream-health",
+                        StreamHealthEvent {
+                            source: AudioSourceLabel::System,
+                            status: "restart_failed".into(),
+                            message: format!("preflight system restart failed: {e}"),
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    drop(manager);
+
+    for label in restarted {
+        let name = source_display_name(&label);
+        let _ = app_handle.emit(
+            "stream-health",
+            StreamHealthEvent {
+                source: label,
+                status: "restarted".into(),
+                message: format!("{name} stream restarted (preflight)"),
+            },
+        );
+    }
+
+    Ok(())
+}
+
 /// Classification of consecutive empty WAV flush extractions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EmptyFlushClassification {
@@ -1671,6 +1781,13 @@ pub async fn start_live_transcription(
             });
         }
     }
+
+    // Pre-flight: restart any silently-stalled capture streams before we
+    // read backfill or spawn the loop. Without this, the first dictation
+    // after a long idle (device change, Bluetooth drop, OS sleep) transcribes
+    // whatever stale audio happens to be in the ring buffer.
+    let preflight_source: CaptureSource = config.source.clone().into();
+    preflight_stream_health(audio_state.inner(), &preflight_source, &app_handle).await?;
 
     // Clamp backfill to actual audio available in the buffer.
     let effective_backfill_seconds = {
