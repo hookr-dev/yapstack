@@ -1,4 +1,5 @@
 import OpenAI from "openai";
+import { fetch as tauriFetch } from "@tauri-apps/plugin-http";
 import type {
   ChatCompletionMessageParam,
   ChatCompletionTool,
@@ -166,15 +167,15 @@ export function createAIClient(settings: AISettings): OpenAI {
   return new OpenAI({
     apiKey,
     baseURL: config.baseUrl,
-    // Intentional: desktop app — API key is stored locally, never leaves the device
     dangerouslyAllowBrowser: true,
     defaultHeaders: Object.keys(headers).length > 0 ? headers : undefined,
+    fetch: tauriFetch,
   });
 }
 
 export async function fetchCustomModels(baseUrl: string): Promise<string[]> {
   const url = baseUrl.replace(/\/$/, "") + "/models";
-  const res = await fetch(url);
+  const res = await tauriFetch(url);
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const json = (await res.json()) as { data?: Array<{ id?: unknown }> };
   if (!Array.isArray(json.data)) throw new Error("Unexpected response shape");
