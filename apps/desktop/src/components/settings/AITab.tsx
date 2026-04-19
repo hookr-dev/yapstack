@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, Fragment } from "react";
 import { useAppStore } from "@/stores/appStore";
 import { Button } from "@/components/ui/button";
 import { Label } from "@/components/ui/label";
@@ -355,25 +355,10 @@ export function AITab() {
     </div>
   );
 
-  if (provider === "custom") {
-    return (
-      <>
-        {providerField}
-        {baseUrlField}
-        {apiKeyField}
-        {customModelField}
-        {testButton}
-      </>
-    );
-  }
+  const modelField = provider === "custom" ? customModelField : knownModelField;
+  const ordered = provider === "custom"
+    ? [providerField, baseUrlField, apiKeyField, modelField, testButton]
+    : [providerField, apiKeyField, modelField, baseUrlField, testButton];
 
-  return (
-    <>
-      {providerField}
-      {apiKeyField}
-      {knownModelField}
-      {baseUrlField}
-      {testButton}
-    </>
-  );
+  return <>{ordered.map((node, i) => <Fragment key={i}>{node}</Fragment>)}</>;
 }

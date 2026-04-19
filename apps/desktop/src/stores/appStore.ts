@@ -807,49 +807,30 @@ function createAppStore() {
       },
 
       autoSetup: async () => {
+        // HMR-preserved Zustand store already holds "ready" when the backend
+        // is warm — skip the whole setup path. On fresh app start enginePhase
+        // is "idle", so this falls through to full init. Backend commands are
+        // idempotent (startCapture treats AlreadyRunning as Ok, init_whisper_client
+        // short-circuits on is_some()), so any duplicate calls are harmless.
+        if (get().enginePhase === "ready") return;
+
         const { settings } = get();
 
-        // Rehydrate frontend store from the backend's actual state BEFORE
-        // issuing any start/init commands. In dev, Vite HMR remounts the
-        // frontend while the Rust host keeps its AudioManager and WhisperClient
-        // warm — blindly re-issuing startCapture/initWhisperClient either
-        // errors with AlreadyRunning or respawns the sidecar, leaving
-        // enginePhase stuck in "initializing" long enough for dictation to
-        // fail its readiness check.
-        const [captureStatusResult, whisperStatusResult] = await Promise.all([
-          commands.getCaptureStatus(),
-          commands.getWhisperStatus(),
-        ]);
-        const backendCapturing =
-          captureStatusResult.status === "ok" &&
-          captureStatusResult.data.state === "Capturing";
-        const backendWhisperReady =
-          whisperStatusResult.status === "ok" &&
-          whisperStatusResult.data.initialized;
-
-        if (captureStatusResult.status === "ok") {
-          get().setCaptureStatus(captureStatusResult.data);
-        }
-
-        // Track 1 — Start capture only if the backend isn't already capturing.
-        if (!backendCapturing) {
-          commands
-            .startCapture(
-              settings.selectedMicDeviceId,
-              settings.captureSource,
-              settings.bufferMaxSeconds,
-            )
-            .then((result) => {
-              if (result.status === "error") {
-                // Eagerly fetch status so the UI reflects the error immediately
-                // instead of waiting for the next poll tick
-                commands.getCaptureStatus().then((r) => {
-                  if (r.status === "ok") get().setCaptureStatus(r.data);
-                });
-              }
-            })
-            .catch(() => {});
-        }
+        // Track 1 — Start capture (fire and forget, errors surface via capture-status events)
+        commands
+          .startCapture(
+            settings.selectedMicDeviceId,
+            settings.captureSource,
+            settings.bufferMaxSeconds,
+          )
+          .then((result) => {
+            if (result.status === "error") {
+              commands.getCaptureStatus().then((r) => {
+                if (r.status === "ok") get().setCaptureStatus(r.data);
+              });
+            }
+          })
+          .catch(() => {});
 
         // Track 2 — Engine setup
         try {
@@ -862,13 +843,6 @@ function createAppStore() {
           const modelsResult = await commands.getAvailableModels();
           if (modelsResult.status === "ok") {
             set({ models: modelsResult.data });
-          }
-
-          // Fast path: backend already has a Whisper client running. Trust it
-          // and mark the engine ready without respawning the sidecar.
-          if (backendWhisperReady) {
-            set({ enginePhase: "ready", engineError: null });
-            return;
           }
 
           const models = get().models;
