@@ -954,9 +954,9 @@ Modular tool registry. Each tool is self-contained with schema, executor, undo h
 | Type | Fields |
 |------|--------|
 | `ToolCallResult` | `{ id, name, arguments: Record<string, unknown> }` |
-| `ExecutedTool` | `{ name, label, detail, undoData? }` |
-| `ToolContext` | `{ sessionId, currentTitle, currentNote: DbNote \| null, isPinned, segments?: DbSegment[] }` |
-| `ToolEffect` | `"session-meta" \| "notes"` — declarative side-effect categories |
+| `ExecutedTool` | `{ name, label, detail, toolCallId?, result?, undoData? }` — `result` is sent to LLM as tool-role message, `detail` is human-facing badge |
+| `ToolContext` | `{ sessionId, currentTitle, currentNote: DbNote \| null, isPinned, segments?, tags?, folderIds? }` |
+| `ToolEffect` | `"session-meta" \| "notes" \| "organization"` — declarative side-effect categories |
 | `ToolDefinition` | `{ schema: ChatCompletionTool, execute: (args, ctx) → Promise<ExecutedTool \| null>, undo: (undoData, ctx) → Promise<void>, affects?: ToolEffect[] }` |
 
 **Functions**
@@ -975,8 +975,11 @@ Modular tool registry. Each tool is self-contained with schema, executor, undo h
 | Tool Name | Parameters | DB Operations | Effects |
 |-----------|-----------|---------------|---------|
 | `update_title` | `{ title: string }` | `updateSessionTitle()` | `["session-meta"]` |
-| `save_to_notes` | `{ content: string, mode: "replace" \| "append" }` | `markdownToBasicHtml()` → `convertCitationsToSegmentRefs()` → `saveNote()` + `createNoteVersion()` | `["notes"]` |
+| `save_to_notes` | `{ content: string, mode: "replace" \| "append" }` | `markdownToBasicHtml()` → `convertCitationsToSegmentRefs()` → `saveNote()` | `["notes"]` |
 | `pin_session` | `{ pinned: boolean }` | `togglePin()` (conditional) | `["session-meta"]` |
+| `tag_session` | `{ add: string[], remove?: string[] }` | `getTagByName()` → `createTag()` → `addSessionTag()` / `removeSessionTag()` | `["organization"]` |
+| `add_to_folder` | `{ folder_name: string }` | `listFolders()` → `findBranchConflicts()` → `dbAddSessionToFolder()` | `["organization"]` |
+| `get_folder_context` | `{ folder_name?: string }` | `listFolders()` → `buildFolderTree()` / `getFolderPath()` | `[]` (read-only) |
 
 ### `lib/ai-prompts.ts`
 

@@ -1064,6 +1064,88 @@ Users reported mid-session silent death of system-audio capture when toggling Ai
 
 ---
 
+## Phase 27 — Knowledge Management: Tags, Multi-Turn Tools, Vocabulary Hints, Auto-Folder Suggestions
+
+### Tags Infrastructure (Migration v11)
+
+New `tags` and `session_tags` tables with `COLLATE NOCASE` uniqueness and `source` column (`manual`/`auto`/`ai`). Tag CRUD in `db.ts`, store state (`tags`, `sessionTagMap`) in `appStore.ts`, loaded on mount alongside folders.
+
+**Design decision**: Tags are flat (no hierarchy) — folders are the primary organizational primitive. Tags are applied by the AI during summarization, not by the user during recording. This distinction is intentional: folders carry hierarchical descriptions that enrich AI context, tags are lightweight cross-cutting metadata.
+
+### Multi-Turn Tool Execution
+
+Replaced single-turn tool flow with a multi-turn loop in `useChatMessages.ts`. After tools execute, results are sent back as `tool`-role messages and a new streaming call fires (up to `MAX_TOOL_ROUNDS=3`). This enables phased workflows:
+
+- Turn 1: LLM calls `add_to_folder` → receives folder description chain
+- Turn 2: LLM uses folder context to call `update_title` + `tag_session` + `save_to_notes`
+
+**Key hardening**:
+- Null tool results send `"No action needed."` (OpenAI API requires a response for every `tool_call` ID)
+- All tools now have explicit `result` strings (sent to LLM) distinct from `detail` (human badge)
+- Abort signal checked between turns and between individual tool executions
+- `ToolExecution[]` state on `ChatMessage` with per-tool status (`running`/`done`/`error`)
+
+### New AI Tools
+
+| Tool | Purpose |
+|------|---------|
+| `tag_session` | Add/remove tags. Creates tags on-the-fly. Source tracked as `"ai"`. |
+| `add_to_folder` | Classify session into folder by name. Handles branch conflicts. Returns hierarchical description chain in `result`. |
+| `get_folder_context` | Read-only. Returns full folder tree or specific folder's context chain. |
+
+### Folder-First Summarization
+
+All 4 action directives rewritten with explicit two-phase instructions:
+- **Phase 1**: "Call ONLY `add_to_folder`. Do NOT call other tools yet."
+- **Phase 2**: "After receiving folder context, proceed with title, tags, notes."
+
+The folder tree (names + descriptions) is injected into the system prompt only during action triggers via `assembleFolderTreeForActions()` — not in regular freeform chat.
+
+### Whisper Vocabulary Hints
+
+Folder/tag names (≥4 chars) are prepended to Whisper's `initial_prompt` as comma-separated hints: `"ConsignR, ProjectAlpha. <rolling context>"`. Budget: 80 chars for vocab prefix, remainder for rolling context.
+
+**Dynamic updates**: Vocabulary hints moved from immutable `LiveTranscriptionConfig` to `Arc<Mutex<String>>` on `LiveTranscriptionRuntime`. New `update_vocabulary_hints` Tauri command writes to the shared Arc. `transcribe_chunk()` reads fresh each chunk. Frontend pushes updates when folder chip is accepted.
+
+**Fresh DB queries**: Both session start and dictation start query `listFolders()` + `listTags()` directly from SQLite — not from the store snapshot. This ensures newly created folders are always included.
+
+### Auto-Folder Suggestion Chips
+
+`FolderSuggestionTracker` in `lib/auto-tag.ts` scans live transcript segments for folder name keywords. Matching rules: names ≥4 chars, word-boundary regex, 2+ distinct mentions before suggesting. `AutoTagSuggestions` component renders inline chips below session header during recording. On acceptance: session added to folder, vocab hints rebuilt and pushed to Whisper backend.
+
+**Folders only**: Chips suggest folder placement exclusively. Tags are applied by the AI during Phase 2 of summarization.
+
+### Tool Execution UI
+
+Replaced raw `*Executing: add_to_folder, tag_session...*` text with structured `ToolExecutionBlock` component. Each row shows: status icon (spinning Loader2 → Check → AlertCircle), tool-specific icon (FolderInput, Tag, FileText, etc.), human label, and detail. Rendered in a subtle bordered container above the message bubble. Both live executions and persisted `[tool:]` badges render through the same component.
+
+### Files Changed
+
+| File | Change |
+|------|--------|
+| `src-tauri/src/db.rs` | Migration v11: tags, session_tags tables |
+| `src-tauri/src/commands/live_transcription.rs` | `LiveTranscriptionRuntime` wrapper, dynamic vocab hints Arc, `update_vocabulary_hints` command |
+| `src-tauri/src/lib.rs` | Register new command, update state access pattern |
+| `src/lib/db.ts` | Tag CRUD, `DbTag`/`DbSessionTag` interfaces |
+| `src/lib/ai-tools.ts` | 3 new tools (tag_session, add_to_folder, get_folder_context), `result` field on all tools, `ToolEffect: "organization"` |
+| `src/lib/ai-actions.ts` | Two-phase directives on all 4 actions |
+| `src/lib/ai-prompts.ts` | `GENERAL_DIRECTIVE` updated with new tool descriptions, `folderTreeContext` param on `getSystemPromptWithToolContext` |
+| `src/lib/ai-context.ts` | 6 tools in session context, `assembleFolderTreeForActions()`, expanded `ToolContext` |
+| `src/lib/ai.ts` | `ToolExecution`/`ToolExecutionStatus` types, `assembleFolderTreeContext()`, `ChatMessage.toolExecutions` |
+| `src/lib/transcription.ts` | New file: `buildVocabularyHints()` |
+| `src/lib/auto-tag.ts` | New file: `FolderSuggestionTracker`, keyword matching (folders only) |
+| `src/hooks/useChatMessages.ts` | Multi-turn loop, `ToolExecution[]` state tracking, per-tool status updates, null result handling |
+| `src/hooks/useAutoTag.ts` | New file: folder suggestion hook with vocab hint push |
+| `src/hooks/useDictation.ts` | Vocab hints from fresh DB |
+| `src/stores/appStore.ts` | Tags state, tag actions, vocab hints from fresh DB |
+| `src/components/ToolExecutionBlock.tsx` | New file: tool status rows with icons/spinners |
+| `src/components/AutoTagSuggestions.tsx` | New file: folder suggestion chips |
+| `src/components/AIChatMessage.tsx` | Render `ToolExecutionBlock` for live + persisted tool state |
+| `src/components/NoteDetailView.tsx` | Wire `useAutoTag`, render `AutoTagSuggestions`, `"organization"` effect refresh |
+| `src/components/AppLayout.tsx` | Load tags + session tags on mount |
+
+---
+
 ## What's Not Yet Built
 
 - **End-to-end integration tests** — capture audio, transcribe, verify text (unit + component tests now exist; integration tests still needed)
@@ -1071,8 +1153,10 @@ Users reported mid-session silent death of system-audio capture when toggling Ai
 - **Temp file cleanup** — WAV files from capture accumulate; needs cleanup after transcription
 - **Sidecar auto-restart** — `WhisperClient` detects crashes but doesn't restart automatically
 - **Progress events during sidecar inference** — the sidecar emits `Progress` responses and the client handles them (skipping to wait for final result), but whisper-rs doesn't provide a progress callback during inference itself
-- **Multi-turn tool calling** — Current AI tool flow is single-turn (execute tools, don't send results back). Multi-turn would allow the AI to observe tool results and take follow-up actions.
-- **Additional AI tools** — `suggest_folder`, `create_tag`, `export_pdf`, `search_sessions` are natural extensions of the tool registry
+- **Memory system** — Three-layer knowledge model (permanent facts, project context, daily logs) with SQLite storage, tag-based retrieval, and AI tools (`create_memory`, `update_memory`). Planned as Phase 4 of knowledge management.
+- **Daily digest & knowledge gardening** — AI-driven end-of-day summarization with full knowledge gardening (extract, update, merge, promote, archive). Manual trigger with smart nudge.
+- **Memory UI & vault sync** — Memory browser, backlinks panel, action item tracker, optional markdown vault sync for Obsidian interop.
+- **Tag management UI** — Tag CRUD, tag picker, tag filtering in sidebar, tags in search results. Tags infrastructure exists but no dedicated management UI yet.
 - **Sharing** — `shares` table exists but no sharing UI or backend logic
 - **Dictation during active recording** — WhisperClient is exclusively held by live transcription; dictation is unavailable while recording. Requires a second WhisperClient instance or queuing mechanism.
 - **Multi-platform dictation testing** — Auto-paste (`osascript`) is macOS-only. Windows implementation needs testing. Linux not yet supported.

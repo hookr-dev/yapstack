@@ -8,6 +8,24 @@ vi.mock("@/lib/db", () => ({
   createNoteVersion: vi.fn(),
   togglePin: vi.fn(),
   getSession: vi.fn(),
+  getTagByName: vi.fn(),
+  createTag: vi.fn(),
+  addSessionTag: vi.fn(),
+  removeSessionTag: vi.fn(),
+  addSessionToFolder: vi.fn(),
+  removeSessionFromFolder: vi.fn(),
+  listFolders: vi.fn().mockResolvedValue([]),
+}));
+
+vi.mock("@/lib/folder-tree", () => ({
+  findBranchConflicts: vi.fn().mockReturnValue([]),
+  getFolderPath: vi.fn().mockReturnValue([]),
+  buildFolderTree: vi.fn().mockReturnValue([]),
+}));
+
+vi.mock("@/lib/ai", () => ({
+  markdownToBasicHtml: vi.fn((s: string) => `<p>${s}</p>`),
+  assembleFolderTreeContext: vi.fn().mockReturnValue(""),
 }));
 
 import {
@@ -84,22 +102,25 @@ describe("convertCitationsToSegmentRefs", () => {
 });
 
 describe("getRegisteredTools", () => {
-  it("returns 3 registered tools", () => {
+  it("returns 6 registered tools", () => {
     const tools = getRegisteredTools();
-    expect(tools).toHaveLength(3);
+    expect(tools).toHaveLength(6);
     const names = tools.map((t) =>
       t.type === "function" ? t.function.name : "",
     );
     expect(names).toContain("update_title");
     expect(names).toContain("save_to_notes");
     expect(names).toContain("pin_session");
+    expect(names).toContain("tag_session");
+    expect(names).toContain("add_to_folder");
+    expect(names).toContain("get_folder_context");
   });
 });
 
 describe("getToolsForContext", () => {
   it("returns tools for session context", () => {
     const tools = getToolsForContext(true);
-    expect(tools).toHaveLength(3);
+    expect(tools).toHaveLength(6);
   });
 
   it("returns empty for non-session context", () => {

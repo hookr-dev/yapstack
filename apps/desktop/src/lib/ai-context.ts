@@ -7,12 +7,17 @@ import {
   getSession,
   getNotesForSessions,
   listDictationHistory,
+  getSessionTagIds,
+  listAllSessionFolders,
+  listTags,
+  listFolders,
 } from "./db";
 import {
   assembleTranscriptContext,
   assembleNoteContext,
   assembleMultiSessionContext,
   assembleDictationContext,
+  assembleFolderTreeContext,
   chatContextKey,
   transcriptHasSpeakers,
 } from "./ai";
@@ -29,7 +34,7 @@ import {
 import type { FolderContextLayer } from "./ai-prompts";
 import type { ToolContext } from "./ai-tools";
 import type { ActionDefinition } from "./ai-actions";
-import { getFolderPath } from "./folder-tree";
+import { getFolderPath, buildFolderTree } from "./folder-tree";
 
 // --- Core types ---
 
@@ -116,18 +121,31 @@ export function createSessionSources(
 
 export function createSessionTools(sessionId: string): AIContextTools {
   return {
-    availableToolIds: ["update_title", "save_to_notes", "pin_session"],
+    availableToolIds: ["update_title", "save_to_notes", "pin_session", "tag_session", "add_to_folder", "get_folder_context"],
     contextType: "session",
     getToolContext: async (): Promise<ToolContext> => {
-      const session = await getSession(sessionId);
-      const note = await getNote(sessionId);
-      const segments = await getSessionSegments(sessionId);
+      const [session, note, segments, tagIds, allSessionFolders, allTags] = await Promise.all([
+        getSession(sessionId),
+        getNote(sessionId),
+        getSessionSegments(sessionId),
+        getSessionTagIds(sessionId),
+        listAllSessionFolders(),
+        listTags(),
+      ]);
+      const folderIds = allSessionFolders
+        .filter((sf) => sf.session_id === sessionId)
+        .map((sf) => sf.folder_id);
+      const tagNames = tagIds
+        .map((tid) => allTags.find((t) => t.id === tid)?.name)
+        .filter((n): n is string => !!n);
       return {
         sessionId,
         currentTitle: session?.title ?? "Untitled",
         currentNote: note,
         isPinned: session?.is_pinned === 1,
         segments,
+        tags: tagNames,
+        folderIds,
       };
     },
   };
@@ -139,6 +157,7 @@ export function createSessionSystemPromptBuilder(
   return async (directive, contextParts, attachments) => {
     const transcript = contextParts["transcript"] ?? "";
     const notes = contextParts["notes"] ?? "";
+    const folderTreeCtx = contextParts["folder-tree"] ?? undefined;
     const session = await getSession(sessionId);
     const note = await getNote(sessionId);
     const sessionMeta = {
@@ -156,9 +175,17 @@ export function createSessionSystemPromptBuilder(
       notes,
       attachments,
       sessionMeta,
+      folderTreeCtx,
       { hasSpeakers },
     );
   };
+}
+
+export async function assembleFolderTreeForActions(): Promise<string> {
+  const folders = await listFolders();
+  if (folders.length === 0) return "";
+  const tree = buildFolderTree(folders);
+  return assembleFolderTreeContext(tree);
 }
 
 export function createMultiSessionSources(

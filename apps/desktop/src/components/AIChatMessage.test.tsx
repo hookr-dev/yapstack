@@ -203,7 +203,7 @@ describe("AIChatMessage", () => {
   // ---- Tool badges ----
 
   describe("tool badges", () => {
-    it("renders tool badge chips from [tool:name] prefix lines", () => {
+    it("renders tool execution block from [tool:name] prefix lines", () => {
       renderWithTooltip(
         <AIChatMessage
           message={makeMessage({
@@ -213,7 +213,8 @@ describe("AIChatMessage", () => {
           })}
         />,
       );
-      expect(screen.getByText("New Title")).toBeInTheDocument();
+      expect(screen.getByText("Title updated")).toBeInTheDocument();
+      expect(screen.getByText(/New Title/)).toBeInTheDocument();
       expect(screen.getByText("Here is the rest of the message")).toBeInTheDocument();
     });
 
@@ -229,7 +230,7 @@ describe("AIChatMessage", () => {
       expect(screen.getByText("Pin toggled")).toBeInTheDocument();
     });
 
-    it("renders multiple tool badges", () => {
+    it("renders multiple tool executions", () => {
       renderWithTooltip(
         <AIChatMessage
           message={makeMessage({
@@ -239,8 +240,8 @@ describe("AIChatMessage", () => {
           })}
         />,
       );
-      expect(screen.getByText("My Title")).toBeInTheDocument();
-      expect(screen.getByText("Done")).toBeInTheDocument();
+      expect(screen.getByText("Title updated")).toBeInTheDocument();
+      expect(screen.getByText("Notes saved")).toBeInTheDocument();
       expect(screen.getByText("Message body")).toBeInTheDocument();
     });
   });
@@ -248,7 +249,7 @@ describe("AIChatMessage", () => {
   // ---- Empty text with only badges ----
 
   describe("empty text with only badges", () => {
-    it("hides message bubble when only badges present", () => {
+    it("hides message bubble when only tool executions present", () => {
       const { container } = renderWithTooltip(
         <AIChatMessage
           message={makeMessage({
@@ -257,9 +258,9 @@ describe("AIChatMessage", () => {
           })}
         />,
       );
-      expect(screen.getByText("New Title")).toBeInTheDocument();
-      const bubble = container.querySelector("[class*='bg-muted']");
-      expect(bubble).toBeNull();
+      expect(screen.getByText("Title updated")).toBeInTheDocument();
+      const chatBubbles = container.querySelectorAll("[class*='ai-chat-markdown']");
+      expect(chatBubbles.length).toBe(0);
     });
 
     it("does not show copy button when only badges present", () => {
