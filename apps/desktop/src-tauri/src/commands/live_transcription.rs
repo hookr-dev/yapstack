@@ -667,15 +667,24 @@ async fn preflight_stream_health(
         return Ok(());
     }
 
-    let (mic_initial, sys_initial, mic_err, sys_err) = {
+    let (mic_initial, sys_initial, mic_err, sys_err, has_mic_buf, has_sys_buf) = {
         let m = audio_state.lock().await;
         (
             m.mic_write_pos(),
             m.system_write_pos(),
             m.mic_has_stream_error(),
             m.system_has_stream_error(),
+            m.mic_buffer().is_some(),
+            m.system_buffer().is_some(),
         )
     };
+
+    let check_mic = check_mic && has_mic_buf;
+    let check_system = check_system && has_sys_buf;
+
+    if !check_mic && !check_system {
+        return Ok(());
+    }
 
     tokio::time::sleep(Duration::from_millis(PREFLIGHT_SAMPLE_WINDOW_MS)).await;
 
