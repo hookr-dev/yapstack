@@ -95,7 +95,7 @@ export function DictationBubble() {
           <YapStackIcon className="h-3.5 w-3.5 text-white translate-y-[0.5px]" />
         </div>
         <span
-          className={`text-[11px] font-medium leading-none ${config.textColor} whitespace-nowrap pr-1.5 transition-colors duration-300`}
+          className={`text-[11px] font-medium ${config.textColor} whitespace-nowrap pr-1 transition-colors duration-300`}
         >
           {label}
         </span>
