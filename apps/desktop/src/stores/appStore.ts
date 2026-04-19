@@ -51,12 +51,20 @@ import {
   getDictationHistoryEntry,
   clearDictationHistory as dbClearDictationHistory,
   clearDictationSessionLink,
+  listTags,
+  listAllSessionTags,
+  createTag as dbCreateTag,
+  deleteTag as dbDeleteTag,
+  addSessionTag as dbAddSessionTag,
+  removeSessionTag as dbRemoveSessionTag,
+  getTagByName,
 } from "@/lib/db";
-import type { DbDictationHistory } from "@/lib/db";
+import type { DbDictationHistory, DbTag } from "@/lib/db";
 import { findBranchConflicts, buildFolderTree, buildChildMap, type FolderTreeNode } from "@/lib/folder-tree";
 import type { DbSession, DbSegment, DbFolder } from "@/lib/db";
 import { toast } from "sonner";
 import { DEFAULT_AI_SETTINGS } from "@/lib/ai";
+import { buildVocabularyHints } from "@/lib/transcription";
 import type { AISettings } from "@/lib/ai";
 import {
   trackSessionCreated,
@@ -218,6 +226,10 @@ interface AppState {
   playbackTime: number;
   isPlaying: boolean;
 
+  // Tags
+  tags: DbTag[];
+  sessionTagMap: Record<string, string[]>;
+
   // Dictation history (runtime, loaded from SQLite)
   dictationHistory: DbDictationHistory[];
 
@@ -302,6 +314,14 @@ interface AppState {
   toggleSessionFolder: (sessionId: string, folderId: string) => Promise<void>;
   addSessionToFolder: (sessionId: string, folderId: string) => Promise<void>;
   removeSessionFromAllFolders: (sessionId: string) => Promise<void>;
+
+  // Tag actions
+  loadTags: () => Promise<void>;
+  loadSessionTags: () => Promise<void>;
+  createTag: (name: string, color?: string | null) => Promise<DbTag>;
+  deleteTagAction: (id: string) => Promise<void>;
+  addTagToSession: (sessionId: string, tagName: string, source?: "manual" | "auto" | "ai") => Promise<void>;
+  removeTagFromSession: (sessionId: string, tagId: string) => Promise<void>;
 
   // Segment editing actions
   editSegmentText: (segmentId: string, newText: string) => Promise<void>;
@@ -463,6 +483,8 @@ function createAppStore() {
       noteRefreshCounter: 0,
       playbackTime: 0,
       isPlaying: false,
+      tags: [],
+      sessionTagMap: {},
       dictationHistory: [],
       updateAvailable: null,
       updateDismissedVersion: null,
@@ -745,6 +767,73 @@ function createAppStore() {
         }
       },
 
+      loadTags: async () => {
+        try {
+          const tags = await listTags();
+          set({ tags });
+        } catch (e) {
+          console.error("Failed to load tags:", e);
+        }
+      },
+
+      loadSessionTags: async () => {
+        try {
+          const rows = await listAllSessionTags();
+          const map: Record<string, string[]> = {};
+          for (const row of rows) {
+            if (!map[row.session_id]) map[row.session_id] = [];
+            map[row.session_id].push(row.tag_id);
+          }
+          set({ sessionTagMap: map });
+        } catch (e) {
+          console.error("Failed to load session tags:", e);
+        }
+      },
+
+      createTag: async (name: string, color: string | null = null) => {
+        const existing = await getTagByName(name);
+        if (existing) return existing;
+        const id = crypto.randomUUID();
+        await dbCreateTag(id, name, color);
+        const tag: DbTag = { id, name, color, created_at: new Date().toISOString() };
+        set({ tags: [...get().tags, tag] });
+        return tag;
+      },
+
+      deleteTagAction: async (id: string) => {
+        await dbDeleteTag(id);
+        set({ tags: get().tags.filter((t) => t.id !== id) });
+        const sessionTagMap = { ...get().sessionTagMap };
+        for (const sessionId of Object.keys(sessionTagMap)) {
+          sessionTagMap[sessionId] = sessionTagMap[sessionId].filter((tid) => tid !== id);
+          if (sessionTagMap[sessionId].length === 0) delete sessionTagMap[sessionId];
+        }
+        set({ sessionTagMap });
+      },
+
+      addTagToSession: async (sessionId: string, tagName: string, source: "manual" | "auto" | "ai" = "manual") => {
+        let tag = await getTagByName(tagName);
+        if (!tag) {
+          tag = await get().createTag(tagName);
+        }
+        await dbAddSessionTag(sessionId, tag.id, source);
+        const map = { ...get().sessionTagMap };
+        const current = map[sessionId] ?? [];
+        if (!current.includes(tag.id)) {
+          map[sessionId] = [...current, tag.id];
+          set({ sessionTagMap: map });
+        }
+      },
+
+      removeTagFromSession: async (sessionId: string, tagId: string) => {
+        await dbRemoveSessionTag(sessionId, tagId);
+        const map = { ...get().sessionTagMap };
+        const current = map[sessionId] ?? [];
+        map[sessionId] = current.filter((id) => id !== tagId);
+        if (map[sessionId].length === 0) delete map[sessionId];
+        set({ sessionTagMap: map });
+      },
+
       createAndStartSession: async (backfillSeconds?: number, trigger?: string) => {
         const { settings, enginePhase, captureStatus } = get();
 
@@ -758,6 +847,9 @@ function createAppStore() {
         const sessionId = crypto.randomUUID();
 
         await dbCreateSession(sessionId, settings.captureSource);
+
+        const [freshFolders, freshTags] = await Promise.all([listFolders(), listTags()]);
+        const vocabHints = buildVocabularyHints(freshFolders, freshTags);
 
         const config: LiveTranscriptionConfig = {
           silence_threshold: 0.01,
@@ -779,6 +871,7 @@ function createAppStore() {
           mp3_bitrate: settings.audioExportFormat === "mp3" ? settings.mp3Bitrate : null,
           diarization:
             settings.selectedEngine === "Parakeet" && settings.diarizationEnabled,
+          vocabulary_hints: vocabHints,
         };
 
         const result = await commands.startLiveTranscription(config);
@@ -869,6 +962,7 @@ function createAppStore() {
           trackSessionDeleted();
           const sessions = await listSessions();
           const { [id]: _, ...restMap } = get().sessionFolderMap;
+          const { [id]: _t, ...restTagMap } = get().sessionTagMap;
 
           // Refresh dictation history if viewing dictation list
           if (get().listFilter.type === "dictation") {
@@ -879,13 +973,14 @@ function createAppStore() {
             set({
               sessions,
               sessionFolderMap: restMap,
+              sessionTagMap: restTagMap,
               currentView: "note-list",
               selectedSessionId: null,
               viewSession: null,
               viewSessionSegments: [],
             });
           } else {
-            set({ sessions, sessionFolderMap: restMap });
+            set({ sessions, sessionFolderMap: restMap, sessionTagMap: restTagMap });
           }
         } catch (e) {
           console.error("Failed to delete session:", e);
@@ -1399,6 +1494,7 @@ function createAppStore() {
           set({
             sessions: [],
             sessionFolderMap: {},
+            sessionTagMap: {},
             currentView: "note-list",
             selectedSessionId: null,
             viewSession: null,

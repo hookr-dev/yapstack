@@ -1,6 +1,7 @@
 import { useState, useRef, useEffect, useCallback } from "react";
 import type { AIContextValue } from "@/lib/ai-context";
-import type { ChatMessage, FileAttachment } from "@/lib/ai";
+import { assembleFolderTreeForActions } from "@/lib/ai-context";
+import type { ChatMessage, FileAttachment, ToolExecution } from "@/lib/ai";
 import type { ActionDefinition } from "@/lib/ai-actions";
 import type { ExecutedTool } from "@/lib/ai-tools";
 import type { ChatCompletionMessageParam } from "openai/resources/chat/completions";
@@ -38,6 +39,15 @@ function dbToChatMessage(row: DbChatMessage): ChatMessage {
 }
 
 const UNDO_TIMEOUT_MS = 10_000;
+
+const TOOL_DISPLAY_LABELS: Record<string, string> = {
+  update_title: "Updating title",
+  save_to_notes: "Saving notes",
+  pin_session: "Pinning session",
+  tag_session: "Adding tags",
+  add_to_folder: "Classifying session",
+  get_folder_context: "Reading folders",
+};
 
 function cleanToolBadges(content: string): string {
   return content.split("\n").filter((l) => !/^\[tool:\w+\]/.test(l)).join("\n").trimStart();
@@ -218,12 +228,20 @@ export function useChatMessages(
 
         let accumulated = "";
         const executedTools: ExecutedTool[] = [];
+        const allToolExecs: ToolExecution[] = [];
         const history = messagesRef.current.filter((m) => m.content);
 
         const contextParts: Record<string, string> = {};
         for (const source of sources) {
           if (source.enabled) {
             contextParts[source.id] = await source.assembler();
+          }
+        }
+
+        if (actionDef && isSessionContext) {
+          const folderTree = await assembleFolderTreeForActions();
+          if (folderTree) {
+            contextParts["folder-tree"] = folderTree;
           }
         }
 
@@ -262,39 +280,126 @@ export function useChatMessages(
         };
         flushTimer = setInterval(flush, 50);
 
-        for await (const event of streamChatWithTools(
-          client,
-          activeConfig.model,
-          chatMessages,
-          tools,
-          abort.signal,
-        )) {
-          if (event.type === "token") {
-            accumulated += event.content;
-            needsFlush = true;
-          } else if (event.type === "tool_calls" && ctxTools.getToolContext) {
-            const toolCtx = await ctxTools.getToolContext();
+        // Multi-turn tool execution: after each LLM turn, if it emits tool_calls,
+        // execute them and send results back for a follow-up turn. This lets the
+        // LLM use tool results (e.g., folder context from add_to_folder) to inform
+        // subsequent output (e.g., writing a summary). Capped to prevent runaway loops.
+        const MAX_TOOL_ROUNDS = 3;
+        let turnMessages = chatMessages;
 
-            for (const call of event.calls) {
-              try {
-                const result = await executeTool(
-                  call.name,
-                  call.arguments,
-                  toolCtx,
-                );
-                if (result) {
-                  executedTools.push(result);
-                  trackChatToolExecuted({ tool_name: call.name });
-                }
-              } catch (e) {
-                console.error(`Tool ${call.name} failed:`, e);
-                toast.error(
-                  `Tool failed: ${e instanceof Error ? e.message : String(e)}`,
-                );
-              }
+        for (let round = 0; round <= MAX_TOOL_ROUNDS; round++) {
+          let turnText = "";
+          let turnToolCalls: import("@/lib/ai-tools").ToolCallResult[] = [];
+
+          for await (const event of streamChatWithTools(
+            client,
+            activeConfig.model,
+            turnMessages,
+            tools,
+            abort.signal,
+          )) {
+            if (event.type === "token") {
+              accumulated += event.content;
+              turnText += event.content;
+              needsFlush = true;
+            } else if (event.type === "tool_calls") {
+              turnToolCalls = event.calls;
             }
           }
+
+          if (turnToolCalls.length === 0 || !ctxTools.getToolContext) break;
+          if (abort.signal.aborted) break;
+
+          const pendingExecs: ToolExecution[] = turnToolCalls.map((c) => ({
+            name: c.name,
+            label: TOOL_DISPLAY_LABELS[c.name] ?? c.name,
+            status: "running" as const,
+          }));
+          allToolExecs.push(...pendingExecs);
+
+          setMessages((prev) =>
+            prev.map((m) =>
+              m.id === assistantMessage.id
+                ? { ...m, content: accumulated, toolExecutions: [...allToolExecs] }
+                : m,
+            ),
+          );
+
+          const toolCtx = await ctxTools.getToolContext();
+          const toolResultMessages: ChatCompletionMessageParam[] = [];
+
+          const assistantToolCalls = turnToolCalls.map((call) => ({
+            id: call.id,
+            type: "function" as const,
+            function: { name: call.name, arguments: JSON.stringify(call.arguments) },
+          }));
+
+          turnMessages = [
+            ...turnMessages,
+            {
+              role: "assistant" as const,
+              content: turnText || null,
+              tool_calls: assistantToolCalls,
+            },
+          ];
+
+          for (let ci = 0; ci < turnToolCalls.length; ci++) {
+            const call = turnToolCalls[ci];
+            if (abort.signal.aborted) break;
+            const execIdx = allToolExecs.length - turnToolCalls.length + ci;
+            try {
+              const result = await executeTool(
+                call.name,
+                call.arguments,
+                toolCtx,
+              );
+              if (result) {
+                result.toolCallId = call.id;
+                executedTools.push(result);
+                trackChatToolExecuted({ tool_name: call.name });
+                allToolExecs[execIdx] = { ...allToolExecs[execIdx], status: "done", detail: result.detail };
+                toolResultMessages.push({
+                  role: "tool" as const,
+                  tool_call_id: call.id,
+                  content: result.result ?? result.detail,
+                });
+              } else {
+                allToolExecs[execIdx] = { ...allToolExecs[execIdx], status: "done" };
+                toolResultMessages.push({
+                  role: "tool" as const,
+                  tool_call_id: call.id,
+                  content: "No action needed.",
+                });
+              }
+            } catch (e) {
+              console.error(`Tool ${call.name} failed:`, e);
+              allToolExecs[execIdx] = {
+                ...allToolExecs[execIdx],
+                status: "error",
+                detail: e instanceof Error ? e.message : String(e),
+              };
+              toast.error(
+                `Tool failed: ${e instanceof Error ? e.message : String(e)}`,
+              );
+              toolResultMessages.push({
+                role: "tool" as const,
+                tool_call_id: call.id,
+                content: `Error: ${e instanceof Error ? e.message : String(e)}`,
+              });
+            }
+
+            setMessages((prev) =>
+              prev.map((m) =>
+                m.id === assistantMessage.id
+                  ? { ...m, toolExecutions: [...allToolExecs] }
+                  : m,
+              ),
+            );
+          }
+
+          turnMessages = [...turnMessages, ...toolResultMessages];
         }
+
         clearInterval(flushTimer);
         flush();
 
@@ -305,10 +410,11 @@ export function useChatMessages(
           accumulated = badgeLines + "\n" + accumulated;
         }
 
+        const finalToolExecs = allToolExecs.length > 0 ? [...allToolExecs] : undefined;
         setMessages((prev) =>
           prev.map((m) =>
             m.id === assistantMessage.id
-              ? { ...m, content: accumulated, isStreaming: false }
+              ? { ...m, content: accumulated, isStreaming: false, toolExecutions: finalToolExecs }
               : m,
           ),
         );
@@ -365,6 +471,7 @@ export function useChatMessages(
     [
       contextKey,
       sessionId,
+      isSessionContext,
       sources,
       ctxTools,
       attachments,

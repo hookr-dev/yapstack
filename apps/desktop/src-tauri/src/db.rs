@@ -292,6 +292,33 @@ pub fn migrations() -> Vec<Migration> {
         "#,
             kind: MigrationKind::Up,
         },
+        Migration {
+            version: 11,
+            description: "add tags and session_tags tables",
+            sql: r#"
+            CREATE TABLE tags (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                color TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE INDEX idx_tags_name ON tags(name);
+
+            CREATE TABLE session_tags (
+                session_id TEXT NOT NULL,
+                tag_id TEXT NOT NULL,
+                source TEXT NOT NULL DEFAULT 'manual',
+                confidence REAL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY (session_id, tag_id),
+                FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE,
+                FOREIGN KEY (tag_id) REFERENCES tags(id) ON DELETE CASCADE
+            );
+            CREATE INDEX idx_session_tags_tag ON session_tags(tag_id);
+            CREATE INDEX idx_session_tags_session ON session_tags(session_id);
+        "#,
+            kind: MigrationKind::Up,
+        },
         // segments.speaker_id is added by `ensure_runtime_schema()` instead —
         // see that function for why.
     ]
@@ -311,7 +338,7 @@ mod tests {
     fn test_migrations_sequential_versions() {
         let m = migrations();
         let actual_versions: Vec<i64> = m.iter().map(|x| x.version).collect();
-        assert_eq!(actual_versions, (1..=10).collect::<Vec<_>>());
+        assert_eq!(actual_versions, (1..=11).collect::<Vec<_>>());
     }
 
     #[test]
@@ -361,6 +388,10 @@ mod tests {
 
         // v10 should create dictation_history
         assert!(m[9].sql.contains("CREATE TABLE dictation_history"));
+
+        // v11 should create tags and session_tags
+        assert!(m[10].sql.contains("CREATE TABLE tags"));
+        assert!(m[10].sql.contains("CREATE TABLE session_tags"));
     }
 
     #[test]
@@ -378,8 +409,8 @@ mod tests {
     fn test_migration_count() {
         assert_eq!(
             migrations().len(),
-            10,
-            "v1-v10; speaker_id handled at runtime"
+            11,
+            "v1-v11; segments.speaker_id handled at runtime via ensure_runtime_schema"
         );
     }
 }

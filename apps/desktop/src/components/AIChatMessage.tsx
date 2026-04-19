@@ -10,6 +10,7 @@ import { memo, useState, type ReactNode } from "react";
 import type { ChatMessage } from "@/lib/ai";
 import type { DbSegment } from "@/lib/db";
 import { getAction } from "@/lib/ai-actions";
+import { ToolExecutionBlock } from "@/components/ToolExecutionBlock";
 
 interface ToolBadge {
   tool: string;
@@ -27,6 +28,9 @@ const TOOL_LABELS: Record<string, string> = {
   update_title: "Title updated",
   save_to_notes: "Notes saved",
   pin_session: "Pin toggled",
+  tag_session: "Tags updated",
+  add_to_folder: "Classified",
+  get_folder_context: "Folders loaded",
 };
 
 function parseToolBadges(content: string): {
@@ -169,22 +173,26 @@ export const AIChatMessage = memo(function AIChatMessage({
     );
   }
 
+  const hasLiveExecs = message.toolExecutions && message.toolExecutions.length > 0;
   const { badges, text } = parseToolBadges(message.content);
   const hasCitations = CITE_REGEX.test(text);
 
+  const toolExecsFromBadges = !hasLiveExecs && badges.length > 0
+    ? badges.map((b) => ({
+        name: b.tool,
+        label: TOOL_LABELS[b.tool] ?? b.tool,
+        detail: b.detail || undefined,
+        status: "done" as const,
+      }))
+    : undefined;
+
+  const toolExecs = message.toolExecutions ?? toolExecsFromBadges;
+
   return (
     <div className="flex flex-col gap-1">
-      {badges.length > 0 && (
-        <div className="flex flex-wrap gap-1 mb-0.5">
-          {badges.map((b, i) => (
-            <span
-              key={i}
-              className="inline-flex items-center gap-1 rounded-md bg-primary/10 px-1.5 py-0.5 text-[10px] font-medium text-primary"
-            >
-              <Check className="h-2.5 w-2.5" />
-              {b.detail || TOOL_LABELS[b.tool] || b.tool}
-            </span>
-          ))}
+      {toolExecs && toolExecs.length > 0 && (
+        <div className="max-w-[95%] rounded-xl bg-muted/40 border border-border/30 px-2.5 py-1.5">
+          <ToolExecutionBlock executions={toolExecs} />
         </div>
       )}
       {(text.trim() || message.isStreaming) && (

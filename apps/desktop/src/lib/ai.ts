@@ -10,6 +10,7 @@ import type { DbSegment } from "./db";
 import type { SessionWithNote } from "./db";
 import type { DbDictationHistory } from "./db";
 import type { ToolCallResult } from "./ai-tools";
+import type { FolderTreeNode } from "./folder-tree";
 
 // ----- ChatContext -----
 
@@ -54,12 +55,22 @@ export interface AISettings {
   providers: Record<AIProvider, AIProviderConfig>;
 }
 
+export type ToolExecutionStatus = "running" | "done" | "error";
+
+export interface ToolExecution {
+  name: string;
+  label: string;
+  detail?: string;
+  status: ToolExecutionStatus;
+}
+
 export interface ChatMessage {
   id: string;
   role: "user" | "assistant";
   content: string;
   action?: AIActionType;
   isStreaming?: boolean;
+  toolExecutions?: ToolExecution[];
 }
 
 export interface FileAttachment {
@@ -283,6 +294,23 @@ export function assembleNoteContext(noteHtml: string): string {
     .replace(/&#39;/g, "'")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
+}
+
+// ----- Folder Tree Context -----
+
+export function assembleFolderTreeContext(tree: FolderTreeNode[]): string {
+  function renderNode(node: FolderTreeNode, depth: number): string {
+    const indent = "  ".repeat(depth);
+    const desc = node.folder.description
+      ? ` — "${node.folder.description}"`
+      : "";
+    let line = `${indent}- ${node.folder.name}${desc}`;
+    for (const child of node.children) {
+      line += "\n" + renderNode(child, depth + 1);
+    }
+    return line;
+  }
+  return tree.map((root) => renderNode(root, 0)).join("\n");
 }
 
 // ----- Message Building -----

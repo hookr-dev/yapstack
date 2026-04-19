@@ -75,6 +75,21 @@ export interface DbSessionFolder {
   created_at: string;
 }
 
+export interface DbTag {
+  id: string;
+  name: string;
+  color: string | null;
+  created_at: string;
+}
+
+export interface DbSessionTag {
+  session_id: string;
+  tag_id: string;
+  source: "manual" | "auto" | "ai";
+  confidence: number | null;
+  created_at: string;
+}
+
 export interface DbChatMessage {
   id: string;
   context_key: string;
@@ -316,6 +331,77 @@ export async function listAllSessionFolders(): Promise<DbSessionFolder[]> {
   return await db.select<DbSessionFolder[]>(
     "SELECT * FROM session_folders",
   );
+}
+
+// --- Tag CRUD ---
+
+export async function createTag(
+  id: string,
+  name: string,
+  color: string | null = null,
+): Promise<void> {
+  const db = await getDb();
+  await db.execute(
+    "INSERT INTO tags (id, name, color) VALUES ($1, $2, $3)",
+    [id, name, color],
+  );
+}
+
+export async function listTags(): Promise<DbTag[]> {
+  const db = await getDb();
+  return await db.select<DbTag[]>("SELECT * FROM tags ORDER BY name");
+}
+
+export async function getTagByName(name: string): Promise<DbTag | null> {
+  const db = await getDb();
+  const rows = await db.select<DbTag[]>(
+    "SELECT * FROM tags WHERE name = $1 COLLATE NOCASE LIMIT 1",
+    [name],
+  );
+  return rows[0] ?? null;
+}
+
+export async function deleteTag(id: string): Promise<void> {
+  const db = await getDb();
+  await db.execute("DELETE FROM tags WHERE id = $1", [id]);
+}
+
+export async function addSessionTag(
+  sessionId: string,
+  tagId: string,
+  source: "manual" | "auto" | "ai" = "manual",
+  confidence: number | null = null,
+): Promise<void> {
+  const db = await getDb();
+  await db.execute(
+    "INSERT OR IGNORE INTO session_tags (session_id, tag_id, source, confidence) VALUES ($1, $2, $3, $4)",
+    [sessionId, tagId, source, confidence],
+  );
+}
+
+export async function removeSessionTag(
+  sessionId: string,
+  tagId: string,
+): Promise<void> {
+  const db = await getDb();
+  await db.execute(
+    "DELETE FROM session_tags WHERE session_id = $1 AND tag_id = $2",
+    [sessionId, tagId],
+  );
+}
+
+export async function listAllSessionTags(): Promise<DbSessionTag[]> {
+  const db = await getDb();
+  return await db.select<DbSessionTag[]>("SELECT * FROM session_tags");
+}
+
+export async function getSessionTagIds(sessionId: string): Promise<string[]> {
+  const db = await getDb();
+  const rows = await db.select<{ tag_id: string }[]>(
+    "SELECT tag_id FROM session_tags WHERE session_id = $1",
+    [sessionId],
+  );
+  return rows.map((r) => r.tag_id);
 }
 
 // --- Segment CRUD ---

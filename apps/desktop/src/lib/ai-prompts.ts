@@ -45,6 +45,8 @@ You can use your tools to help the user:
 - \`update_title\` — Set a better session title if the user asks
 - \`save_to_notes\` — Save content to notes when the user asks you to write, draft, or create something
 - \`pin_session\` — Pin/unpin the session
+- \`tag_session\` — Add or remove tags from the session
+- \`add_to_folder\` — Classify the session into an organizational folder
 
 Only use tools when the user's request clearly calls for it. For general questions, just answer in text.`;
 
@@ -95,6 +97,7 @@ export function getSystemPromptWithToolContext(
   noteText: string,
   attachments: { name: string; content: string }[],
   sessionMeta: SessionMeta,
+  folderTreeContext?: string,
   options?: { hasSpeakers?: boolean },
 ): string {
   const base = getSystemPrompt(
@@ -105,10 +108,13 @@ export function getSystemPromptWithToolContext(
     options,
   );
 
-  return (
-    base +
-    `\n---\nSession metadata:\n- Current title: "${sessionMeta.title}"\n- Pinned: ${sessionMeta.isPinned ? "yes" : "no"}\n- Has existing notes: ${sessionMeta.hasNotes ? "yes" : "no"}\n`
-  );
+  let meta = `\n---\nSession metadata:\n- Current title: "${sessionMeta.title}"\n- Pinned: ${sessionMeta.isPinned ? "yes" : "no"}\n- Has existing notes: ${sessionMeta.hasNotes ? "yes" : "no"}\n`;
+
+  if (folderTreeContext) {
+    meta += `\n**Available folders (classify this session before summarizing):**\n${folderTreeContext}\n`;
+  }
+
+  return base + meta;
 }
 
 export interface FolderContextLayer {
