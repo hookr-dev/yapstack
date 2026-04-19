@@ -612,12 +612,10 @@ pub fn run() {
         .run(|_app, event| match event {
             #[cfg(target_os = "macos")]
             RunEvent::Reopen {
-                has_visible_windows,
+                has_visible_windows: false,
                 ..
             } => {
-                if !has_visible_windows {
-                    show_main_window(_app);
-                }
+                show_main_window(_app);
             }
             RunEvent::Exit => {
                 // The aptabase plugin's own on_event handler calls flush_blocking()
