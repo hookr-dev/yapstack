@@ -680,8 +680,7 @@ async fn preflight_stream_health(
 
     if check_mic {
         let mic_now = manager.mic_write_pos();
-        let stalled =
-            mic_now == mic_initial && should_stall_restart(&AudioSourceLabel::Mic);
+        let stalled = mic_now == mic_initial && should_stall_restart(&AudioSourceLabel::Mic);
         if mic_err || stalled {
             warn!(
                 "preflight: mic stream needs restart (error={}, stalled={})",
@@ -699,8 +698,7 @@ async fn preflight_stream_health(
 
     if check_system {
         let sys_now = manager.system_write_pos();
-        let stalled =
-            sys_now == sys_initial && should_stall_restart(&AudioSourceLabel::System);
+        let stalled = sys_now == sys_initial && should_stall_restart(&AudioSourceLabel::System);
         if sys_err || stalled {
             warn!(
                 "preflight: system stream needs restart (error={}, stalled={})",
