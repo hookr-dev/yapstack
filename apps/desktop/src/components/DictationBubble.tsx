@@ -8,7 +8,7 @@ const stateConfig: Record<
   { label: string; ringColor: string; textColor: string; glow: string; animate?: string }
 > = {
   recording: {
-    label: "Listening...",
+    label: "Listening",
     ringColor: "ring-red-500",
     textColor: "text-red-400",
     glow: "shadow-[0_0_12px_rgba(239,68,68,0.5)]",
@@ -88,14 +88,14 @@ export function DictationBubble() {
 
   return (
     <div className="flex h-screen w-screen items-center justify-center bg-transparent">
-      <div className="flex items-center gap-2 rounded-full bg-background p-2 shadow-2xl border border-white/[0.08]">
+      <div className="flex items-center gap-2.5 rounded-full bg-background p-2 shadow-2xl border border-white/[0.08]">
         <div
-          className={`flex h-5 w-5 shrink-0 items-center justify-center rounded-full ring-2 ${config.ringColor} ${config.glow} ${config.animate ?? ""} transition-all duration-300`}
+          className={`flex h-5 w-5 shrink-0 items-center justify-center rounded-full ring-2 ${config.ringColor} ${config.glow} ${config.animate ?? ""} transition-colors duration-300`}
         >
-          <YapStackIcon className="h-3 w-3 text-white" />
+          <YapStackIcon className="h-3.5 w-3.5 text-white translate-y-[0.5px]" />
         </div>
         <span
-          className={`text-[11px] font-medium leading-none ${config.textColor} whitespace-nowrap pr-0.5 transition-colors duration-300`}
+          className={`text-[11px] font-medium leading-none ${config.textColor} whitespace-nowrap pr-1.5 transition-colors duration-300`}
         >
           {label}
         </span>

@@ -2,7 +2,7 @@ export function YapStackIcon({ className }: { className?: string }) {
   return (
     <svg
       xmlns="http://www.w3.org/2000/svg"
-      viewBox="0 0 180 221"
+      viewBox="0 18 180 180"
       className={className}
       fill="currentColor"
     >
