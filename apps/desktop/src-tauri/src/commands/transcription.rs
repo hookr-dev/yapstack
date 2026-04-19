@@ -263,14 +263,7 @@ pub async fn init_whisper_client(
             CommandError::from(e)
         })?;
 
-    // Re-check under the write lock — a racing caller may have spawned one
-    // while we were awaiting the sidecar boot. Drop ours if so.
     let mut client_guard = whisper_state.lock().await;
-    if client_guard.is_some() {
-        info!("whisper client was spawned concurrently, dropping duplicate");
-        drop(client);
-        return Ok(());
-    }
     *client_guard = Some(client);
 
     info!("whisper client initialized");
