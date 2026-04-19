@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use specta::Type;
+use tauri::{AppHandle, Emitter};
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 use yapstack_audio::AudioManager;
@@ -10,6 +11,17 @@ use yapstack_audio::RingBufferInfo;
 use yapstack_common::types;
 
 use super::error::CommandError;
+
+/// Matches the shape of `StreamHealthEvent` in `live_transcription.rs` so the
+/// frontend's existing `stream-health` toast handler can surface degradations
+/// that happen during initial capture startup (e.g. missing TCC permission for
+/// system audio on macOS).
+#[derive(Debug, Clone, Serialize)]
+struct CaptureStreamHealthEvent {
+    source: &'static str,
+    status: &'static str,
+    message: String,
+}
 
 // DTO wrappers that derive specta::Type for IPC boundary
 #[derive(Debug, Clone, Serialize, Type)]
@@ -269,6 +281,7 @@ pub fn get_default_input_device() -> Result<AudioDeviceInfoDto, CommandError> {
 #[tauri::command]
 #[specta::specta]
 pub async fn start_capture(
+    app_handle: AppHandle,
     state: tauri::State<'_, AudioManagerState>,
     mic_device_id: Option<String>,
     capture_source: CaptureSourceDto,
@@ -296,11 +309,45 @@ pub async fn start_capture(
         manager.set_config(config);
     }
 
+    let requested_source: types::CaptureSource = capture_source.into();
+
     // Idempotent: treat "already running" as success. A Vite HMR remount or
     // StrictMode double-mount will re-fire autoSetup → startCapture, and
     // surfacing AlreadyRunning as an error corrupts the UI's capture status.
-    match manager.start_capture(capture_source.into(), mic_device_id.as_deref()) {
-        Ok(()) => Ok(()),
+    match manager.start_capture(requested_source, mic_device_id.as_deref()) {
+        Ok(()) => {
+            // In Mixed mode, system-audio failures are swallowed by `start_all`
+            // and only surface via `CaptureStatus.error_message` — which the
+            // frontend currently toasts only on state transitions to Error.
+            // Emit a stream-health event here so the user sees the degradation
+            // (e.g. missing screen/system-audio recording permission for the
+            // terminal during `npm run dev`, or a Bluetooth output device that
+            // cpal loopback can't tap).
+            let status = manager.status();
+            if matches!(requested_source, types::CaptureSource::Mixed)
+                && !status.system_audio_active
+            {
+                let detail = status
+                    .error_message
+                    .unwrap_or_else(|| "unknown error".to_string());
+                warn!(
+                    "start_capture: mixed mode degraded to mic-only — {}",
+                    detail
+                );
+                let _ = app_handle.emit(
+                    "stream-health",
+                    CaptureStreamHealthEvent {
+                        source: "System",
+                        status: "restart_failed",
+                        message: format!(
+                            "System audio unavailable — capturing microphone only. {}",
+                            detail
+                        ),
+                    },
+                );
+            }
+            Ok(())
+        }
         Err(yapstack_audio::AudioError::AlreadyRunning) => {
             warn!("start_capture: already running, treating as no-op");
             Ok(())
