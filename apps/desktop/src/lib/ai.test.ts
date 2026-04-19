@@ -14,7 +14,10 @@ import {
   assembleNoteContext,
   markdownToBasicHtml,
   fetchCustomModels,
+  isAIConfigured,
+  DEFAULT_AI_SETTINGS,
   type ChatContext,
+  type AISettings,
 } from "./ai";
 
 describe("chatContextKey", () => {
@@ -273,5 +276,59 @@ describe("fetchCustomModels", () => {
 
     const ids = await fetchCustomModels("http://x/v1");
     expect(ids).toEqual(["a", "b"]);
+  });
+});
+
+describe("isAIConfigured", () => {
+  function settingsWith(overrides: Partial<AISettings>): AISettings {
+    return { ...DEFAULT_AI_SETTINGS, ...overrides };
+  }
+
+  it("returns false for openai with blank apiKey", () => {
+    expect(isAIConfigured(settingsWith({ activeProvider: "openai" }))).toBe(false);
+  });
+
+  it("returns true for openai with an apiKey set", () => {
+    const s = settingsWith({
+      activeProvider: "openai",
+      providers: {
+        ...DEFAULT_AI_SETTINGS.providers,
+        openai: { ...DEFAULT_AI_SETTINGS.providers.openai, apiKey: "sk-abc" },
+      },
+    });
+    expect(isAIConfigured(s)).toBe(true);
+  });
+
+  it("returns true for custom with baseUrl + model, blank apiKey", () => {
+    const s = settingsWith({
+      activeProvider: "custom",
+      providers: {
+        ...DEFAULT_AI_SETTINGS.providers,
+        custom: { apiKey: "", model: "llama3", baseUrl: "http://127.0.0.1:8080/v1" },
+      },
+    });
+    expect(isAIConfigured(s)).toBe(true);
+  });
+
+  it("returns false for custom with empty model", () => {
+    const s = settingsWith({
+      activeProvider: "custom",
+      providers: {
+        ...DEFAULT_AI_SETTINGS.providers,
+        custom: { apiKey: "", model: "", baseUrl: "http://127.0.0.1:8080/v1" },
+      },
+    });
+    expect(isAIConfigured(s)).toBe(false);
+  });
+
+  it("returns false for custom with empty baseUrl", () => {
+    const s = settingsWith({
+      activeProvider: "custom",
+      providers: {
+        ...DEFAULT_AI_SETTINGS.providers,
+        custom: { apiKey: "", model: "llama3", baseUrl: "" },
+      },
+    });
+    expect(isAIConfigured(s)).toBe(false);
   });
 });

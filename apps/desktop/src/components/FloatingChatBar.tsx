@@ -22,7 +22,7 @@ import {
   saveNote,
 } from "@/lib/db";
 import {
-  getActiveConfig,
+  isAIConfigured,
   markdownToBasicHtml,
   DEFAULT_AI_SETTINGS,
 } from "@/lib/ai";
@@ -48,8 +48,7 @@ export function FloatingChatBar() {
   const navigateTo = useAppStore((s) => s.navigateTo);
   const setPlaybackTime = useAppStore((s) => s.setPlaybackTime);
   const incrementNoteRefresh = useAppStore((s) => s.incrementNoteRefresh);
-  const activeConfig = getActiveConfig(aiSettings);
-  const hasApiKey = !!activeConfig.apiKey;
+  const aiConfigured = isAIConfigured(aiSettings);
 
   const sources = useMemo(() => ctx?.sources ?? [], [ctx?.sources]);
   const toggleSource = ctx?.toggleSource;
@@ -129,7 +128,7 @@ export function FloatingChatBar() {
   if (!ctx) return null;
 
   // Compact "no API key" inline message
-  if (!hasApiKey) {
+  if (!aiConfigured) {
     return (
       <div className="absolute bottom-2 inset-x-2 z-10 bg-card/95 backdrop-blur-sm border rounded-xl shadow-lg">
         <div className="flex items-center gap-2 px-3 py-2.5">

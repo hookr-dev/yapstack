@@ -5,7 +5,7 @@ import { PhysicalPosition } from "@tauri-apps/api/dpi";
 import { useAppStore } from "@/stores/appStore";
 import { commands } from "@/lib/tauri";
 import { EVENTS, WINDOWS, listenEvent, emitEvent, type BubbleState } from "@/lib/events";
-import { createAIClient, getActiveConfig } from "@/lib/ai";
+import { createAIClient, getActiveConfig, isAIConfigured } from "@/lib/ai";
 import { createManualSession as dbCreateManualSession, saveNote, insertDictationHistory } from "@/lib/db";
 import { toast } from "sonner";
 import { trackDictationStarted, trackDictationCompleted, trackDictationFailed } from "@/lib/analytics";
@@ -328,8 +328,10 @@ export function useDictation() {
           const aiSettings = s.settings.ai;
           const config = getActiveConfig(aiSettings);
 
-          if (!config.apiKey) {
-            // No API key — fall through to output raw transcription
+          if (!isAIConfigured(aiSettings)) {
+            // AI not configured for this provider — fall through to raw transcription.
+            // For custom providers a blank apiKey is valid (local servers), so we
+            // check both baseUrl + model presence via isAIConfigured.
           } else {
             try {
               const client = createAIClient(aiSettings);

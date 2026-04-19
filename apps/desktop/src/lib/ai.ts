@@ -187,6 +187,20 @@ export function getActiveConfig(settings: AISettings): AIProviderConfig {
   return settings.providers[settings.activeProvider];
 }
 
+/**
+ * A provider is "configured" (usable for AI features) when the server can be
+ * reached and a model is named. Custom providers (local llama.cpp / LM Studio /
+ * Ollama) accept a blank API key — an empty key must not count as "not set up"
+ * for them, or dictation silently skips its AI cleanup step.
+ */
+export function isAIConfigured(settings: AISettings): boolean {
+  const config = getActiveConfig(settings);
+  if (settings.activeProvider === "custom") {
+    return !!config.baseUrl && !!config.model;
+  }
+  return !!config.apiKey;
+}
+
 // ----- Context Assembly -----
 
 export function assembleTranscriptContext(segments: DbSegment[]): string {

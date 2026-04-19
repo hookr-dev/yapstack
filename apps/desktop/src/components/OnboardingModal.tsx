@@ -555,7 +555,7 @@ function AIStep({
             variant="outline"
             className="w-full text-xs"
             onClick={handleTestConnection}
-            disabled={testing || !config.apiKey}
+            disabled={testing || (provider !== "custom" && !config.apiKey)}
           >
             {testing && <Loader2 className="mr-1.5 h-3 w-3 animate-spin" />}
             Test Connection
