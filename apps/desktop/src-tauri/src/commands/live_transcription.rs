@@ -56,6 +56,11 @@ pub struct LiveTranscriptionConfig {
     pub audio_export_format: Option<String>,
     /// MP3 bitrate in kbps (e.g. 64, 128, 192). Only used when format is "mp3".
     pub mp3_bitrate: Option<u16>,
+    /// Request speaker diarization on every transcribed chunk. Honored only
+    /// when the active engine is Parakeet *and* the sidecar was spawned with
+    /// a Sortformer model path. Whisper sessions ignore this flag.
+    #[serde(default)]
+    pub diarization: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Type)]
@@ -1588,8 +1593,20 @@ async fn transcribe_chunk(
         let mut client_guard = ctx.whisper_client.lock().await;
         match client_guard.as_mut() {
             Some(client) => {
+                // initial_prompt is Whisper-only — Parakeet's TDT decoder has no
+                // text-prompt input, so passing it would just be ignored. Drop it
+                // explicitly so the IPC payload is honest about what was sent.
+                let prompt_for_engine = match client.engine() {
+                    yapstack_common::types::EngineKind::Whisper => effective_prompt,
+                    yapstack_common::types::EngineKind::Parakeet => None,
+                };
                 client
-                    .transcribe(&wav_path, ctx.config.language.as_deref(), effective_prompt)
+                    .transcribe_with(
+                        &wav_path,
+                        ctx.config.language.as_deref(),
+                        prompt_for_engine,
+                        ctx.config.diarization,
+                    )
                     .await
             }
             None => {
@@ -1660,6 +1677,7 @@ async fn transcribe_chunk(
                     end_ms: s.end_ms,
                     text: s.text,
                     confidence: s.confidence,
+                    speaker_id: s.speaker_id,
                 })
                 .collect();
 

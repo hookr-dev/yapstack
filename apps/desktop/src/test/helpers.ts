@@ -44,6 +44,7 @@ export function makeSegment(overrides: Partial<DbSegment> = {}): DbSegment {
     edited_at: null,
     deleted_at: null,
     hidden: 0,
+    speaker_id: null,
     ...overrides,
   };
 }

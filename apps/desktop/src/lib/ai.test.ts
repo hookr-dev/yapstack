@@ -146,6 +146,7 @@ describe("assembleTranscriptContext", () => {
         edited_at: null,
         deleted_at: "2024-01-01",
         hidden: 0,
+        speaker_id: null,
       },
     ];
     expect(assembleTranscriptContext(segments)).toBe("");

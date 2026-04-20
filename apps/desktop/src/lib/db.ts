@@ -51,6 +51,10 @@ export interface DbSegment {
   edited_at: string | null;
   deleted_at: string | null;
   hidden: number;
+  // Populated when Parakeet + Sortformer diarization tagged this segment.
+  // NULL/undefined for Whisper-transcribed segments and for any row written
+  // before migration v11.
+  speaker_id?: number | null;
 }
 
 export interface DbFolder {
@@ -313,8 +317,8 @@ export async function listAllSessionFolders(): Promise<DbSessionFolder[]> {
 export async function insertSegment(segment: DbSegment): Promise<void> {
   const db = await getDb();
   await db.execute(
-    `INSERT INTO segments (id, session_id, source, text, audio_offset_seconds, chunk_duration_seconds, confidence, chunk_index)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+    `INSERT INTO segments (id, session_id, source, text, audio_offset_seconds, chunk_duration_seconds, confidence, chunk_index, speaker_id)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
     [
       segment.id,
       segment.session_id,
@@ -324,6 +328,7 @@ export async function insertSegment(segment: DbSegment): Promise<void> {
       segment.chunk_duration_seconds,
       segment.confidence,
       segment.chunk_index,
+      segment.speaker_id ?? null,
     ],
   );
 }

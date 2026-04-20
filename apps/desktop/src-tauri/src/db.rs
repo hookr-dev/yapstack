@@ -1,4 +1,76 @@
+use std::path::Path;
+
 use tauri_plugin_sql::{Migration, MigrationKind};
+
+/// Apply runtime schema patches that aren't well-served by the sqlx-style
+/// migration system. Currently:
+///
+/// - Adds `segments.speaker_id INTEGER` if absent. Lives outside the
+///   migration list because some local dev databases have a "ghost" v11
+///   from another branch in `_sqlx_migrations`, which makes sqlx refuse to
+///   apply any v12+ migration. A direct, idempotent `ALTER TABLE` sidesteps
+///   that entirely.
+///
+/// Called from `lib.rs::run()` *before* tauri-plugin-sql wires up. Best-effort:
+/// errors are logged but never abort startup, since by far the most common
+/// failure here is "column already exists" which is precisely what we want.
+pub fn ensure_runtime_schema(db_path: &Path) {
+    use rusqlite::Connection;
+
+    if !db_path.exists() {
+        // Fresh install — tauri-plugin-sql's migrations will create the table.
+        // We'll be invoked again on the next startup once it exists.
+        return;
+    }
+
+    let conn = match Connection::open(db_path) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(
+                "ensure_runtime_schema: open({}) failed: {e}; skipping",
+                db_path.display()
+            );
+            return;
+        }
+    };
+
+    if !table_exists(&conn, "segments") {
+        // Migrations haven't run yet (first launch); nothing to patch.
+        return;
+    }
+
+    if !column_exists(&conn, "segments", "speaker_id") {
+        match conn.execute("ALTER TABLE segments ADD COLUMN speaker_id INTEGER", []) {
+            Ok(_) => tracing::info!(
+                "ensure_runtime_schema: added segments.speaker_id (Parakeet/Sortformer)"
+            ),
+            Err(e) => tracing::warn!(
+                "ensure_runtime_schema: ALTER TABLE segments ADD COLUMN speaker_id failed: {e}"
+            ),
+        }
+    }
+}
+
+fn table_exists(conn: &rusqlite::Connection, name: &str) -> bool {
+    conn.query_row(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+        [name],
+        |_| Ok(()),
+    )
+    .is_ok()
+}
+
+fn column_exists(conn: &rusqlite::Connection, table: &str, column: &str) -> bool {
+    let mut stmt = match conn.prepare(&format!("PRAGMA table_info({table})")) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    let rows = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .map(|iter| iter.flatten().collect::<Vec<_>>())
+        .unwrap_or_default();
+    rows.iter().any(|c| c == column)
+}
 
 pub fn migrations() -> Vec<Migration> {
     vec![
@@ -209,6 +281,14 @@ pub fn migrations() -> Vec<Migration> {
         "#,
             kind: MigrationKind::Up,
         },
+        // The Parakeet/Sortformer `speaker_id` column is *not* added via the
+        // migration system. sqlx-style migrations refuse to apply new
+        // versions when an unknown applied version (e.g. a "ghost" v11 from
+        // another local dev branch) is in `_sqlx_migrations`, and there's no
+        // ergonomic way to clean those up from inside a migration. Instead
+        // we add the column via `ensure_runtime_schema()` at app startup
+        // (idempotent ALTER TABLE that no-ops if the column already exists).
+        // See `ensure_runtime_schema()` in this file.
     ]
 }
 
@@ -224,16 +304,11 @@ mod tests {
 
     #[test]
     fn test_migrations_sequential_versions() {
+        // v11+ are intentionally absent from the migration list; the
+        // `speaker_id` column is added by `ensure_runtime_schema()` instead.
         let m = migrations();
-        for (i, migration) in m.iter().enumerate() {
-            assert_eq!(
-                migration.version as usize,
-                i + 1,
-                "migration {} should have version {}",
-                i,
-                i + 1
-            );
-        }
+        let actual_versions: Vec<i64> = m.iter().map(|x| x.version).collect();
+        assert_eq!(actual_versions, (1..=10).collect::<Vec<_>>());
     }
 
     #[test]
@@ -283,6 +358,9 @@ mod tests {
 
         // v10 should create dictation_history
         assert!(m[9].sql.contains("CREATE TABLE dictation_history"));
+
+        // speaker_id is no longer added via the migration list — see
+        // `ensure_runtime_schema()` in this file.
     }
 
     #[test]
@@ -298,6 +376,10 @@ mod tests {
 
     #[test]
     fn test_migration_count() {
-        assert_eq!(migrations().len(), 10, "should have 10 migrations (v1-v10)");
+        assert_eq!(
+            migrations().len(),
+            10,
+            "v1-v10; speaker_id handled at runtime"
+        );
     }
 }

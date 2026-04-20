@@ -12,6 +12,11 @@ import type {
   LiveTranscriptionConfig,
   LiveTranscriptionPhase,
   LiveSegmentEvent,
+  EngineKindDto,
+  ParakeetVariantDto,
+  EngineDescriptorDto,
+  ParakeetModelInfoDto,
+  SortformerModelInfoDto,
 } from "@/lib/tauri";
 import {
   createSession as dbCreateSession,
@@ -115,7 +120,20 @@ export interface OnboardingState {
 export interface Settings {
   captureSource: CaptureSourceDto;
   selectedMicDeviceId: string | null;
+  /// Active transcription engine (peer to Whisper).
+  selectedEngine: EngineKindDto;
+  /// Whisper model size — used when selectedEngine === "Whisper".
   selectedModelSize: ModelSizeDto;
+  /// Parakeet variant — used when selectedEngine === "Parakeet".
+  selectedParakeetVariant: ParakeetVariantDto;
+  /// User-selected speaker-diarization toggle. Honored only when
+  /// selectedEngine supports diarization (Parakeet today). The Sortformer
+  /// model is downloaded lazily when this flag flips on for the first time.
+  diarizationEnabled: boolean;
+  /// Per-session custom speaker names: `{ [sessionId]: { [speakerId]: "Alice" } }`.
+  /// Persisted client-side via Zustand. A future DB migration can move
+  /// these into a `sessions.speaker_names` JSON column for cross-device sync.
+  speakerNames: Record<string, Record<number, string>>;
   language: string;
   mixConfig: MixConfigDto;
   bufferMaxSeconds: number;
@@ -206,6 +224,12 @@ interface AppState {
   // Devices (loaded once)
   devices: AudioDeviceInfoDto[];
   models: ModelInfoDto[];
+  // Engine catalogue + Parakeet/Sortformer model state (loaded on autoSetup).
+  // engineCatalogue is the static capability descriptor from the Rust side.
+  // parakeetModels/sortformerStatus are the per-variant download status.
+  engineCatalogue: EngineDescriptorDto[];
+  parakeetModels: ParakeetModelInfoDto[];
+  sortformerStatus: SortformerModelInfoDto | null;
 
   // Setters (called by event listeners)
   setCaptureStatus: (status: CaptureStatusDto) => void;
@@ -239,6 +263,24 @@ interface AppState {
   downloadModel: (size: ModelSizeDto) => Promise<void>;
   deleteModel: (size: ModelSizeDto) => Promise<void>;
   switchModel: (size: ModelSizeDto) => Promise<void>;
+
+  // Engine + Parakeet/Sortformer actions
+  loadEngineCatalogue: () => Promise<void>;
+  refreshParakeetModels: () => Promise<void>;
+  refreshSortformerStatus: () => Promise<void>;
+  /// Switch the active transcription engine. Shuts down the current sidecar
+  /// client and re-inits with the new engine. The frontend persists the
+  /// selection via `updateSettings`; autoSetup picks it up on next start.
+  switchEngine: (engine: EngineKindDto) => Promise<void>;
+  downloadParakeetModel: (variant: ParakeetVariantDto) => Promise<void>;
+  deleteParakeetModel: (variant: ParakeetVariantDto) => Promise<void>;
+  /// Toggle speaker diarization. When flipped on for the first time and
+  /// Sortformer is missing, downloads it. Re-inits the client so the new
+  /// flag takes effect on the next transcribe call.
+  setDiarizationEnabled: (enabled: boolean) => Promise<void>;
+  /// Rename a speaker for a single session. Pass an empty/whitespace `name`
+  /// to clear the override and fall back to the default `Speaker N` label.
+  setSpeakerName: (sessionId: string, speakerId: number, name: string) => void;
 
   // Folder actions
   createFolder: (name: string, parentId?: string | null, icon?: string | null, color?: string | null, description?: string | null) => Promise<void>;
@@ -302,7 +344,13 @@ function enqueueSegmentWork(fn: () => Promise<void>): void {
 const defaultSettings: Settings = {
   captureSource: "Mixed",
   selectedMicDeviceId: null,
+  // Whisper stays the default for fresh installs and for upgrade users
+  // (the migration adds this field without changing the active engine).
+  selectedEngine: "Whisper",
   selectedModelSize: "Small",
+  selectedParakeetVariant: "TdtV3",
+  diarizationEnabled: false,
+  speakerNames: {},
   language: "en",
   mixConfig: { mic_gain: 1.0, system_gain: 1.0, normalize: false },
   bufferMaxSeconds: 300,
@@ -397,6 +445,9 @@ function createAppStore() {
       settings: defaultSettings,
       devices: [],
       models: [],
+      engineCatalogue: [],
+      parakeetModels: [],
+      sortformerStatus: null,
       showHiddenSegments: false,
 
       // Setters
@@ -503,6 +554,7 @@ function createAppStore() {
               edited_at: null,
               deleted_at: null,
               hidden: 0,
+              speaker_id: seg.speaker_id ?? null,
             });
           }
 
@@ -840,12 +892,72 @@ function createAppStore() {
 
         // Track 2 — Engine setup
         try {
-          // Load devices in parallel (non-blocking)
+          // Load devices + catalogue in parallel (non-blocking)
           get()
             .refreshDevices()
             .catch((e) => console.error("Failed to refresh devices:", e));
+          get()
+            .loadEngineCatalogue()
+            .catch((e) => console.error("Failed to load catalogue:", e));
 
-          // Check models
+          if (settings.selectedEngine === "Parakeet") {
+            // Parakeet path
+            await get().refreshParakeetModels();
+            await get().refreshSortformerStatus();
+            const variant = settings.selectedParakeetVariant;
+            const ready = get().parakeetModels.find(
+              (m) => m.variant === variant && m.downloaded,
+            );
+            if (!ready) {
+              set({ enginePhase: "downloading", modelDownloadProgress: 0 });
+              const dl = await commands.downloadParakeetModel(variant);
+              if (dl.status === "error") {
+                trackEngineError({ error: dl.error.message, phase: "downloading" });
+                set({
+                  enginePhase: "error",
+                  engineError: dl.error.message,
+                  modelDownloadProgress: null,
+                });
+                return;
+              }
+              set({ modelDownloadProgress: null });
+              await get().refreshParakeetModels();
+            }
+
+            // Sortformer download is lazy — only when diarization is on.
+            if (
+              settings.diarizationEnabled &&
+              !get().sortformerStatus?.downloaded
+            ) {
+              set({ modelDownloadProgress: 0 });
+              const dl = await commands.downloadSortformerModel("V2_1");
+              if (dl.status === "error") {
+                console.error(
+                  "sortformer download failed; continuing without diarization:",
+                  dl.error.message,
+                );
+              }
+              set({ modelDownloadProgress: null });
+              await get().refreshSortformerStatus();
+            }
+
+            set({ enginePhase: "initializing" });
+            const initResult = await commands.initTranscriptionClient(
+              "Parakeet",
+              null,
+              variant,
+              settings.diarizationEnabled,
+            );
+            if (initResult.status === "error") {
+              trackEngineError({ error: initResult.error.message, phase: "initializing" });
+              set({ enginePhase: "error", engineError: initResult.error.message });
+              return;
+            }
+            set({ enginePhase: "ready", engineError: null });
+            return;
+          }
+
+          // Whisper path (default).
           const modelsResult = await commands.getAvailableModels();
           if (modelsResult.status === "ok") {
             set({ models: modelsResult.data });
@@ -856,7 +968,6 @@ function createAppStore() {
             (m) => m.size === settings.selectedModelSize,
           );
 
-          // Download if needed
           if (!selectedModel?.downloaded) {
             set({ enginePhase: "downloading", modelDownloadProgress: 0 });
             const downloadResult = await commands.downloadModel(
@@ -872,11 +983,9 @@ function createAppStore() {
               return;
             }
             set({ modelDownloadProgress: null });
-            // Refresh models after download
             await get().refreshModels();
           }
 
-          // Initialize engine
           set({ enginePhase: "initializing" });
           const initResult = await commands.initWhisperClient(
             settings.selectedModelSize,
@@ -950,6 +1059,200 @@ function createAppStore() {
           get().updateSettings({ selectedModelSize: size });
         } catch (e) {
           set({ enginePhase: "error", engineError: String(e) });
+        }
+      },
+
+      // ---------- Engine + Parakeet/Sortformer actions ----------
+
+      loadEngineCatalogue: async () => {
+        try {
+          const r = await commands.getEngineCatalogue();
+          if (r.status === "ok") set({ engineCatalogue: r.data });
+        } catch (e) {
+          console.error("Failed to load engine catalogue:", e);
+        }
+      },
+
+      refreshParakeetModels: async () => {
+        try {
+          const r = await commands.getParakeetModels();
+          if (r.status === "ok") set({ parakeetModels: r.data });
+        } catch (e) {
+          console.error("Failed to refresh parakeet models:", e);
+        }
+      },
+
+      refreshSortformerStatus: async () => {
+        try {
+          const r = await commands.getSortformerStatus();
+          if (r.status === "ok") set({ sortformerStatus: r.data });
+        } catch (e) {
+          console.error("Failed to refresh sortformer status:", e);
+        }
+      },
+
+      switchEngine: async (engine: EngineKindDto) => {
+        const settings = get().settings;
+        if (settings.selectedEngine === engine) return;
+
+        try {
+          // Auto-download the target engine's selected model if missing,
+          // matching autoSetup's behaviour on app start. This avoids the
+          // chicken-and-egg where the user can't reach the engine's model
+          // picker without first being on that engine.
+          if (engine === "Parakeet") {
+            await get().refreshParakeetModels();
+            const variant = settings.selectedParakeetVariant;
+            const ready = get().parakeetModels.find(
+              (m) => m.variant === variant && m.downloaded,
+            );
+            if (!ready) {
+              set({ enginePhase: "downloading", modelDownloadProgress: 0 });
+              const dl = await commands.downloadParakeetModel(variant);
+              if (dl.status === "error") {
+                set({ modelDownloadProgress: null });
+                throw new Error(dl.error.message);
+              }
+              set({ modelDownloadProgress: null });
+              await get().refreshParakeetModels();
+            }
+            // Diarization toggle may also need the Sortformer download.
+            if (settings.diarizationEnabled) {
+              await get().refreshSortformerStatus();
+              if (!get().sortformerStatus?.downloaded) {
+                set({ modelDownloadProgress: 0 });
+                const dl = await commands.downloadSortformerModel("V2_1");
+                if (dl.status === "error") {
+                  console.error(
+                    "sortformer download failed; continuing without diarization:",
+                    dl.error.message,
+                  );
+                }
+                set({ modelDownloadProgress: null });
+                await get().refreshSortformerStatus();
+              }
+            }
+          } else if (engine === "Whisper") {
+            await get().refreshModels();
+            const ready = get().models.find(
+              (m) => m.size === settings.selectedModelSize && m.downloaded,
+            );
+            if (!ready) {
+              set({ enginePhase: "downloading", modelDownloadProgress: 0 });
+              const dl = await commands.downloadModel(
+                settings.selectedModelSize,
+              );
+              if (dl.status === "error") {
+                set({ modelDownloadProgress: null });
+                throw new Error(dl.error.message);
+              }
+              set({ modelDownloadProgress: null });
+              await get().refreshModels();
+            }
+          }
+
+          set({ enginePhase: "initializing" });
+          await commands.shutdownWhisperClient();
+
+          const initResult = await commands.initTranscriptionClient(
+            engine,
+            engine === "Whisper" ? settings.selectedModelSize : null,
+            engine === "Parakeet" ? settings.selectedParakeetVariant : null,
+            engine === "Parakeet" ? settings.diarizationEnabled : false,
+          );
+          if (initResult.status === "error") {
+            throw new Error(initResult.error.message);
+          }
+
+          get().updateSettings({ selectedEngine: engine });
+          set({ enginePhase: "ready", engineError: null });
+        } catch (e) {
+          set({ enginePhase: "error", engineError: String(e) });
+          throw e;
+        }
+      },
+
+      downloadParakeetModel: async (variant: ParakeetVariantDto) => {
+        set({ modelDownloadProgress: 0 });
+        try {
+          const result = await commands.downloadParakeetModel(variant);
+          if (result.status === "error") {
+            throw new Error(result.error.message);
+          }
+          await get().refreshParakeetModels();
+        } finally {
+          set({ modelDownloadProgress: null });
+        }
+      },
+
+      setSpeakerName: (sessionId: string, speakerId: number, name: string) => {
+        const trimmed = name.trim();
+        set((state) => {
+          const next = { ...state.settings.speakerNames };
+          const sessionMap = { ...(next[sessionId] ?? {}) };
+          if (trimmed === "") {
+            delete sessionMap[speakerId];
+          } else {
+            sessionMap[speakerId] = trimmed;
+          }
+          if (Object.keys(sessionMap).length === 0) {
+            delete next[sessionId];
+          } else {
+            next[sessionId] = sessionMap;
+          }
+          return {
+            settings: { ...state.settings, speakerNames: next },
+          };
+        });
+      },
+
+      deleteParakeetModel: async (variant: ParakeetVariantDto) => {
+        const result = await commands.deleteParakeetModel(variant);
+        if (result.status === "error") {
+          throw new Error(result.error.message);
+        }
+        await get().refreshParakeetModels();
+      },
+
+      setDiarizationEnabled: async (enabled: boolean) => {
+        const settings = get().settings;
+        if (settings.diarizationEnabled === enabled) return;
+
+        // Persist the flag immediately — UI feedback first, model download
+        // second. If the download fails the flag stays on but the next
+        // engine init will try again.
+        get().updateSettings({ diarizationEnabled: enabled });
+
+        if (enabled) {
+          await get().refreshSortformerStatus();
+          if (!get().sortformerStatus?.downloaded) {
+            set({ modelDownloadProgress: 0 });
+            try {
+              const r = await commands.downloadSortformerModel("V2_1");
+              if (r.status === "error") throw new Error(r.error.message);
+              await get().refreshSortformerStatus();
+            } finally {
+              set({ modelDownloadProgress: null });
+            }
+          }
+        }
+
+        // Re-init the active client so the new flag takes effect. Only
+        // matters when the active engine supports diarization (Parakeet).
+        if (settings.selectedEngine === "Parakeet") {
+          set({ enginePhase: "initializing" });
+          await commands.shutdownWhisperClient();
+          const r = await commands.initTranscriptionClient(
+            "Parakeet",
+            null,
+            settings.selectedParakeetVariant,
+            enabled,
+          );
+          if (r.status === "error") {
+            set({ enginePhase: "error", engineError: r.error.message });
+            throw new Error(r.error.message);
+          }
+          set({ enginePhase: "ready", engineError: null });
         }
       },
 
@@ -1326,7 +1629,7 @@ function createAppStore() {
     }),
     {
       name: "yapstack-settings",
-      version: 21,
+      version: 22,
       partialize: (state) => ({
         settings: state.settings,
       }),
@@ -1484,6 +1787,18 @@ function createAppStore() {
           const old = state.settings as Record<string, unknown>;
           if (old.audioExportFormat === undefined) old.audioExportFormat = "mp3";
           if (old.mp3Bitrate === undefined) old.mp3Bitrate = 64;
+        }
+        if (version < 22 && state.settings) {
+          // Engines become first-class peers. Default existing users to
+          // Whisper so behavior is unchanged on upgrade; the cascading
+          // settings UI lets them switch.
+          const old = state.settings as Record<string, unknown>;
+          if (old.selectedEngine === undefined) old.selectedEngine = "Whisper";
+          if (old.selectedParakeetVariant === undefined)
+            old.selectedParakeetVariant = "TdtV3";
+          if (old.diarizationEnabled === undefined)
+            old.diarizationEnabled = false;
+          if (old.speakerNames === undefined) old.speakerNames = {};
         }
         return state as unknown as { settings: Settings };
       },

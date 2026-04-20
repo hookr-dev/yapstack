@@ -69,12 +69,37 @@ pnpm check
 
 ### yapstack-sidecar
 ```bash
-cargo build -p yapstack-sidecar --features whisper       # Whisper inference (requires cmake)
-cargo build -p yapstack-sidecar --features metal          # Metal acceleration on macOS (via whisper-rs)
-cargo build -p yapstack-sidecar --features whisper,metal  # Both
+# Single engines
+cargo build -p yapstack-sidecar --features whisper                # Whisper only (requires cmake)
+cargo build -p yapstack-sidecar --features parakeet               # Parakeet only (no cmake needed; pulls ort + parakeet-rs)
+
+# Add accelerators
+cargo build -p yapstack-sidecar --features whisper,metal          # Whisper + Metal
+cargo build -p yapstack-sidecar --features parakeet,coreml        # Parakeet + ORT-CoreML EP (Apple)
+cargo build -p yapstack-sidecar --features parakeet,webgpu        # Parakeet + ORT-WebGPU EP
+
+# Standard apple build (what scripts/build-sidecar.sh produces on macOS)
+cargo build -p yapstack-sidecar --features whisper,parakeet,metal,coreml,webgpu
+
+# Default features
+cargo build -p yapstack-sidecar                                   # = whisper + parakeet
 ```
-- **`whisper`** — Enables Whisper transcription via `whisper-rs`. Requires cmake. Without this flag, the sidecar binary compiles but responds with "whisper feature not enabled" errors.
-- **`metal`** — Enables Metal GPU acceleration for Whisper inference on macOS (passes through to `whisper-rs/metal`).
+
+| Feature | Purpose |
+|---------|---------|
+| `whisper` | Whisper transcription via whisper-rs. Requires cmake. Without it, the sidecar still compiles but every `--engine whisper` request returns "engine 'whisper' not compiled in this build". |
+| `metal` | Metal GPU acceleration for whisper-rs (Apple). |
+| `parakeet` | Parakeet TDT v3 via parakeet-rs + ONNX Runtime. Also enables Sortformer speaker diarization (parakeet-rs ships it under the `sortformer` sub-feature, which `parakeet` enables). |
+| `coreml` | Adds the ORT-CoreML execution provider for Parakeet on Apple. Strict superset of `parakeet`. The Parakeet backend's "Auto" policy will skip CoreML at load time if the model dir contains external `.onnx.data` files (known ORT bug); set `YAPSTACK_PARAKEET_ACCEL=coreml` to force-attempt. |
+| `webgpu` | Adds the ORT-WebGPU execution provider for Parakeet (Metal under the hood on macOS, Vulkan/Dawn elsewhere). Set `YAPSTACK_PARAKEET_ACCEL=webgpu` to opt in. |
+| `cuda` | NVIDIA CUDA EP for Parakeet (Linux/Windows). |
+
+If the engine the sidecar was spawned with isn't compiled in (e.g. `--engine parakeet` on a `--features whisper` build), every IPC request returns `engine 'X' not compiled in this build`. The dispatcher in `main.rs` is engine-agnostic and unconditional.
+
+### Runtime env vars (sidecar)
+
+- **`YAPSTACK_PARAKEET_ACCEL=auto|cpu|coreml|webgpu`** — selects the Parakeet ORT execution provider. Default `auto`: uses CoreML when compiled in *and* the model has no external `.onnx.data` initializers, otherwise CPU. Empirical RTFx on Apple Silicon for Parakeet TDT v3, 2-13 s chunks: CPU 4-8×, WebGPU 4-9× (similar mean, higher variance). CoreML doesn't load for TDT v3 (external-data bug); use Auto to silently fall through.
+- **`RUST_LOG`** — standard tracing override. Default sidecar filter is `info,yapstack_sidecar=debug`; default desktop filter is `info` for our crates + `warn` for noisy upstream deps. Example: `RUST_LOG=debug,ort=warn npm run dev`.
 
 System audio capture is always compiled in via cpal loopback — no feature flag needed. Available on macOS (CoreAudio) and Windows (WASAPI). On Linux, `SystemAudioCapture::is_available()` returns false at runtime. On Windows, WASAPI loopback delivers zero packets during system silence (no audio playing) — this is normal and handled by the stream health watchdog.
 

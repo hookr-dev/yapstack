@@ -3,10 +3,14 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use specta::Type;
-use tauri::Emitter;
+use tauri::{Emitter, Manager};
 use tokio::sync::Mutex;
 use tracing::{error, info};
-use yapstack_transcription::{ModelManager, ModelSize, TranscriptionResult, WhisperClient};
+use yapstack_common::engines::engine_catalogue;
+use yapstack_common::types::EngineKind;
+use yapstack_transcription::{
+    ModelManager, ModelSize, ParakeetVariant, SortformerVariant, TranscriptionResult, WhisperClient,
+};
 
 use super::error::CommandError;
 
@@ -42,6 +46,52 @@ pub struct TranscriptSegmentDto {
     pub end_ms: u64,
     pub text: String,
     pub confidence: f32,
+    /// Populated when the active engine is Parakeet *and* diarization
+    /// was requested for the originating transcribe call. `None` for Whisper.
+    pub speaker_id: Option<u8>,
+}
+
+/// Which transcription engine the frontend has selected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
+pub enum EngineKindDto {
+    Whisper,
+    Parakeet,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
+pub enum ParakeetVariantDto {
+    TdtV3,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
+pub enum SortformerVariantDto {
+    V2_1,
+}
+
+/// Engine capabilities + supported languages for the cascading UI in Settings.
+#[derive(Debug, Clone, Serialize, Type)]
+pub struct EngineDescriptorDto {
+    pub kind: EngineKindDto,
+    pub display_name: String,
+    pub languages: Vec<String>,
+    pub supports_diarization: bool,
+    pub supports_initial_prompt: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Type)]
+pub struct ParakeetModelInfoDto {
+    pub variant: ParakeetVariantDto,
+    pub downloaded: bool,
+    pub display_name: String,
+    pub approximate_size_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Type)]
+pub struct SortformerModelInfoDto {
+    pub variant: SortformerVariantDto,
+    pub downloaded: bool,
+    pub display_name: String,
+    pub approximate_size_bytes: u64,
 }
 
 // --- From impls ---
@@ -64,6 +114,48 @@ impl From<ModelSize> for ModelSizeDto {
             ModelSize::Base => ModelSizeDto::Base,
             ModelSize::Small => ModelSizeDto::Small,
             ModelSize::Medium => ModelSizeDto::Medium,
+        }
+    }
+}
+
+impl From<EngineKindDto> for EngineKind {
+    fn from(k: EngineKindDto) -> Self {
+        match k {
+            EngineKindDto::Whisper => EngineKind::Whisper,
+            EngineKindDto::Parakeet => EngineKind::Parakeet,
+        }
+    }
+}
+
+impl From<EngineKind> for EngineKindDto {
+    fn from(k: EngineKind) -> Self {
+        match k {
+            EngineKind::Whisper => EngineKindDto::Whisper,
+            EngineKind::Parakeet => EngineKindDto::Parakeet,
+        }
+    }
+}
+
+impl From<ParakeetVariantDto> for ParakeetVariant {
+    fn from(v: ParakeetVariantDto) -> Self {
+        match v {
+            ParakeetVariantDto::TdtV3 => ParakeetVariant::TdtV3,
+        }
+    }
+}
+
+impl From<ParakeetVariant> for ParakeetVariantDto {
+    fn from(v: ParakeetVariant) -> Self {
+        match v {
+            ParakeetVariant::TdtV3 => ParakeetVariantDto::TdtV3,
+        }
+    }
+}
+
+impl From<SortformerVariantDto> for SortformerVariant {
+    fn from(v: SortformerVariantDto) -> Self {
+        match v {
+            SortformerVariantDto::V2_1 => SortformerVariant::V2_1,
         }
     }
 }
@@ -92,6 +184,7 @@ impl From<TranscriptionResult> for TranscriptionResultDto {
                     end_ms: s.end_ms,
                     text: s.text,
                     confidence: s.confidence,
+                    speaker_id: s.speaker_id,
                 })
                 .collect(),
             duration_ms: r.duration_ms,
@@ -256,12 +349,23 @@ pub async fn init_whisper_client(
         (mp, sp, vad_path)
     }; // lock dropped
 
-    let client = WhisperClient::spawn(&sidecar_path, &model_path, vad_model_path.as_deref())
-        .await
-        .map_err(|e| {
-            error!("failed to spawn whisper client: {}", e);
-            CommandError::from(e)
-        })?;
+    // Engine selection lives in a follow-up commit (frontend cascading UI).
+    // For now `init_whisper_client` continues to mean "Whisper" and neither
+    // Sortformer nor the CoreML cache are needed; the Parakeet path lands
+    // with the engine-aware init command.
+    let client = WhisperClient::spawn(
+        &sidecar_path,
+        EngineKind::Whisper,
+        &model_path,
+        vad_model_path.as_deref(),
+        None,
+        None,
+    )
+    .await
+    .map_err(|e| {
+        error!("failed to spawn whisper client: {}", e);
+        CommandError::from(e)
+    })?;
 
     let mut client_guard = whisper_state.lock().await;
     *client_guard = Some(client);
@@ -304,6 +408,270 @@ pub async fn get_whisper_status(
     Ok(WhisperStatusDto {
         initialized: client_guard.is_some(),
     })
+}
+
+// ---------- Engine catalogue + Parakeet/Sortformer commands ----------
+
+/// Returns the static engine catalogue (Whisper + Parakeet capability + language lists).
+/// The frontend uses this to drive the cascading engine → model → language UI.
+#[tauri::command]
+#[specta::specta]
+pub async fn get_engine_catalogue() -> Result<Vec<EngineDescriptorDto>, CommandError> {
+    Ok(engine_catalogue()
+        .iter()
+        .map(|d| EngineDescriptorDto {
+            kind: d.kind.into(),
+            display_name: d.display_name.to_string(),
+            languages: d.languages.iter().map(|s| (*s).to_string()).collect(),
+            supports_diarization: d.supports_diarization,
+            supports_initial_prompt: d.supports_initial_prompt,
+        })
+        .collect())
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn get_parakeet_models(
+    state: tauri::State<'_, ModelManagerState>,
+) -> Result<Vec<ParakeetModelInfoDto>, CommandError> {
+    let manager = state.lock().await;
+    Ok(ParakeetVariant::all()
+        .iter()
+        .copied()
+        .map(|v| ParakeetModelInfoDto {
+            variant: v.into(),
+            downloaded: manager.parakeet_is_available(v),
+            display_name: v.display_name().to_string(),
+            approximate_size_bytes: v.approximate_size_bytes(),
+        })
+        .collect())
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn download_parakeet_model(
+    state: tauri::State<'_, ModelManagerState>,
+    window: tauri::Window,
+    variant: ParakeetVariantDto,
+) -> Result<String, CommandError> {
+    info!(variant = ?variant, "downloading parakeet model");
+    let manager = {
+        let guard = state.lock().await;
+        guard.clone()
+    };
+    let v: ParakeetVariant = variant.into();
+    let path = manager
+        .download_parakeet(v, move |progress| {
+            let _ = window.emit(
+                "model-download-progress",
+                serde_json::json!({
+                    "percent": progress,
+                    "kind": "parakeet",
+                    "variant": format!("{:?}", v),
+                }),
+            );
+        })
+        .await
+        .map_err(|e| {
+            error!("parakeet model download failed: {}", e);
+            CommandError::from(e)
+        })?;
+    info!(path = %path.display(), "parakeet model downloaded");
+    Ok(path.to_string_lossy().into_owned())
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn delete_parakeet_model(
+    state: tauri::State<'_, ModelManagerState>,
+    variant: ParakeetVariantDto,
+) -> Result<(), CommandError> {
+    info!(variant = ?variant, "deleting parakeet model");
+    let manager = {
+        let guard = state.lock().await;
+        guard.clone()
+    };
+    manager
+        .delete_parakeet(variant.into())
+        .await
+        .map_err(CommandError::from)
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn get_sortformer_status(
+    state: tauri::State<'_, ModelManagerState>,
+) -> Result<SortformerModelInfoDto, CommandError> {
+    let manager = state.lock().await;
+    let v = SortformerVariant::V2_1;
+    Ok(SortformerModelInfoDto {
+        variant: SortformerVariantDto::V2_1,
+        downloaded: manager.sortformer_model_path(v).is_some(),
+        display_name: v.display_name().to_string(),
+        approximate_size_bytes: v.approximate_size_bytes(),
+    })
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn download_sortformer_model(
+    state: tauri::State<'_, ModelManagerState>,
+    window: tauri::Window,
+    variant: SortformerVariantDto,
+) -> Result<String, CommandError> {
+    info!(variant = ?variant, "downloading sortformer model");
+    let manager = {
+        let guard = state.lock().await;
+        guard.clone()
+    };
+    let v: SortformerVariant = variant.into();
+    let path = manager
+        .download_sortformer(v, move |progress| {
+            let _ = window.emit(
+                "model-download-progress",
+                serde_json::json!({
+                    "percent": progress,
+                    "kind": "sortformer",
+                    "variant": format!("{:?}", v),
+                }),
+            );
+        })
+        .await
+        .map_err(|e| {
+            error!("sortformer download failed: {}", e);
+            CommandError::from(e)
+        })?;
+    info!(path = %path.display(), "sortformer downloaded");
+    Ok(path.to_string_lossy().into_owned())
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn delete_sortformer_model(
+    state: tauri::State<'_, ModelManagerState>,
+    variant: SortformerVariantDto,
+) -> Result<(), CommandError> {
+    info!(variant = ?variant, "deleting sortformer model");
+    let manager = {
+        let guard = state.lock().await;
+        guard.clone()
+    };
+    manager
+        .delete_sortformer(variant.into())
+        .await
+        .map_err(CommandError::from)
+}
+
+/// Engine-aware client init. For `Whisper`, `whisper_model` is required.
+/// For `Parakeet`, `parakeet_variant` is required and `enable_diarization`
+/// optionally wires Sortformer (auto-downloads if missing). On Apple targets
+/// the Parakeet path uses CoreML by default with a per-app persistent cache
+/// at `$APP_DATA_DIR/cache/coreml/` so model loads after the first one are
+/// sub-second.
+#[tauri::command]
+#[specta::specta]
+#[allow(clippy::too_many_arguments)]
+pub async fn init_transcription_client(
+    app_handle: tauri::AppHandle,
+    model_manager_state: tauri::State<'_, ModelManagerState>,
+    whisper_state: tauri::State<'_, WhisperClientState>,
+    engine: EngineKindDto,
+    whisper_model: Option<ModelSizeDto>,
+    parakeet_variant: Option<ParakeetVariantDto>,
+    enable_diarization: bool,
+) -> Result<(), CommandError> {
+    info!(
+        engine = ?engine,
+        whisper_model = ?whisper_model,
+        parakeet_variant = ?parakeet_variant,
+        enable_diarization,
+        "initializing transcription client"
+    );
+
+    // Idempotent fast-path: don't respawn if a client is already live.
+    {
+        let guard = whisper_state.lock().await;
+        if guard.is_some() {
+            info!("transcription client already initialized, skipping respawn");
+            return Ok(());
+        }
+    }
+
+    let (model_path, sidecar_path, vad_model_path, sortformer_model_path, coreml_cache_dir) = {
+        let manager = model_manager_state.lock().await;
+        let sp = find_sidecar_path()?;
+
+        match engine {
+            EngineKindDto::Whisper => {
+                let size: ModelSize = whisper_model
+                    .ok_or(CommandError::NotFound {
+                        message: "whisper_model required when engine=Whisper".into(),
+                    })?
+                    .into();
+                let mp = manager.model_path(size).ok_or(CommandError::NotFound {
+                    message: format!("whisper model {:?} not downloaded", size),
+                })?;
+                let vad = match manager.ensure_vad_model().await {
+                    Ok(p) => Some(p),
+                    Err(e) => {
+                        error!("ensure_vad_model failed: {}, proceeding without VAD", e);
+                        None
+                    }
+                };
+                (mp, sp, vad, None, None)
+            }
+            EngineKindDto::Parakeet => {
+                let variant: ParakeetVariant = parakeet_variant
+                    .ok_or(CommandError::NotFound {
+                        message: "parakeet_variant required when engine=Parakeet".into(),
+                    })?
+                    .into();
+                if !manager.parakeet_is_available(variant) {
+                    return Err(CommandError::NotFound {
+                        message: format!("parakeet variant {:?} not downloaded", variant),
+                    });
+                }
+                let mp = manager.parakeet_model_dir(variant);
+                let sortformer = if enable_diarization {
+                    Some(manager.ensure_sortformer(SortformerVariant::V2_1).await?)
+                } else {
+                    None
+                };
+                // Per-app CoreML cache. The sidecar tolerates a non-existent
+                // path (creates it lazily), so we only resolve and forward —
+                // if app_data_dir() fails we silently skip caching.
+                let cache_dir = app_handle
+                    .path()
+                    .app_data_dir()
+                    .ok()
+                    .map(|d| d.join("cache").join("coreml"));
+                (mp, sp, None, sortformer, cache_dir)
+            }
+        }
+    };
+
+    let engine_kind: EngineKind = engine.into();
+    let client = WhisperClient::spawn(
+        &sidecar_path,
+        engine_kind,
+        &model_path,
+        vad_model_path.as_deref(),
+        sortformer_model_path.as_deref(),
+        coreml_cache_dir.as_deref(),
+    )
+    .await
+    .map_err(|e| {
+        error!("failed to spawn transcription client: {}", e);
+        CommandError::from(e)
+    })?;
+
+    let mut guard = whisper_state.lock().await;
+    *guard = Some(client);
+    info!(
+        "transcription client initialized: engine={}",
+        engine_kind.as_str()
+    );
+    Ok(())
 }
 
 /// Locates the sidecar binary relative to the current executable.
