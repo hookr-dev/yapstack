@@ -130,7 +130,7 @@ export function useDictation() {
       }
 
       if (s.enginePhase !== "ready") {
-        toast.error("Whisper engine is not ready.");
+        toast.error("Transcription engine is not ready.");
         return;
       }
 

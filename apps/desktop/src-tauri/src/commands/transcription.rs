@@ -9,7 +9,8 @@ use tracing::{error, info};
 use yapstack_common::engines::engine_catalogue;
 use yapstack_common::types::EngineKind;
 use yapstack_transcription::{
-    ModelManager, ModelSize, ParakeetVariant, SortformerVariant, TranscriptionResult, WhisperClient,
+    ModelManager, ModelSize, ParakeetVariant, SortformerVariant, TranscriptionClient,
+    TranscriptionResult,
 };
 
 use super::error::CommandError;
@@ -195,7 +196,7 @@ impl From<TranscriptionResult> for TranscriptionResultDto {
 // --- State types ---
 
 pub type ModelManagerState = Arc<Mutex<ModelManager>>;
-pub type WhisperClientState = Arc<Mutex<Option<WhisperClient>>>;
+pub type TranscriptionClientState = Arc<Mutex<Option<TranscriptionClient>>>;
 
 // --- Commands ---
 
@@ -269,7 +270,7 @@ pub async fn delete_model(
 #[tauri::command]
 #[specta::specta]
 pub async fn transcribe_audio(
-    state: tauri::State<'_, WhisperClientState>,
+    state: tauri::State<'_, TranscriptionClientState>,
     audio_path: String,
     language: Option<String>,
     initial_prompt: Option<String>,
@@ -303,79 +304,10 @@ pub async fn transcribe_audio(
 
 #[tauri::command]
 #[specta::specta]
-pub async fn init_whisper_client(
-    model_manager_state: tauri::State<'_, ModelManagerState>,
-    whisper_state: tauri::State<'_, WhisperClientState>,
-    size: ModelSizeDto,
+pub async fn shutdown_transcription_client(
+    state: tauri::State<'_, TranscriptionClientState>,
 ) -> Result<(), CommandError> {
-    info!(size = ?size, "initializing whisper client");
-    let model_size: ModelSize = size.into();
-
-    // Idempotent: if a client is already live, don't respawn. A concurrent
-    // caller (Vite HMR remount, React StrictMode double-mount, rapid UI
-    // clicks) that races through the check-and-spawn window would otherwise
-    // leave two sidecar processes with the old one orphaned.
-    {
-        let client_guard = whisper_state.lock().await;
-        if client_guard.is_some() {
-            info!("whisper client already initialized, skipping respawn");
-            return Ok(());
-        }
-    }
-
-    // Extract paths under lock, then drop lock before the potentially slow spawn
-    let (model_path, sidecar_path, vad_model_path) = {
-        let manager = model_manager_state.lock().await;
-        let mp = manager
-            .model_path(model_size)
-            .ok_or(CommandError::NotFound {
-                message: format!("model {:?} not downloaded", model_size),
-            })?;
-        let sp = find_sidecar_path()?;
-
-        // Ensure VAD model is available (auto-download if missing, only ~885KB)
-        let vad_path = match manager.ensure_vad_model().await {
-            Ok(path) => {
-                info!(path = %path.display(), "VAD model ready");
-                Some(path)
-            }
-            Err(e) => {
-                // VAD is optional — log but don't fail whisper init
-                error!("failed to ensure VAD model: {}, proceeding without VAD", e);
-                None
-            }
-        };
-
-        (mp, sp, vad_path)
-    }; // lock dropped
-
-    let client = WhisperClient::spawn(
-        &sidecar_path,
-        EngineKind::Whisper,
-        &model_path,
-        vad_model_path.as_deref(),
-        None,
-        None,
-    )
-    .await
-    .map_err(|e| {
-        error!("failed to spawn whisper client: {}", e);
-        CommandError::from(e)
-    })?;
-
-    let mut client_guard = whisper_state.lock().await;
-    *client_guard = Some(client);
-
-    info!("whisper client initialized");
-    Ok(())
-}
-
-#[tauri::command]
-#[specta::specta]
-pub async fn shutdown_whisper_client(
-    state: tauri::State<'_, WhisperClientState>,
-) -> Result<(), CommandError> {
-    info!("shutting down whisper client");
+    info!("shutting down transcription client");
     let mut client_guard = state.lock().await;
     if let Some(ref mut client) = *client_guard {
         client.shutdown().await.map_err(CommandError::from)?;
@@ -385,23 +317,24 @@ pub async fn shutdown_whisper_client(
 }
 
 #[derive(Debug, Clone, serde::Serialize, specta::Type)]
-pub struct WhisperStatusDto {
+pub struct TranscriptionStatusDto {
     pub initialized: bool,
 }
 
-/// Reports whether the Whisper sidecar has been initialized.
+/// Reports whether the transcription sidecar has been initialized.
 ///
-/// The frontend uses this on mount to decide whether to call `init_whisper_client`
-/// again. Without it, a Vite HMR remount re-runs autoSetup and respawns the sidecar
-/// even when the backend is already warm, leaving `enginePhase: "initializing"`
-/// long enough for dictation to fail the readiness check.
+/// The frontend uses this on mount to decide whether to call
+/// `init_transcription_client` again. Without it, a Vite HMR remount re-runs
+/// autoSetup and respawns the sidecar even when the backend is already warm,
+/// leaving `enginePhase: "initializing"` long enough for dictation to fail
+/// the readiness check.
 #[tauri::command]
 #[specta::specta]
-pub async fn get_whisper_status(
-    state: tauri::State<'_, WhisperClientState>,
-) -> Result<WhisperStatusDto, CommandError> {
+pub async fn get_transcription_status(
+    state: tauri::State<'_, TranscriptionClientState>,
+) -> Result<TranscriptionStatusDto, CommandError> {
     let client_guard = state.lock().await;
-    Ok(WhisperStatusDto {
+    Ok(TranscriptionStatusDto {
         initialized: client_guard.is_some(),
     })
 }
@@ -558,15 +491,16 @@ pub async fn delete_sortformer_model(
         .map_err(CommandError::from)
 }
 
-/// Engine-aware client init. Whisper requires `whisper_model`; Parakeet
-/// requires `parakeet_variant` and may optionally enable Sortformer diarization.
+/// Spawn the sidecar with the requested engine. Whisper requires
+/// `whisper_model`; Parakeet requires `parakeet_variant` and may optionally
+/// enable Sortformer diarization.
 #[tauri::command]
 #[specta::specta]
 #[allow(clippy::too_many_arguments)]
 pub async fn init_transcription_client(
     app_handle: tauri::AppHandle,
     model_manager_state: tauri::State<'_, ModelManagerState>,
-    whisper_state: tauri::State<'_, WhisperClientState>,
+    transcription_state: tauri::State<'_, TranscriptionClientState>,
     engine: EngineKindDto,
     whisper_model: Option<ModelSizeDto>,
     parakeet_variant: Option<ParakeetVariantDto>,
@@ -581,7 +515,7 @@ pub async fn init_transcription_client(
     );
 
     {
-        let guard = whisper_state.lock().await;
+        let guard = transcription_state.lock().await;
         if guard.is_some() {
             info!("transcription client already initialized, skipping respawn");
             return Ok(());
@@ -639,7 +573,7 @@ pub async fn init_transcription_client(
     };
 
     let engine_kind: EngineKind = engine.into();
-    let client = WhisperClient::spawn(
+    let client = TranscriptionClient::spawn(
         &sidecar_path,
         engine_kind,
         &model_path,
@@ -653,7 +587,7 @@ pub async fn init_transcription_client(
         CommandError::from(e)
     })?;
 
-    let mut guard = whisper_state.lock().await;
+    let mut guard = transcription_state.lock().await;
     *guard = Some(client);
     info!(
         "transcription client initialized: engine={}",
