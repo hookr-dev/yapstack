@@ -1,16 +1,4 @@
 //! Parakeet TDT-v3 backend (parakeet-rs 0.3 + ONNX Runtime via `ort`).
-//!
-//! Loads the multilingual TDT model from a directory containing
-//! `encoder-model.onnx`, `encoder-model.onnx.data`, `decoder_joint-model.onnx`,
-//! and `vocab.txt`.
-//!
-//! Execution provider:
-//! - With the `coreml` feature on (default for Apple targets via the
-//!   build script), uses ort-coreml with `ComputeUnits::CPUAndGPU` and a
-//!   per-app cache directory to avoid the ~5 s recompile on every spawn.
-//!   parakeet-rs falls back to CPU automatically (`error_on_failure()`)
-//!   if a given user's model can't run on CoreML.
-//! - Otherwise, runs on CPU.
 
 use std::path::{Path, PathBuf};
 
@@ -20,37 +8,22 @@ use tracing::{debug, info, warn};
 use yapstack_common::types::TranscriptSegment;
 
 use crate::engines::{
-    normalize_spacing, sanitize_text, should_include_segment, TranscribeOpts, TranscriptionBackend,
-    TranscriptionOutput,
+    normalize_spacing, read_wav_as_mono_16k, sanitize_text, should_include_segment, TranscribeOpts,
+    TranscriptionBackend, TranscriptionOutput,
 };
 
 const SORTFORMER_SAMPLE_RATE: u32 = 16000;
 /// parakeet-rs's `transcribe_samples` rejects anything other than 16 kHz mono
-/// despite the docstring claiming auto-resampling — empirically confirmed
-/// against parakeet-rs 0.3.5 with TDT v3. We resample on our side using the
-/// shared rubato-based helper.
+/// despite docs claiming auto-resampling (verified against parakeet-rs 0.3.5).
 const PARAKEET_SAMPLE_RATE: u32 = 16000;
 
-/// Silence gap (seconds) that forces a new segment boundary when grouping
-/// Parakeet's word-level tokens. Roughly matches Whisper's per-segment cadence.
 const SEGMENT_GAP_SECS: f32 = 0.5;
-
-/// Soft cap (seconds) on a single segment's span — once a segment runs this
-/// long without hitting a silence gap, force a break for UI readability.
 const MAX_SEGMENT_SECS: f32 = 12.0;
 
 pub struct ParakeetBackend {
     model: Option<ParakeetTDT>,
-    /// Path to the Sortformer ONNX file, set at sidecar startup via
-    /// `--sortformer-model`. `None` disables diarization regardless of
-    /// per-request flags.
     sortformer_model_path: Option<PathBuf>,
-    /// Lazily initialized on the first diarization request — model load
-    /// takes seconds and is wasted when diarization is off.
     sortformer: Option<Sortformer>,
-    /// Optional CoreML model-cache directory. When set and the `coreml`
-    /// feature is enabled, parakeet-rs caches compiled CoreML graphs here
-    /// so model loads after the first one are sub-second.
     coreml_cache_dir: Option<PathBuf>,
 }
 
@@ -98,33 +71,17 @@ impl TranscriptionBackend for ParakeetBackend {
             self.coreml_cache_dir.as_deref()
         );
 
-        // ORT+CoreML deterministically fails on models with external `.onnx.data`
-        // initializer files (the `model_path must not be empty` error path during
-        // CoreML cache write). The Auto policy skips CoreML up front when we can
-        // see them on disk — saves ~600 ms of doomed load attempt and the noisy
-        // ERROR log on every spawn. The user can still force CoreML or WebGPU
-        // via `YAPSTACK_PARAKEET_ACCEL`; we honor that even on incompatible
-        // models so the failure mode is observable.
         let cache_dir = self.coreml_cache_dir.as_deref();
         let choice = AccelChoice::from_env();
+        // Auto: skip CoreML when external `.onnx.data` is present (known ORT bug
+        // `model_path must not be empty`). User-forced choices are honored.
         let exec_config = match choice {
-            AccelChoice::Auto if has_external_data_file(model_path) => {
-                if cache_dir.is_some() {
-                    info!(
-                        "external `.onnx.data` initializer present — Auto policy \
-                         skipping CoreML and loading on CPU"
-                    );
-                }
-                None
-            }
-            _ => build_exec_config(cache_dir),
+            AccelChoice::Auto if has_external_data_file(model_path) => None,
+            _ => build_exec_config(choice, cache_dir),
         };
         let accel_attempted = exec_config.is_some();
         let model = match ParakeetTDT::from_pretrained(model_path, exec_config) {
             Ok(m) => m,
-            // Defensive: if the chosen accelerator fails at load (CoreML on a
-            // model with external initializers, WebGPU not available, etc.),
-            // fall back to plain CPU rather than refusing to load entirely.
             Err(e) if accel_attempted => {
                 warn!(
                     "accelerator load failed ({e}); falling back to CPU \
@@ -150,53 +107,33 @@ impl TranscriptionBackend for ParakeetBackend {
     ) -> Result<TranscriptionOutput, String> {
         let model = self.model.as_mut().ok_or("no model loaded")?;
 
-        let mut reader =
-            hound::WavReader::open(audio_path).map_err(|e| format!("failed to open WAV: {e}"))?;
-        let spec = reader.spec();
-
-        let raw_samples: Vec<f32> = if spec.sample_format == hound::SampleFormat::Float {
-            reader
-                .samples::<f32>()
-                .map(|s| s.map_err(|e| format!("sample read error: {e}")))
-                .collect::<Result<Vec<f32>, String>>()?
-        } else {
-            reader
-                .samples::<i16>()
-                .map(|s| s.map(|v| v as f32 / i16::MAX as f32))
-                .map(|s| s.map_err(|e| format!("sample read error: {e}")))
-                .collect::<Result<Vec<f32>, String>>()?
-        };
-
-        let audio_seconds = raw_samples.len() as f32 / spec.sample_rate as f32;
+        let mono_16k = read_wav_as_mono_16k(audio_path)?;
+        let audio_seconds = mono_16k.len() as f32 / PARAKEET_SAMPLE_RATE as f32;
         debug!(
-            "parakeet transcribe: {} samples ({:.2}s) at {}Hz x {}ch (diarization={})",
-            raw_samples.len(),
+            "parakeet transcribe: {} samples ({:.2}s) at 16kHz mono (diarization={})",
+            mono_16k.len(),
             audio_seconds,
-            spec.sample_rate,
-            spec.channels,
             opts.diarization
         );
 
-        // parakeet-rs requires 16 kHz mono. The shared resample helper is a
-        // no-op (Cow::Borrowed) when the input is already at the target rate.
-        let mono = yapstack_common::audio::deinterleave_to_mono(&raw_samples, spec.channels);
-        let resampled =
-            yapstack_common::audio::resample(&mono, spec.sample_rate, PARAKEET_SAMPLE_RATE)
-                .map_err(|e| format!("resample to 16kHz for parakeet failed: {e}"))?;
-        let model_input: Vec<f32> = resampled.into_owned();
+        _ = opts.language;
+        _ = opts.initial_prompt;
+        _ = opts.single_segment;
 
         let start = std::time::Instant::now();
+        let (transcribe_input, diarize_input) = if opts.diarization {
+            (mono_16k.clone(), Some(mono_16k))
+        } else {
+            (mono_16k, None)
+        };
         let result = model
             .transcribe_samples(
-                model_input,
+                transcribe_input,
                 PARAKEET_SAMPLE_RATE,
                 1,
                 Some(TimestampMode::Words),
             )
             .map_err(|e| format!("parakeet transcription failed: {e}"))?;
-        let _ = opts.language; // TDT v3 auto-detects; explicit hint not yet exposed by parakeet-rs.
-        let _ = opts.initial_prompt; // TDT decoder has no prompt input.
-        let _ = opts.single_segment; // We always group below per silence gaps.
         let elapsed_ms = start.elapsed().as_millis();
         let rtfx = if elapsed_ms > 0 {
             (audio_seconds * 1000.0) / elapsed_ms as f32
@@ -214,8 +151,7 @@ impl TranscriptionBackend for ParakeetBackend {
         let mut text = String::new();
         let mut filtered: Vec<TranscriptSegment> = Vec::with_capacity(segments.len());
         for seg in segments {
-            // Parakeet doesn't expose per-segment confidence; assume high
-            // (the model rarely produces YouTube-style hallucinations).
+            // Parakeet doesn't expose per-segment confidence.
             let confidence = 1.0_f32;
             let normalized = normalize_spacing(seg.text.trim());
             let sanitized = sanitize_text(&normalized);
@@ -236,9 +172,8 @@ impl TranscriptionBackend for ParakeetBackend {
             });
         }
 
-        // Optional diarization pass.
-        if opts.diarization {
-            match self.run_diarization(&raw_samples, spec.sample_rate, spec.channels) {
+        if let Some(diarize_audio) = diarize_input {
+            match self.run_diarization(diarize_audio) {
                 Ok(speaker_segs) => {
                     debug!(
                         "sortformer produced {} speaker segments",
@@ -262,54 +197,25 @@ impl TranscriptionBackend for ParakeetBackend {
 }
 
 impl ParakeetBackend {
-    /// Resample to 16 kHz mono if needed, then run Sortformer.
-    fn run_diarization(
-        &mut self,
-        raw_samples: &[f32],
-        sample_rate: u32,
-        channels: u16,
-    ) -> Result<Vec<SpeakerSegment>, String> {
-        let mono = yapstack_common::audio::deinterleave_to_mono(raw_samples, channels);
-        let resampled =
-            yapstack_common::audio::resample(&mono, sample_rate, SORTFORMER_SAMPLE_RATE)
-                .map_err(|e| format!("resample to 16kHz for diarization failed: {e}"))?;
-        let audio: Vec<f32> = resampled.into_owned();
+    fn run_diarization(&mut self, mono_16k: Vec<f32>) -> Result<Vec<SpeakerSegment>, String> {
         let sortformer = self.ensure_sortformer()?;
         sortformer
-            .diarize(audio, SORTFORMER_SAMPLE_RATE, 1)
+            .diarize(mono_16k, SORTFORMER_SAMPLE_RATE, 1)
             .map_err(|e| format!("sortformer diarize failed: {e}"))
     }
 }
 
-/// True iff `model_dir` contains any `.onnx.data` (or `.onnx_data`) sidecar
-/// file — the deterministic signature that ORT+CoreML will fail with the
-/// `model_path must not be empty` initializer error.
 fn has_external_data_file(model_dir: &Path) -> bool {
-    let entries = match std::fs::read_dir(model_dir) {
-        Ok(e) => e,
-        Err(e) => {
-            debug!(
-                "has_external_data_file: read_dir({}) failed: {e}",
-                model_dir.display()
-            );
-            return false;
-        }
+    let Ok(entries) = std::fs::read_dir(model_dir) else {
+        return false;
     };
-    let mut found = false;
-    for entry in entries.flatten() {
-        let name_os = entry.file_name();
-        let name = name_os.to_string_lossy();
-        debug!("has_external_data_file: saw {}", name);
-        if name.ends_with(".onnx.data") || name.ends_with(".onnx_data") {
-            found = true;
-        }
-    }
-    found
+    entries.flatten().any(|entry| {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        name.ends_with(".onnx.data") || name.ends_with(".onnx_data")
+    })
 }
 
-/// Which Parakeet execution provider to use. Controlled by the
-/// `YAPSTACK_PARAKEET_ACCEL` env var; default is `Auto` which today means
-/// "CoreML if no external `.onnx.data` files, else CPU".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AccelChoice {
     Auto,
@@ -348,23 +254,21 @@ impl AccelChoice {
     }
 }
 
-/// Build the parakeet-rs `ExecutionConfig` for `from_pretrained`.
-/// Returns `None` to mean "let parakeet-rs use its CPU default".
-fn build_exec_config(cache_dir: Option<&Path>) -> Option<parakeet_rs::ExecutionConfig> {
-    let choice = AccelChoice::from_env();
+fn build_exec_config(
+    choice: AccelChoice,
+    cache_dir: Option<&Path>,
+) -> Option<parakeet_rs::ExecutionConfig> {
     info!("parakeet accelerator choice: {:?}", choice);
     match choice {
         AccelChoice::Cpu => None,
         AccelChoice::Auto => {
-            // Auto: prefer CoreML when compiled in (the load_model preflight
-            // skips it for known-incompatible models). Otherwise CPU.
             #[cfg(feature = "coreml")]
             {
                 build_coreml_config(cache_dir)
             }
             #[cfg(not(feature = "coreml"))]
             {
-                let _ = cache_dir;
+                _ = cache_dir;
                 None
             }
         }
@@ -402,14 +306,10 @@ fn build_webgpu_config() -> Option<parakeet_rs::ExecutionConfig> {
     Some(ExecutionConfig::default().with_execution_provider(ExecutionProvider::WebGPU))
 }
 
-/// Assign each transcript segment a `speaker_id` based on the maximum-overlap
-/// speaker range from Sortformer. Segments with no overlap (e.g. between
-/// detected speech regions) keep `speaker_id = None`.
 fn assign_speakers(segments: &mut [TranscriptSegment], speakers: &[SpeakerSegment]) {
     for seg in segments {
         let mut best: Option<(u64, u8)> = None;
         for sp in speakers {
-            // Sortformer ranges are in samples at 16kHz; convert to ms.
             let sp_start_ms = sp.start * 1000 / SORTFORMER_SAMPLE_RATE as u64;
             let sp_end_ms = sp.end * 1000 / SORTFORMER_SAMPLE_RATE as u64;
             let overlap_start = seg.start_ms.max(sp_start_ms);
@@ -427,17 +327,12 @@ fn assign_speakers(segments: &mut [TranscriptSegment], speakers: &[SpeakerSegmen
     }
 }
 
-/// Aggregated word-level tokens that look like a "Whisper segment" to the
-/// rest of the pipeline. Internal — not part of the IPC protocol.
 struct GroupedSegment {
     text: String,
     start_secs: f32,
     end_secs: f32,
 }
 
-/// Group word-level [`TimedToken`]s into segments at silence gaps and at the
-/// soft per-segment time cap, mirroring Whisper's per-segment cadence so the
-/// downstream UI can render either engine identically.
 fn group_tokens_into_segments(tokens: &[TimedToken]) -> Vec<GroupedSegment> {
     let mut out: Vec<GroupedSegment> = Vec::new();
     let mut current: Option<GroupedSegment> = None;

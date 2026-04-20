@@ -349,10 +349,6 @@ pub async fn init_whisper_client(
         (mp, sp, vad_path)
     }; // lock dropped
 
-    // Engine selection lives in a follow-up commit (frontend cascading UI).
-    // For now `init_whisper_client` continues to mean "Whisper" and neither
-    // Sortformer nor the CoreML cache are needed; the Parakeet path lands
-    // with the engine-aware init command.
     let client = WhisperClient::spawn(
         &sidecar_path,
         EngineKind::Whisper,
@@ -562,12 +558,8 @@ pub async fn delete_sortformer_model(
         .map_err(CommandError::from)
 }
 
-/// Engine-aware client init. For `Whisper`, `whisper_model` is required.
-/// For `Parakeet`, `parakeet_variant` is required and `enable_diarization`
-/// optionally wires Sortformer (auto-downloads if missing). On Apple targets
-/// the Parakeet path uses CoreML by default with a per-app persistent cache
-/// at `$APP_DATA_DIR/cache/coreml/` so model loads after the first one are
-/// sub-second.
+/// Engine-aware client init. Whisper requires `whisper_model`; Parakeet
+/// requires `parakeet_variant` and may optionally enable Sortformer diarization.
 #[tauri::command]
 #[specta::specta]
 #[allow(clippy::too_many_arguments)]
@@ -588,7 +580,6 @@ pub async fn init_transcription_client(
         "initializing transcription client"
     );
 
-    // Idempotent fast-path: don't respawn if a client is already live.
     {
         let guard = whisper_state.lock().await;
         if guard.is_some() {
@@ -637,9 +628,6 @@ pub async fn init_transcription_client(
                 } else {
                     None
                 };
-                // Per-app CoreML cache. The sidecar tolerates a non-existent
-                // path (creates it lazily), so we only resolve and forward —
-                // if app_data_dir() fails we silently skip caching.
                 let cache_dir = app_handle
                     .path()
                     .app_data_dir()

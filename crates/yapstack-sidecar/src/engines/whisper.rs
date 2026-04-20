@@ -9,11 +9,9 @@ use whisper_rs::{
 use yapstack_common::types::TranscriptSegment;
 
 use crate::engines::{
-    normalize_spacing, sanitize_text, should_include_segment, TranscribeOpts, TranscriptionBackend,
-    TranscriptionOutput,
+    normalize_spacing, read_wav_as_mono_16k, sanitize_text, should_include_segment, TranscribeOpts,
+    TranscriptionBackend, TranscriptionOutput,
 };
-
-const WHISPER_SAMPLE_RATE: u32 = 16000;
 
 pub struct WhisperBackend {
     ctx: Option<WhisperContext>,
@@ -57,27 +55,7 @@ impl TranscriptionBackend for WhisperBackend {
     ) -> Result<TranscriptionOutput, String> {
         let ctx = self.ctx.as_ref().ok_or("no model loaded")?;
 
-        let mut reader =
-            hound::WavReader::open(audio_path).map_err(|e| format!("failed to open WAV: {e}"))?;
-        let spec = reader.spec();
-
-        let raw_samples: Vec<f32> = if spec.sample_format == hound::SampleFormat::Float {
-            reader
-                .samples::<f32>()
-                .map(|s| s.map_err(|e| format!("sample read error: {e}")))
-                .collect::<Result<Vec<f32>, String>>()?
-        } else {
-            reader
-                .samples::<i16>()
-                .map(|s| s.map(|v| v as f32 / i16::MAX as f32))
-                .map(|s| s.map_err(|e| format!("sample read error: {e}")))
-                .collect::<Result<Vec<f32>, String>>()?
-        };
-
-        let mono = yapstack_common::audio::deinterleave_to_mono(&raw_samples, spec.channels);
-        let samples =
-            yapstack_common::audio::resample(&mono, spec.sample_rate, WHISPER_SAMPLE_RATE)
-                .map_err(|e| format!("resample to 16kHz failed: {e}"))?;
+        let samples = read_wav_as_mono_16k(audio_path)?;
 
         let start = std::time::Instant::now();
 
@@ -116,7 +94,7 @@ impl TranscriptionBackend for WhisperBackend {
 
         // Adaptive single_segment: short chunks (<10s) → single segment to
         // avoid over-segmentation; longer chunks → natural sentence boundaries.
-        let audio_duration_s = samples.len() as f32 / WHISPER_SAMPLE_RATE as f32;
+        let audio_duration_s = samples.len() as f32 / 16_000.0;
         let use_single_segment = opts.single_segment.unwrap_or(audio_duration_s < 10.0);
         params.set_single_segment(use_single_segment);
 
