@@ -200,10 +200,6 @@ fn read_file_range(path: &Path, start: u64, end: u64) -> std::io::Result<Vec<u8>
     Ok(buf)
 }
 
-/// Initialise the global tracing subscriber so `tracing::info!` etc. — and
-/// the lines we forward from the sidecar's stderr — actually reach the
-/// terminal during `pnpm tauri dev`. Default level is `info` for our crates
-/// and `warn` for noisy upstream deps; override with `RUST_LOG=…`.
 fn init_tracing() {
     use tracing_subscriber::{fmt, EnvFilter};
 
@@ -221,8 +217,7 @@ fn init_tracing() {
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_filter));
 
-    // try_init so we don't panic if some test harness already wired one up.
-    let _ = fmt()
+    _ = fmt()
         .with_writer(std::io::stderr)
         .with_target(true)
         .with_env_filter(filter)
@@ -479,11 +474,7 @@ pub fn run() {
                 .app_data_dir()
                 .expect("failed to resolve app data directory");
 
-            // Apply runtime schema patches (idempotent ALTERs that the
-            // sqlx-style migration list can't safely express on dev DBs
-            // with "ghost" migration entries from other branches).
-            // tauri-plugin-sql writes the DB to app_config_dir(), which on
-            // macOS is the same path as app_data_dir().
+            // tauri-plugin-sql writes the DB to app_config_dir().
             let db_path = app
                 .path()
                 .app_config_dir()

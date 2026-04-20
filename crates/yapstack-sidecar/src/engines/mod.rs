@@ -25,8 +25,7 @@ pub struct TranscribeOpts<'a> {
     pub language: Option<&'a str>,
     pub initial_prompt: Option<&'a str>,
     pub single_segment: Option<bool>,
-    /// Read by the Parakeet+Sortformer path (added in a follow-up commit).
-    /// Whisper backend ignores this field.
+    /// Honored by Parakeet via Sortformer; ignored by Whisper.
     #[allow(dead_code)]
     pub diarization: bool,
 }
@@ -37,6 +36,31 @@ pub struct TranscriptionOutput {
     pub text: String,
     pub segments: Vec<TranscriptSegment>,
     pub duration_ms: u64,
+}
+
+/// Read a WAV file, downmix to mono, and resample to 16 kHz. Both Whisper
+/// and Parakeet require this exact input shape.
+#[cfg(any(feature = "whisper", feature = "parakeet"))]
+pub(crate) fn read_wav_as_mono_16k(audio_path: &Path) -> Result<Vec<f32>, String> {
+    let mut reader =
+        hound::WavReader::open(audio_path).map_err(|e| format!("failed to open WAV: {e}"))?;
+    let spec = reader.spec();
+    let raw: Vec<f32> = if spec.sample_format == hound::SampleFormat::Float {
+        reader
+            .samples::<f32>()
+            .map(|s| s.map_err(|e| format!("sample read error: {e}")))
+            .collect::<Result<Vec<f32>, String>>()?
+    } else {
+        reader
+            .samples::<i16>()
+            .map(|s| s.map(|v| v as f32 / i16::MAX as f32))
+            .map(|s| s.map_err(|e| format!("sample read error: {e}")))
+            .collect::<Result<Vec<f32>, String>>()?
+    };
+    let mono = yapstack_common::audio::deinterleave_to_mono(&raw, spec.channels);
+    let resampled = yapstack_common::audio::resample(&mono, spec.sample_rate, 16_000)
+        .map_err(|e| format!("resample to 16kHz failed: {e}"))?;
+    Ok(resampled.into_owned())
 }
 
 /// What every transcription backend must implement. Engine-specific

@@ -177,12 +177,8 @@ async initWhisperClient(size: ModelSizeDto) : Promise<Result<null, CommandError>
 }
 },
 /**
- * Engine-aware client init. For `Whisper`, `whisper_model` is required.
- * For `Parakeet`, `parakeet_variant` is required and `enable_diarization`
- * optionally wires Sortformer (auto-downloads if missing). On Apple targets
- * the Parakeet path uses CoreML by default with a per-app persistent cache
- * at `$APP_DATA_DIR/cache/coreml/` so model loads after the first one are
- * sub-second.
+ * Engine-aware client init. Whisper requires `whisper_model`; Parakeet
+ * requires `parakeet_variant` and may optionally enable Sortformer diarization.
  */
 async initTranscriptionClient(engine: EngineKindDto, whisperModel: ModelSizeDto | null, parakeetVariant: ParakeetVariantDto | null, enableDiarization: boolean) : Promise<Result<null, CommandError>> {
     try {

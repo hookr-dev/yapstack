@@ -120,19 +120,11 @@ export interface OnboardingState {
 export interface Settings {
   captureSource: CaptureSourceDto;
   selectedMicDeviceId: string | null;
-  /// Active transcription engine (peer to Whisper).
   selectedEngine: EngineKindDto;
-  /// Whisper model size — used when selectedEngine === "Whisper".
   selectedModelSize: ModelSizeDto;
-  /// Parakeet variant — used when selectedEngine === "Parakeet".
   selectedParakeetVariant: ParakeetVariantDto;
-  /// User-selected speaker-diarization toggle. Honored only when
-  /// selectedEngine supports diarization (Parakeet today). The Sortformer
-  /// model is downloaded lazily when this flag flips on for the first time.
   diarizationEnabled: boolean;
-  /// Per-session custom speaker names: `{ [sessionId]: { [speakerId]: "Alice" } }`.
-  /// Persisted client-side via Zustand. A future DB migration can move
-  /// these into a `sessions.speaker_names` JSON column for cross-device sync.
+  /// `{ [sessionId]: { [speakerId]: "Alice" } }`. Client-side persisted.
   speakerNames: Record<string, Record<number, string>>;
   language: string;
   mixConfig: MixConfigDto;
@@ -1096,10 +1088,6 @@ function createAppStore() {
         if (settings.selectedEngine === engine) return;
 
         try {
-          // Auto-download the target engine's selected model if missing,
-          // matching autoSetup's behaviour on app start. This avoids the
-          // chicken-and-egg where the user can't reach the engine's model
-          // picker without first being on that engine.
           if (engine === "Parakeet") {
             await get().refreshParakeetModels();
             const variant = settings.selectedParakeetVariant;
@@ -1116,7 +1104,6 @@ function createAppStore() {
               set({ modelDownloadProgress: null });
               await get().refreshParakeetModels();
             }
-            // Diarization toggle may also need the Sortformer download.
             if (settings.diarizationEnabled) {
               await get().refreshSortformerStatus();
               if (!get().sortformerStatus?.downloaded) {
@@ -1187,6 +1174,8 @@ function createAppStore() {
 
       setSpeakerName: (sessionId: string, speakerId: number, name: string) => {
         const trimmed = name.trim();
+        const current = get().settings.speakerNames[sessionId]?.[speakerId];
+        if ((current ?? "") === trimmed) return;
         set((state) => {
           const next = { ...state.settings.speakerNames };
           const sessionMap = { ...(next[sessionId] ?? {}) };
@@ -1218,9 +1207,6 @@ function createAppStore() {
         const settings = get().settings;
         if (settings.diarizationEnabled === enabled) return;
 
-        // Persist the flag immediately — UI feedback first, model download
-        // second. If the download fails the flag stays on but the next
-        // engine init will try again.
         get().updateSettings({ diarizationEnabled: enabled });
 
         if (enabled) {
@@ -1237,8 +1223,6 @@ function createAppStore() {
           }
         }
 
-        // Re-init the active client so the new flag takes effect. Only
-        // matters when the active engine supports diarization (Parakeet).
         if (settings.selectedEngine === "Parakeet") {
           set({ enginePhase: "initializing" });
           await commands.shutdownWhisperClient();

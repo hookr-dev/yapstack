@@ -1,12 +1,10 @@
-import { Fragment, useState, type RefObject } from "react";
+import { Fragment, useMemo, useState, type RefObject } from "react";
 import { EditableSegment } from "@/components/EditableSegment";
 import { useAppStore } from "@/stores/appStore";
 import type { DbSegment } from "@/lib/db";
 import { Pencil } from "lucide-react";
 import { Input } from "@/components/ui/input";
 
-/// Up to 4 speakers (Sortformer cap). Subtle accent backgrounds tuned to
-/// stay readable in both light and dark themes.
 const SPEAKER_COLORS = [
   "bg-sky-500/10 text-sky-700 dark:text-sky-300 border-sky-500/30",
   "bg-emerald-500/10 text-emerald-700 dark:text-emerald-300 border-emerald-500/30",
@@ -88,9 +86,8 @@ interface TranscriptSegmentsProps {
   onTimestampClick?: (time: number) => void;
 }
 
-/// Renders a flat or speaker-grouped transcript depending on whether any
-/// segment carries a `speaker_id`. Falls back to the existing flat layout
-/// when no speakers are present, so Whisper sessions render unchanged.
+type Group = { speakerId: number | null; items: DbSegment[] };
+
 export function TranscriptSegments({
   sessionId,
   segments,
@@ -103,45 +100,41 @@ export function TranscriptSegments({
     (s) => s.settings.speakerNames[sessionId],
   );
 
-  const hasSpeakers = segments.some((s) => s.speaker_id != null);
-  if (!hasSpeakers) {
-    return (
-      <>
-        {segments.map((segment) => {
-          const isActive = segment.id === activeSegmentId;
-          return (
-            <EditableSegment
-              key={segment.id}
-              segment={segment}
-              isActive={isActive}
-              readOnly={!isEditable}
-              onTimestampClick={onTimestampClick}
-              ref={isActive ? activeRef : undefined}
-            />
-          );
-        })}
-      </>
-    );
-  }
-
-  // Group consecutive same-speaker segments. A null/undefined speaker_id
-  // groups separately from any numbered speaker.
-  type Group = { speakerId: number | null; items: DbSegment[] };
-  const groups: Group[] = [];
-  for (const seg of segments) {
-    const id = seg.speaker_id ?? null;
-    const tail = groups[groups.length - 1];
-    if (tail && tail.speakerId === id) {
-      tail.items.push(seg);
-    } else {
-      groups.push({ speakerId: id, items: [seg] });
+  const groups = useMemo<Group[] | null>(() => {
+    if (!segments.some((s) => s.speaker_id != null)) return null;
+    const out: Group[] = [];
+    for (const seg of segments) {
+      const id = seg.speaker_id ?? null;
+      const tail = out[out.length - 1];
+      if (tail && tail.speakerId === id) {
+        tail.items.push(seg);
+      } else {
+        out.push({ speakerId: id, items: [seg] });
+      }
     }
+    return out;
+  }, [segments]);
+
+  if (groups === null) {
+    return segments.map((segment) => {
+      const isActive = segment.id === activeSegmentId;
+      return (
+        <EditableSegment
+          key={segment.id}
+          segment={segment}
+          isActive={isActive}
+          readOnly={!isEditable}
+          onTimestampClick={onTimestampClick}
+          ref={isActive ? activeRef : undefined}
+        />
+      );
+    });
   }
 
   return (
     <>
       {groups.map((group, idx) => (
-        <Fragment key={`${group.speakerId ?? "none"}-${idx}`}>
+        <Fragment key={idx}>
           {group.speakerId != null && (
             <SpeakerHeader
               sessionId={sessionId}
