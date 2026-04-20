@@ -9,7 +9,6 @@ import { createAIClient, getActiveConfig, isAIConfigured } from "@/lib/ai";
 import { createManualSession as dbCreateManualSession, saveNote, insertDictationHistory } from "@/lib/db";
 import { toast } from "sonner";
 import { trackDictationStarted, trackDictationCompleted, trackDictationFailed } from "@/lib/analytics";
-import { startKeepAwake, stopKeepAwake } from "@/lib/keepAwake";
 
 type DictationState = "idle" | "recording" | "transcribing" | "processing" | "done";
 
@@ -142,9 +141,10 @@ export function useDictation() {
 
       // Set state before async work to prevent re-entry
       stateRef.current = "recording";
-      // Keep this webview's JS runtime unthrottled while another app holds
-      // focus — otherwise macOS App Nap stalls the post-stop awaits.
-      startKeepAwake();
+      // Prevent macOS App Nap for the dictation lifetime — otherwise the
+      // main window's WKWebView JS runtime stalls while another app holds
+      // focus, freezing post-stop awaits (AI fetch, clipboard paste, etc.).
+      commands.preventAppNapBegin("YapStack dictation").catch(() => {});
       startTimeRef.current = Date.now();
       slotIdRef.current = detail.slotId;
       dictationIdRef.current = crypto.randomUUID();
@@ -472,7 +472,7 @@ export function useDictation() {
 
     function setIdle() {
       stateRef.current = "idle";
-      stopKeepAwake();
+      commands.preventAppNapEnd().catch(() => {});
       // Notify toggle mode that dictation is done (clears toggle state)
       window.dispatchEvent(new CustomEvent("yapstack:dictation-idle"));
     }
@@ -488,7 +488,9 @@ export function useDictation() {
       if (stateRef.current === "recording") {
         commands.stopLiveTranscription().catch(() => {});
       }
-      if (stateRef.current !== "idle") stopKeepAwake();
+      if (stateRef.current !== "idle") {
+        commands.preventAppNapEnd().catch(() => {});
+      }
       cleanupListeners();
     };
   }, []);
