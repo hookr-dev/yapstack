@@ -204,16 +204,30 @@ export function isAIConfigured(settings: AISettings): boolean {
 
 // ----- Context Assembly -----
 
-export function assembleTranscriptContext(segments: DbSegment[]): string {
+export function assembleTranscriptContext(
+  segments: DbSegment[],
+  speakerNames?: Record<number, string>,
+): string {
   return segments
     .filter((s) => s.hidden !== 1 && !s.deleted_at)
     .map((s) => {
       const mins = Math.floor(s.audio_offset_seconds / 60);
       const secs = Math.floor(s.audio_offset_seconds % 60);
       const ts = `${mins}:${secs.toString().padStart(2, "0")}`;
-      return `[seg:${s.id} ${ts}] ${s.text}`;
+      const speakerPrefix =
+        s.speaker_id != null
+          ? ` (${speakerNames?.[s.speaker_id] ?? `Speaker ${s.speaker_id + 1}`})`
+          : "";
+      return `[seg:${s.id} ${ts}]${speakerPrefix} ${s.text}`;
     })
     .join("\n");
+}
+
+/// True when any segment carries a non-null `speaker_id` — i.e. the
+/// transcript came from a diarized session. Used by the system-prompt
+/// builder to decide whether to include speaker guidance.
+export function transcriptHasSpeakers(segments: DbSegment[]): boolean {
+  return segments.some((s) => s.speaker_id != null);
 }
 
 export function assembleNoteContext(noteHtml: string): string {

@@ -24,6 +24,13 @@ export function getContentScaleGuidance(transcriptText: string): string {
 const CITATION_INSTRUCTION = `
 When referencing specific parts of the conversation, cite the segment using its ID in this format: [[seg:ID]]. For example: "The team discussed increasing marketing spend [[seg:def456]]." Only cite when it adds value — don't cite every statement.`;
 
+/// Added to the system prompt only when the transcript was produced by a
+/// diarized engine (Parakeet + Sortformer). Tells the model that segment
+/// lines carry a `(Speaker N)` or `(Alice)` parenthetical and that the
+/// user expects answers to attribute statements to the right person.
+const SPEAKER_INSTRUCTION = `
+This transcript includes speaker labels in parentheses after each segment timestamp — e.g. \`[seg:abc 0:12] (Alice) Yes, exactly.\`. When summarizing or answering questions about who said what, attribute statements to the named speaker. If a speaker has only the default label (\`Speaker 1\`, \`Speaker 2\`, …), use that label verbatim — don't invent names.`;
+
 const NOTES_GUIDANCE = `
 When saving to notes, choose the mode based on context:
 - Use "append" to add your content alongside existing notes
@@ -46,10 +53,14 @@ export function getSystemPrompt(
   transcriptText: string,
   noteText: string,
   attachments: { name: string; content: string }[],
+  options?: { hasSpeakers?: boolean },
 ): string {
   let context = directive;
   if (transcriptText) {
     context += "\n" + CITATION_INSTRUCTION;
+    if (options?.hasSpeakers) {
+      context += "\n" + SPEAKER_INSTRUCTION;
+    }
   }
   context += "\n" + NOTES_GUIDANCE + "\n\n---\n\n";
 
@@ -84,8 +95,15 @@ export function getSystemPromptWithToolContext(
   noteText: string,
   attachments: { name: string; content: string }[],
   sessionMeta: SessionMeta,
+  options?: { hasSpeakers?: boolean },
 ): string {
-  const base = getSystemPrompt(directive, transcriptText, noteText, attachments);
+  const base = getSystemPrompt(
+    directive,
+    transcriptText,
+    noteText,
+    attachments,
+    options,
+  );
 
   return (
     base +

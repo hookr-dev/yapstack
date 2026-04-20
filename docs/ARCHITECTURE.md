@@ -2,7 +2,7 @@
 
 ## Overview
 
-YapStack is a desktop app for real-time audio capture and transcription. Built with Tauri v2 (Rust backend) + React 19 (TypeScript frontend). Audio is captured via `cpal`, stored in lock-free ring buffers, exported to WAV, and transcribed by a Whisper sidecar process. Sessions and segments are persisted to SQLite via `tauri-plugin-sql`.
+YapStack is a desktop app for real-time audio capture and transcription. Built with Tauri v2 (Rust backend) + React 19 (TypeScript frontend). Audio is captured via `cpal`, stored in lock-free ring buffers, exported to WAV, and transcribed by a sidecar process that supports two engines as first-class peers: **Whisper** (whisper-rs, 99 languages) and **NVIDIA Parakeet TDT v3** (parakeet-rs + ONNX Runtime, 25 European languages, optional Sortformer speaker diarization). The user picks the engine in Settings; the sidecar is spawned with `--engine whisper|parakeet` and dispatches IPC requests through a `TranscriptionBackend` trait so adding a third engine is one feature flag plus one impl. Sessions and segments are persisted to SQLite via `tauri-plugin-sql`.
 
 ## Workspace Layout
 
@@ -43,9 +43,10 @@ yapstack-sidecar (standalone binary)
 
 ### yapstack-common
 Shared types used across all crates. No business logic.
-- `audio.rs` — `deinterleave_to_mono()` — canonical implementation for converting interleaved multi-channel audio to mono. Used by `yapstack-audio` internally and `live_transcription.rs` directly.
+- `audio.rs` — `deinterleave_to_mono()`, `resample()` (rubato sinc, no-op when from_rate == to_rate). Used by `yapstack-audio` internally, `live_transcription.rs` directly, and the Parakeet/Sortformer backends in `yapstack-sidecar`.
 - `config.rs` — `AppConfig`, `AudioConfig` (only `capture_history_seconds`), `TranscriptionConfig` with serde
-- `types.rs` — Domain types (`CaptureState`, `CaptureSource`, `PermissionStatus`, etc.) and IPC protocol (`SidecarRequest`, `SidecarResponse`)
+- `types.rs` — Domain types (`CaptureState`, `CaptureSource`, `PermissionStatus`, `EngineKind`, etc.). `TranscriptSegment` carries an optional `speaker_id` for Parakeet+Sortformer output. IPC protocol (`SidecarRequest`, `SidecarResponse`) is engine-agnostic; `Transcribe` carries an optional `diarization: bool`.
+- `engines.rs` — Static `engine_catalogue()` exposing `EngineDescriptor { kind, display_name, languages, supports_diarization, supports_initial_prompt }` per engine. Single source of truth for engine capabilities + supported languages, consumed by both backend validation and the frontend cascading dropdowns (via the `get_engine_catalogue` Tauri command).
 
 ### yapstack-audio
 All audio capture and processing. Core of the application.
@@ -60,18 +61,30 @@ All audio capture and processing. Core of the application.
 - `error.rs` — `AudioError` enum with `From` impls for cpal and hound errors
 
 ### yapstack-transcription
-Model management and sidecar client. No whisper-rs dependency (unless `whisper` feature enabled).
-- `model.rs` — `ModelManager` downloads ggml models from HuggingFace, verifies checksums, manages model storage. Also manages Silero VAD model (`vad_model_path()`, `ensure_vad_model()`, `download_vad_model()`) — auto-downloaded ~885KB ONNX model used by whisper.cpp for voice activity detection.
-- `whisper.rs` — `WhisperClient` spawns the sidecar process and communicates via JSON-line IPC. `spawn()` accepts optional `vad_model_path` for Silero VAD.
+Model management and sidecar client. No whisper-rs / parakeet-rs dependencies — those live entirely in the sidecar.
+- `model.rs` — `ModelManager` manages three model families with HuggingFace download + streaming SHA-256 verification:
+  - **Whisper** (single ggml file): `ModelSize { Tiny, Base, Small, Medium }`, `download`, `verify_checksum`, `delete`, `list_all`.
+  - **Whisper VAD** (Silero, ~885KB, auto-downloaded): `vad_model_path`, `download_vad_model`, `ensure_vad_model`.
+  - **Parakeet** (multi-file ONNX bundle in `models_dir/parakeet-<variant>/`): `ParakeetVariant::TdtV3`, `parakeet_model_dir`, `parakeet_is_available` (checks all required files), `download_parakeet` (loops over the variant's `files()` list with per-file SHA verify), `delete_parakeet`, `ensure_parakeet`.
+  - **Sortformer** (single ONNX file, ~50MB): `SortformerVariant::V2_1`, `sortformer_model_path`, `download_sortformer`, `ensure_sortformer`.
+- `client.rs` (was `whisper.rs`) — `TranscriptionClient` spawns the sidecar process and communicates via JSON-line IPC. `spawn()` takes `engine: EngineKind`, `model_path`, `vad_model_path?` (Whisper-only), `sortformer_model_path?` (Parakeet-only), and `coreml_cache_dir?` (Parakeet-only). `transcribe_with(audio, language, prompt, diarization)` exposes the per-call diarization flag. `respawn()` re-spawns the sidecar preserving engine + all paths + `next_id`. A `WhisperClient` type alias is retained for transitional compat with the Tauri layer.
 - `error.rs` — `TranscriptionError` with variants for download, sidecar, timeout, IO, HTTP
 
 ### yapstack-sidecar
-Standalone binary. Reads JSON-line requests from stdin, writes responses to stdout. Logging goes to stderr. CLI: `yapstack-sidecar [--model /path/to/model.bin] [--vad-model /path/to/vad.bin]`
-- Behind `whisper` feature flag: loads whisper-rs model with flash attention, converts audio to 16kHz mono (stereo→mono averaging + sinc interpolation resampling via rubato: Cubic, BlackmanHarris2), transcribes WAV files with optional `initial_prompt` for context continuity, filters hallucination segments via `should_include_segment()`
-- Without feature: responds with error messages (useful for testing IPC without cmake)
+Standalone binary. Reads JSON-line requests from stdin, writes responses to stdout. Logging goes to stderr.
+
+**CLI**: `yapstack-sidecar [--engine whisper|parakeet] [--model PATH] [--vad-model PATH] [--sortformer-model PATH] [--coreml-cache-dir PATH]`
+
+**Architecture**: `engines/mod.rs` defines a `TranscriptionBackend` trait + shared text-cleanup helpers. Concrete impls in `engines/whisper.rs` (whisper-rs + flash attention + Silero VAD) and `engines/parakeet.rs` (ParakeetTDT + Sortformer post-pass + ORT EP selection). `main.rs` is a thin IPC dispatcher that picks one backend at startup and forwards every request through the trait. When the engine the sidecar was spawned with isn't compiled in (e.g. `--engine parakeet` on a `--features whisper` build), every IPC request returns `engine 'X' not compiled in this build`.
+
+**Whisper backend (`engines/whisper.rs`)**: Loads whisper-rs model with flash attention, converts audio to 16kHz mono (stereo→mono averaging + sinc interpolation resampling via rubato), transcribes WAV files with optional `initial_prompt` for context continuity, filters hallucination segments via `should_include_segment()`.
 - Whisper params: `greedy(best_of=1)`, `no_context(true)`, `logprob_thold(-1.0)`, `max_tokens(100/200)`, `suppress_blank(true)`, `suppress_nst(true)`, `temperature_inc(0.2)`, `no_speech_thold(0.45)`, `single_segment(adaptive)`
 - **Silero VAD**: Optional `--vad-model` arg enables voice activity detection as whisper.cpp preprocessing (threshold 0.5, min_speech 250ms, min_silence 100ms, pad 30ms). Skips non-speech audio before decoding, reducing hallucinations.
-- Hallucination filtering: drops empty text, special tokens (`[BLANK_AUDIO]`, `[MUSIC]`), low-confidence segments (< 0.4), excessive word/phrase repetition (3+ consecutive identical words with punctuation-normalized detection via `normalize_for_repetition()`), and 47 known filler/hallucination patterns ("thank you", "thanks for watching", "yeah", "um", "so", etc.) at marginal confidence (< 0.6)
+- Hallucination filtering: drops empty text, special tokens (`[BLANK_AUDIO]`, `[MUSIC]`), low-confidence segments (< 0.4), excessive word/phrase repetition (3+ consecutive identical words with punctuation-normalized detection via `normalize_for_repetition()`), and 47 known filler/hallucination patterns ("thank you", "thanks for watching", "yeah", "um", "so", etc.) at marginal confidence (< 0.6).
+
+**Parakeet backend (`engines/parakeet.rs`)**: Loads `ParakeetTDT::from_pretrained(model_dir, exec_config)` from a directory containing `encoder-model.onnx` + `encoder-model.onnx.data` + `decoder_joint-model.onnx` + `vocab.txt`. Resamples audio to 16 kHz mono via `yapstack_common::audio::resample` before calling `transcribe_samples` (parakeet-rs 0.3.5 rejects other rates despite its docs). Token-level timestamps grouped into segments at 0.5 s silence gaps + 12 s soft cap. Same `should_include_segment` post-filter as Whisper (mostly a no-op for Parakeet which doesn't hallucinate the same patterns).
+- **ORT execution provider** selected at startup via `YAPSTACK_PARAKEET_ACCEL=auto|cpu|coreml|webgpu` env var. `auto` uses CoreML when compiled in *and* the model dir contains no external `.onnx.data` files (TDT v3 *does* — so Auto falls through to CPU on this model). Per-load CPU fallback at the backend level catches CoreML/WebGPU load failures and degrades silently — the sidecar never returns "no model loaded".
+- **Sortformer post-pass** (when `Transcribe.diarization=true` and the sidecar was spawned with `--sortformer-model`): runs Sortformer on the same resampled 16 kHz audio, returns `Vec<SpeakerSegment>` with sample-range + `speaker_id`. `assign_speakers()` maps speaker ranges onto produced transcript segments by maximum-overlap (samples → ms → segment range overlap) and populates `TranscriptSegment.speaker_id`. Sortformer model is loaded lazily on first diarization request to avoid the cost when diarization is off.
 
 ### yapstack-desktop (Tauri app)
 Tauri commands layer. Thin wrappers that convert between domain types and DTOs (with `specta::Type` for TypeScript generation).
@@ -122,19 +135,36 @@ Fallback path (short sessions or re-export):
 
 ### Transcription
 ```
-Frontend: init_whisper_client(model_size)
-    → ensures VAD model is downloaded (auto-downloads ~885KB Silero model on first init)
-    → spawns yapstack-sidecar process with --model flag and optional --vad-model flag
+Frontend: init_transcription_client(engine, whisper_model?, parakeet_variant?, enable_diarization)
+                                    (or legacy init_whisper_client(size) — shim that calls the engine-aware path with EngineKind::Whisper)
+    → Validates the engine's selected model is on disk; returns NotFound if not
+    → For Parakeet+diarization, also ensure_sortformer() (auto-downloads ~50MB Sortformer ONNX)
+    → For Whisper, ensure_vad_model() (auto-downloads ~885KB Silero ONNX)
+    → Resolves CoreML cache dir under $APP_DATA_DIR/cache/coreml/ (Parakeet only)
+    → spawns yapstack-sidecar with: --engine, --model, [--vad-model | --sortformer-model + --coreml-cache-dir]
     → JSON-line IPC over stdin/stdout
 
 Frontend: transcribe_audio(wav_path)
-    → WhisperClient.transcribe()
-    → sends {"type":"transcribe", ...} to sidecar stdin
-    → sidecar loads WAV (any sample rate / channel count)
-    → converts to mono (averaging channels) if needed
-    → resamples to 16kHz (sinc interpolation via rubato) if needed
-    → runs whisper inference on 16kHz mono samples
-    → returns {"type":"transcription", text, segments, ...}
+    → TranscriptionClient.transcribe() / .transcribe_with(diarization=true)
+    → sends {"type":"transcribe", ..., diarization} to sidecar stdin
+    → sidecar dispatches via TranscriptionBackend trait:
+
+      Whisper backend:
+        → loads WAV (any sample rate / channel count)
+        → converts to mono (averaging channels) + resamples to 16kHz (sinc via rubato) if needed
+        → runs whisper inference with optional initial_prompt
+        → segments[*].speaker_id = None
+
+      Parakeet backend:
+        → loads WAV at native rate
+        → resamples to 16kHz mono via yapstack_common::audio::resample
+        → calls ParakeetTDT.transcribe_samples (CoreML/WebGPU/CPU per env var)
+        → groups word-level tokens into segments at silence gaps
+        → if diarization=true: also runs Sortformer on the same audio,
+          assigns speaker_id by max-overlap onto produced segments
+        → drops opts.initial_prompt silently (TDT decoder has no prompt input)
+
+    → returns {"type":"transcription", text, segments[* speaker_id], duration_ms}
     → TranscriptionResult { text, segments, duration_ms }
 ```
 
@@ -156,7 +186,9 @@ Frontend: start_live_transcription(config)
         6. Emit "live-segment" events with is_backfill=true
         7. Emit "backfill-complete" event
 
-    Track 2 — Live VAD loop (runs concurrently):
+    Track 2 — Live VAD loop (runs concurrently; per-call diarization gated on
+              ctx.config.diarization, initial_prompt gated on
+              client.engine() == EngineKind::Whisper):
         1. Poll every 300ms
         2. Single lock: peek_energy_rms() + extract_since() for WAV flush
         3. Write WAV samples outside the lock (disk I/O doesn't hold AudioManager)
@@ -202,13 +234,15 @@ The live transcription loop includes a stream health watchdog (`check_stream_hea
 ### Backend (Rust)
 Four `Arc<Mutex<T>>` states managed by Tauri:
 - `AudioManagerState` — audio capture lifecycle, ring buffers, sessions
-- `ModelManagerState` — model download/delete/list
-- `WhisperClientState` — `Option<WhisperClient>`, sidecar process lifecycle
+- `ModelManagerState` — model download/delete/list (Whisper + Parakeet + Sortformer)
+- `WhisperClientState` — `Option<TranscriptionClient>`, sidecar process lifecycle (alias name kept for backward compat; the wrapped value is the engine-agnostic `TranscriptionClient`, regardless of which engine was selected)
 - `LiveTranscriptionState` — `Option<LiveTranscriptionController>`, live transcription task + stop signal
 
+Startup also runs `db::ensure_runtime_schema()` *before* tauri-plugin-sql wires up — this opens the SQLite DB directly via `rusqlite` and adds `segments.speaker_id INTEGER` if missing. The column is intentionally outside the migration list because some local dev DBs have a "ghost" v11 entry from another branch in `_sqlx_migrations`, which makes sqlx silently refuse any v12+ migration. The startup hook sidesteps the entire ordering problem; idempotent on every boot.
+
 ### Frontend (TypeScript)
-- **State**: Zustand store (`stores/appStore.ts`) with persisted settings (version 16, migrations for schema changes). Settings include capture source, model size, language, VAD params, prompt context, prompt decay silence, theme, sidebar state, buffer size, AI settings, shortcut bindings, audio save location, dictation settings (`{ enabled, slots: DictationSlot[], activationMode: DictationActivationMode }`), and `showRecordingIndicator`.
-- **Persistence**: SQLite via `tauri-plugin-sql` (`lib/db.ts`) for sessions, segments, notes, note versions, folders, session_folders (many-to-many), chat messages, and dictation history. DB file at app data dir. 10 DB migration versions (see [API Reference](API_REFERENCE.md)).
+- **State**: Zustand store (`stores/appStore.ts`) with persisted settings (**version 22**, migrations for schema changes). Settings include capture source, **selected engine** (`"Whisper" | "Parakeet"`, peers — Whisper is the upgrade-safe default), Whisper model size, **selected Parakeet variant**, **diarization enabled**, **per-session `speakerNames` map** (renames `Speaker N` → custom labels, persisted client-side), language, VAD params, prompt context, prompt decay silence, theme, sidebar state, buffer size, AI settings, shortcut bindings, audio save location, dictation settings, `showRecordingIndicator`. The store also caches the engine catalogue (`engineCatalogue: EngineDescriptorDto[]`) and Parakeet/Sortformer download status (`parakeetModels`, `sortformerStatus`) loaded on `autoSetup`.
+- **Persistence**: SQLite via `tauri-plugin-sql` (`lib/db.ts`) for sessions, segments, notes, note versions, folders, session_folders (many-to-many), chat messages, and dictation history. DB file at app data dir. 10 DB migration versions; `segments.speaker_id INTEGER` is added by `db::ensure_runtime_schema()` at app startup (outside the migration list — see [API Reference](API_REFERENCE.md) and the comment in `db.rs`).
 - **Type generation**: Specta-generated types in `src/lib/types.ts` (auto-generated, excluded from tsconfig). Tauri command wrappers in `src/lib/tauri.ts`.
 - **Serialization queue**: `onLiveSegment` uses a promise queue (`segmentQueueTail`) to prevent concurrent backfill + live events from racing on DB writes.
 - **Hooks**: `useAutoSetup` (engine init), `useCaptureEvents` (backend status push), `useLiveTranscriptionEvents` (segment/phase/backfill/session-wav-ready events), `useCreateSession` (session creation guard), `useDownloadProgress` (model download), `useKeyboardShortcuts` (in-app capture-phase keydown in AppLayout), `useGlobalShortcuts` (Tauri global-shortcut plugin in App.tsx), `useDictation` (hold-to-talk or toggle mode voice dictation lifecycle in App.tsx), `useRecordingIndicator` (show/hide floating overlay when recording + unfocused, in App.tsx), `useTrayEvents` (listen for tray menu actions, in AppLayout), `useChatMessages` (chat message lifecycle: send, stream, tool execution, undo, DB persistence).
@@ -217,7 +251,9 @@ Four `Arc<Mutex<T>>` states managed by Tauri:
   - **Active recording**: `SessionHeaderV2` + `ChatView` (transcript bubbles with backfill indicator) + `RecordingControls`
   - **Completed transcription**: `SessionHeaderV2` + `AudioPlayer` + resizable split pane (`ChatView` left, `NoteEditor` + `NoteHistoryPanel` right)
   - **Manual notes**: `SessionHeaderV2` + full-width `NoteEditor` + `NoteHistoryPanel`
-- **Settings UI**: Tabbed (`AudioTab`, `TranscriptionTab`, `GeneralTab`, `ShortcutsTab`, `DictationTab`). `ModelSection` handles download/delete. `GeneralTab` manages theme, audio save location, and session clearing. `DictationTab` manages dictation enable/disable, dynamic slot configuration (name, keybind, output action, AI prompt), and slot add/delete.
+- **Settings UI**: Tabbed (`AudioTab`, `TranscriptionTab`, `GeneralTab`, `ShortcutsTab`, `DictationTab`). `TranscriptionTab` renders an **engine → model → language cascade**: engine radio (Whisper/Parakeet, peers), conditional model picker (`ModelSection` for Whisper sizes, new `ParakeetModelSection` for Parakeet variants), language dropdown derived from `engineCatalogue` (clamps to "auto" when current language isn't in the new engine's supported set), Switch-style **diarization toggle** (greyed out unless engine supports it; first enable lazily downloads Sortformer + re-inits the client). `GeneralTab` manages theme, audio save location, and session clearing. `DictationTab` manages dictation enable/disable, dynamic slot configuration (name, keybind, output action, AI prompt), and slot add/delete.
+- **Transcript view (`TranscriptSegments.tsx`)**: Wrapper around `EditableSegment` rendered by `ChatView`. Falls back to a flat segment list when no segment carries a `speaker_id` (Whisper sessions render unchanged). Otherwise groups consecutive same-speaker segments under a `Speaker N` header with a 4-color palette. Speaker headers are inline-editable; renames persist to per-session `speakerNames` Zustand map.
+- **AI prompts**: `ai-prompts.ts::getSystemPrompt(directive, ..., { hasSpeakers })` injects a `SPEAKER_INSTRUCTION` paragraph telling the model to attribute statements correctly when the active session has diarization data. `ai.ts::assembleTranscriptContext(segments, speakerNames?)` adds `(SpeakerName)` prefixes per segment.
 - **Global features**: `SearchCommand` (Cmd+K fuzzy search via `cmdk`), drag-and-drop sessions into folders via `@dnd-kit`.
 - **AI Chat**: `AIContextProvider` wraps `FloatingChatBar` to provide context-dependent AI chat. `FloatingChatBar` delegates chat logic to the `useChatMessages` hook and input UI to `ChatInputBar` (with `ContextPill` and `ModelPickerPill` sub-components in `components/chat/`). Factory functions in `ai-context.ts` assemble sources/tools/prompts for session vs. multi-session (folder) contexts. `resolveListContext()` centralizes context resolution for non-session views (all, pinned, folder, dictation). `ListContextBar` renders the floating chat bar for list-level contexts. See [AI Chat & Tool Calling](#ai-chat--tool-calling) below.
 - **Dictation**: `DictationBubble` renders in a separate Tauri window. `YapStackIcon` provides a reusable SVG mask-based icon component. See [Dictation](#dictation) below.

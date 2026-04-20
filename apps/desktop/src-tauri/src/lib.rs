@@ -200,7 +200,40 @@ fn read_file_range(path: &Path, start: u64, end: u64) -> std::io::Result<Vec<u8>
     Ok(buf)
 }
 
+/// Initialise the global tracing subscriber so `tracing::info!` etc. — and
+/// the lines we forward from the sidecar's stderr — actually reach the
+/// terminal during `pnpm tauri dev`. Default level is `info` for our crates
+/// and `warn` for noisy upstream deps; override with `RUST_LOG=…`.
+fn init_tracing() {
+    use tracing_subscriber::{fmt, EnvFilter};
+
+    let default_filter = "info,\
+        yapstack_desktop=debug,\
+        yapstack_audio=info,\
+        yapstack_transcription=debug,\
+        yapstack_sidecar=debug,\
+        tao=warn,\
+        wry=warn,\
+        hyper=warn,\
+        reqwest=warn,\
+        sqlx=warn";
+
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_filter));
+
+    // try_init so we don't panic if some test harness already wired one up.
+    let _ = fmt()
+        .with_writer(std::io::stderr)
+        .with_target(true)
+        .with_env_filter(filter)
+        .try_init();
+
+    tracing::info!("yapstack-desktop tracing initialised");
+}
+
 pub fn run() {
+    init_tracing();
+
     let specta_builder =
         tauri_specta::Builder::<tauri::Wry>::new().commands(tauri_specta::collect_commands![
             commands::health_check,
@@ -225,8 +258,16 @@ pub fn run() {
             commands::transcription::delete_model,
             commands::transcription::transcribe_audio,
             commands::transcription::init_whisper_client,
+            commands::transcription::init_transcription_client,
             commands::transcription::shutdown_whisper_client,
             commands::transcription::get_whisper_status,
+            commands::transcription::get_engine_catalogue,
+            commands::transcription::get_parakeet_models,
+            commands::transcription::download_parakeet_model,
+            commands::transcription::delete_parakeet_model,
+            commands::transcription::get_sortformer_status,
+            commands::transcription::download_sortformer_model,
+            commands::transcription::delete_sortformer_model,
             commands::live_transcription::start_live_transcription,
             commands::live_transcription::stop_live_transcription,
             commands::live_transcription::get_live_transcription_status,
@@ -437,6 +478,19 @@ pub fn run() {
                 .path()
                 .app_data_dir()
                 .expect("failed to resolve app data directory");
+
+            // Apply runtime schema patches (idempotent ALTERs that the
+            // sqlx-style migration list can't safely express on dev DBs
+            // with "ghost" migration entries from other branches).
+            // tauri-plugin-sql writes the DB to app_config_dir(), which on
+            // macOS is the same path as app_data_dir().
+            let db_path = app
+                .path()
+                .app_config_dir()
+                .map(|p| p.join("yapstack.db"))
+                .unwrap_or_else(|_| app_data_dir.join("yapstack.db"));
+            db::ensure_runtime_schema(&db_path);
+
             let model_manager = ModelManager::new(app_data_dir);
             app.manage(
                 Arc::new(Mutex::new(model_manager)) as commands::transcription::ModelManagerState

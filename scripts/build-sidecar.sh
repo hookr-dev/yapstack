@@ -71,19 +71,21 @@ else
     PROFILE_DIR="debug"
 fi
 
-echo "Building yapstack-sidecar with whisper feature ($PROFILE_LABEL)..."
+echo "Building yapstack-sidecar with whisper + parakeet features ($PROFILE_LABEL)..."
 echo "Targets: ${TARGETS[*]}"
 echo ""
 
 for target in "${TARGETS[@]}"; do
     echo "=== Building for $target ==="
 
-    # Enable GPU acceleration per platform
-    FEATURES="whisper"
+    # Both engines ship in dev + release builds. Apple targets get Metal
+    # for whisper-rs and CoreML for parakeet-rs (CPU fallback is automatic
+    # via parakeet-rs's `error_on_failure()` chain).
+    FEATURES="whisper,parakeet"
     if [[ "$target" == *"apple"* ]]; then
-        FEATURES="whisper,metal"
+        FEATURES="whisper,parakeet,metal,coreml,webgpu"
     elif [[ "$target" == *"windows"* ]]; then
-        FEATURES="whisper,cuda"
+        FEATURES="whisper,parakeet,cuda"
     fi
 
     # shellcheck disable=SC2086
@@ -114,6 +116,24 @@ for target in "${TARGETS[@]}"; do
         strip "$dest" 2>/dev/null || true
     fi
     echo "Copied to $dest"
+
+    # Dev fallback: `find_sidecar_path()` in apps/desktop looks for
+    # `<exe_dir>/yapstack-sidecar-<triple>` first, then falls back to
+    # `<exe_dir>/yapstack-sidecar`. In `pnpm tauri dev` the running exe
+    # lives in target/debug/, where tauri-cli builds the un-suffixed
+    # `yapstack-sidecar` once at app build time and never updates it on
+    # later sidecar rebuilds. Mirror our fresh build there so an
+    # iterative `pnpm build:sidecar:dev` plus a sidecar respawn (kill
+    # the sidecar; the live controller auto-restarts) actually picks
+    # up the new code without rebuilding the desktop app.
+    if ! $RELEASE && [[ "$target" != *"windows"* ]]; then
+        dev_runtime_dest="$PROJECT_ROOT/target/debug/yapstack-sidecar"
+        if [ -d "$PROJECT_ROOT/target/debug" ]; then
+            cp "$dest" "$dev_runtime_dest"
+            chmod +x "$dev_runtime_dest"
+            echo "Mirrored to $dev_runtime_dest (dev runtime path)"
+        fi
+    fi
     echo ""
 done
 

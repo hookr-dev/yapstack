@@ -923,6 +923,69 @@ cpal audio streams can silently die (device disconnect, macOS sleep/wake, Blueto
 
 ---
 
+## Phase 24 — NVIDIA Parakeet engine + Sortformer diarization
+
+Added Parakeet-TDT-0.6b-v3 (multilingual, 25 languages) as a first-class peer to Whisper, optional Sortformer speaker diarization, and ORT-CoreML / ORT-WebGPU acceleration paths. Previously Whisper was the only transcription backend; sessions had no concept of speakers.
+
+### What was built
+
+| File | Purpose |
+|------|---------|
+| `crates/yapstack-common/src/engines.rs` | New static `engine_catalogue()` (engine kinds × supported languages × capability flags). Whisper = 99 languages + initial-prompt; Parakeet = 25 European languages + diarization. |
+| `crates/yapstack-common/src/types.rs` | New `EngineKind` enum (Whisper, Parakeet). `TranscriptSegment` gains `speaker_id: Option<u8>` (skipped on serialize when `None`). `SidecarRequest::Transcribe` gains `diarization: bool` (default false). All additive — old IPC payloads still deserialize. |
+| `crates/yapstack-sidecar/src/engines/{mod,whisper,parakeet,sortformer}.rs` | Extracted Whisper from monolithic `main.rs` into a `TranscriptionBackend` trait. Concrete backends in `whisper.rs` (whisper-rs + Metal) and `parakeet.rs` (parakeet-rs 0.3.5 + ORT + Sortformer post-pass). Shared text helpers (`normalize_spacing`, `sanitize_text`, `should_include_segment`) moved into `engines/mod.rs`. `main.rs` shrank from 832 → ~280 lines, now a thin IPC dispatcher with `--engine whisper\|parakeet` arg parsing. |
+| `crates/yapstack-sidecar/src/engines/parakeet.rs` | Wraps `ParakeetTDT` for transcription and `Sortformer` for diarization. Resamples to 16 kHz mono before model input (parakeet-rs requires it despite the docs implying auto-resampling). Groups word-level tokens into segments at 0.5 s silence gaps + 12 s soft cap. When `opts.diarization=true`, runs Sortformer on the same audio and assigns `speaker_id` by max-overlap. CoreML / WebGPU EPs selected via `YAPSTACK_PARAKEET_ACCEL` env var with CPU fallback on load failure. |
+| `crates/yapstack-transcription/src/{whisper.rs → client.rs}` | File renamed via `git mv`. `WhisperClient` → `TranscriptionClient` (alias kept for transitional compat). New `spawn(sidecar, engine, model, vad_model, sortformer_model, coreml_cache_dir)` signature; `engine()` accessor; `transcribe_with(audio, language, prompt, diarization)` for per-call diarization control. |
+| `crates/yapstack-transcription/src/model.rs` | Added `ParakeetVariant::TdtV3` (multi-file ONNX bundle: `encoder-model.onnx` + `encoder-model.onnx.data` + `decoder_joint-model.onnx` + `vocab.txt`, ~600 MB total) and `SortformerVariant::V2_1` (~50 MB single file). New `ModelManager` methods: `parakeet_model_dir`, `parakeet_is_available`, `download_parakeet`, `delete_parakeet`, `ensure_parakeet`, `sortformer_model_path`, `download_sortformer`, `ensure_sortformer`, `delete_sortformer`. Multi-file Parakeet downloads loop through the variant's `files()` list with per-file SHA-256 streaming. |
+| `apps/desktop/src-tauri/src/db.rs` | New `ensure_runtime_schema()` that opens the SQLite DB directly via `rusqlite` at app startup and adds `segments.speaker_id INTEGER` if missing. Idempotent — silent no-op when present. **Lives outside the migration list** because some local dev DBs have a "ghost" v11 from another branch in `_sqlx_migrations`, which makes sqlx silently refuse to apply our v12. The startup hook sidesteps the entire ordering problem. |
+| `apps/desktop/src-tauri/src/lib.rs` | New `init_tracing()` wires `tracing-subscriber` so all our `info!`/`warn!`/`error!` calls (and forwarded sidecar stderr) actually surface in `pnpm tauri dev`. Default filter: `info` for our crates + `warn` for noisy deps; `RUST_LOG` overrides. Calls `db::ensure_runtime_schema()` before tauri-plugin-sql initializes. |
+| `apps/desktop/src-tauri/src/commands/transcription.rs` | New DTOs: `EngineKindDto`, `ParakeetVariantDto`, `SortformerVariantDto`, `EngineDescriptorDto`, `ParakeetModelInfoDto`, `SortformerModelInfoDto`. `TranscriptSegmentDto` gains `speaker_id`. New commands: `init_transcription_client(engine, whisper_model?, parakeet_variant?, enable_diarization)` (engine-aware peer to `init_whisper_client`), `get_engine_catalogue`, `get_parakeet_models`, `download_parakeet_model`, `delete_parakeet_model`, `get_sortformer_status`, `download_sortformer_model`, `delete_sortformer_model`. Computes the CoreML cache dir under `$APP_DATA_DIR/cache/coreml/` and forwards on Parakeet init. |
+| `apps/desktop/src-tauri/src/commands/live_transcription.rs` | `LiveTranscriptionConfig` gains `diarization: bool`. Live loop now branches on `client.engine()`: Parakeet calls drop `initial_prompt` (TDT decoder has no text-prompt input); Whisper unchanged. Per-segment `speaker_id` propagates into `LiveSegmentEvent` so the frontend can group by speaker. |
+| `apps/desktop/src/stores/appStore.ts` | Persist version 21 → 22 migration adds `selectedEngine: "Whisper"` (upgrade-safe default), `selectedParakeetVariant: "TdtV3"`, `diarizationEnabled: false`, and a per-session `speakerNames: Record<string, Record<number, string>>` map. New actions: `loadEngineCatalogue`, `refreshParakeetModels`, `refreshSortformerStatus`, `switchEngine` (auto-downloads target model if missing), `downloadParakeetModel`, `deleteParakeetModel`, `setDiarizationEnabled` (lazily downloads Sortformer + re-inits client), `setSpeakerName`. `autoSetup` branches on `settings.selectedEngine`. |
+| `apps/desktop/src/components/settings/{TranscriptionTab,ParakeetModelSection}.tsx` | Engine radio (Whisper / Parakeet — peers, no Recommended badge), conditional model picker (existing `ModelSection` for Whisper, new `ParakeetModelSection` for Parakeet), language dropdown derived from the catalogue (clamps to "auto" when current selection isn't supported by the new engine), Switch-style **diarization toggle** greyed out unless engine supports it. |
+| `apps/desktop/src/components/TranscriptSegments.tsx` | New wrapper component for `ChatView`. Falls back to a flat segment list when no segment carries a `speaker_id` (Whisper sessions render unchanged). Otherwise groups consecutive same-speaker segments under a `Speaker N` header with a 4-color palette, inline-editable name (persisted to per-session `speakerNames` Zustand map). |
+| `apps/desktop/src/lib/{ai,ai-prompts,ai-context}.ts` | `assembleTranscriptContext(segments, speakerNames?)` adds `(SpeakerName)` prefix per segment when diarization data is present. New `transcriptHasSpeakers()` predicate. `getSystemPrompt(directive, ..., { hasSpeakers })` injects a `SPEAKER_INSTRUCTION` paragraph telling the model to attribute statements correctly. |
+| `apps/desktop/src/lib/db.ts` | `DbSegment.speaker_id?: number \| null` (optional + nullable to keep test fixtures compatible). `insertSegment` writes to the new column with `?? null` coalescing. |
+| `scripts/build-sidecar.sh` | Now builds with `whisper,parakeet` everywhere; adds `metal,coreml,webgpu` on Apple targets and `cuda` on Windows. Dev mode also mirrors the binary to `target/debug/yapstack-sidecar` so iterative `pnpm build:sidecar:dev` actually takes effect on the next sidecar respawn (without that, tauri-cli only copies the binary into `target/debug/` once at app build time). |
+
+### Dependencies added
+
+- `parakeet-rs = "0.3"` (sidecar, optional, with `sortformer` feature) — wraps NVIDIA Parakeet TDT v3 + Sortformer ONNX models via `ort`
+- `ort` (transitive via parakeet-rs) — ONNX Runtime bindings; linked statically; CoreML.framework dynamically linked on Apple targets
+- `rusqlite = "0.32"` with `bundled` (desktop) — used only by `ensure_runtime_schema()` to do an idempotent ALTER TABLE outside the tauri-plugin-sql migration system
+- `tracing-subscriber` (desktop, was already in workspace) — finally initialised in `lib.rs::run()`; previously every `tracing` call in the desktop crate vanished into the void
+
+### Key decisions
+
+- **Engines as peers, not primary/fallback.** Whisper stays the upgrade-safe default for existing users, but the Settings UI presents Whisper and Parakeet side-by-side with no "Recommended" badge — users pick consciously.
+- **Engine + language form a cascade.** The catalogue lives in `yapstack-common` so backend validation and the frontend dropdown are driven by the same source of truth. Switching engines clamps the language selection to one the new engine supports (or "auto").
+- **Trait-based backend abstraction in the sidecar.** `TranscriptionBackend` trait keeps `main.rs` engine-agnostic. Adding a third engine in the future means: feature flag + `engines/foo.rs` + one `EngineKind` variant. Per-engine config (Whisper VAD model, Parakeet Sortformer + CoreML cache) flows through the constructor, not the trait.
+- **Sortformer is a post-pass, not a separate IPC trip.** Diarization runs on the same audio buffer right after transcription and merges speaker IDs into the produced segments by max-overlap (samples → ms → segment range). Saves a second WAV write + IPC round-trip and keeps the chunked timing aligned.
+- **`speaker_id` lives outside the migration list.** sqlx-style migrations check that every applied migration is also in the registered list (checksum verified). Some local dev DBs picked up a "ghost" v11 from another feature branch; sqlx silently skips any newer migration when an unknown applied version is present, leaving `segments.speaker_id` missing and every insert failing. `ensure_runtime_schema()` does the ALTER directly via `rusqlite` at startup — idempotent, no migration list needed, self-heals on every developer's machine regardless of prior local state.
+- **CoreML preflight skip.** ORT-CoreML deterministically fails to load Parakeet TDT v3 because the model ships a 2.3 GB external `.onnx.data` initializer file and CoreML's compilation step loses the model_path context. We detect `*.onnx.data` files in the model dir and silently fall back to CPU under the Auto policy, avoiding a 600 ms doomed load attempt and a noisy `ERROR ort` line on every spawn. Power users can still force CoreML via `YAPSTACK_PARAKEET_ACCEL=coreml`.
+- **Per-load CPU fallback at the backend level.** parakeet-rs's built-in `error_on_failure()` only catches *runtime* op failures, not load-time ones. We wrap `ParakeetTDT::from_pretrained` with a try/CPU-retry so any chosen accelerator (CoreML or WebGPU) that fails at load surfaces a clear `WARN` and the sidecar still returns a working model.
+- **Resample on our side.** parakeet-rs 0.3.5 documents auto-resampling but actually rejects anything other than 16 kHz mono with `Audio sample rate X doesn't match expected 16000`. We resample via the existing `yapstack_common::audio::resample` helper before calling `transcribe_samples` (no-op when already 16 kHz).
+- **`tracing-subscriber` was the silent failure.** The desktop crate had `tracing` calls everywhere but never installed a global subscriber, so every `info!`/`warn!`/`error!` (including forwarded sidecar stderr) vanished. Adding `init_tracing()` to `run()` was a one-line fix that unlocked all the diagnostic firepower we already had.
+
+### Empirical RTFx (single Apple Silicon machine, Parakeet TDT v3, 2-13 s chunks)
+
+| EP | Mean RTFx | Range | Notes |
+|---|---|---|---|
+| CPU | ~5-7× | 4-8× | Baseline, deterministic |
+| WebGPU | ~6× | 4-10× | Similar mean to CPU, higher variance |
+| CoreML | n/a | n/a | Doesn't load (external `.onnx.data` issue) |
+
+For comparison, FluidAudio (Swift + CoreML + ANE) reportedly hits 155-237× realtime on the same model on the same hardware class. The path to a real (10×+) speedup is option #2 (data-inlining + CoreML CPUAndGPU) or option #5 (Swift sidecar with FluidAudio's ANE pipeline). Both deferred — current CPU performance is already sub-second per chunk for typical recording chunk sizes.
+
+### What's *not* in this phase
+
+- **Live diarization** — Sortformer runs once at transcribe time, not on a streaming buffer. Live transcription with diarization toggled on still works but processes each chunk independently, so the speaker ID for the same speaker may drift between chunks. Streaming Sortformer (`Sortformer::diarize_chunk`) exists in parakeet-rs and is a follow-up.
+- **Multi-engine UI for the language dropdown** — currently shows the union, would be cleaner to show only the active engine's languages with a tooltip explaining the constraint.
+- **CoreML on data-inlined models** — option #2 from the matrix; would require pre-processing the model on download to merge `.onnx.data` into the `.onnx` file.
+- **Swift FluidAudio sidecar** — option #5; would actually use the Apple Neural Engine for 30-100× speedups but breaks the cross-platform single-Rust-sidecar story.
+
+---
+
 ## What's Not Yet Built
 
 - **End-to-end integration tests** — capture audio, transcribe, verify text (unit + component tests now exist; integration tests still needed)

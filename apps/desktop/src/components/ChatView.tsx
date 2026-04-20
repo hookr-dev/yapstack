@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ArrowDown, ArrowUp } from "lucide-react";
 import { ScrollArea } from "@/components/ui/scroll-area";
-import { EditableSegment } from "@/components/EditableSegment";
+import { TranscriptSegments } from "@/components/TranscriptSegments";
 import type { DbSegment } from "@/lib/db";
 
 export function ChatView({
+  sessionId,
   segments,
   backfillActive,
   isEditable,
@@ -12,6 +13,9 @@ export function ChatView({
   onTimestampClick,
   initialScrollToBottom,
 }: {
+  /// Required for speaker-name rename persistence; falls back to "" when
+  /// rendering ad-hoc segment lists outside a session.
+  sessionId?: string;
   segments: DbSegment[];
   backfillActive?: boolean;
   isEditable?: boolean;
@@ -127,19 +131,14 @@ export function ChatView({
     <div className="relative min-h-0 flex-1 select-text">
       <ScrollArea ref={scrollAreaRef} className="h-full">
         <div className="space-y-2 px-3 py-2">
-          {segments.map((segment) => {
-            const isActive = segment.id === activeSegmentId;
-            return (
-              <EditableSegment
-                key={segment.id}
-                segment={segment}
-                isActive={isActive}
-                readOnly={!isEditable}
-                onTimestampClick={handleTimestampClick}
-                ref={isActive ? activeRef : undefined}
-              />
-            );
-          })}
+          <TranscriptSegments
+            sessionId={sessionId ?? ""}
+            segments={segments}
+            isEditable={!!isEditable}
+            activeSegmentId={activeSegmentId}
+            activeRef={activeRef}
+            onTimestampClick={handleTimestampClick}
+          />
           {backfillActive && (
             <div className="flex items-center gap-4 py-2 text-muted-foreground">
               <div className="h-px flex-1 border-t border-dashed" />
