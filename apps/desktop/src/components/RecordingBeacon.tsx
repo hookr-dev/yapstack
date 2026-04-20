@@ -5,18 +5,36 @@ import { formatElapsed } from "@/lib/utils";
 export function RecordingBeacon() {
   const activeSessionId = useAppStore((s) => s.activeSessionId);
   const activeSessionStartTime = useAppStore((s) => s.activeSessionStartTime);
+  const sessionStopping = useAppStore((s) => s.sessionStopping);
   const openSession = useAppStore((s) => s.openSession);
   const [elapsed, setElapsed] = useState(0);
 
   useEffect(() => {
-    if (!activeSessionStartTime) return;
+    if (!activeSessionStartTime || sessionStopping) return;
     const update = () => setElapsed(Date.now() - activeSessionStartTime);
     update();
     const id = setInterval(update, 1000);
     return () => clearInterval(id);
-  }, [activeSessionStartTime]);
+  }, [activeSessionStartTime, sessionStopping]);
 
   if (!activeSessionId) return null;
+
+  if (sessionStopping) {
+    return (
+      <button
+        className="flex w-full items-center gap-3 rounded-lg bg-amber-500/10 px-3 py-2.5 text-left transition-colors hover:bg-amber-500/15 animate-pulse"
+        onClick={() => openSession(activeSessionId)}
+      >
+        <span className="relative flex h-3 w-3 shrink-0">
+          <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-amber-500 opacity-75" />
+          <span className="relative inline-flex h-3 w-3 rounded-full bg-amber-500" />
+        </span>
+        <span className="truncate text-sm font-medium text-amber-600 dark:text-amber-400">
+          Finalizing…
+        </span>
+      </button>
+    );
+  }
 
   return (
     <button

@@ -19,12 +19,14 @@ const stateConfig: Record<
     ringColor: "ring-blue-500",
     textColor: "text-blue-400",
     glow: "shadow-[0_0_12px_rgba(59,130,246,0.5)]",
+    animate: "animate-pulse",
   },
   processing: {
     label: "Processing",
     ringColor: "ring-purple-500",
     textColor: "text-purple-400",
     glow: "shadow-[0_0_12px_rgba(168,85,247,0.5)]",
+    animate: "animate-pulse",
   },
   pasted: {
     label: "Pasted",

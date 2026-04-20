@@ -195,6 +195,10 @@ interface AppState {
   liveTranscriptionActive: boolean;
   livePhase: LiveTranscriptionPhase | null;
   backfillActive: boolean;
+  // True from when the user clicks Stop until the backend's Stopped/Error
+  // event fires. Lets the UI show a pulsing "Finalizing…" state immediately
+  // while the engine drains the current chunk + finalizes the WAV.
+  sessionStopping: boolean;
 
   // Note refresh (for cross-component refresh signaling)
   noteRefreshCounter: number;
@@ -428,6 +432,7 @@ function createAppStore() {
       liveTranscriptionActive: false,
       livePhase: null,
       backfillActive: false,
+      sessionStopping: false,
       noteRefreshCounter: 0,
       playbackTime: 0,
       isPlaying: false,
@@ -480,6 +485,7 @@ function createAppStore() {
                 liveTranscriptionActive: false,
                 livePhase: null,
                 backfillActive: false,
+                sessionStopping: false,
               });
 
               // Reload session data — re-read selectedSessionId inside .then()
@@ -750,13 +756,20 @@ function createAppStore() {
       },
 
       stopActiveSession: async () => {
-        const { activeSessionId } = get();
-        if (!activeSessionId) return;
+        const { activeSessionId, sessionStopping } = get();
+        if (!activeSessionId || sessionStopping) return;
+
+        // Flip the UI immediately — the Rust command returns right away but
+        // the loop still needs to drain the current chunk and finalize the
+        // WAV before emitting Stopped. Users shouldn't see the stop button
+        // appear to hang during that window.
+        set({ sessionStopping: true });
 
         try {
           await commands.stopLiveTranscription();
         } catch (e) {
           console.error("Failed to stop session:", e);
+          set({ sessionStopping: false });
         }
       },
 
