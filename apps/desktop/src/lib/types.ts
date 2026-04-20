@@ -168,17 +168,10 @@ async transcribeAudio(audioPath: string, language: string | null, initialPrompt:
     else return { status: "error", error: e  as any };
 }
 },
-async initWhisperClient(size: ModelSizeDto) : Promise<Result<null, CommandError>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("init_whisper_client", { size }) };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
 /**
- * Engine-aware client init. Whisper requires `whisper_model`; Parakeet
- * requires `parakeet_variant` and may optionally enable Sortformer diarization.
+ * Spawn the sidecar with the requested engine. Whisper requires
+ * `whisper_model`; Parakeet requires `parakeet_variant` and may optionally
+ * enable Sortformer diarization.
  */
 async initTranscriptionClient(engine: EngineKindDto, whisperModel: ModelSizeDto | null, parakeetVariant: ParakeetVariantDto | null, enableDiarization: boolean) : Promise<Result<null, CommandError>> {
     try {
@@ -188,25 +181,26 @@ async initTranscriptionClient(engine: EngineKindDto, whisperModel: ModelSizeDto 
     else return { status: "error", error: e  as any };
 }
 },
-async shutdownWhisperClient() : Promise<Result<null, CommandError>> {
+async shutdownTranscriptionClient() : Promise<Result<null, CommandError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("shutdown_whisper_client") };
+    return { status: "ok", data: await TAURI_INVOKE("shutdown_transcription_client") };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
 /**
- * Reports whether the Whisper sidecar has been initialized.
+ * Reports whether the transcription sidecar has been initialized.
  * 
- * The frontend uses this on mount to decide whether to call `init_whisper_client`
- * again. Without it, a Vite HMR remount re-runs autoSetup and respawns the sidecar
- * even when the backend is already warm, leaving `enginePhase: "initializing"`
- * long enough for dictation to fail the readiness check.
+ * The frontend uses this on mount to decide whether to call
+ * `init_transcription_client` again. Without it, a Vite HMR remount re-runs
+ * autoSetup and respawns the sidecar even when the backend is already warm,
+ * leaving `enginePhase: "initializing"` long enough for dictation to fail
+ * the readiness check.
  */
-async getWhisperStatus() : Promise<Result<WhisperStatusDto, CommandError>> {
+async getTranscriptionStatus() : Promise<Result<TranscriptionStatusDto, CommandError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("get_whisper_status") };
+    return { status: "ok", data: await TAURI_INVOKE("get_transcription_status") };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -456,7 +450,7 @@ export type TranscriptSegmentDto = { start_ms: number; end_ms: number; text: str
  */
 speaker_id: number | null }
 export type TranscriptionResultDto = { text: string; segments: TranscriptSegmentDto[]; duration_ms: number }
-export type WhisperStatusDto = { initialized: boolean }
+export type TranscriptionStatusDto = { initialized: boolean }
 
 /** tauri-specta globals **/
 

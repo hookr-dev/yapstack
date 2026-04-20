@@ -862,8 +862,9 @@ function createAppStore() {
         // HMR-preserved Zustand store already holds "ready" when the backend
         // is warm — skip the whole setup path. On fresh app start enginePhase
         // is "idle", so this falls through to full init. Backend commands are
-        // idempotent (startCapture treats AlreadyRunning as Ok, init_whisper_client
-        // short-circuits on is_some()), so any duplicate calls are harmless.
+        // idempotent (startCapture treats AlreadyRunning as Ok,
+        // init_transcription_client short-circuits on is_some()), so any
+        // duplicate calls are harmless.
         if (get().enginePhase === "ready") return;
 
         const { settings } = get();
@@ -981,8 +982,11 @@ function createAppStore() {
           }
 
           set({ enginePhase: "initializing" });
-          const initResult = await commands.initWhisperClient(
+          const initResult = await commands.initTranscriptionClient(
+            "Whisper",
             settings.selectedModelSize,
+            null,
+            false,
           );
           if (initResult.status === "error") {
             trackEngineError({ error: initResult.error.message, phase: "initializing" });
@@ -1037,10 +1041,15 @@ function createAppStore() {
 
           // Shutdown current engine
           set({ enginePhase: "initializing" });
-          await commands.shutdownWhisperClient();
+          await commands.shutdownTranscriptionClient();
 
           // Init with new model
-          const initResult = await commands.initWhisperClient(size);
+          const initResult = await commands.initTranscriptionClient(
+            "Whisper",
+            size,
+            null,
+            false,
+          );
           if (initResult.status === "error") {
             throw new Error(initResult.error.message);
           }
@@ -1141,7 +1150,7 @@ function createAppStore() {
           }
 
           set({ enginePhase: "initializing" });
-          await commands.shutdownWhisperClient();
+          await commands.shutdownTranscriptionClient();
 
           const initResult = await commands.initTranscriptionClient(
             engine,
@@ -1227,7 +1236,7 @@ function createAppStore() {
 
         if (settings.selectedEngine === "Parakeet") {
           set({ enginePhase: "initializing" });
-          await commands.shutdownWhisperClient();
+          await commands.shutdownTranscriptionClient();
           const r = await commands.initTranscriptionClient(
             "Parakeet",
             null,

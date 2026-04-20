@@ -25,7 +25,7 @@ use yapstack_transcription::ModelManager;
 
 // Lock ordering (acquire in this order to prevent deadlocks):
 //   1. AudioManagerState
-//   2. WhisperClientState
+//   2. TranscriptionClientState
 //   3. LiveTranscriptionState
 //   4. ModelManagerState
 //   5. TrayState
@@ -252,10 +252,9 @@ pub fn run() {
             commands::transcription::download_model,
             commands::transcription::delete_model,
             commands::transcription::transcribe_audio,
-            commands::transcription::init_whisper_client,
             commands::transcription::init_transcription_client,
-            commands::transcription::shutdown_whisper_client,
-            commands::transcription::get_whisper_status,
+            commands::transcription::shutdown_transcription_client,
+            commands::transcription::get_transcription_status,
             commands::transcription::get_engine_catalogue,
             commands::transcription::get_parakeet_models,
             commands::transcription::download_parakeet_model,
@@ -487,8 +486,10 @@ pub fn run() {
                 Arc::new(Mutex::new(model_manager)) as commands::transcription::ModelManagerState
             );
 
-            // Initialize whisper client state (starts as None)
-            app.manage(Arc::new(Mutex::new(None)) as commands::transcription::WhisperClientState);
+            // Initialize transcription client state (starts as None)
+            app.manage(
+                Arc::new(Mutex::new(None)) as commands::transcription::TranscriptionClientState
+            );
 
             let menu = build_tray_menu(app.handle(), false, false)?;
 
