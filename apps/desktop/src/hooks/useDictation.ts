@@ -220,6 +220,8 @@ export function useDictation() {
         audio_save_location: null,
         audio_export_format: s.settings.audioExportFormat,
         mp3_bitrate: s.settings.audioExportFormat === "mp3" ? s.settings.mp3Bitrate : null,
+        diarization:
+          s.settings.selectedEngine === "Parakeet" && s.settings.diarizationEnabled,
       });
 
       if (result.status === "error") {

@@ -716,6 +716,8 @@ function createAppStore() {
           audio_save_location: settings.audioSaveLocation,
           audio_export_format: settings.audioExportFormat,
           mp3_bitrate: settings.audioExportFormat === "mp3" ? settings.mp3Bitrate : null,
+          diarization:
+            settings.selectedEngine === "Parakeet" && settings.diarizationEnabled,
         };
 
         const result = await commands.startLiveTranscription(config);

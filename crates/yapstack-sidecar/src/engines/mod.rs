@@ -110,8 +110,11 @@ pub(crate) fn normalize_spacing(text: &str) -> String {
     result
 }
 
-/// Replace common Unicode punctuation with ASCII equivalents, strip remaining
-/// non-ASCII characters, and collapse runs of multiple spaces.
+/// Replace common Unicode punctuation (smart quotes, em/en dashes, ellipsis)
+/// with ASCII equivalents, strip control characters, and collapse runs of
+/// multiple spaces. Other printable Unicode (accents, non-Latin scripts) is
+/// preserved verbatim — Parakeet TDT v3 supports 25 European languages and
+/// Whisper supports 99, including non-ASCII scripts.
 #[cfg(any(feature = "whisper", feature = "parakeet", test))]
 pub(crate) fn sanitize_text(text: &str) -> String {
     let mut result = String::with_capacity(text.len());
@@ -144,11 +147,14 @@ pub(crate) fn sanitize_text(text: &str) -> String {
                 }
                 prev_space = true;
             }
-            c if c.is_ascii() => {
+            // Strip control + invisible-formatting noise (ZWSP, BOM) but keep
+            // printable Unicode (accented Latin, Greek, Cyrillic, etc.).
+            '\u{200B}' | '\u{200C}' | '\u{200D}' | '\u{FEFF}' => {}
+            c if c.is_control() => {}
+            c => {
                 result.push(c);
                 prev_space = false;
             }
-            _ => {} // strip non-ASCII artifacts
         }
     }
     result
@@ -441,9 +447,27 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_text_strips_non_ascii_artifacts() {
-        assert_eq!(sanitize_text("Hello \u{266A} world"), "Hello world");
+    fn sanitize_text_strips_invisible_formatting() {
+        // Zero-width space, ZWNJ, ZWJ, BOM are common Whisper noise.
         assert_eq!(sanitize_text("text\u{200B}here"), "texthere");
+        assert_eq!(sanitize_text("a\u{FEFF}b"), "ab");
+        // Control chars (NUL, BEL) are dropped.
+        assert_eq!(sanitize_text("a\u{0007}b"), "ab");
+    }
+
+    #[test]
+    fn sanitize_text_preserves_printable_unicode() {
+        // Accented Latin (French/Spanish/etc.).
+        assert_eq!(sanitize_text("Café naïve jalapeño"), "Café naïve jalapeño");
+        // Greek.
+        assert_eq!(sanitize_text("Γειά σου"), "Γειά σου");
+        // Cyrillic (Ukrainian).
+        assert_eq!(sanitize_text("Привіт"), "Привіт");
+        // Symbol punctuation (musical note) survives — not a control char.
+        assert_eq!(
+            sanitize_text("Hello \u{266A} world"),
+            "Hello \u{266A} world"
+        );
     }
 
     #[test]

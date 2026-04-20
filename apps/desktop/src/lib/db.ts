@@ -92,6 +92,12 @@ let dbInstance: Database | null = null;
 async function getDb(): Promise<Database> {
   if (!dbInstance) {
     dbInstance = await Database.load("sqlite:yapstack.db");
+    // Idempotent runtime patch: tauri-plugin-sql migrations stop at v10, but
+    // segment inserts reference speaker_id. Duplicate-column error is the
+    // expected no-op on subsequent runs.
+    await dbInstance
+      .execute("ALTER TABLE segments ADD COLUMN speaker_id INTEGER")
+      .catch(() => {});
   }
   return dbInstance;
 }

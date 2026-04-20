@@ -2,11 +2,9 @@ use std::path::Path;
 
 use tauri_plugin_sql::{Migration, MigrationKind};
 
-/// Idempotent schema patches applied before tauri-plugin-sql wires up.
-///
-/// `segments.speaker_id` lives here (not in the migration list) because some
-/// local dev DBs have a "ghost" v11 from another branch in `_sqlx_migrations`
-/// that blocks any v11+ migration from applying.
+/// Pre-migration runtime patches. Currently only sweeps stale `recording`
+/// sessions left by a prior crash; runtime *schema* patches (segments.speaker_id)
+/// live in the frontend's `getDb()` so they run after migrations on fresh installs.
 pub fn ensure_runtime_schema(db_path: &Path) {
     use rusqlite::Connection;
 
@@ -27,17 +25,6 @@ pub fn ensure_runtime_schema(db_path: &Path) {
 
     if !table_exists(&conn, "segments") {
         return;
-    }
-
-    if !column_exists(&conn, "segments", "speaker_id") {
-        match conn.execute("ALTER TABLE segments ADD COLUMN speaker_id INTEGER", []) {
-            Ok(_) => tracing::info!(
-                "ensure_runtime_schema: added segments.speaker_id (Parakeet/Sortformer)"
-            ),
-            Err(e) => tracing::warn!(
-                "ensure_runtime_schema: ALTER TABLE segments ADD COLUMN speaker_id failed: {e}"
-            ),
-        }
     }
 
     close_orphaned_recordings(&conn);
@@ -94,16 +81,6 @@ fn table_exists(conn: &rusqlite::Connection, name: &str) -> bool {
         |_| Ok(()),
     )
     .is_ok()
-}
-
-fn column_exists(conn: &rusqlite::Connection, table: &str, column: &str) -> bool {
-    let Ok(mut stmt) = conn.prepare(&format!("PRAGMA table_info({table})")) else {
-        return false;
-    };
-    let Ok(mut rows) = stmt.query_map([], |row| row.get::<_, String>(1)) else {
-        return false;
-    };
-    rows.any(|r| r.is_ok_and(|c| c == column))
 }
 
 pub fn migrations() -> Vec<Migration> {
