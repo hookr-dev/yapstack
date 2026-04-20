@@ -39,6 +39,52 @@ pub fn ensure_runtime_schema(db_path: &Path) {
             ),
         }
     }
+
+    close_orphaned_recordings(&conn);
+}
+
+/// At startup the app cannot have a real in-flight recording session, so any
+/// row left at status='recording' is from a prior crash or force-quit. Empty
+/// ones (no segments, no WAV file) are deleted; the rest are marked completed
+/// with duration recomputed from their segments.
+fn close_orphaned_recordings(conn: &rusqlite::Connection) {
+    let deleted = conn
+        .execute(
+            "DELETE FROM sessions \
+             WHERE status = 'recording' \
+               AND wav_file_path IS NULL \
+               AND NOT EXISTS (SELECT 1 FROM segments WHERE session_id = sessions.id)",
+            [],
+        )
+        .unwrap_or_else(|e| {
+            tracing::warn!("close_orphaned_recordings: delete failed: {e}");
+            0
+        });
+
+    let completed = conn
+        .execute(
+            "UPDATE sessions SET \
+                status = 'completed', \
+                total_segments = (SELECT COUNT(*) FROM segments WHERE session_id = sessions.id), \
+                duration_seconds = COALESCE( \
+                    (SELECT MAX(audio_offset_seconds + chunk_duration_seconds) \
+                     FROM segments WHERE session_id = sessions.id), \
+                    duration_seconds \
+                ), \
+                updated_at = datetime('now') \
+             WHERE status = 'recording'",
+            [],
+        )
+        .unwrap_or_else(|e| {
+            tracing::warn!("close_orphaned_recordings: update failed: {e}");
+            0
+        });
+
+    if deleted > 0 || completed > 0 {
+        tracing::info!(
+            "close_orphaned_recordings: deleted {deleted} empty, completed {completed} stale"
+        );
+    }
 }
 
 fn table_exists(conn: &rusqlite::Connection, name: &str) -> bool {
