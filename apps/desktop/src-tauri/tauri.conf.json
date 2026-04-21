@@ -36,7 +36,7 @@
         "title": "YapStack - Dictation",
         "url": "index.html?window=dictation",
         "width": 220,
-        "height": 64,
+        "height": 96,
         "visible": false,
         "resizable": false,
         "decorations": false,

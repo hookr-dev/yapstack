@@ -25,7 +25,7 @@ export function RecordingIndicator() {
       data-tauri-drag-region
     >
       <div
-        className="flex flex-col items-center gap-1 rounded-full bg-background pt-2 pb-1 px-2 shadow-2xl border border-white/[0.08]"
+        className="flex flex-col items-center gap-1 rounded-full bg-background pt-2 pb-1 px-2 shadow-lg border border-white/[0.08]"
         data-tauri-drag-region
       >
         <button
