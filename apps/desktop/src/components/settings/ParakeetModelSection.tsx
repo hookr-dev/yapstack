@@ -122,7 +122,10 @@ export function ParakeetModelSection() {
             </div>
 
             <div className="flex items-center gap-1">
-              {isDownloading && downloadingVariant === model.variant ? (
+              {isDownloading &&
+              (downloadingVariant === model.variant ||
+                (downloadingVariant === null &&
+                  model.variant === selectedVariant)) ? (
                 <div className="w-24">
                   <Progress
                     value={modelDownloadProgress ?? 0}
