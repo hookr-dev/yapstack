@@ -2,7 +2,7 @@ import { useEffect, useRef } from "react";
 import { useAppStore } from "@/stores/appStore";
 import { trackAppLaunched } from "@/lib/analytics";
 
-/** Runs one-time engine initialization (capture start, model load, whisper init). Mounted in AppLayout. */
+/** Runs one-time engine initialization (capture start, model load, transcription init). Mounted in AppLayout. */
 export function useAutoSetup() {
   const autoSetup = useAppStore((s) => s.autoSetup);
   const ran = useRef(false);

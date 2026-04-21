@@ -8,6 +8,28 @@ pub struct TranscriptSegment {
     pub end_ms: u64,
     pub text: String,
     pub confidence: f32,
+    /// Speaker ID assigned by diarization (0..N). `None` when diarization
+    /// was not requested or is unsupported by the active engine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speaker_id: Option<u8>,
+}
+
+/// Which transcription engine should handle a request, and which the
+/// frontend has selected. Engines are first-class peers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EngineKind {
+    Whisper,
+    Parakeet,
+}
+
+impl EngineKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            EngineKind::Whisper => "whisper",
+            EngineKind::Parakeet => "parakeet",
+        }
+    }
 }
 
 // --- Sidecar IPC Protocol ---
@@ -26,6 +48,11 @@ pub enum SidecarRequest {
         /// audio duration (true for <10s, false for longer chunks).
         #[serde(default)]
         single_segment: Option<bool>,
+        /// Run speaker diarization in addition to transcription. Only honored
+        /// when the active engine supports it (Parakeet). Whisper sidecar
+        /// ignores this flag.
+        #[serde(default)]
+        diarization: bool,
     },
     #[serde(rename = "load_model")]
     LoadModel { id: u64, model_path: PathBuf },
@@ -182,6 +209,7 @@ mod tests {
             language: Some("en".to_string()),
             initial_prompt: None,
             single_segment: None,
+            diarization: false,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("\"type\":\"transcribe\""));
@@ -203,6 +231,7 @@ mod tests {
             language: Some("en".to_string()),
             initial_prompt: Some("Hello world".to_string()),
             single_segment: None,
+            diarization: false,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("\"initial_prompt\":\"Hello world\""));
@@ -220,16 +249,39 @@ mod tests {
 
     #[test]
     fn test_sidecar_request_transcribe_backward_compat() {
-        // Deserialize without initial_prompt field — should default to None
+        // Deserialize without initial_prompt or diarization fields — both default.
         let json = r#"{"type":"transcribe","id":3,"audio_path":"/tmp/test.wav","language":"en"}"#;
         let deserialized: SidecarRequest = serde_json::from_str(json).unwrap();
         match deserialized {
             SidecarRequest::Transcribe {
-                id, initial_prompt, ..
+                id,
+                initial_prompt,
+                diarization,
+                ..
             } => {
                 assert_eq!(id, 3);
                 assert_eq!(initial_prompt, None);
+                assert!(!diarization);
             }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_sidecar_request_transcribe_with_diarization() {
+        let req = SidecarRequest::Transcribe {
+            id: 4,
+            audio_path: PathBuf::from("/tmp/test.wav"),
+            language: None,
+            initial_prompt: None,
+            single_segment: None,
+            diarization: true,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("\"diarization\":true"));
+        let deserialized: SidecarRequest = serde_json::from_str(&json).unwrap();
+        match deserialized {
+            SidecarRequest::Transcribe { diarization, .. } => assert!(diarization),
             _ => panic!("wrong variant"),
         }
     }
@@ -244,6 +296,7 @@ mod tests {
                 end_ms: 1000,
                 text: "hello world".to_string(),
                 confidence: 0.95,
+                speaker_id: None,
             }],
             duration_ms: 1000,
         };
@@ -260,6 +313,56 @@ mod tests {
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[test]
+    fn test_transcript_segment_speaker_id_roundtrip() {
+        let seg = TranscriptSegment {
+            start_ms: 0,
+            end_ms: 1000,
+            text: "hi".to_string(),
+            confidence: 0.9,
+            speaker_id: Some(2),
+        };
+        let json = serde_json::to_string(&seg).unwrap();
+        assert!(json.contains("\"speaker_id\":2"));
+        let back: TranscriptSegment = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.speaker_id, Some(2));
+    }
+
+    #[test]
+    fn test_transcript_segment_speaker_id_omitted_when_none() {
+        let seg = TranscriptSegment {
+            start_ms: 0,
+            end_ms: 1000,
+            text: "hi".to_string(),
+            confidence: 0.9,
+            speaker_id: None,
+        };
+        let json = serde_json::to_string(&seg).unwrap();
+        assert!(!json.contains("speaker_id"));
+    }
+
+    #[test]
+    fn test_transcript_segment_backward_compat_no_speaker_id() {
+        // Pre-Parakeet sidecars never emit speaker_id; deserialization must accept absence.
+        let json = r#"{"start_ms":0,"end_ms":1000,"text":"hi","confidence":0.9}"#;
+        let seg: TranscriptSegment = serde_json::from_str(json).unwrap();
+        assert_eq!(seg.speaker_id, None);
+    }
+
+    #[test]
+    fn test_engine_kind_serde() {
+        assert_eq!(
+            serde_json::to_string(&EngineKind::Whisper).unwrap(),
+            "\"whisper\""
+        );
+        assert_eq!(
+            serde_json::to_string(&EngineKind::Parakeet).unwrap(),
+            "\"parakeet\""
+        );
+        let back: EngineKind = serde_json::from_str("\"parakeet\"").unwrap();
+        assert_eq!(back, EngineKind::Parakeet);
     }
 
     #[test]

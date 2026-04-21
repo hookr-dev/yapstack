@@ -12,8 +12,14 @@ import {
   CommandFooter,
   CommandLoading,
 } from "@/components/ui/command";
-import { searchSegments, searchNotes, searchSessionsByTitle, searchFolders } from "@/lib/db";
-import type { SearchResult } from "@/lib/db";
+import {
+  searchSegments,
+  searchNotes,
+  searchSessionsByTitle,
+  searchFolders,
+  searchDictations,
+} from "@/lib/db";
+import type { SearchResult, DictationSearchResult } from "@/lib/db";
 import { trackSearchUsed } from "@/lib/analytics";
 import { formatShortcutDisplay } from "@/lib/utils";
 import { getBinding } from "@/lib/shortcuts";
@@ -34,18 +40,20 @@ import {
 } from "lucide-react";
 import { ICON_MAP } from "@/lib/folder-constants";
 
-function TypeBadge({ type }: { type: "session" | "note" | "segment" | "folder" }) {
+function TypeBadge({ type }: { type: "session" | "note" | "segment" | "folder" | "dictation" }) {
   const styles: Record<string, string> = {
     session: "bg-blue-500/15 text-blue-600 dark:text-blue-400",
     note: "bg-green-500/15 text-green-600 dark:text-green-400",
     segment: "bg-amber-500/15 text-amber-600 dark:text-amber-400",
     folder: "bg-purple-500/15 text-purple-600 dark:text-purple-400",
+    dictation: "bg-pink-500/15 text-pink-600 dark:text-pink-400",
   };
   const labels: Record<string, string> = {
     session: "Session",
     note: "Note",
     segment: "Transcript",
     folder: "Folder",
+    dictation: "Dictation",
   };
   return (
     <span className={`ml-auto shrink-0 rounded-full px-2 py-0.5 text-[10px] font-medium ${styles[type]}`}>
@@ -105,6 +113,7 @@ export function SearchCommand({
   const [query, setQuery] = useState("");
   const [results, setResults] = useState<SearchResult[]>([]);
   const [folderResults, setFolderResults] = useState<{ id: string; name: string }[]>([]);
+  const [dictationResults, setDictationResults] = useState<DictationSearchResult[]>([]);
   const [searching, setSearching] = useState(false);
   const [newFolderRequested, setNewFolderRequested] = useState(false);
 
@@ -122,20 +131,23 @@ export function SearchCommand({
     if (!query.trim()) {
       setResults([]);
       setFolderResults([]);
+      setDictationResults([]);
       return;
     }
 
     setSearching(true);
     const timeout = setTimeout(async () => {
       try {
-        const [segResults, noteResults, titleResults, fResults] = await Promise.all([
+        const [segResults, noteResults, titleResults, fResults, dResults] = await Promise.all([
           searchSegments(query.trim()),
           searchNotes(query.trim()),
           searchSessionsByTitle(query.trim()),
           searchFolders(query.trim()),
+          searchDictations(query.trim()),
         ]);
         setResults([...titleResults, ...noteResults, ...segResults]);
         setFolderResults(fResults);
+        setDictationResults(dResults);
         trackSearchUsed();
       } catch (e) {
         console.error("Search failed:", e);
@@ -165,12 +177,32 @@ export function SearchCommand({
     [onOpenChange],
   );
 
+  const handleSelectDictation = useCallback(
+    (dictationId: string) => {
+      setListFilter({ type: "dictation" });
+      navigateTo("note-list");
+      onOpenChange(false);
+      setQuery("");
+      // List may still be mounting or loading entries — fire the event after
+      // the filter switch has a chance to render.
+      requestAnimationFrame(() => {
+        window.dispatchEvent(
+          new CustomEvent("yapstack:scroll-to-dictation", {
+            detail: { dictationId },
+          }),
+        );
+      });
+    },
+    [setListFilter, navigateTo, onOpenChange],
+  );
+
   // Reset on close
   useEffect(() => {
     if (!open) {
       setQuery("");
       setResults([]);
       setFolderResults([]);
+      setDictationResults([]);
       setNewFolderRequested(false);
     }
   }, [open]);
@@ -206,7 +238,7 @@ export function SearchCommand({
       </div>
       <CommandList>
         {/* Empty state when query typed but no results */}
-        {hasQuery && !searching && results.length === 0 && folderResults.length === 0 && (
+        {hasQuery && !searching && results.length === 0 && folderResults.length === 0 && dictationResults.length === 0 && (
           <CommandEmpty>
             <div className="flex flex-col items-center gap-2">
               <Search className="h-10 w-10 text-muted-foreground/30" />
@@ -303,6 +335,28 @@ export function SearchCommand({
                       </span>
                     </div>
                     <TypeBadge type="segment" />
+                  </CommandItem>
+                ))}
+              </CommandGroup>
+            )}
+            {dictationResults.length > 0 && (
+              <CommandGroup heading="Dictations">
+                {dictationResults.map((result) => (
+                  <CommandItem
+                    key={`dict-${result.dictationId}`}
+                    value={`dict-${result.dictationId}`}
+                    onSelect={() => handleSelectDictation(result.dictationId)}
+                  >
+                    <Mic className="shrink-0 text-muted-foreground" />
+                    <div className="flex flex-col gap-0.5 min-w-0">
+                      <span className="text-sm font-medium truncate">
+                        {result.slotName}
+                      </span>
+                      <span className="text-xs text-muted-foreground truncate">
+                        {highlightSnippet(result.snippet, query)}
+                      </span>
+                    </div>
+                    <TypeBadge type="dictation" />
                   </CommandItem>
                 ))}
               </CommandGroup>

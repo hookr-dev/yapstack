@@ -19,7 +19,7 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import { ArrowLeft, FolderOpen, MoreHorizontal, Square, Trash2 } from "lucide-react";
+import { ArrowLeft, FolderOpen, Loader2, MoreHorizontal, Square, Trash2 } from "lucide-react";
 import type { DbSession } from "@/lib/db";
 import { updateSessionTitle, getSession } from "@/lib/db";
 import { formatDuration, formatElapsed } from "@/lib/utils";
@@ -28,15 +28,28 @@ import { revealItemInDir } from "@tauri-apps/plugin-opener";
 function RecordingBadge() {
   const activeSessionStartTime = useAppStore((s) => s.activeSessionStartTime);
   const stopActiveSession = useAppStore((s) => s.stopActiveSession);
+  const sessionStopping = useAppStore((s) => s.sessionStopping);
   const [elapsed, setElapsed] = useState(0);
 
   useEffect(() => {
-    if (!activeSessionStartTime) return;
+    if (!activeSessionStartTime || sessionStopping) return;
     const update = () => setElapsed(Date.now() - activeSessionStartTime);
     update();
     const id = setInterval(update, 1000);
     return () => clearInterval(id);
-  }, [activeSessionStartTime]);
+  }, [activeSessionStartTime, sessionStopping]);
+
+  if (sessionStopping) {
+    return (
+      <div
+        className="flex items-center gap-2 rounded-full bg-amber-500/10 border border-amber-500/20 text-amber-600 dark:text-amber-400 px-3 py-1 text-xs font-medium animate-pulse"
+        aria-live="polite"
+      >
+        <Loader2 className="h-3 w-3 animate-spin" />
+        <span>Finalizing…</span>
+      </div>
+    );
+  }
 
   return (
     <button

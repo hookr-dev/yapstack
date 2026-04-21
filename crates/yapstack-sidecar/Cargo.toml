@@ -4,9 +4,22 @@ version = "0.1.0"
 edition = "2021"
 
 [features]
+default = ["whisper", "parakeet"]
 whisper = ["dep:whisper-rs"]
 metal = ["whisper-rs/metal"]
 cuda = ["whisper-rs/cuda"]
+# Sortformer (speaker diarization) ships under the same parakeet feature
+# so it travels with the engine that needs it.
+parakeet = ["dep:parakeet-rs"]
+# Apple-only CoreML execution provider for Parakeet. Strict superset of
+# `parakeet`. Adds ~Metal/ANE acceleration via ort-coreml; CPU is kept as
+# automatic fallback by parakeet-rs (`error_on_failure()`).
+coreml = ["parakeet", "parakeet-rs/coreml"]
+# WebGPU execution provider for Parakeet (Metal under the hood on macOS,
+# Vulkan/Dawn elsewhere). Different ORT codepath than CoreML — doesn't
+# go through the cache-write step that fails on models with external
+# `.onnx.data` initializers.
+webgpu = ["parakeet", "parakeet-rs/webgpu"]
 
 [dependencies]
 yapstack-common = { path = "../yapstack-common" }
@@ -17,3 +30,4 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 hound = { workspace = true }
 whisper-rs = { version = "0.15", optional = true }
+parakeet-rs = { version = "0.3", optional = true, features = ["sortformer"] }

@@ -13,7 +13,7 @@ import { trackDictationStarted, trackDictationCompleted, trackDictationFailed } 
 type DictationState = "idle" | "recording" | "transcribing" | "processing" | "done";
 
 const BUBBLE_WIDTH = 220;
-const BUBBLE_HEIGHT = 64;
+const BUBBLE_HEIGHT = 96;
 const BOTTOM_MARGIN = 30;
 
 const ENERGY_SILENCE_THRESHOLD = 0.005;
@@ -130,7 +130,7 @@ export function useDictation() {
       }
 
       if (s.enginePhase !== "ready") {
-        toast.error("Whisper engine is not ready.");
+        toast.error("Transcription engine is not ready.");
         return;
       }
 
@@ -220,6 +220,8 @@ export function useDictation() {
         audio_save_location: null,
         audio_export_format: s.settings.audioExportFormat,
         mp3_bitrate: s.settings.audioExportFormat === "mp3" ? s.settings.mp3Bitrate : null,
+        diarization:
+          s.settings.selectedEngine === "Parakeet" && s.settings.diarizationEnabled,
       });
 
       if (result.status === "error") {

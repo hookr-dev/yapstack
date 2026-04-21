@@ -137,7 +137,7 @@ export function ChatInputBar({
   return (
     <>
       {/* Input bar */}
-      <div className="flex items-end gap-1 px-3 py-2.5">
+      <div className="flex items-end gap-1 px-2 py-2.5">
         {actions.length > 0 && (
           <Popover open={actionsOpen} onOpenChange={setActionsOpen}>
             <PopoverTrigger asChild>
@@ -219,7 +219,7 @@ export function ChatInputBar({
       </div>
 
       {/* Context pills */}
-      <div className="flex items-center gap-1.5 px-3 pb-2.5">
+      <div className="flex items-center gap-1.5 px-2 pb-2.5">
         <ModelPickerPill />
         <span className="text-muted-foreground/30 text-[9px] select-none">|</span>
         {sources.map((source) => (

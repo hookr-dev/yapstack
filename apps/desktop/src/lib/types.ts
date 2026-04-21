@@ -168,33 +168,99 @@ async transcribeAudio(audioPath: string, language: string | null, initialPrompt:
     else return { status: "error", error: e  as any };
 }
 },
-async initWhisperClient(size: ModelSizeDto) : Promise<Result<null, CommandError>> {
+/**
+ * Spawn the sidecar with the requested engine. Whisper requires
+ * `whisper_model`; Parakeet requires `parakeet_variant` and may optionally
+ * enable Sortformer diarization.
+ */
+async initTranscriptionClient(engine: EngineKindDto, whisperModel: ModelSizeDto | null, parakeetVariant: ParakeetVariantDto | null, enableDiarization: boolean) : Promise<Result<null, CommandError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("init_whisper_client", { size }) };
+    return { status: "ok", data: await TAURI_INVOKE("init_transcription_client", { engine, whisperModel, parakeetVariant, enableDiarization }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
-async shutdownWhisperClient() : Promise<Result<null, CommandError>> {
+async shutdownTranscriptionClient() : Promise<Result<null, CommandError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("shutdown_whisper_client") };
+    return { status: "ok", data: await TAURI_INVOKE("shutdown_transcription_client") };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
 /**
- * Reports whether the Whisper sidecar has been initialized.
+ * Reports whether the transcription sidecar has been initialized.
  * 
- * The frontend uses this on mount to decide whether to call `init_whisper_client`
- * again. Without it, a Vite HMR remount re-runs autoSetup and respawns the sidecar
- * even when the backend is already warm, leaving `enginePhase: "initializing"`
- * long enough for dictation to fail the readiness check.
+ * The frontend uses this on mount to decide whether to call
+ * `init_transcription_client` again. Without it, a Vite HMR remount re-runs
+ * autoSetup and respawns the sidecar even when the backend is already warm,
+ * leaving `enginePhase: "initializing"` long enough for dictation to fail
+ * the readiness check.
  */
-async getWhisperStatus() : Promise<Result<WhisperStatusDto, CommandError>> {
+async getTranscriptionStatus() : Promise<Result<TranscriptionStatusDto, CommandError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("get_whisper_status") };
+    return { status: "ok", data: await TAURI_INVOKE("get_transcription_status") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Returns the static engine catalogue (Whisper + Parakeet capability + language lists).
+ * The frontend uses this to drive the cascading engine → model → language UI.
+ */
+async getEngineCatalogue() : Promise<Result<EngineDescriptorDto[], CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("get_engine_catalogue") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async getParakeetModels() : Promise<Result<ParakeetModelInfoDto[], CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("get_parakeet_models") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async downloadParakeetModel(variant: ParakeetVariantDto) : Promise<Result<string, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("download_parakeet_model", { variant }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async deleteParakeetModel(variant: ParakeetVariantDto) : Promise<Result<null, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("delete_parakeet_model", { variant }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async getSortformerStatus() : Promise<Result<SortformerModelInfoDto, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("get_sortformer_status") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async downloadSortformerModel(variant: SortformerVariantDto) : Promise<Result<string, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("download_sortformer_model", { variant }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async deleteSortformerModel(variant: SortformerVariantDto) : Promise<Result<null, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("delete_sortformer_model", { variant }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -293,6 +359,14 @@ export type CaptureStatusDto = { state: CaptureStateDto; mic_active: boolean; sy
  */
 export type CommandError = { kind: "Audio"; message: string } | { kind: "Transcription"; message: string } | { kind: "NotInitialized"; message: string } | { kind: "InvalidInput"; message: string } | { kind: "NotFound"; message: string } | { kind: "Internal"; message: string }
 export type DeviceTypeDto = "Input" | "Output"
+/**
+ * Engine capabilities + supported languages for the cascading UI in Settings.
+ */
+export type EngineDescriptorDto = { kind: EngineKindDto; display_name: string; languages: string[]; supports_diarization: boolean; supports_initial_prompt: boolean }
+/**
+ * Which transcription engine the frontend has selected.
+ */
+export type EngineKindDto = "Whisper" | "Parakeet"
 export type HealthStatus = { status: string; version: string }
 export type LiveTranscriptionConfig = { 
 /**
@@ -348,20 +422,35 @@ audio_export_format: string | null;
 /**
  * MP3 bitrate in kbps (e.g. 64, 128, 192). Only used when format is "mp3".
  */
-mp3_bitrate: number | null }
+mp3_bitrate: number | null; 
+/**
+ * Request speaker diarization on every transcribed chunk. Honored only
+ * when the active engine is Parakeet *and* the sidecar was spawned with
+ * a Sortformer model path. Whisper sessions ignore this flag.
+ */
+diarization?: boolean }
 export type LiveTranscriptionPhase = "Running" | "Stopped" | "Error"
 export type LiveTranscriptionStartResult = { effective_start_epoch_ms: number }
 export type LiveTranscriptionStatus = { phase: LiveTranscriptionPhase; chunks_processed: number; total_audio_seconds: number; error_message: string | null; session_id: string | null; effective_start_epoch_ms: number | null }
 export type MixConfigDto = { mic_gain: number; system_gain: number; normalize: boolean }
 export type ModelInfoDto = { size: ModelSizeDto; downloaded: boolean; path: string | null; display_name: string; approximate_size_bytes: number }
 export type ModelSizeDto = "Tiny" | "Base" | "Small" | "Medium"
+export type ParakeetModelInfoDto = { variant: ParakeetVariantDto; downloaded: boolean; display_name: string; approximate_size_bytes: number }
+export type ParakeetVariantDto = "TdtV3"
 export type PermissionStatusDto = "Granted" | "Denied" | "NotDetermined" | "Unavailable"
 export type RingBufferInfoDto = { capacity_samples: number; samples_written: number; available_samples: number; capacity_seconds: number; available_seconds: number; sample_rate: number; channels: number }
 export type SessionStatusDto = { active: boolean; elapsed_seconds: number | null }
 export type SessionWavResultDto = { file_path: string; duration_seconds: number }
-export type TranscriptSegmentDto = { start_ms: number; end_ms: number; text: string; confidence: number }
+export type SortformerModelInfoDto = { variant: SortformerVariantDto; downloaded: boolean; display_name: string; approximate_size_bytes: number }
+export type SortformerVariantDto = "V2_1"
+export type TranscriptSegmentDto = { start_ms: number; end_ms: number; text: string; confidence: number; 
+/**
+ * Populated when the active engine is Parakeet *and* diarization
+ * was requested for the originating transcribe call. `None` for Whisper.
+ */
+speaker_id: number | null }
 export type TranscriptionResultDto = { text: string; segments: TranscriptSegmentDto[]; duration_ms: number }
-export type WhisperStatusDto = { initialized: boolean }
+export type TranscriptionStatusDto = { initialized: boolean }
 
 /** tauri-specta globals **/
 

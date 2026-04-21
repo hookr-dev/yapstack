@@ -82,6 +82,104 @@ const VAD_MODEL_URL: &str =
     "https://huggingface.co/ggml-org/whisper-vad/resolve/main/ggml-silero-v6.2.0.bin";
 const VAD_MODEL_SIZE_BYTES: u64 = 885_000;
 
+// ----------- Parakeet TDT v3 -----------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ParakeetVariant {
+    /// nvidia/parakeet-tdt-0.6b-v3 (multilingual, 25 European languages),
+    /// repackaged to ONNX by `istupakov` on HuggingFace.
+    TdtV3,
+}
+
+impl ParakeetVariant {
+    /// Subdirectory under `$APP_DATA_DIR/models/` where this variant's files live.
+    pub fn dir_name(&self) -> &'static str {
+        match self {
+            ParakeetVariant::TdtV3 => "parakeet-tdt-v3",
+        }
+    }
+
+    /// Files this variant requires on disk to load. Each tuple is
+    /// `(filename, download_url, approximate_size_bytes)`.
+    /// `parakeet-rs` expects these inside the variant directory.
+    pub fn files(&self) -> &'static [(&'static str, &'static str, u64)] {
+        match self {
+            ParakeetVariant::TdtV3 => &[
+                (
+                    "encoder-model.onnx",
+                    "https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/resolve/main/encoder-model.onnx",
+                    1_700_000,
+                ),
+                (
+                    "encoder-model.onnx.data",
+                    "https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/resolve/main/encoder-model.onnx.data",
+                    560_000_000,
+                ),
+                (
+                    "decoder_joint-model.onnx",
+                    "https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/resolve/main/decoder_joint-model.onnx",
+                    34_000_000,
+                ),
+                (
+                    "vocab.txt",
+                    "https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/resolve/main/vocab.txt",
+                    32_000,
+                ),
+            ],
+        }
+    }
+
+    pub fn approximate_size_bytes(&self) -> u64 {
+        self.files().iter().map(|(_, _, s)| s).sum()
+    }
+
+    pub fn display_name(&self) -> &'static str {
+        match self {
+            ParakeetVariant::TdtV3 => "Parakeet TDT v3 (~600 MB)",
+        }
+    }
+
+    pub fn all() -> &'static [ParakeetVariant] {
+        &[ParakeetVariant::TdtV3]
+    }
+}
+
+// ----------- Sortformer (speaker diarization) -----------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SortformerVariant {
+    /// `diar_streaming_sortformer_4spk-v2.1.onnx` — up to 4 speakers,
+    /// streaming-capable. Hosted under altunenes' parakeet-rs HF repo.
+    V2_1,
+}
+
+impl SortformerVariant {
+    pub fn filename(&self) -> &'static str {
+        match self {
+            SortformerVariant::V2_1 => "diar_streaming_sortformer_4spk-v2.1.onnx",
+        }
+    }
+
+    pub fn download_url(&self) -> String {
+        format!(
+            "https://huggingface.co/altunenes/parakeet-rs/resolve/main/{}",
+            self.filename()
+        )
+    }
+
+    pub fn approximate_size_bytes(&self) -> u64 {
+        match self {
+            SortformerVariant::V2_1 => 50_000_000,
+        }
+    }
+
+    pub fn display_name(&self) -> &'static str {
+        match self {
+            SortformerVariant::V2_1 => "Sortformer 4-spk v2.1 (~50 MB)",
+        }
+    }
+}
+
 /// Download a file from `url` to `dest` via a temp file, with streaming progress.
 /// `fallback_size` is used when the server doesn't provide Content-Length.
 async fn download_file(
@@ -296,6 +394,128 @@ impl ModelManager {
         }
         self.download_vad_model(|_| {}).await
     }
+
+    // ---------- Parakeet ----------
+
+    /// Directory where a Parakeet variant's ONNX files live (whether or not
+    /// they're all downloaded yet). The directory is what `parakeet-rs`'
+    /// `from_pretrained` is called with.
+    pub fn parakeet_model_dir(&self, variant: ParakeetVariant) -> PathBuf {
+        self.models_dir.join(variant.dir_name())
+    }
+
+    /// True iff every required file for `variant` is present on disk.
+    pub fn parakeet_is_available(&self, variant: ParakeetVariant) -> bool {
+        let dir = self.parakeet_model_dir(variant);
+        variant
+            .files()
+            .iter()
+            .all(|(name, _, _)| dir.join(name).exists())
+    }
+
+    /// Download every missing file for `variant`, reporting overall progress
+    /// across all files in [0.0, 1.0].
+    pub async fn download_parakeet(
+        &self,
+        variant: ParakeetVariant,
+        on_progress: impl Fn(f32) + Send + Sync,
+    ) -> Result<PathBuf> {
+        let dir = self.parakeet_model_dir(variant);
+        tokio::fs::create_dir_all(&dir).await?;
+
+        let files = variant.files();
+        let total_size: u64 = files.iter().map(|(_, _, s)| *s).sum();
+        let mut completed: u64 = 0;
+
+        for (name, url, size) in files {
+            let dest = dir.join(name);
+            if dest.exists() {
+                completed += *size;
+                on_progress((completed as f32 / total_size as f32).min(1.0));
+                continue;
+            }
+            info!("downloading parakeet file {} from {}", name, url);
+            let base = completed;
+            download_file(url, &dest, *size, &|file_progress| {
+                let bytes_so_far = base + (file_progress * *size as f32) as u64;
+                on_progress((bytes_so_far as f32 / total_size as f32).min(1.0));
+            })
+            .await?;
+            completed += *size;
+        }
+
+        on_progress(1.0);
+        info!(
+            "parakeet variant {} downloaded successfully",
+            variant.dir_name()
+        );
+        Ok(dir)
+    }
+
+    /// Ensure every file for `variant` is present, downloading any that are missing.
+    pub async fn ensure_parakeet(&self, variant: ParakeetVariant) -> Result<PathBuf> {
+        if self.parakeet_is_available(variant) {
+            return Ok(self.parakeet_model_dir(variant));
+        }
+        self.download_parakeet(variant, |_| {}).await
+    }
+
+    /// Delete all files for a Parakeet variant.
+    pub async fn delete_parakeet(&self, variant: ParakeetVariant) -> Result<()> {
+        let dir = self.parakeet_model_dir(variant);
+        if dir.exists() {
+            tokio::fs::remove_dir_all(&dir).await?;
+            info!("deleted parakeet variant {}", variant.dir_name());
+        }
+        Ok(())
+    }
+
+    // ---------- Sortformer ----------
+
+    pub fn sortformer_model_path(&self, variant: SortformerVariant) -> Option<PathBuf> {
+        let path = self.models_dir.join(variant.filename());
+        if path.exists() {
+            Some(path)
+        } else {
+            None
+        }
+    }
+
+    pub async fn download_sortformer(
+        &self,
+        variant: SortformerVariant,
+        on_progress: impl Fn(f32) + Send,
+    ) -> Result<PathBuf> {
+        tokio::fs::create_dir_all(&self.models_dir).await?;
+        let dest = self.models_dir.join(variant.filename());
+        let url = variant.download_url();
+        info!(
+            "downloading sortformer model {} from {}",
+            variant.filename(),
+            url
+        );
+        download_file(&url, &dest, variant.approximate_size_bytes(), &on_progress).await?;
+        info!(
+            "sortformer model {} downloaded successfully",
+            variant.filename()
+        );
+        Ok(dest)
+    }
+
+    pub async fn ensure_sortformer(&self, variant: SortformerVariant) -> Result<PathBuf> {
+        if let Some(path) = self.sortformer_model_path(variant) {
+            return Ok(path);
+        }
+        self.download_sortformer(variant, |_| {}).await
+    }
+
+    pub async fn delete_sortformer(&self, variant: SortformerVariant) -> Result<()> {
+        if let Some(path) = self.sortformer_model_path(variant) {
+            tokio::fs::remove_file(&path).await?;
+            info!("deleted sortformer model {}", variant.filename());
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -411,5 +631,70 @@ mod tests {
             let deserialized: ModelSize = serde_json::from_str(&json).unwrap();
             assert_eq!(deserialized, *size);
         }
+    }
+
+    #[test]
+    fn test_parakeet_variant_files_are_consistent() {
+        let v = ParakeetVariant::TdtV3;
+        let files = v.files();
+        assert!(!files.is_empty());
+        // Required by parakeet-rs's ParakeetTDT::from_pretrained.
+        let names: Vec<&str> = files.iter().map(|(n, _, _)| *n).collect();
+        assert!(names.contains(&"vocab.txt"));
+        assert!(names.iter().any(|n| n.contains("encoder")));
+        assert!(names.iter().any(|n| n.contains("decoder")));
+    }
+
+    #[test]
+    fn test_parakeet_not_available_until_all_files_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = ModelManager::new(dir.path().to_path_buf());
+        let variant = ParakeetVariant::TdtV3;
+        assert!(!manager.parakeet_is_available(variant));
+
+        // Drop one of the required files into the variant dir; partial
+        // download must still report unavailable.
+        let v_dir = manager.parakeet_model_dir(variant);
+        std::fs::create_dir_all(&v_dir).unwrap();
+        std::fs::write(v_dir.join("vocab.txt"), b"placeholder").unwrap();
+        assert!(!manager.parakeet_is_available(variant));
+    }
+
+    #[test]
+    fn test_parakeet_available_when_all_files_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = ModelManager::new(dir.path().to_path_buf());
+        let variant = ParakeetVariant::TdtV3;
+        let v_dir = manager.parakeet_model_dir(variant);
+        std::fs::create_dir_all(&v_dir).unwrap();
+        for (name, _, _) in variant.files() {
+            std::fs::write(v_dir.join(name), b"placeholder").unwrap();
+        }
+        assert!(manager.parakeet_is_available(variant));
+    }
+
+    #[test]
+    fn test_sortformer_not_available_when_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = ModelManager::new(dir.path().to_path_buf());
+        assert!(manager
+            .sortformer_model_path(SortformerVariant::V2_1)
+            .is_none());
+    }
+
+    #[test]
+    fn test_sortformer_detects_existing() {
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        std::fs::write(
+            models_dir.join(SortformerVariant::V2_1.filename()),
+            b"fake sortformer",
+        )
+        .unwrap();
+        let manager = ModelManager::new(dir.path().to_path_buf());
+        assert!(manager
+            .sortformer_model_path(SortformerVariant::V2_1)
+            .is_some());
     }
 }

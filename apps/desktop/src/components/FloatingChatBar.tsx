@@ -131,7 +131,7 @@ export function FloatingChatBar() {
   if (!aiConfigured) {
     return (
       <div className="absolute bottom-2 inset-x-2 z-10 bg-card/95 backdrop-blur-sm border rounded-xl shadow-lg">
-        <div className="flex items-center gap-2 px-3 py-2.5">
+        <div className="flex items-center gap-2 px-2 py-2.5">
           <Settings className="h-4 w-4 text-muted-foreground/60 shrink-0" />
           <span className="text-xs text-muted-foreground">
             Configure AI in{" "}
@@ -168,7 +168,7 @@ export function FloatingChatBar() {
         )}
 
         <CollapsibleContent>
-          <div className="flex items-center justify-end px-3 pt-2">
+          <div className="flex items-center justify-end px-2 pt-2">
             <Button
               variant="inline-destructive"
               size="inline"

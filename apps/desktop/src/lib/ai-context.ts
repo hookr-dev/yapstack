@@ -14,8 +14,10 @@ import {
   assembleMultiSessionContext,
   assembleDictationContext,
   chatContextKey,
+  transcriptHasSpeakers,
 } from "./ai";
 import type { ChatContext, FileAttachment } from "./ai";
+import { useAppStore } from "@/stores/appStore";
 
 export type ListChatContext = Exclude<ChatContext, { type: "session" }>;
 
@@ -88,7 +90,9 @@ export function createSessionSources(
       summary: segmentCount > 0 ? `${segmentCount} segments` : undefined,
       assembler: async () => {
         const segments = await getSessionSegments(sessionId);
-        return assembleTranscriptContext(segments);
+        const speakerNames =
+          useAppStore.getState().settings.speakerNames[sessionId];
+        return assembleTranscriptContext(segments, speakerNames);
       },
     });
   }
@@ -142,12 +146,17 @@ export function createSessionSystemPromptBuilder(
       isPinned: session?.is_pinned === 1,
       hasNotes: !!(note && note.content && note.content !== "<p></p>"),
     };
+    // Detect diarization at prompt-build time so the SPEAKER_INSTRUCTION
+    // only appears for sessions that actually have speaker labels.
+    const segments = await getSessionSegments(sessionId);
+    const hasSpeakers = transcriptHasSpeakers(segments);
     return getSystemPromptWithToolContext(
       directive,
       transcript,
       notes,
       attachments,
       sessionMeta,
+      { hasSpeakers },
     );
   };
 }
