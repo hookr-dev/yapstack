@@ -73,12 +73,12 @@ export const DEFAULT_AI_SETTINGS: AISettings = {
   providers: {
     openai: {
       apiKey: "",
-      model: "gpt-4o-mini",
+      model: "gpt-5.4-mini",
       baseUrl: "https://api.openai.com/v1",
     },
     openrouter: {
       apiKey: "",
-      model: "anthropic/claude-sonnet-4",
+      model: "anthropic/claude-haiku-4.5",
       baseUrl: "https://openrouter.ai/api/v1",
     },
     custom: {
@@ -99,19 +99,38 @@ export interface ModelOption {
 
 export const MODEL_CATALOG: Partial<Record<AIProvider, ModelOption[]>> = {
   openai: [
-    { id: "gpt-4o", label: "GPT-4o", recommended: true },
+    // GPT-5.4 — current flagship family
+    { id: "gpt-5.4-mini", label: "GPT-5.4 Mini", recommended: true },
+    { id: "gpt-5.4", label: "GPT-5.4" },
+    { id: "gpt-5.4-nano", label: "GPT-5.4 Nano" },
+    { id: "gpt-5.4-pro", label: "GPT-5.4 Pro" },
+    // GPT-5.2 — reasoning/thinking
+    { id: "gpt-5.2", label: "GPT-5.2 (thinking)" },
+    // GPT-4.1 — 1M-token long context
+    { id: "gpt-4.1", label: "GPT-4.1" },
+    { id: "gpt-4.1-mini", label: "GPT-4.1 Mini" },
+    { id: "gpt-4.1-nano", label: "GPT-4.1 Nano" },
+    // o-series reasoning
+    { id: "o4-mini", label: "o4 Mini" },
+    { id: "o3", label: "o3" },
+    // Legacy — still live, kept for existing installs
+    { id: "gpt-4o", label: "GPT-4o" },
     { id: "gpt-4o-mini", label: "GPT-4o Mini" },
-    { id: "o3-mini", label: "o3 Mini" },
-    { id: "gpt-4-turbo", label: "GPT-4 Turbo" },
   ],
   openrouter: [
-    { id: "anthropic/claude-sonnet-4", label: "Claude Sonnet 4", recommended: true },
-    { id: "anthropic/claude-opus-4", label: "Claude Opus 4" },
-    { id: "anthropic/claude-haiku-3.5", label: "Claude Haiku 3.5" },
-    { id: "anthropic/claude-sonnet-3.5", label: "Claude Sonnet 3.5" },
-    { id: "openai/gpt-4o", label: "GPT-4o" },
-    { id: "openai/gpt-4o-mini", label: "GPT-4o Mini" },
-    { id: "google/gemini-2.0-flash", label: "Gemini 2.0 Flash" },
+    // Anthropic Claude — best tool-calling quality
+    { id: "anthropic/claude-haiku-4.5", label: "Claude Haiku 4.5", recommended: true },
+    { id: "anthropic/claude-sonnet-4.5", label: "Claude Sonnet 4.5" },
+    // OpenAI via OpenRouter
+    { id: "openai/gpt-5.4", label: "GPT-5.4" },
+    { id: "openai/gpt-5.4-mini", label: "GPT-5.4 Mini" },
+    { id: "openai/gpt-5.4-nano", label: "GPT-5.4 Nano" },
+    { id: "openai/gpt-5.2", label: "GPT-5.2 (thinking)" },
+    // Google Gemini
+    { id: "google/gemini-3.1-pro", label: "Gemini 3.1 Pro" },
+    { id: "google/gemini-3.1-flash-lite", label: "Gemini 3.1 Flash Lite" },
+    // Budget frontier-class option
+    { id: "deepseek/deepseek-v3.2", label: "DeepSeek V3.2" },
   ],
 };
 
@@ -425,7 +444,6 @@ export async function testConnection(
     await client.chat.completions.create({
       model: config.model,
       messages: [{ role: "user", content: "Hi" }],
-      max_tokens: 1,
     });
     return { ok: true };
   } catch (e) {
