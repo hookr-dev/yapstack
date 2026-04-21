@@ -54,10 +54,39 @@ export function DictationHistoryList() {
   const clearDictationHistory = useAppStore((s) => s.clearDictationHistory);
   const setListFilter = useAppStore((s) => s.setListFilter);
   const [clearDialogOpen, setClearDialogOpen] = useState(false);
+  const [highlightId, setHighlightId] = useState<string | null>(null);
 
   useEffect(() => {
     loadDictationHistory();
   }, [loadDictationHistory]);
+
+  // Handle scroll-to-entry requests from the Cmd+K search. The event may arrive
+  // before `loadDictationHistory()` has resolved, so retry briefly until the
+  // entry lands in the DOM.
+  useEffect(() => {
+    function handler(e: Event) {
+      const detail = (e as CustomEvent<{ dictationId: string }>).detail;
+      if (!detail?.dictationId) return;
+      const id = detail.dictationId;
+      let attempts = 0;
+      const tryScroll = () => {
+        const el = document.querySelector<HTMLElement>(
+          `[data-dictation-id="${CSS.escape(id)}"]`,
+        );
+        if (el) {
+          el.scrollIntoView({ behavior: "smooth", block: "center" });
+          setHighlightId(id);
+          window.setTimeout(() => setHighlightId(null), 1600);
+          return;
+        }
+        if (attempts++ < 20) window.setTimeout(tryScroll, 50);
+      };
+      tryScroll();
+    }
+    window.addEventListener("yapstack:scroll-to-dictation", handler);
+    return () =>
+      window.removeEventListener("yapstack:scroll-to-dictation", handler);
+  }, []);
 
   const grouped = useMemo(() => groupByDay(history), [history]);
 
@@ -138,7 +167,11 @@ export function DictationHistoryList() {
                 </span>
               </div>
               {group.entries.map((entry) => (
-                <DictationFeedEntry key={entry.id} entry={entry} />
+                <DictationFeedEntry
+                  key={entry.id}
+                  entry={entry}
+                  highlighted={highlightId === entry.id}
+                />
               ))}
             </div>
           ))}
