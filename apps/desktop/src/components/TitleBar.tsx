@@ -1,7 +1,6 @@
 import { useState, useEffect, useCallback } from "react";
 import { useAppStore } from "@/stores/appStore";
 import { useCreateSession } from "@/hooks/useCreateSession";
-import { Progress } from "@/components/ui/progress";
 import {
   Popover,
   PopoverContent,
@@ -13,11 +12,12 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { Button } from "@/components/ui/button";
-import { formatBytes, SOURCE_LABELS_FULL, formatShortcutDisplay, isMac } from "@/lib/utils";
+import { formatShortcutDisplay, isMac } from "@/lib/utils";
 import { getBinding } from "@/lib/shortcuts";
 import { Search, PanelLeftClose, PanelLeftOpen, Plus, PenLine, Minus, Square, X } from "lucide-react";
 import { SearchCommand } from "@/components/SearchCommand";
 import { BackfillDropdown } from "@/components/BackfillDropdown";
+import { StatusPopover } from "@/components/StatusPopover";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 
 function StatusDot({ color }: { color: string }) {
@@ -26,77 +26,6 @@ function StatusDot({ color }: { color: string }) {
       className={`inline-block h-2 w-2 rounded-full ${color}`}
       aria-hidden
     />
-  );
-}
-
-function BufferDetail({
-  label,
-  info,
-}: {
-  label: string;
-  info: {
-    available_seconds: number;
-    capacity_seconds: number;
-    capacity_samples: number;
-  } | null;
-}) {
-  if (!info) {
-    return (
-      <div className="space-y-1">
-        <span className="text-xs text-muted-foreground">{label}</span>
-        <p className="text-xs">N/A</p>
-      </div>
-    );
-  }
-  const pct =
-    info.capacity_seconds > 0
-      ? (info.available_seconds / info.capacity_seconds) * 100
-      : 0;
-  const memBytes = info.capacity_samples * 4;
-  return (
-    <div className="space-y-1">
-      <div className="flex items-center justify-between">
-        <span className="text-xs text-muted-foreground">{label}</span>
-        <span className="font-mono text-xs">
-          {Math.floor(info.available_seconds)}s / {Math.floor(info.capacity_seconds)}s
-        </span>
-      </div>
-      <Progress value={pct} className="h-1.5" />
-      <p className="text-[10px] text-muted-foreground/60">{formatBytes(memBytes)}</p>
-    </div>
-  );
-}
-
-function BufferPopoverContent() {
-  const bufferInfo = useAppStore((s) => s.bufferInfo);
-  const captureStatus = useAppStore((s) => s.captureStatus);
-  const captureSource = useAppStore((s) => s.settings.captureSource);
-  const selectedMicDeviceId = useAppStore((s) => s.settings.selectedMicDeviceId);
-  const devices = useAppStore((s) => s.devices);
-  const sourceLabel = SOURCE_LABELS_FULL[captureSource];
-
-  return (
-    <div className="space-y-3">
-      <BufferDetail label="Mic Capture Buffer" info={bufferInfo?.mic ?? null} />
-      <BufferDetail label="System Capture Buffer" info={bufferInfo?.system ?? null} />
-      <div className="space-y-1 border-t pt-2">
-        <div className="flex items-center justify-between">
-          <span className="text-xs text-muted-foreground">Source</span>
-          <span className="text-xs">{sourceLabel}</span>
-        </div>
-        {captureStatus?.mic_active && (
-          <div className="flex items-center justify-between">
-            <span className="text-xs text-muted-foreground">Device</span>
-            <span className="max-w-[140px] truncate text-xs">
-              {(selectedMicDeviceId
-                ? (devices.find((d) => d.id === selectedMicDeviceId)
-                  ?? devices.find((d) => d.name === selectedMicDeviceId))?.name
-                : null) ?? "Default"}
-            </span>
-          </div>
-        )}
-      </div>
-    </div>
   );
 }
 
@@ -238,8 +167,8 @@ export function TitleBar() {
                   <span className="max-w-[180px] truncate">{statusText}</span>
                 </button>
               </PopoverTrigger>
-              <PopoverContent className="w-64 p-3" align="end">
-                <BufferPopoverContent />
+              <PopoverContent className="w-auto p-0" align="end">
+                <StatusPopover />
               </PopoverContent>
             </Popover>
 

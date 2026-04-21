@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { useAppStore } from "@/stores/appStore";
 import { Button } from "@/components/ui/button";
 import {
@@ -15,8 +15,18 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { Switch } from "@/components/ui/switch";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 import { ChevronsUpDown } from "lucide-react";
+import { toast } from "sonner";
+import type { EngineKindDto } from "@/lib/tauri";
 import { ModelSection } from "./ModelSection";
+import { ParakeetModelSection } from "./ParakeetModelSection";
 
 const CHUNK_DURATION_OPTIONS = [10, 15, 20, 30].map((d) => ({
   value: d,
@@ -40,18 +50,49 @@ const PROMPT_DECAY_OPTIONS = [
   { value: 10, label: "10s" },
 ];
 
-const LANGUAGES = [
-  { value: "en", label: "English" },
-  { value: "es", label: "Spanish" },
-  { value: "fr", label: "French" },
-  { value: "de", label: "German" },
-  { value: "ja", label: "Japanese" },
-  { value: "zh", label: "Chinese" },
-  { value: "ko", label: "Korean" },
-  { value: "pt", label: "Portuguese" },
-  { value: "it", label: "Italian" },
-  { value: "ru", label: "Russian" },
-];
+/// Friendly display labels for the language codes the engine catalogue
+/// returns. Codes not in this map fall back to displaying the raw code so
+/// the dropdown stays usable as the catalogue grows.
+const LANGUAGE_LABELS: Record<string, string> = {
+  en: "English",
+  es: "Spanish",
+  fr: "French",
+  de: "German",
+  ja: "Japanese",
+  zh: "Chinese",
+  ko: "Korean",
+  pt: "Portuguese",
+  it: "Italian",
+  ru: "Russian",
+  nl: "Dutch",
+  pl: "Polish",
+  sv: "Swedish",
+  no: "Norwegian",
+  da: "Danish",
+  fi: "Finnish",
+  cs: "Czech",
+  sk: "Slovak",
+  hu: "Hungarian",
+  ro: "Romanian",
+  bg: "Bulgarian",
+  hr: "Croatian",
+  sl: "Slovenian",
+  el: "Greek",
+  uk: "Ukrainian",
+  et: "Estonian",
+  lv: "Latvian",
+  lt: "Lithuanian",
+  ga: "Irish",
+  mt: "Maltese",
+  ar: "Arabic",
+  hi: "Hindi",
+  vi: "Vietnamese",
+  th: "Thai",
+  he: "Hebrew",
+  tr: "Turkish",
+  id: "Indonesian",
+  ca: "Catalan",
+};
 
 interface ButtonGroupOption {
   value: number;
@@ -94,27 +135,97 @@ function ButtonGroupSetting({
 
 export function TranscriptionTab() {
   const language = useAppStore((s) => s.settings.language);
+  const selectedEngine = useAppStore((s) => s.settings.selectedEngine);
+  const diarizationEnabled = useAppStore(
+    (s) => s.settings.diarizationEnabled,
+  );
+  const engineCatalogue = useAppStore((s) => s.engineCatalogue);
   const maxChunkSeconds = useAppStore((s) => s.settings.maxChunkSeconds);
   const silenceDurationMs = useAppStore((s) => s.settings.silenceDurationMs);
   const promptContextChars = useAppStore((s) => s.settings.promptContextChars);
-  const promptDecaySilenceSeconds = useAppStore((s) => s.settings.promptDecaySilenceSeconds);
+  const promptDecaySilenceSeconds = useAppStore(
+    (s) => s.settings.promptDecaySilenceSeconds,
+  );
   const updateSettings = useAppStore((s) => s.updateSettings);
+  const switchEngine = useAppStore((s) => s.switchEngine);
+  const setDiarizationEnabled = useAppStore((s) => s.setDiarizationEnabled);
   const [showAdvanced, setShowAdvanced] = useState(false);
+
+  // Derive available languages from the current engine's catalogue entry.
+  // When the catalogue hasn't loaded yet, fall back to a permissive list
+  // (the persisted language stays visible without flicker).
+  const activeDescriptor = useMemo(
+    () => engineCatalogue.find((d) => d.kind === selectedEngine),
+    [engineCatalogue, selectedEngine],
+  );
+  const availableLanguages = useMemo(() => {
+    const codes = activeDescriptor?.languages ?? [language];
+    return codes.map((code) => ({
+      value: code,
+      label: LANGUAGE_LABELS[code] ?? code,
+    }));
+  }, [activeDescriptor, language]);
+
+  const supportsDiarization = activeDescriptor?.supports_diarization ?? false;
+
+  const handleEngineChange = async (engine: EngineKindDto) => {
+    if (engine === selectedEngine) return;
+    try {
+      await switchEngine(engine);
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  const handleLanguageChange = (code: string) => {
+    updateSettings({ language: code });
+  };
+
+  // Clamp language when the engine changes — if the persisted code is no
+  // longer in the active catalogue, fall back to the engine's primary code.
+  const languageInList = availableLanguages.some((l) => l.value === language);
+  const effectiveLanguage = languageInList
+    ? language
+    : availableLanguages[0]?.value ?? language;
 
   return (
     <>
+      {/* Engine radio — peer engines, no recommended badge */}
+      <div className="space-y-2">
+        <Label className="text-xs text-muted-foreground">
+          Transcription engine
+        </Label>
+        <div className="flex gap-1.5">
+          {(["Whisper", "Parakeet"] as const).map((kind) => (
+            <Button
+              key={kind}
+              size="sm"
+              variant={selectedEngine === kind ? "default" : "outline"}
+              className="flex-1 text-xs"
+              onClick={() => handleEngineChange(kind)}
+            >
+              {kind}
+            </Button>
+          ))}
+        </div>
+        <p className="text-[10px] text-muted-foreground/60">
+          {selectedEngine === "Whisper"
+            ? "OpenAI Whisper — 99 languages, hallucination filters tuned for podcasts."
+            : "NVIDIA Parakeet TDT v3 — 25 European languages, 3–5× faster, optional speaker diarization."}
+        </p>
+      </div>
+
+      <Separator />
+
       {/* Language */}
       <div className="space-y-2">
         <Label className="text-xs text-muted-foreground">Language</Label>
-        <Select
-          value={language}
-          onValueChange={(v) => updateSettings({ language: v })}
-        >
-          <SelectTrigger className="h-8 text-xs">
+        <Select value={effectiveLanguage} onValueChange={handleLanguageChange}>
+          <SelectTrigger className="h-8 w-full text-xs">
             <SelectValue />
           </SelectTrigger>
-          <SelectContent>
-            {LANGUAGES.map((lang) => (
+          <SelectContent className="max-h-72">
+            {availableLanguages.map((lang) => (
               <SelectItem
                 key={lang.value}
                 value={lang.value}
@@ -129,10 +240,51 @@ export function TranscriptionTab() {
 
       <Separator />
 
-      {/* Model */}
+      {/* Model — depends on selected engine */}
       <div className="space-y-2">
         <Label className="text-xs text-muted-foreground">Model</Label>
-        <ModelSection />
+        {selectedEngine === "Whisper" ? <ModelSection /> : <ParakeetModelSection />}
+      </div>
+
+      <Separator />
+
+      {/* Diarization toggle */}
+      <div className="space-y-2">
+        <div className="flex items-center justify-between">
+          <Label className="text-xs text-muted-foreground">
+            Speaker diarization
+          </Label>
+          <TooltipProvider delayDuration={300}>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <span>
+                  <Switch
+                    checked={diarizationEnabled}
+                    disabled={!supportsDiarization}
+                    onCheckedChange={async (checked) => {
+                      try {
+                        await setDiarizationEnabled(checked);
+                      } catch (e) {
+                        toast.error(
+                          e instanceof Error ? e.message : String(e),
+                        );
+                      }
+                    }}
+                  />
+                </span>
+              </TooltipTrigger>
+              {!supportsDiarization && (
+                <TooltipContent side="left">
+                  Diarization requires the Parakeet engine
+                </TooltipContent>
+              )}
+            </Tooltip>
+          </TooltipProvider>
+        </div>
+        <p className="text-[10px] text-muted-foreground/60">
+          Identifies up to 4 distinct speakers using NVIDIA Sortformer
+          (~50&nbsp;MB, downloaded on first enable).
+        </p>
       </div>
 
       <Separator />
@@ -162,14 +314,14 @@ export function TranscriptionTab() {
           />
           <ButtonGroupSetting
             label="Prompt Context"
-            description="Characters of prior transcript fed to Whisper for continuity"
+            description="Characters of prior transcript fed to Whisper for continuity (Whisper only)"
             options={PROMPT_CONTEXT_OPTIONS}
             currentValue={promptContextChars}
             onChange={(v) => updateSettings({ promptContextChars: v })}
           />
           <ButtonGroupSetting
             label="Prompt Decay"
-            description="Clear prompt context after this much silence to prevent hallucination"
+            description="Clear prompt context after this much silence to prevent hallucination (Whisper only)"
             options={PROMPT_DECAY_OPTIONS}
             currentValue={promptDecaySilenceSeconds}
             onChange={(v) => updateSettings({ promptDecaySilenceSeconds: v })}

@@ -121,7 +121,7 @@ export function AITab() {
           trackAIProviderChanged({ provider: v });
         }}
       >
-        <SelectTrigger className="h-8 text-xs">
+        <SelectTrigger className="h-8 w-full text-xs">
           <SelectValue />
         </SelectTrigger>
         <SelectContent>
@@ -237,7 +237,7 @@ export function AITab() {
           }
         }}
       >
-        <SelectTrigger className="h-8 text-xs">
+        <SelectTrigger className="h-8 w-full text-xs">
           <SelectValue />
         </SelectTrigger>
         <SelectContent>
@@ -299,7 +299,7 @@ export function AITab() {
           value={fetchedModels.includes(config.model) ? config.model : ""}
           onValueChange={(v) => updateProviderConfig("model", v)}
         >
-          <SelectTrigger className="h-8 text-xs">
+          <SelectTrigger className="h-8 w-full text-xs">
             <SelectValue placeholder="Pick a fetched model..." />
           </SelectTrigger>
           <SelectContent>

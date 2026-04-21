@@ -169,6 +169,7 @@ export function NoteDetailView() {
           <ResizablePanel defaultSize="40%" minSize="20%">
             <div className="flex flex-col h-full min-h-0">
               <ChatView
+                sessionId={selectedSessionId ?? undefined}
                 segments={segments}
                 backfillActive={backfillActive}
                 isEditable={isEditable}
@@ -206,6 +207,7 @@ export function NoteDetailView() {
           <ResizablePanel defaultSize="40%" minSize="20%">
             <div className="flex flex-col h-full min-h-0">
               <ChatView
+                sessionId={selectedSessionId ?? undefined}
                 segments={segments}
                 isEditable={isEditable}
                 currentPlaybackTime={hasWav ? playbackTime : undefined}
@@ -229,7 +231,7 @@ export function NoteDetailView() {
   return (
     <div className="flex flex-1 flex-col min-h-0 pb-16 view-enter">
       <SessionHeader session={session} />
-      <ChatView segments={segments} />
+      <ChatView sessionId={selectedSessionId ?? undefined} segments={segments} />
     </div>
   );
 }

@@ -25,7 +25,7 @@ use yapstack_transcription::ModelManager;
 
 // Lock ordering (acquire in this order to prevent deadlocks):
 //   1. AudioManagerState
-//   2. WhisperClientState
+//   2. TranscriptionClientState
 //   3. LiveTranscriptionState
 //   4. ModelManagerState
 //   5. TrayState
@@ -200,7 +200,35 @@ fn read_file_range(path: &Path, start: u64, end: u64) -> std::io::Result<Vec<u8>
     Ok(buf)
 }
 
+fn init_tracing() {
+    use tracing_subscriber::{fmt, EnvFilter};
+
+    let default_filter = "info,\
+        yapstack_desktop=debug,\
+        yapstack_audio=info,\
+        yapstack_transcription=debug,\
+        yapstack_sidecar=debug,\
+        tao=warn,\
+        wry=warn,\
+        hyper=warn,\
+        reqwest=warn,\
+        sqlx=warn";
+
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_filter));
+
+    _ = fmt()
+        .with_writer(std::io::stderr)
+        .with_target(true)
+        .with_env_filter(filter)
+        .try_init();
+
+    tracing::info!("yapstack-desktop tracing initialised");
+}
+
 pub fn run() {
+    init_tracing();
+
     let specta_builder =
         tauri_specta::Builder::<tauri::Wry>::new().commands(tauri_specta::collect_commands![
             commands::health_check,
@@ -224,9 +252,16 @@ pub fn run() {
             commands::transcription::download_model,
             commands::transcription::delete_model,
             commands::transcription::transcribe_audio,
-            commands::transcription::init_whisper_client,
-            commands::transcription::shutdown_whisper_client,
-            commands::transcription::get_whisper_status,
+            commands::transcription::init_transcription_client,
+            commands::transcription::shutdown_transcription_client,
+            commands::transcription::get_transcription_status,
+            commands::transcription::get_engine_catalogue,
+            commands::transcription::get_parakeet_models,
+            commands::transcription::download_parakeet_model,
+            commands::transcription::delete_parakeet_model,
+            commands::transcription::get_sortformer_status,
+            commands::transcription::download_sortformer_model,
+            commands::transcription::delete_sortformer_model,
             commands::live_transcription::start_live_transcription,
             commands::live_transcription::stop_live_transcription,
             commands::live_transcription::get_live_transcription_status,
@@ -437,13 +472,24 @@ pub fn run() {
                 .path()
                 .app_data_dir()
                 .expect("failed to resolve app data directory");
+
+            // tauri-plugin-sql writes the DB to app_config_dir().
+            let db_path = app
+                .path()
+                .app_config_dir()
+                .map(|p| p.join("yapstack.db"))
+                .unwrap_or_else(|_| app_data_dir.join("yapstack.db"));
+            db::ensure_runtime_schema(&db_path);
+
             let model_manager = ModelManager::new(app_data_dir);
             app.manage(
                 Arc::new(Mutex::new(model_manager)) as commands::transcription::ModelManagerState
             );
 
-            // Initialize whisper client state (starts as None)
-            app.manage(Arc::new(Mutex::new(None)) as commands::transcription::WhisperClientState);
+            // Initialize transcription client state (starts as None)
+            app.manage(
+                Arc::new(Mutex::new(None)) as commands::transcription::TranscriptionClientState
+            );
 
             let menu = build_tray_menu(app.handle(), false, false)?;
 

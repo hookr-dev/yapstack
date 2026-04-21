@@ -135,13 +135,13 @@ export const tauriCommandsMock = () => ({
     transcribeAudio: vi
       .fn()
       .mockResolvedValue({ status: "ok", data: null }),
-    initWhisperClient: vi
+    initTranscriptionClient: vi
       .fn()
       .mockResolvedValue({ status: "ok", data: null }),
-    shutdownWhisperClient: vi
+    shutdownTranscriptionClient: vi
       .fn()
       .mockResolvedValue({ status: "ok", data: null }),
-    getWhisperStatus: vi.fn().mockResolvedValue({
+    getTranscriptionStatus: vi.fn().mockResolvedValue({
       status: "ok",
       data: { initialized: false },
     }),

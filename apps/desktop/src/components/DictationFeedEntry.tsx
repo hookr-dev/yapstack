@@ -31,7 +31,13 @@ function formatDurationCompact(seconds: number): string {
   return `${mins}:${secs.toString().padStart(2, "0")}`;
 }
 
-export function DictationFeedEntry({ entry }: { entry: DbDictationHistory }) {
+export function DictationFeedEntry({
+  entry,
+  highlighted = false,
+}: {
+  entry: DbDictationHistory;
+  highlighted?: boolean;
+}) {
   const deleteEntry = useAppStore((s) => s.deleteDictationHistoryEntry);
   const loadSessions = useAppStore((s) => s.loadSessions);
   const openSession = useAppStore((s) => s.openSession);
@@ -102,7 +108,12 @@ export function DictationFeedEntry({ entry }: { entry: DbDictationHistory }) {
   return (
     <ContextMenu>
       <ContextMenuTrigger asChild>
-        <div className="px-4 py-3 border-b border-border/30 hover:bg-accent/30 transition-colors cursor-default">
+        <div
+          data-dictation-id={entry.id}
+          className={`px-4 py-3 border-b border-border/30 hover:bg-accent/30 transition-colors cursor-default ${
+            highlighted ? "bg-primary/10 ring-1 ring-primary/40" : ""
+          }`}
+        >
           {/* Metadata line */}
           <div className="flex items-center gap-1.5">
             <span className="text-[11px] text-muted-foreground tabular-nums">

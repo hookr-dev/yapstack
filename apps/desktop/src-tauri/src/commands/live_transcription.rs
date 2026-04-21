@@ -16,7 +16,7 @@ use yapstack_common::types::CaptureSource;
 use super::error::{validate_session_id, CommandError};
 
 use super::audio::{AudioManagerState, CaptureSourceDto, MixConfigDto};
-use super::transcription::{TranscriptSegmentDto, WhisperClientState};
+use super::transcription::{TranscriptSegmentDto, TranscriptionClientState};
 
 // --- DTOs ---
 
@@ -56,6 +56,11 @@ pub struct LiveTranscriptionConfig {
     pub audio_export_format: Option<String>,
     /// MP3 bitrate in kbps (e.g. 64, 128, 192). Only used when format is "mp3".
     pub mp3_bitrate: Option<u16>,
+    /// Request speaker diarization on every transcribed chunk. Honored only
+    /// when the active engine is Parakeet *and* the sidecar was spawned with
+    /// a Sortformer model path. Whisper sessions ignore this flag.
+    #[serde(default)]
+    pub diarization: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Type)]
@@ -143,17 +148,18 @@ struct SessionWavState {
 
 /// Immutable shared context for transcription operations.
 ///
-/// During live transcription, the WhisperClient is extracted from the shared
-/// `WhisperClientState` and held privately in `whisper_client`. This eliminates
-/// mutex contention with other commands that may access `WhisperClientState`
-/// (e.g. `transcribe_audio`, `shutdown_whisper_client`). The client is returned
-/// to shared state when the live transcription loop ends.
+/// During live transcription, the TranscriptionClient is extracted from the
+/// shared `TranscriptionClientState` and held privately in
+/// `transcription_client`. This eliminates mutex contention with other
+/// commands that may access `TranscriptionClientState` (e.g.
+/// `transcribe_audio`, `shutdown_transcription_client`). The client is
+/// returned to shared state when the live transcription loop ends.
 #[derive(Clone)]
 struct TranscriptionContext {
     /// Private client for the live transcription loop — zero contention.
-    whisper_client: Arc<Mutex<Option<yapstack_transcription::WhisperClient>>>,
+    transcription_client: Arc<Mutex<Option<yapstack_transcription::TranscriptionClient>>>,
     /// Reference to the shared state so we can return the client when done.
-    shared_whisper_state: WhisperClientState,
+    shared_transcription_state: TranscriptionClientState,
     app_handle: AppHandle,
     config: LiveTranscriptionConfig,
     /// Shared prompt context bridging backfill → live transcription.
@@ -895,7 +901,7 @@ async fn process_backfill(
     for window_idx in 0..total_windows {
         for (source_idx, (label, chunks)) in source_entries.iter().enumerate() {
             if let Some(chunk) = chunks.get(window_idx) {
-                // Trim leading silence so Whisper gets audio starting near speech
+                // Trim leading silence so the engine gets audio starting near speech
                 let (trimmed, trim_offset) = trim_leading_silence(
                     chunk.samples,
                     chunk.sample_rate,
@@ -904,7 +910,7 @@ async fn process_backfill(
                 );
                 let adjusted_offset = offsets[source_idx] + trim_offset;
 
-                // Skip entirely silent chunks — nothing for Whisper to transcribe
+                // Skip entirely silent chunks — nothing to transcribe
                 if trimmed.is_empty() {
                     debug!(
                         "backfill chunk: source={:?} window={} skipped (silent)",
@@ -1585,22 +1591,34 @@ async fn transcribe_chunk(
     };
 
     let transcription_result = {
-        let mut client_guard = ctx.whisper_client.lock().await;
+        let mut client_guard = ctx.transcription_client.lock().await;
         match client_guard.as_mut() {
             Some(client) => {
+                // initial_prompt is Whisper-only — Parakeet's TDT decoder has no
+                // text-prompt input, so passing it would just be ignored. Drop it
+                // explicitly so the IPC payload is honest about what was sent.
+                let prompt_for_engine = match client.engine() {
+                    yapstack_common::types::EngineKind::Whisper => effective_prompt,
+                    yapstack_common::types::EngineKind::Parakeet => None,
+                };
                 client
-                    .transcribe(&wav_path, ctx.config.language.as_deref(), effective_prompt)
+                    .transcribe_with(
+                        &wav_path,
+                        ctx.config.language.as_deref(),
+                        prompt_for_engine,
+                        ctx.config.diarization,
+                    )
                     .await
             }
             None => {
-                error!("live transcription: whisper client not initialized");
+                error!("live transcription: transcription client not initialized");
                 let _ = ctx.app_handle.emit(
                     "live-transcription-status",
                     LiveTranscriptionStatus {
                         phase: LiveTranscriptionPhase::Error,
                         chunks_processed: *chunk_index,
                         total_audio_seconds: 0.0,
-                        error_message: Some("whisper client not initialized".to_string()),
+                        error_message: Some("transcription client not initialized".to_string()),
                         session_id: ctx.config.session_id.clone(),
                         effective_start_epoch_ms: None,
                     },
@@ -1660,6 +1678,7 @@ async fn transcribe_chunk(
                     end_ms: s.end_ms,
                     text: s.text,
                     confidence: s.confidence,
+                    speaker_id: s.speaker_id,
                 })
                 .collect();
 
@@ -1689,7 +1708,7 @@ async fn transcribe_chunk(
             warn!("live transcription: chunk failed: {}, skipping", e);
 
             // Check if the sidecar process died — attempt auto-restart.
-            let mut client_guard = ctx.whisper_client.lock().await;
+            let mut client_guard = ctx.transcription_client.lock().await;
             if let Some(ref mut client) = *client_guard {
                 if !client.is_running() {
                     warn!("sidecar process died — attempting restart");
@@ -1757,7 +1776,7 @@ async fn transcribe_and_emit_chunk(
 #[specta::specta]
 pub async fn start_live_transcription(
     audio_state: tauri::State<'_, AudioManagerState>,
-    whisper_state: tauri::State<'_, WhisperClientState>,
+    transcription_state: tauri::State<'_, TranscriptionClientState>,
     live_state: tauri::State<'_, LiveTranscriptionState>,
     app_handle: AppHandle,
     mut config: LiveTranscriptionConfig,
@@ -1963,7 +1982,7 @@ pub async fn start_live_transcription(
     let (stop_tx, stop_rx) = oneshot::channel();
 
     let audio_state_clone = audio_state.inner().clone();
-    let whisper_state_clone = whisper_state.inner().clone();
+    let transcription_state_clone = transcription_state.inner().clone();
 
     // Align config backfill with the clamped value so WAV writer and transcript
     // cursor share the same time origin (prevents timestamp drift on playback).
@@ -1972,18 +1991,18 @@ pub async fn start_live_transcription(
     // Capture session_id before config is moved into TranscriptionContext
     let controller_session_id = config.session_id.clone();
 
-    // Extract the whisper client only after all fallible setup above succeeds.
-    // This avoids losing the client on early-return setup errors.
+    // Extract the transcription client only after all fallible setup above
+    // succeeds. This avoids losing the client on early-return setup errors.
     let extracted_client = {
-        let mut client_guard = whisper_state.lock().await;
+        let mut client_guard = transcription_state.lock().await;
         client_guard.take().ok_or(CommandError::NotInitialized {
-            message: "whisper client not initialized".into(),
+            message: "transcription client not initialized".into(),
         })?
     };
 
     let ctx = TranscriptionContext {
-        whisper_client: Arc::new(Mutex::new(Some(extracted_client))),
-        shared_whisper_state: whisper_state_clone,
+        transcription_client: Arc::new(Mutex::new(Some(extracted_client))),
+        shared_transcription_state: transcription_state_clone,
         app_handle,
         config,
         bridged_prompt: Arc::new(Mutex::new(String::new())),
@@ -2001,13 +2020,13 @@ pub async fn start_live_transcription(
             .catch_unwind()
             .await;
 
-            // Always return the WhisperClient to shared state, even after a panic.
+            // Always return the transcription client to shared state, even after a panic.
             {
-                let mut private_guard = ctx_guard.whisper_client.lock().await;
+                let mut private_guard = ctx_guard.transcription_client.lock().await;
                 if let Some(client) = private_guard.take() {
-                    let mut shared_guard = ctx_guard.shared_whisper_state.lock().await;
+                    let mut shared_guard = ctx_guard.shared_transcription_state.lock().await;
                     *shared_guard = Some(client);
-                    debug!("returned whisper client to shared state");
+                    debug!("returned transcription client to shared state");
                 }
             }
 

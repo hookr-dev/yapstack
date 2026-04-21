@@ -4,7 +4,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
-use yapstack_common::types::{SidecarRequest, SidecarResponse, TranscriptSegment};
+use yapstack_common::types::{EngineKind, SidecarRequest, SidecarResponse, TranscriptSegment};
 
 use crate::error::TranscriptionError;
 
@@ -17,35 +17,53 @@ pub struct TranscriptionResult {
     pub duration_ms: u64,
 }
 
-pub struct WhisperClient {
+pub struct TranscriptionClient {
     stdin: ChildStdin,
     response_rx: mpsc::Receiver<SidecarResponse>,
     next_id: u64,
     _child: Child,
     // Stored for auto-restart (respawn)
     sidecar_path: PathBuf,
+    engine: EngineKind,
     model_path: PathBuf,
     vad_model_path: Option<PathBuf>,
+    sortformer_model_path: Option<PathBuf>,
+    coreml_cache_dir: Option<PathBuf>,
 }
 
-/// Raw parts returned by sidecar spawn (avoids Drop issues when moving into an existing WhisperClient).
+/// Raw parts returned by sidecar spawn (avoids Drop issues when moving into an existing TranscriptionClient).
 struct SidecarParts {
     stdin: ChildStdin,
     response_rx: mpsc::Receiver<SidecarResponse>,
     child: Child,
 }
 
-impl WhisperClient {
+impl TranscriptionClient {
     /// Spawns the sidecar process and sets up JSON-line IPC.
     ///
-    /// If `vad_model_path` is provided, the sidecar will use Silero VAD to skip
-    /// non-speech regions before decoding, which significantly reduces hallucinations.
+    /// `engine` selects which backend the sidecar instantiates (Whisper or
+    /// Parakeet). `vad_model_path` is honored only for Whisper (Silero VAD,
+    /// reduces hallucinations). `sortformer_model_path` is honored only for
+    /// Parakeet — when set, per-request `diarization: true` populates speaker IDs.
+    /// `coreml_cache_dir` is Parakeet+macOS only; persistent cache for compiled
+    /// CoreML graphs to avoid the ~5 s recompile on every spawn.
     pub async fn spawn(
         sidecar_path: &Path,
+        engine: EngineKind,
         model_path: &Path,
         vad_model_path: Option<&Path>,
+        sortformer_model_path: Option<&Path>,
+        coreml_cache_dir: Option<&Path>,
     ) -> Result<Self> {
-        let parts = Self::spawn_sidecar(sidecar_path, model_path, vad_model_path).await?;
+        let parts = Self::spawn_sidecar(
+            sidecar_path,
+            engine,
+            model_path,
+            vad_model_path,
+            sortformer_model_path,
+            coreml_cache_dir,
+        )
+        .await?;
 
         Ok(Self {
             stdin: parts.stdin,
@@ -53,29 +71,45 @@ impl WhisperClient {
             next_id: 1,
             _child: parts.child,
             sidecar_path: sidecar_path.to_path_buf(),
+            engine,
             model_path: model_path.to_path_buf(),
             vad_model_path: vad_model_path.map(|p| p.to_path_buf()),
+            sortformer_model_path: sortformer_model_path.map(|p| p.to_path_buf()),
+            coreml_cache_dir: coreml_cache_dir.map(|p| p.to_path_buf()),
         })
     }
 
     /// Internal: spawn the sidecar process and return raw parts.
     async fn spawn_sidecar(
         sidecar_path: &Path,
+        engine: EngineKind,
         model_path: &Path,
         vad_model_path: Option<&Path>,
+        sortformer_model_path: Option<&Path>,
+        coreml_cache_dir: Option<&Path>,
     ) -> Result<SidecarParts> {
         info!(
-            "spawning sidecar: {} with model: {}, vad_model: {:?}",
+            "spawning sidecar: {} engine={} model={} vad_model={:?} sortformer_model={:?} coreml_cache_dir={:?}",
             sidecar_path.display(),
+            engine.as_str(),
             model_path.display(),
             vad_model_path.map(|p| p.display().to_string()),
+            sortformer_model_path.map(|p| p.display().to_string()),
+            coreml_cache_dir.map(|p| p.display().to_string()),
         );
 
         let mut cmd = tokio::process::Command::new(sidecar_path);
+        cmd.arg("--engine").arg(engine.as_str());
         cmd.arg("--model").arg(model_path);
 
         if let Some(vad_path) = vad_model_path {
             cmd.arg("--vad-model").arg(vad_path);
+        }
+        if let Some(s_path) = sortformer_model_path {
+            cmd.arg("--sortformer-model").arg(s_path);
+        }
+        if let Some(c_path) = coreml_cache_dir {
+            cmd.arg("--coreml-cache-dir").arg(c_path);
         }
 
         // On Windows, prevent the sidecar from creating a visible console window.
@@ -226,12 +260,33 @@ impl WhisperClient {
         }
     }
 
-    /// Transcribes an audio file.
+    /// Engine the sidecar was spawned with. Read-only after construction.
+    pub fn engine(&self) -> EngineKind {
+        self.engine
+    }
+
+    /// Transcribes an audio file. Diarization is off — use
+    /// [`Self::transcribe_with`] when you need to control it per-call.
     pub async fn transcribe(
         &mut self,
         audio_path: &Path,
         language: Option<&str>,
         initial_prompt: Option<&str>,
+    ) -> Result<TranscriptionResult> {
+        self.transcribe_with(audio_path, language, initial_prompt, false)
+            .await
+    }
+
+    /// Transcribes an audio file with explicit per-request diarization control.
+    /// `diarization: true` is honored only when the sidecar was spawned with
+    /// `engine = Parakeet` *and* a Sortformer model path; otherwise the flag
+    /// is silently a no-op.
+    pub async fn transcribe_with(
+        &mut self,
+        audio_path: &Path,
+        language: Option<&str>,
+        initial_prompt: Option<&str>,
+        diarization: bool,
     ) -> Result<TranscriptionResult> {
         let id = self.next_id;
         self.next_id += 1;
@@ -242,6 +297,7 @@ impl WhisperClient {
             language: language.map(String::from),
             initial_prompt: initial_prompt.map(String::from),
             single_segment: None, // let sidecar decide based on audio duration
+            diarization,
         };
 
         self.send_request(&request).await?;
@@ -348,8 +404,11 @@ impl WhisperClient {
 
         let parts = Self::spawn_sidecar(
             &self.sidecar_path,
+            self.engine,
             &self.model_path,
             self.vad_model_path.as_deref(),
+            self.sortformer_model_path.as_deref(),
+            self.coreml_cache_dir.as_deref(),
         )
         .await?;
 
@@ -365,7 +424,7 @@ impl WhisperClient {
     }
 }
 
-impl Drop for WhisperClient {
+impl Drop for TranscriptionClient {
     fn drop(&mut self) {
         // Kill the sidecar process to prevent orphaned processes when the
         // client is dropped without an explicit shutdown() call.

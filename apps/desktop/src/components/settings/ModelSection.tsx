@@ -107,7 +107,10 @@ export function ModelSection() {
             </div>
 
             <div className="flex items-center gap-1">
-              {isDownloading && downloadingSize === model.size ? (
+              {isDownloading &&
+              (downloadingSize === model.size ||
+                (downloadingSize === null &&
+                  model.size === selectedModelSize)) ? (
                 <div className="w-24">
                   <Progress value={modelDownloadProgress ?? 0} className="h-2" />
                 </div>

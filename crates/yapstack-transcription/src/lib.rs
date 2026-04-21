@@ -1,7 +1,7 @@
+pub mod client;
 pub mod error;
 pub mod model;
-pub mod whisper;
 
+pub use client::{TranscriptionClient, TranscriptionResult};
 pub use error::TranscriptionError;
-pub use model::{ModelInfo, ModelManager, ModelSize};
-pub use whisper::{TranscriptionResult, WhisperClient};
+pub use model::{ModelInfo, ModelManager, ModelSize, ParakeetVariant, SortformerVariant};
