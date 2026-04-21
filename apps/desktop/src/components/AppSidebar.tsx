@@ -74,7 +74,7 @@ export function AppSidebar() {
   return (
     <div className="flex h-full flex-col bg-sidebar text-sidebar-foreground">
       {/* Header */}
-      <div className="flex items-center justify-between border-b border-sidebar-border px-4 py-2">
+      <div className="flex items-center justify-between border-b border-sidebar-border pl-4 pr-2 py-2">
         <button
           className="cursor-pointer opacity-80 hover:opacity-100 transition-opacity"
           onClick={() => {
@@ -159,7 +159,7 @@ export function AppSidebar() {
       <Separator className="my-1.5" />
 
       {/* Folders */}
-      <div className="flex items-center justify-between px-4 py-1">
+      <div className="flex items-center justify-between pl-4 pr-2 py-1">
         <span className="text-[11px] font-medium uppercase text-muted-foreground">
           Folders
         </span>
@@ -197,7 +197,7 @@ export function AppSidebar() {
         <>
           <Separator className="my-1.5" />
           <Collapsible open={dictationOpen} onOpenChange={setDictationOpen}>
-            <div className="flex items-center justify-between px-4 pb-1">
+            <div className="flex items-center justify-between pl-4 pr-2 pb-1">
               <CollapsibleTrigger className="-ml-0.5 flex items-center gap-0.5 text-[11px] font-medium uppercase text-muted-foreground hover:text-foreground transition-colors">
                 {dictationOpen ? (
                   <ChevronDown className="h-2.5 w-2.5" />
