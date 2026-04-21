@@ -158,7 +158,7 @@ export function DictationHistoryList() {
     <div className="flex flex-1 flex-col min-h-0">
       {header}
       <ScrollArea className="min-h-0 flex-1">
-        <div className="pb-20">
+        <div className="pb-28">
           {grouped.map((group) => (
             <div key={group.label}>
               <div className="sticky top-0 z-10 bg-background/80 backdrop-blur-sm px-4 py-1.5 border-b border-border/20">

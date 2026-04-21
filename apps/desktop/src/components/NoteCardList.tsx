@@ -206,7 +206,7 @@ export function NoteCardList() {
     <div className="flex flex-1 flex-col min-h-0">
       {breadcrumbBar}
       <ScrollArea className="min-h-0 flex-1">
-        <div className="space-y-1 px-3 pt-1 pb-20">
+        <div className="space-y-1 px-3 pt-1 pb-28">
           {hasCards && (
             <div className="grid grid-cols-2 gap-1.5 mt-2">
               {showPinnedCard && (
