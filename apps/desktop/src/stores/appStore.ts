@@ -1110,6 +1110,12 @@ function createAppStore() {
       switchEngine: async (engine: EngineKindDto) => {
         const settings = get().settings;
         if (settings.selectedEngine === engine) return;
+        const previousEngine = settings.selectedEngine;
+
+        // Flip the UI to the target engine up front so any download shows
+        // progress in the same model row the user would see after the switch
+        // completes — no top-of-screen banner, no cross-engine flicker.
+        get().updateSettings({ selectedEngine: engine });
 
         try {
           if (engine === "Parakeet") {
@@ -1119,7 +1125,7 @@ function createAppStore() {
               (m) => m.variant === variant && m.downloaded,
             );
             if (!ready) {
-              set({ enginePhase: "downloading", modelDownloadProgress: 0 });
+              set({ modelDownloadProgress: 0 });
               const dl = await commands.downloadParakeetModel(variant);
               if (dl.status === "error") {
                 set({ modelDownloadProgress: null });
@@ -1149,7 +1155,7 @@ function createAppStore() {
               (m) => m.size === settings.selectedModelSize && m.downloaded,
             );
             if (!ready) {
-              set({ enginePhase: "downloading", modelDownloadProgress: 0 });
+              set({ modelDownloadProgress: 0 });
               const dl = await commands.downloadModel(
                 settings.selectedModelSize,
               );
@@ -1175,9 +1181,9 @@ function createAppStore() {
             throw new Error(initResult.error.message);
           }
 
-          get().updateSettings({ selectedEngine: engine });
           set({ enginePhase: "ready", engineError: null });
         } catch (e) {
+          get().updateSettings({ selectedEngine: previousEngine });
           set({ enginePhase: "error", engineError: String(e) });
           throw e;
         }
