@@ -25,6 +25,7 @@
         "titleBarStyle": "Overlay",
         "hiddenTitle": true,
         "acceptFirstMouse": true,
+        "backgroundThrottling": "disabled",
         "trafficLightPosition": {
           "x": 12,
           "y": 20
@@ -44,7 +45,8 @@
         "visibleOnAllWorkspaces": true,
         "skipTaskbar": true,
         "focus": false,
-        "shadow": false
+        "shadow": false,
+        "backgroundThrottling": "disabled"
       },
       {
         "label": "recording-indicator",
@@ -60,7 +62,8 @@
         "visibleOnAllWorkspaces": true,
         "skipTaskbar": true,
         "focus": false,
-        "shadow": false
+        "shadow": false,
+        "backgroundThrottling": "disabled"
       }
     ],
     "security": {
