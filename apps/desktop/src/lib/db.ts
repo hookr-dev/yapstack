@@ -445,6 +445,13 @@ export interface SearchResult {
   snippet: string;
 }
 
+export interface DictationSearchResult {
+  dictationId: string;
+  slotName: string;
+  snippet: string;
+  sessionId: string | null;
+}
+
 function stripHtml(html: string): string {
   return html.replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim();
 }
@@ -526,6 +533,43 @@ export async function searchFolders(
     `SELECT id, name FROM folders WHERE name LIKE $1 ORDER BY name ASC LIMIT 20`,
     [pattern],
   );
+}
+
+export async function searchDictations(
+  query: string,
+): Promise<DictationSearchResult[]> {
+  const db = await getDb();
+  const pattern = `%${query}%`;
+  const rows = await db.select<
+    {
+      id: string;
+      slot_name: string;
+      input_text: string;
+      output_text: string;
+      session_id: string | null;
+    }[]
+  >(
+    `SELECT id, slot_name, input_text, output_text, session_id
+     FROM dictation_history
+     WHERE output_text LIKE $1 OR input_text LIKE $1
+     ORDER BY created_at DESC
+     LIMIT 50`,
+    [pattern],
+  );
+  const q = query.toLowerCase();
+  return rows.map((r) => {
+    // Prefer the output_text snippet if the match lives there, else fall
+    // back to input_text so the user sees which field actually hit.
+    const source = r.output_text.toLowerCase().includes(q)
+      ? r.output_text
+      : r.input_text;
+    return {
+      dictationId: r.id,
+      slotName: r.slot_name,
+      snippet: source,
+      sessionId: r.session_id,
+    };
+  });
 }
 
 // --- Sort order ---
