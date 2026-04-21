@@ -298,6 +298,27 @@ async clipboardPaste(text: string, autoPaste: boolean) : Promise<Result<null, Co
     else return { status: "error", error: e  as any };
 }
 },
+async checkScreenCapturePermission() : Promise<Result<ScreenCapturePermissionDto, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("check_screen_capture_permission") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Triggers the Screen Recording TCC prompt if the app has never asked. The
+ * OS dialog is shown asynchronously, so callers should re-check via
+ * `check_screen_capture_permission` after the user has responded.
+ */
+async requestScreenCapturePermission() : Promise<Result<ScreenCapturePermissionDto, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("request_screen_capture_permission") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async getAutostartEnabled() : Promise<Result<boolean, CommandError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("get_autostart_enabled") };
@@ -439,6 +460,7 @@ export type ParakeetModelInfoDto = { variant: ParakeetVariantDto; downloaded: bo
 export type ParakeetVariantDto = "TdtV3"
 export type PermissionStatusDto = "Granted" | "Denied" | "NotDetermined" | "Unavailable"
 export type RingBufferInfoDto = { capacity_samples: number; samples_written: number; available_samples: number; capacity_seconds: number; available_seconds: number; sample_rate: number; channels: number }
+export type ScreenCapturePermissionDto = "Granted" | "NotDetermined" | "Unavailable"
 export type SessionStatusDto = { active: boolean; elapsed_seconds: number | null }
 export type SessionWavResultDto = { file_path: string; duration_seconds: number }
 export type SortformerModelInfoDto = { variant: SortformerVariantDto; downloaded: boolean; display_name: string; approximate_size_bytes: number }
