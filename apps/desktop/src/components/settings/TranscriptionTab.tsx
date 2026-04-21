@@ -221,7 +221,7 @@ export function TranscriptionTab() {
       <div className="space-y-2">
         <Label className="text-xs text-muted-foreground">Language</Label>
         <Select value={effectiveLanguage} onValueChange={handleLanguageChange}>
-          <SelectTrigger className="h-8 text-xs">
+          <SelectTrigger className="h-8 w-full text-xs">
             <SelectValue />
           </SelectTrigger>
           <SelectContent className="max-h-72">
