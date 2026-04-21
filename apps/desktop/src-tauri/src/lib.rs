@@ -266,6 +266,8 @@ pub fn run() {
             commands::live_transcription::stop_live_transcription,
             commands::live_transcription::get_live_transcription_status,
             commands::dictation::clipboard_paste,
+            commands::permissions::check_screen_capture_permission,
+            commands::permissions::request_screen_capture_permission,
             commands::get_autostart_enabled,
             commands::set_autostart_enabled,
             commands::show_overlay_panel,

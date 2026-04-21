@@ -882,6 +882,12 @@ function createAppStore() {
 
         const { settings } = get();
 
+        // Request Screen Recording TCC up front — on macOS 14.2+ this gates
+        // the Core Audio tap cpal uses for system audio loopback. Fire the
+        // prompt before startCapture so users see it during onboarding instead
+        // of later, silently failing.
+        commands.requestScreenCapturePermission().catch(() => {});
+
         // Track 1 — Start capture (fire and forget, errors surface via capture-status events)
         commands
           .startCapture(
