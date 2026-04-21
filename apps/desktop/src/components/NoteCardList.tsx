@@ -97,54 +97,58 @@ export function NoteCardList() {
   }
 
   const breadcrumbBar = (
-    <nav className="flex items-center gap-1 border-b px-4 py-2 text-xs text-muted-foreground shrink-0">
-      <button
-        className={
-          listFilter.type === "all"
-            ? "font-medium text-foreground flex items-center gap-1"
-            : "hover:text-foreground transition-colors flex items-center gap-1"
-        }
-        onClick={() => setListFilter({ type: "all" })}
-      >
-        <Inbox className="h-3 w-3" />
-        All Sessions
-      </button>
-      {listFilter.type === "pinned" && (
-        <>
-          <ChevronRight className="h-3 w-3 shrink-0" />
-          <span className="font-medium text-foreground flex items-center gap-1">
-            <Pin className="h-3 w-3" />
-            Pinned
-          </span>
-        </>
-      )}
-      {breadcrumbs?.map((crumb, i) => {
-        const isLast = i === breadcrumbs.length - 1;
-        const CrumbIcon = crumb.icon ? ICON_MAP[crumb.icon] : null;
-        return (
-          <span key={crumb.id} className="flex items-center gap-1">
+    <nav className="flex items-center border-b px-4 py-2 text-xs text-muted-foreground shrink-0">
+      {/* Inner h-6 row mirrors the sidebar header's 24px content so the
+          border-b on each side aligns to the same pixel. */}
+      <div className="flex items-center gap-1 h-6">
+        <button
+          className={
+            listFilter.type === "all"
+              ? "font-medium text-foreground flex items-center gap-1"
+              : "hover:text-foreground transition-colors flex items-center gap-1"
+          }
+          onClick={() => setListFilter({ type: "all" })}
+        >
+          <Inbox className="h-3 w-3" />
+          All Sessions
+        </button>
+        {listFilter.type === "pinned" && (
+          <>
             <ChevronRight className="h-3 w-3 shrink-0" />
-            <button
-              className={
-                isLast
-                  ? "font-medium text-foreground flex items-center gap-1"
-                  : "hover:text-foreground transition-colors flex items-center gap-1"
-              }
-              onClick={() =>
-                setListFilter({ type: "folder", folderId: crumb.id })
-              }
-            >
-              {CrumbIcon && (
-                <CrumbIcon
-                  className="h-3 w-3 shrink-0"
-                  style={crumb.color ? { color: crumb.color } : undefined}
-                />
-              )}
-              {crumb.name}
-            </button>
-          </span>
-        );
-      })}
+            <span className="font-medium text-foreground flex items-center gap-1">
+              <Pin className="h-3 w-3" />
+              Pinned
+            </span>
+          </>
+        )}
+        {breadcrumbs?.map((crumb, i) => {
+          const isLast = i === breadcrumbs.length - 1;
+          const CrumbIcon = crumb.icon ? ICON_MAP[crumb.icon] : null;
+          return (
+            <span key={crumb.id} className="flex items-center gap-1">
+              <ChevronRight className="h-3 w-3 shrink-0" />
+              <button
+                className={
+                  isLast
+                    ? "font-medium text-foreground flex items-center gap-1"
+                    : "hover:text-foreground transition-colors flex items-center gap-1"
+                }
+                onClick={() =>
+                  setListFilter({ type: "folder", folderId: crumb.id })
+                }
+              >
+                {CrumbIcon && (
+                  <CrumbIcon
+                    className="h-3 w-3 shrink-0"
+                    style={crumb.color ? { color: crumb.color } : undefined}
+                  />
+                )}
+                {crumb.name}
+              </button>
+            </span>
+          );
+        })}
+      </div>
     </nav>
   );
 
