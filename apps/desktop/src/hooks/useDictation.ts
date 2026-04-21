@@ -13,7 +13,7 @@ import { trackDictationStarted, trackDictationCompleted, trackDictationFailed } 
 type DictationState = "idle" | "recording" | "transcribing" | "processing" | "done";
 
 const BUBBLE_WIDTH = 220;
-const BUBBLE_HEIGHT = 64;
+const BUBBLE_HEIGHT = 96;
 const BOTTOM_MARGIN = 30;
 
 const ENERGY_SILENCE_THRESHOLD = 0.005;

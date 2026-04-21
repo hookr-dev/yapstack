@@ -90,7 +90,7 @@ export function DictationBubble() {
 
   return (
     <div className="flex h-screen w-screen items-center justify-center bg-transparent">
-      <div className="flex items-center gap-2.5 rounded-full bg-background p-2 shadow-2xl border border-white/[0.08]">
+      <div className="flex items-center gap-2.5 rounded-full bg-background p-2 shadow-lg border border-white/[0.08]">
         <div
           className={`flex h-5 w-5 shrink-0 items-center justify-center rounded-full ring-2 ${config.ringColor} ${config.glow} ${config.animate ?? ""} transition-colors duration-300`}
         >
