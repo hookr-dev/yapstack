@@ -4,6 +4,13 @@ import { Progress } from "@/components/ui/progress";
 import { Badge } from "@/components/ui/badge";
 import { Separator } from "@/components/ui/separator";
 import { Button } from "@/components/ui/button";
+import {
+  Tabs,
+  TabsContent,
+  TabsList,
+  TabsTrigger,
+} from "@/components/ui/tabs";
+import { LogsPanel } from "@/components/LogsPanel";
 import { formatBytes, formatElapsed, SOURCE_LABELS_FULL } from "@/lib/utils";
 import { commands } from "@/lib/tauri";
 import type {
@@ -321,7 +328,7 @@ export function StatusPopover() {
   };
 
   return (
-    <div className="w-[340px]">
+    <div className="w-[420px]">
       {/* Header */}
       <div
         className={`flex items-center gap-2 border-b px-3 py-2.5 ${TINT_BG[tone]}`}
@@ -345,17 +352,28 @@ export function StatusPopover() {
         )}
       </div>
 
-      <div className="space-y-3 px-3 py-2.5">
-        {displayError && (
-          <div className="flex items-start gap-2 rounded-md border border-destructive/30 bg-destructive/10 px-2 py-1.5">
-            <AlertCircle className="mt-0.5 h-3 w-3 shrink-0 text-destructive" />
-            <p className="text-[11px] leading-relaxed text-destructive">
-              {displayError}
-            </p>
-          </div>
-        )}
+      {displayError && (
+        <div className="mx-3 mt-2.5 flex items-start gap-2 rounded-md border border-destructive/30 bg-destructive/10 px-2 py-1.5">
+          <AlertCircle className="mt-0.5 h-3 w-3 shrink-0 text-destructive" />
+          <p className="text-[11px] leading-relaxed text-destructive">
+            {displayError}
+          </p>
+        </div>
+      )}
 
-        {/* Engine */}
+      <Tabs defaultValue="metrics" className="gap-0">
+        <TabsList className="mx-3 mb-0 mt-2 grid h-8 grid-cols-2">
+          <TabsTrigger value="metrics" className="h-6 text-[11px]">
+            Metrics
+          </TabsTrigger>
+          <TabsTrigger value="logs" className="h-6 text-[11px]">
+            Logs
+          </TabsTrigger>
+        </TabsList>
+
+        <TabsContent value="metrics" className="mt-0">
+          <div className="space-y-3 px-3 py-2.5">
+            {/* Engine */}
         <section className="space-y-1.5">
           <SectionLabel icon={Cpu}>Engine</SectionLabel>
           <div className="flex flex-wrap items-center gap-1">
@@ -482,7 +500,13 @@ export function StatusPopover() {
           <Copy className="mr-1 h-3 w-3" />
           Copy debug info
         </Button>
-      </div>
+          </div>
+        </TabsContent>
+
+        <TabsContent value="logs" className="mt-2">
+          <LogsPanel />
+        </TabsContent>
+      </Tabs>
     </div>
   );
 }

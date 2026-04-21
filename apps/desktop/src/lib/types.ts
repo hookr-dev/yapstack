@@ -350,6 +350,52 @@ async hideOverlayPanel(label: string) : Promise<Result<null, CommandError>> {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
+},
+/**
+ * Snapshot of recent entries from the in-memory ring buffer.
+ * `limit` caps the number returned (default 500 = the full buffer).
+ */
+async getRecentLogs(limit: number | null) : Promise<Result<LogEntry[], CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("get_recent_logs", { limit }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Clear the in-memory ring buffer. Does not touch on-disk log files.
+ */
+async clearLogs() : Promise<Result<null, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("clear_logs") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Return the resolved log directory path as a string, for display in the UI.
+ */
+async getLogDir() : Promise<Result<string, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("get_log_dir") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Open Finder / Explorer to the log directory so the user can grab the files
+ * to send to support.
+ */
+async revealLogDir() : Promise<Result<null, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("reveal_log_dir") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
 }
 }
 
@@ -453,6 +499,15 @@ diarization?: boolean }
 export type LiveTranscriptionPhase = "Running" | "Stopped" | "Error"
 export type LiveTranscriptionStartResult = { effective_start_epoch_ms: number }
 export type LiveTranscriptionStatus = { phase: LiveTranscriptionPhase; chunks_processed: number; total_audio_seconds: number; error_message: string | null; session_id: string | null; effective_start_epoch_ms: number | null }
+/**
+ * One log line visible to the frontend. `ts_ms` is unix-epoch milliseconds.
+ */
+export type LogEntry = { ts_ms: number; level: LogLevel; target: string; message: string }
+/**
+ * Mirrors the five `tracing::Level` values so the frontend gets a
+ * typed union instead of an unchecked string.
+ */
+export type LogLevel = "ERROR" | "WARN" | "INFO" | "DEBUG" | "TRACE"
 export type MixConfigDto = { mic_gain: number; system_gain: number; normalize: boolean }
 export type ModelInfoDto = { size: ModelSizeDto; downloaded: boolean; path: string | null; display_name: string; approximate_size_bytes: number }
 export type ModelSizeDto = "Tiny" | "Base" | "Small" | "Medium"

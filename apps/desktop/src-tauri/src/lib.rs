@@ -1,5 +1,6 @@
 mod commands;
 mod db;
+mod logging;
 
 const WINDOW_MAIN: &str = "main";
 #[cfg(target_os = "macos")]
@@ -200,35 +201,7 @@ fn read_file_range(path: &Path, start: u64, end: u64) -> std::io::Result<Vec<u8>
     Ok(buf)
 }
 
-fn init_tracing() {
-    use tracing_subscriber::{fmt, EnvFilter};
-
-    let default_filter = "info,\
-        yapstack_desktop=debug,\
-        yapstack_audio=info,\
-        yapstack_transcription=debug,\
-        yapstack_sidecar=debug,\
-        tao=warn,\
-        wry=warn,\
-        hyper=warn,\
-        reqwest=warn,\
-        sqlx=warn";
-
-    let filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_filter));
-
-    _ = fmt()
-        .with_writer(std::io::stderr)
-        .with_target(true)
-        .with_env_filter(filter)
-        .try_init();
-
-    tracing::info!("yapstack-desktop tracing initialised");
-}
-
 pub fn run() {
-    init_tracing();
-
     let specta_builder =
         tauri_specta::Builder::<tauri::Wry>::new().commands(tauri_specta::collect_commands![
             commands::health_check,
@@ -272,6 +245,10 @@ pub fn run() {
             commands::set_autostart_enabled,
             commands::show_overlay_panel,
             commands::hide_overlay_panel,
+            commands::logs::get_recent_logs,
+            commands::logs::clear_logs,
+            commands::logs::get_log_dir,
+            commands::logs::reveal_log_dir,
         ]);
 
     #[cfg(debug_assertions)]
@@ -468,6 +445,19 @@ pub fn run() {
         .invoke_handler(specta_builder.invoke_handler())
         .setup(move |app| {
             specta_builder.mount_events(app);
+
+            // Initialise tracing → stderr + rotating file + UI ring buffer.
+            // Must happen before other state registration so those log lines
+            // are captured. The WorkerGuard is managed so the non-blocking
+            // file writer survives for the lifetime of the app.
+            let log_dir = app
+                .path()
+                .app_log_dir()
+                .expect("failed to resolve app log directory");
+            std::fs::create_dir_all(&log_dir).ok();
+            let (log_buffer, log_guard) = logging::init(&log_dir, app.handle().clone());
+            app.manage(log_buffer);
+            app.manage(log_guard);
 
             // Initialize model manager with app data directory
             let app_data_dir = app
