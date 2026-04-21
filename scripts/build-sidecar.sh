@@ -117,6 +117,40 @@ for target in "${TARGETS[@]}"; do
     fi
     echo "Copied to $dest"
 
+    # Apple targets pull in libwebgpu_dawn.dylib via parakeet-rs/webgpu → ort/webgpu.
+    # The sidecar's only LC_RPATH is /usr/lib/swift, so without help dyld
+    # cannot resolve @rpath/libwebgpu_dawn.dylib at process launch and the
+    # sidecar fails *before* main() — taking both Whisper and Parakeet down
+    # with it. We add two rpaths and copy the dylib into binaries/ so the
+    # same artifact works in two layouts:
+    #   - bundled:   sidecar at Contents/MacOS/, dylib at Contents/Frameworks/
+    #                resolved via @executable_path/../Frameworks
+    #                (Tauri copies binaries/libwebgpu_dawn.dylib there via
+    #                 bundle.macOS.frameworks in tauri.conf.json)
+    #   - dev:       sidecar mirrored to target/debug/, dylib already lives
+    #                next to it after `cargo build`
+    #                resolved via @executable_path
+    if [[ "$target" == *"apple"* ]] && [[ "$FEATURES" == *"webgpu"* ]]; then
+        dawn_src="$PROJECT_ROOT/target/$target/$PROFILE_DIR/libwebgpu_dawn.dylib"
+        dawn_dest="$BINARIES_DIR/libwebgpu_dawn.dylib"
+        if [ ! -f "$dawn_src" ]; then
+            echo "ERROR: libwebgpu_dawn.dylib not found at $dawn_src" \
+                 "(expected because webgpu feature is enabled)"
+            exit 1
+        fi
+        cp "$dawn_src" "$dawn_dest"
+        chmod 644 "$dawn_dest"
+        echo "Copied Dawn dylib to $dawn_dest"
+
+        # install_name_tool errors if the rpath already exists; tolerate.
+        for rp in "@executable_path/../Frameworks" "@executable_path"; do
+            if ! otool -l "$dest" | grep -qF " path $rp "; then
+                install_name_tool -add_rpath "$rp" "$dest"
+                echo "Added rpath $rp to $dest"
+            fi
+        done
+    fi
+
     # Dev fallback: `find_sidecar_path()` in apps/desktop looks for
     # `<exe_dir>/yapstack-sidecar-<triple>` first, then falls back to
     # `<exe_dir>/yapstack-sidecar`. In `pnpm tauri dev` the running exe
@@ -132,6 +166,14 @@ for target in "${TARGETS[@]}"; do
             cp "$dest" "$dev_runtime_dest"
             chmod +x "$dev_runtime_dest"
             echo "Mirrored to $dev_runtime_dest (dev runtime path)"
+            # Mirror the Dawn dylib next to it so the @executable_path
+            # rpath resolves in dev (cargo --target puts it under
+            # target/<triple>/debug/, not target/debug/).
+            if [[ "$target" == *"apple"* ]] && [[ "$FEATURES" == *"webgpu"* ]]; then
+                cp "$BINARIES_DIR/libwebgpu_dawn.dylib" \
+                   "$PROJECT_ROOT/target/debug/libwebgpu_dawn.dylib"
+                echo "Mirrored Dawn dylib to target/debug/ (dev runtime path)"
+            fi
         fi
     fi
     echo ""
