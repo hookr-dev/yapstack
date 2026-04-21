@@ -10,6 +10,92 @@ use crate::error::TranscriptionError;
 
 type Result<T> = std::result::Result<T, TranscriptionError>;
 
+/// Remove ANSI CSI / OSC escape sequences. Tiny state machine — avoids pulling
+/// in a dependency for one place that needs it. Single-pass over the chars().
+fn strip_ansi(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\x1B' {
+            out.push(ch);
+            continue;
+        }
+        match chars.next() {
+            // CSI: consume until the final byte in @..~ (0x40..=0x7E).
+            Some('[') => {
+                for c in chars.by_ref() {
+                    if matches!(c, '\x40'..='\x7E') {
+                        break;
+                    }
+                }
+            }
+            // OSC: consume until BEL or `ESC \`.
+            Some(']') => {
+                let mut prev_esc = false;
+                for c in chars.by_ref() {
+                    if c == '\x07' || (prev_esc && c == '\\') {
+                        break;
+                    }
+                    prev_esc = c == '\x1B';
+                }
+            }
+            // Other 2-byte escapes or trailing ESC: drop both.
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Log a sidecar response at DEBUG without exposing user speech — Transcription
+/// variants carry full segment text, so we never `Debug`-print the value.
+fn log_sidecar_response(response: &SidecarResponse) {
+    match response {
+        SidecarResponse::Transcription {
+            id,
+            segments,
+            duration_ms,
+            ..
+        } => debug!(
+            id = id,
+            segments = segments.len(),
+            duration_ms = duration_ms,
+            "sidecar response: transcription"
+        ),
+        SidecarResponse::ModelLoaded { id } => {
+            debug!(id = id, "sidecar response: model_loaded")
+        }
+        SidecarResponse::Error { id, message } => debug!(
+            id = id,
+            message = message.as_str(),
+            "sidecar response: error"
+        ),
+        SidecarResponse::Progress { id, percent } => {
+            debug!(id = id, percent = percent, "sidecar response: progress")
+        }
+    }
+}
+
+#[cfg(test)]
+mod strip_ansi_tests {
+    use super::strip_ansi;
+
+    #[test]
+    fn strips_sgr_colors() {
+        let input = "\x1b[32mINFO\x1b[0m hello \x1b[2mworld\x1b[0m";
+        assert_eq!(strip_ansi(input), "INFO hello world");
+    }
+
+    #[test]
+    fn preserves_plain() {
+        assert_eq!(strip_ansi("no escapes here"), "no escapes here");
+    }
+
+    #[test]
+    fn preserves_unicode() {
+        assert_eq!(strip_ansi("héllo — world"), "héllo — world");
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct TranscriptionResult {
     pub text: String,
@@ -164,7 +250,7 @@ impl TranscriptionClient {
                     }
                     match serde_json::from_str::<SidecarResponse>(&line) {
                         Ok(response) => {
-                            debug!("received sidecar response: {:?}", response);
+                            log_sidecar_response(&response);
                             if tx.send(response).await.is_err() {
                                 debug!("response channel closed, stopping reader");
                                 break;
@@ -188,6 +274,9 @@ impl TranscriptionClient {
     }
 
     /// Reads stderr from the sidecar and forwards each line to tracing.
+    /// Strips ANSI escape sequences defensively — the sidecar itself disables
+    /// ANSI but native libraries (ORT, Dawn, whisper.cpp) may still emit
+    /// colored output that would render as boxes in the desktop log UI.
     async fn stderr_reader_task(stderr: tokio::process::ChildStderr) {
         let reader = BufReader::new(stderr);
         let mut lines = reader.lines();
@@ -195,8 +284,9 @@ impl TranscriptionClient {
         loop {
             match lines.next_line().await {
                 Ok(Some(line)) => {
-                    if !line.trim().is_empty() {
-                        info!(target: "yapstack_sidecar", "sidecar stderr: {}", line);
+                    let stripped = strip_ansi(&line);
+                    if !stripped.trim().is_empty() {
+                        info!(target: "yapstack_sidecar", "{}", stripped);
                     }
                 }
                 Ok(None) => {

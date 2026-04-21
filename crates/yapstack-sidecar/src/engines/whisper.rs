@@ -154,9 +154,9 @@ impl TranscriptionBackend for WhisperBackend {
 
             if !should_include_segment(&segment_text, confidence) {
                 info!(
-                    "hallucination filtered: {:?} (confidence: {:.2})",
-                    segment_text.trim(),
-                    confidence
+                    len = segment_text.trim().chars().count(),
+                    confidence = confidence,
+                    "hallucination filtered"
                 );
                 continue;
             }

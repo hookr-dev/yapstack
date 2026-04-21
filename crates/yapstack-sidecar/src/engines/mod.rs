@@ -236,12 +236,16 @@ pub(crate) fn should_include_segment(text: &str, confidence: f32) -> bool {
     }
 
     if has_excessive_repetition(trimmed) {
-        tracing::info!("repetition filtered: {:?}", trimmed);
+        tracing::info!(len = trimmed.chars().count(), "repetition filtered");
         return false;
     }
     let normalized = normalize_for_repetition(trimmed);
     if has_excessive_repetition(&normalized) {
-        tracing::info!("repetition filtered (normalized): {:?}", trimmed);
+        tracing::info!(
+            len = trimmed.chars().count(),
+            normalized_len = normalized.chars().count(),
+            "repetition filtered (normalized)"
+        );
         return false;
     }
 

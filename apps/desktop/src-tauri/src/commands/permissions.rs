@@ -41,8 +41,7 @@ fn request() {
 
 #[tauri::command]
 #[specta::specta]
-pub async fn check_screen_capture_permission(
-) -> Result<ScreenCapturePermissionDto, CommandError> {
+pub async fn check_screen_capture_permission() -> Result<ScreenCapturePermissionDto, CommandError> {
     #[cfg(target_os = "macos")]
     let result = if preflight() {
         ScreenCapturePermissionDto::Granted
@@ -59,8 +58,8 @@ pub async fn check_screen_capture_permission(
 /// `check_screen_capture_permission` after the user has responded.
 #[tauri::command]
 #[specta::specta]
-pub async fn request_screen_capture_permission(
-) -> Result<ScreenCapturePermissionDto, CommandError> {
+pub async fn request_screen_capture_permission() -> Result<ScreenCapturePermissionDto, CommandError>
+{
     #[cfg(target_os = "macos")]
     let result = if preflight() {
         ScreenCapturePermissionDto::Granted

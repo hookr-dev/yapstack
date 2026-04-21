@@ -152,14 +152,14 @@ async fn send_error(id: u64, message: String) {
 
 #[tokio::main]
 async fn main() {
-    // Sidecar logs default to DEBUG for our own crate (so per-chunk timing
-    // is visible during `pnpm tauri dev`) and INFO for everything else;
-    // RUST_LOG overrides as usual.
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,yapstack_sidecar=debug"));
+    // No ANSI colors: desktop captures this stderr into its log UI where
+    // raw escape codes render as garbage.
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_target(true)
+        .with_ansi(false)
         .with_env_filter(filter)
         .init();
 

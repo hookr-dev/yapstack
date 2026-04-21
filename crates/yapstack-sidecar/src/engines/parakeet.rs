@@ -156,7 +156,7 @@ impl TranscriptionBackend for ParakeetBackend {
             let normalized = normalize_spacing(seg.text.trim());
             let sanitized = sanitize_text(&normalized);
             if !should_include_segment(&sanitized, confidence) {
-                info!("parakeet segment filtered: {:?}", sanitized);
+                info!(len = sanitized.chars().count(), "parakeet segment filtered");
                 continue;
             }
             if !text.is_empty() {
