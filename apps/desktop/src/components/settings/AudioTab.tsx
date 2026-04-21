@@ -52,57 +52,59 @@ export function AudioTab() {
 
   return (
     <>
-      {/* Capture Source */}
-      <div className="space-y-2">
-        <Label className="text-xs text-muted-foreground">Capture Source</Label>
-        <Select
-          value={captureSource}
-          onValueChange={(v) =>
-            updateSettings({ captureSource: v as CaptureSourceDto })
-          }
-        >
-          <SelectTrigger className="h-8 text-xs">
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent>
-            <SelectItem value="MicOnly" className="text-xs">
-              Microphone Only
-            </SelectItem>
-            <SelectItem value="SystemOnly" className="text-xs">
-              System Only
-            </SelectItem>
-            <SelectItem value="Mixed" className="text-xs">
-              Mixed
-            </SelectItem>
-          </SelectContent>
-        </Select>
-      </div>
-
-      {/* Input Device */}
-      <div className="space-y-2">
-        <Label className="text-xs text-muted-foreground">Input Device</Label>
-        <Select
-          value={selectedMicDeviceId ?? ""}
-          onValueChange={(v) =>
-            updateSettings({ selectedMicDeviceId: v || null })
-          }
-        >
-          <SelectTrigger className="h-8 text-xs">
-            <SelectValue placeholder="Default" />
-          </SelectTrigger>
-          <SelectContent>
-            {inputDevices.map((device) => (
-              <SelectItem
-                key={device.id ?? device.name}
-                value={device.id ?? device.name}
-                className="text-xs"
-              >
-                {device.name}
-                {device.is_default ? " (default)" : ""}
+      {/* Capture Source + Input Device — source decides whether the mic
+          device matters, so it reads left-to-right. */}
+      <div className="flex gap-3">
+        <div className="flex-1 min-w-0 space-y-2">
+          <Label className="text-xs text-muted-foreground">Capture Source</Label>
+          <Select
+            value={captureSource}
+            onValueChange={(v) =>
+              updateSettings({ captureSource: v as CaptureSourceDto })
+            }
+          >
+            <SelectTrigger className="h-8 w-full text-xs">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="MicOnly" className="text-xs">
+                Microphone Only
               </SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
+              <SelectItem value="SystemOnly" className="text-xs">
+                System Only
+              </SelectItem>
+              <SelectItem value="Mixed" className="text-xs">
+                Mixed
+              </SelectItem>
+            </SelectContent>
+          </Select>
+        </div>
+
+        <div className="flex-1 min-w-0 space-y-2">
+          <Label className="text-xs text-muted-foreground">Input Device</Label>
+          <Select
+            value={selectedMicDeviceId ?? ""}
+            onValueChange={(v) =>
+              updateSettings({ selectedMicDeviceId: v || null })
+            }
+          >
+            <SelectTrigger className="h-8 w-full text-xs">
+              <SelectValue placeholder="Default" />
+            </SelectTrigger>
+            <SelectContent>
+              {inputDevices.map((device) => (
+                <SelectItem
+                  key={device.id ?? device.name}
+                  value={device.id ?? device.name}
+                  className="text-xs"
+                >
+                  {device.name}
+                  {device.is_default ? " (default)" : ""}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
       </div>
 
       {/* Buffer Size */}
