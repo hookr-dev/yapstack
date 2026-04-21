@@ -141,10 +141,6 @@ export function useDictation() {
 
       // Set state before async work to prevent re-entry
       stateRef.current = "recording";
-      // Prevent macOS App Nap for the dictation lifetime — otherwise the
-      // main window's WKWebView JS runtime stalls while another app holds
-      // focus, freezing post-stop awaits (AI fetch, clipboard paste, etc.).
-      commands.preventAppNapBegin("YapStack dictation").catch(() => {});
       startTimeRef.current = Date.now();
       slotIdRef.current = detail.slotId;
       dictationIdRef.current = crypto.randomUUID();
@@ -472,7 +468,6 @@ export function useDictation() {
 
     function setIdle() {
       stateRef.current = "idle";
-      commands.preventAppNapEnd().catch(() => {});
       // Notify toggle mode that dictation is done (clears toggle state)
       window.dispatchEvent(new CustomEvent("yapstack:dictation-idle"));
     }
@@ -487,9 +482,6 @@ export function useDictation() {
       // Stop live transcription if dictation is active on teardown
       if (stateRef.current === "recording") {
         commands.stopLiveTranscription().catch(() => {});
-      }
-      if (stateRef.current !== "idle") {
-        commands.preventAppNapEnd().catch(() => {});
       }
       cleanupListeners();
     };

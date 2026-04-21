@@ -270,8 +270,6 @@ pub fn run() {
             commands::set_autostart_enabled,
             commands::show_overlay_panel,
             commands::hide_overlay_panel,
-            commands::app_nap::prevent_app_nap_begin,
-            commands::app_nap::prevent_app_nap_end,
         ]);
 
     #[cfg(debug_assertions)]
@@ -461,7 +459,6 @@ pub fn run() {
         .manage(Arc::new(Mutex::new(AudioManager::new())) as commands::audio::AudioManagerState)
         .manage(Arc::new(Mutex::new(None::<TrayIcon>)) as TrayState)
         .manage(Arc::new(Mutex::new(None)) as commands::live_transcription::LiveTranscriptionState)
-        .manage(Arc::new(commands::app_nap::AppNapState::new()) as commands::app_nap::AppNapStateArc)
         .manage({
             let (tx, _) = watch::channel(false);
             Arc::new(tx) as ShutdownSignal
