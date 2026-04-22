@@ -125,6 +125,9 @@ export interface Settings {
   selectedParakeetVariant: ParakeetVariantDto;
   diarizationEnabled: boolean;
   /// `{ [sessionId]: { [speakerId]: "Alice" } }`. Client-side persisted.
+  /// Populated when Parakeet + Sortformer diarization tags segments; applies
+  /// to the `SpeakerHeader` component. When diarization is off, segments
+  /// fall back to source-based labels ("You" / "Other") via `SourceHeader`.
   speakerNames: Record<string, Record<number, string>>;
   language: string;
   mixConfig: MixConfigDto;
@@ -529,17 +532,23 @@ function createAppStore() {
               `backfill=${event.is_backfill}`,
           );
 
+          // Prefer the session_id carried on the event so late-arriving
+          // segments (after `setLivePhase("Stopped")` has cleared
+          // activeSessionId) still persist to the right session in the DB.
+          // Fall back to ambient activeSessionId for backward compat with any
+          // older event payload that didn't carry session_id.
           const { activeSessionId } = get();
-          if (!activeSessionId) return;
+          const targetSessionId = event.session_id ?? activeSessionId;
+          if (!targetSessionId) return;
 
-          // Create one DbSegment per Whisper segment to preserve per-segment timestamps
+          // Create one segment per Whisper/Parakeet segment to preserve timestamps
           const newSegments: DbSegment[] = [];
           for (const seg of event.segments) {
             const text = seg.text.trim();
             if (!text) continue;
             newSegments.push({
               id: crypto.randomUUID(),
-              session_id: activeSessionId,
+              session_id: targetSessionId,
               source: event.source,
               text,
               audio_offset_seconds:
@@ -563,19 +572,22 @@ function createAppStore() {
               await insertSegment(segment);
             }
 
-            // Bail if the session was stopped while we were inserting
+            // DB persistence is done. The remaining work updates the in-memory
+            // active-session view; only do it if the target session is still
+            // the active one. Late arrivals after stop persist to DB but don't
+            // disturb whatever the user navigated to.
             const currentActiveId = get().activeSessionId;
-            if (!currentActiveId || currentActiveId !== activeSessionId) return;
+            if (!currentActiveId || currentActiveId !== targetSessionId) return;
 
             // Auto-title from first segment — re-read state to avoid race
             const currentSegments = get().activeSessionSegments;
             if (currentSegments.length === 0) {
               const title = newSegments[0].text.slice(0, 60);
-              await updateSessionTitle(activeSessionId, title);
+              await updateSessionTitle(targetSessionId, title);
             }
 
             // Re-check after the title update await
-            if (get().activeSessionId !== activeSessionId) return;
+            if (get().activeSessionId !== targetSessionId) return;
 
             // Re-read activeSessionSegments after awaits to avoid overwriting
             // segments inserted by a concurrent onLiveSegment call
@@ -591,11 +603,11 @@ function createAppStore() {
             const now = Date.now();
             if (now - lastSessionsRefreshTime >= 1000) {
               lastSessionsRefreshTime = now;
-              const freshSession = await getSession(activeSessionId);
+              const freshSession = await getSession(targetSessionId);
               if (freshSession) {
                 set({
                   sessions: get().sessions.map((s) =>
-                    s.id === activeSessionId ? freshSession : s,
+                    s.id === targetSessionId ? freshSession : s,
                   ),
                 });
               }
@@ -1231,6 +1243,7 @@ function createAppStore() {
         });
       },
 
+
       deleteParakeetModel: async (variant: ParakeetVariantDto) => {
         const result = await commands.deleteParakeetModel(variant);
         if (result.status === "error") {
@@ -1240,24 +1253,30 @@ function createAppStore() {
       },
 
       setDiarizationEnabled: async (enabled: boolean) => {
-        const settings = get().settings;
-        if (settings.diarizationEnabled === enabled) return;
-
-        get().updateSettings({ diarizationEnabled: enabled });
-
+        // Diarization is intentionally locked off pending session-stable
+        // speaker IDs. Sortformer::diarize() resets state per call, so the
+        // speaker_id values it returns are chunk-local — the same person
+        // can flip between Speaker 0 / Speaker 1 across chunk boundaries,
+        // and the transcript UI groups + renames by that numeric id. The
+        // entire IPC + sidecar + DB plumbing stays in place so re-enabling
+        // is a one-line change once the chunk-local issue is resolved
+        // (streaming Sortformer state, post-session pass on the full WAV,
+        // or an embedding-based session registry — see the doc comment on
+        // ParakeetBackend::run_diarization).
+        //
+        // Force enabled = false. We never persist `true` from this path.
+        // Any caller that explicitly tries to enable gets a clear error.
         if (enabled) {
-          await get().refreshSortformerStatus();
-          if (!get().sortformerStatus?.downloaded) {
-            set({ modelDownloadProgress: 0 });
-            try {
-              const r = await commands.downloadSortformerModel("V2_1");
-              if (r.status === "error") throw new Error(r.error.message);
-              await get().refreshSortformerStatus();
-            } finally {
-              set({ modelDownloadProgress: null });
-            }
-          }
+          throw new Error(
+            "Speaker diarization is currently disabled — chunk-local speaker " +
+              "IDs cause unstable labels across the session. Re-enable will " +
+              "land once session-stable IDs are wired up.",
+          );
         }
+        const settings = get().settings;
+        if (!settings.diarizationEnabled) return;
+
+        get().updateSettings({ diarizationEnabled: false });
 
         if (settings.selectedEngine === "Parakeet") {
           set({ enginePhase: "initializing" });
@@ -1266,7 +1285,7 @@ function createAppStore() {
             "Parakeet",
             null,
             settings.selectedParakeetVariant,
-            enabled,
+            false,
           );
           if (r.status === "error") {
             set({ enginePhase: "error", engineError: r.error.message });
@@ -1649,7 +1668,7 @@ function createAppStore() {
     }),
     {
       name: "yapstack-settings",
-      version: 22,
+      version: 23,
       partialize: (state) => ({
         settings: state.settings,
       }),
@@ -1819,6 +1838,16 @@ function createAppStore() {
           if (old.diarizationEnabled === undefined)
             old.diarizationEnabled = false;
           if (old.speakerNames === undefined) old.speakerNames = {};
+        }
+        if (version < 23 && state.settings) {
+          // Force-disable diarization on upgrade. Sortformer's chunk-local
+          // speaker IDs cause the same person to flip across speaker
+          // numbers across chunk boundaries. We're keeping the IPC + DB +
+          // sidecar plumbing intact so re-enable is one line away once
+          // session-stable IDs land, but no user should be running with
+          // the broken behavior in the meantime.
+          const old = state.settings as Record<string, unknown>;
+          old.diarizationEnabled = false;
         }
         return state as unknown as { settings: Settings };
       },

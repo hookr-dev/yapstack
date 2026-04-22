@@ -1,14 +1,23 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout};
-use tokio::sync::mpsc;
+use tokio::sync::{oneshot, Mutex as TokioMutex};
 use tracing::{debug, error, info, warn};
 use yapstack_common::types::{EngineKind, SidecarRequest, SidecarResponse, TranscriptSegment};
 
 use crate::error::TranscriptionError;
 
 type Result<T> = std::result::Result<T, TranscriptionError>;
+
+/// One-shot sender that the reader task uses to deliver the final response
+/// for a given request id. Progress messages are dropped by the reader and
+/// never reach the waiter, so the oneshot fires exactly once.
+type ResponseWaiter = oneshot::Sender<SidecarResponse>;
+type PendingMap = Arc<StdMutex<HashMap<u64, ResponseWaiter>>>;
 
 /// Remove ANSI CSI / OSC escape sequences. Tiny state machine — avoids pulling
 /// in a dependency for one place that needs it. Single-pass over the chars().
@@ -103,11 +112,27 @@ pub struct TranscriptionResult {
     pub duration_ms: u64,
 }
 
+/// Transcription client that supports **concurrent in-flight requests** to the
+/// sidecar. Multiple callers can hold `&TranscriptionClient` and call
+/// `transcribe_with(...)` simultaneously — they race on a brief `stdin` lock
+/// while writing the JSON request, then each awaits its own per-id oneshot
+/// response channel. The sidecar still processes requests serially on the
+/// model side; the benefit is that the main loop's VAD polling isn't blocked
+/// waiting for a transcribe round-trip before the next source can dispatch.
+///
+/// Methods that mutate process-level state (`respawn`, `shutdown`) still take
+/// `&mut self` because they tear down and rebuild the pipeline.
 pub struct TranscriptionClient {
-    stdin: ChildStdin,
-    response_rx: mpsc::Receiver<SidecarResponse>,
-    next_id: u64,
-    _child: Child,
+    stdin: TokioMutex<ChildStdin>,
+    pending: PendingMap,
+    next_id: AtomicU64,
+    child: StdMutex<Child>,
+    /// Set `true` while the reader task is running. Cleared by the reader
+    /// task on exit (stdout EOF / I/O error) so `is_running()` can notice a
+    /// dead IPC pipeline even when the child hasn't reported its exit status
+    /// yet. The old mpsc-based design could check `response_rx.is_closed()`;
+    /// with per-id oneshot routing we need an explicit liveness flag.
+    reader_alive: Arc<AtomicBool>,
     // Stored for auto-restart (respawn)
     sidecar_path: PathBuf,
     engine: EngineKind,
@@ -117,11 +142,12 @@ pub struct TranscriptionClient {
     coreml_cache_dir: Option<PathBuf>,
 }
 
-/// Raw parts returned by sidecar spawn (avoids Drop issues when moving into an existing TranscriptionClient).
+/// Raw parts returned by sidecar spawn.
 struct SidecarParts {
     stdin: ChildStdin,
-    response_rx: mpsc::Receiver<SidecarResponse>,
+    pending: PendingMap,
     child: Child,
+    reader_alive: Arc<AtomicBool>,
 }
 
 impl TranscriptionClient {
@@ -152,10 +178,11 @@ impl TranscriptionClient {
         .await?;
 
         Ok(Self {
-            stdin: parts.stdin,
-            response_rx: parts.response_rx,
-            next_id: 1,
-            _child: parts.child,
+            stdin: TokioMutex::new(parts.stdin),
+            pending: parts.pending,
+            next_id: AtomicU64::new(1),
+            child: StdMutex::new(parts.child),
+            reader_alive: parts.reader_alive,
             sidecar_path: sidecar_path.to_path_buf(),
             engine,
             model_path: model_path.to_path_buf(),
@@ -221,10 +248,16 @@ impl TranscriptionClient {
             .ok_or_else(|| TranscriptionError::SidecarError("failed to open stdout".to_string()))?;
         let stderr = child.stderr.take();
 
-        let (tx, rx) = mpsc::channel::<SidecarResponse>(64);
+        let pending: PendingMap = Arc::new(StdMutex::new(HashMap::new()));
+        let reader_alive = Arc::new(AtomicBool::new(true));
 
-        // Spawn reader task to read JSON lines from stdout
-        tokio::spawn(Self::reader_task(stdout, tx));
+        // Spawn reader task with clones of the pending map + liveness flag
+        // so it can route per-id responses and signal exit when stdout closes.
+        tokio::spawn(Self::reader_task(
+            stdout,
+            pending.clone(),
+            reader_alive.clone(),
+        ));
 
         // Spawn stderr reader task to forward sidecar logs to tracing
         if let Some(stderr) = stderr {
@@ -233,12 +266,22 @@ impl TranscriptionClient {
 
         Ok(SidecarParts {
             stdin,
-            response_rx: rx,
+            pending,
             child,
+            reader_alive,
         })
     }
 
-    async fn reader_task(stdout: ChildStdout, tx: mpsc::Sender<SidecarResponse>) {
+    /// Reads JSON-line responses from the sidecar stdout and dispatches each
+    /// to the per-id oneshot waiter registered by the caller of
+    /// `transcribe_with` / `load_model`. Progress messages are logged and
+    /// dropped (oneshot fires exactly once per request — we only deliver the
+    /// final response variant).
+    ///
+    /// Clears `reader_alive` on exit (EOF or I/O error) so `is_running()` can
+    /// detect a dead IPC pipeline even when the child process hasn't reported
+    /// its exit status yet.
+    async fn reader_task(stdout: ChildStdout, pending: PendingMap, reader_alive: Arc<AtomicBool>) {
         let reader = BufReader::new(stdout);
         let mut lines = reader.lines();
 
@@ -251,9 +294,30 @@ impl TranscriptionClient {
                     match serde_json::from_str::<SidecarResponse>(&line) {
                         Ok(response) => {
                             log_sidecar_response(&response);
-                            if tx.send(response).await.is_err() {
-                                debug!("response channel closed, stopping reader");
-                                break;
+                            // Skip Progress — it is informational and doesn't
+                            // terminate the waiter's oneshot.
+                            if let SidecarResponse::Progress { id, percent } = &response {
+                                debug!(id = id, "transcription progress: {:.0}%", percent * 100.0);
+                                continue;
+                            }
+                            let id = response_id(&response);
+                            let waiter = {
+                                let mut map =
+                                    pending.lock().expect("pending-response mutex poisoned");
+                                id.and_then(|id| map.remove(&id))
+                            };
+                            match waiter {
+                                Some(tx) => {
+                                    // Ignore send error — the waiter may have
+                                    // timed out and dropped its receiver.
+                                    let _ = tx.send(response);
+                                }
+                                None => {
+                                    warn!(
+                                        "sidecar response with no registered waiter (id={:?}) — discarding",
+                                        id
+                                    );
+                                }
                             }
                         }
                         Err(e) => {
@@ -271,6 +335,15 @@ impl TranscriptionClient {
                 }
             }
         }
+        // Stdout closed — any remaining waiters will never get a response.
+        // Dropping the senders wakes them with a `RecvError`, which our
+        // helper turns into `TranscriptionError::SidecarError`.
+        let mut map = pending.lock().expect("pending-response mutex poisoned");
+        map.clear();
+        drop(map);
+        // Signal that the IPC pipeline is dead so `is_running()` triggers a
+        // respawn even if the child process hasn't exited yet.
+        reader_alive.store(false, Ordering::Release);
     }
 
     /// Reads stderr from the sidecar and forwards each line to tracing.
@@ -301,51 +374,73 @@ impl TranscriptionClient {
         }
     }
 
-    /// Sends a request to the sidecar process.
-    async fn send_request(&mut self, request: &SidecarRequest) -> Result<()> {
+    /// Register a fresh oneshot waiter under an allocated request id, send
+    /// the serialized request over stdin, and return the receiver. The caller
+    /// awaits the receiver with its own timeout; on timeout the caller must
+    /// deregister by calling `cancel_pending(id)` so the map doesn't leak.
+    async fn dispatch_request(
+        &self,
+        build: impl FnOnce(u64) -> SidecarRequest,
+    ) -> Result<(u64, oneshot::Receiver<SidecarResponse>)> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = oneshot::channel();
+        {
+            let mut map = self
+                .pending
+                .lock()
+                .expect("pending-response mutex poisoned");
+            map.insert(id, tx);
+        }
+        let request = build(id);
+        if let Err(e) = self.send_request(&request).await {
+            // Failed to write — remove the waiter we just registered.
+            self.cancel_pending(id);
+            return Err(e);
+        }
+        Ok((id, rx))
+    }
+
+    fn cancel_pending(&self, id: u64) {
+        let mut map = self
+            .pending
+            .lock()
+            .expect("pending-response mutex poisoned");
+        map.remove(&id);
+    }
+
+    /// Sends a request to the sidecar process. Serialises just the JSON write
+    /// via the stdin mutex — sub-millisecond hold time, so concurrent
+    /// `transcribe_with` callers barely see each other.
+    async fn send_request(&self, request: &SidecarRequest) -> Result<()> {
         let mut json = serde_json::to_string(request)?;
         json.push('\n');
-        self.stdin.write_all(json.as_bytes()).await?;
-        self.stdin.flush().await?;
+        let mut stdin = self.stdin.lock().await;
+        stdin.write_all(json.as_bytes()).await?;
+        stdin.flush().await?;
         Ok(())
     }
 
-    /// Waits for a response with the given ID, with timeout.
-    async fn wait_for_response(&mut self, id: u64, timeout_secs: u64) -> Result<SidecarResponse> {
+    /// Await a registered waiter with a timeout. On timeout or reader-task
+    /// teardown the pending entry is cleaned up.
+    async fn await_response(
+        &self,
+        id: u64,
+        rx: oneshot::Receiver<SidecarResponse>,
+        timeout_secs: u64,
+    ) -> Result<SidecarResponse> {
         let timeout = tokio::time::Duration::from_secs(timeout_secs);
-
-        loop {
-            match tokio::time::timeout(timeout, self.response_rx.recv()).await {
-                Ok(Some(response)) => {
-                    let response_id = match &response {
-                        SidecarResponse::Transcription { id, .. } => Some(*id),
-                        SidecarResponse::ModelLoaded { id } => Some(*id),
-                        SidecarResponse::Error { id, .. } => Some(*id),
-                        SidecarResponse::Progress { id, .. } => Some(*id),
-                    };
-
-                    if response_id == Some(id) {
-                        // Skip progress messages — keep waiting for the final result
-                        if let SidecarResponse::Progress { percent, .. } = &response {
-                            debug!("transcription progress: {:.0}%", percent * 100.0);
-                            continue;
-                        }
-                        return Ok(response);
-                    } else {
-                        warn!(
-                            "IPC response ID mismatch: expected {}, got {:?} — discarding",
-                            id, response_id
-                        );
-                    }
-                }
-                Ok(None) => {
-                    return Err(TranscriptionError::SidecarError(
-                        "sidecar process exited unexpectedly".to_string(),
-                    ));
-                }
-                Err(_) => {
-                    return Err(TranscriptionError::Timeout(timeout_secs));
-                }
+        match tokio::time::timeout(timeout, rx).await {
+            Ok(Ok(response)) => Ok(response),
+            Ok(Err(_recv_err)) => {
+                // Reader task dropped the sender — sidecar stdout closed.
+                self.cancel_pending(id);
+                Err(TranscriptionError::SidecarError(
+                    "sidecar process exited unexpectedly".to_string(),
+                ))
+            }
+            Err(_) => {
+                self.cancel_pending(id);
+                Err(TranscriptionError::Timeout(timeout_secs))
             }
         }
     }
@@ -358,7 +453,7 @@ impl TranscriptionClient {
     /// Transcribes an audio file. Diarization is off — use
     /// [`Self::transcribe_with`] when you need to control it per-call.
     pub async fn transcribe(
-        &mut self,
+        &self,
         audio_path: &Path,
         language: Option<&str>,
         initial_prompt: Option<&str>,
@@ -371,29 +466,31 @@ impl TranscriptionClient {
     /// `diarization: true` is honored only when the sidecar was spawned with
     /// `engine = Parakeet` *and* a Sortformer model path; otherwise the flag
     /// is silently a no-op.
+    ///
+    /// Safe to call concurrently from multiple tasks holding `&TranscriptionClient`.
     pub async fn transcribe_with(
-        &mut self,
+        &self,
         audio_path: &Path,
         language: Option<&str>,
         initial_prompt: Option<&str>,
         diarization: bool,
     ) -> Result<TranscriptionResult> {
-        let id = self.next_id;
-        self.next_id += 1;
-
-        let request = SidecarRequest::Transcribe {
-            id,
-            audio_path: audio_path.to_path_buf(),
-            language: language.map(String::from),
-            initial_prompt: initial_prompt.map(String::from),
-            single_segment: None, // let sidecar decide based on audio duration
-            diarization,
-        };
-
-        self.send_request(&request).await?;
+        let language = language.map(String::from);
+        let initial_prompt = initial_prompt.map(String::from);
+        let audio_path = audio_path.to_path_buf();
+        let (id, rx) = self
+            .dispatch_request(|id| SidecarRequest::Transcribe {
+                id,
+                audio_path,
+                language,
+                initial_prompt,
+                single_segment: None,
+                diarization,
+            })
+            .await?;
 
         // 5 minutes timeout for transcription (long audio files)
-        let response = self.wait_for_response(id, 300).await?;
+        let response = self.await_response(id, rx, 300).await?;
 
         match response {
             SidecarResponse::Transcription {
@@ -415,20 +512,16 @@ impl TranscriptionClient {
         }
     }
 
-    /// Loads a model into the sidecar process.
-    pub async fn load_model(&mut self, model_path: &Path) -> Result<()> {
-        let id = self.next_id;
-        self.next_id += 1;
-
-        let request = SidecarRequest::LoadModel {
-            id,
-            model_path: model_path.to_path_buf(),
-        };
-
-        self.send_request(&request).await?;
+    /// Loads a model into the sidecar process. Safe to call concurrently, but
+    /// typically called once at startup.
+    pub async fn load_model(&self, model_path: &Path) -> Result<()> {
+        let model_path = model_path.to_path_buf();
+        let (id, rx) = self
+            .dispatch_request(|id| SidecarRequest::LoadModel { id, model_path })
+            .await?;
 
         // 60 seconds timeout for model loading
-        let response = self.wait_for_response(id, 60).await?;
+        let response = self.await_response(id, rx, 60).await?;
 
         match response {
             SidecarResponse::ModelLoaded { .. } => Ok(()),
@@ -441,10 +534,10 @@ impl TranscriptionClient {
         }
     }
 
-    /// Sends a shutdown request and waits for the process to exit.
-    pub async fn shutdown(&mut self) -> Result<()> {
+    /// Sends a shutdown request. Does not wait for the process to exit.
+    pub async fn shutdown(&self) -> Result<()> {
         let request = SidecarRequest::Shutdown;
-        // Best-effort send; if it fails, the process may already be dead
+        // Best-effort send; if it fails, the process may already be dead.
         let _ = self.send_request(&request).await;
         Ok(())
     }
@@ -452,13 +545,18 @@ impl TranscriptionClient {
     /// Returns whether the sidecar process is likely still running.
     ///
     /// Combines two checks:
-    /// 1. Response channel open (reader task / stdout still active)
-    /// 2. Child process hasn't exited (via `try_wait`)
-    pub fn is_running(&mut self) -> bool {
-        if self.response_rx.is_closed() {
+    /// 1. Reader task is alive (stdout still open). If the reader task has
+    ///    exited because of EOF or an I/O error on the pipe, no response can
+    ///    ever come back — even if the child process's exit status hasn't
+    ///    been reaped yet, the IPC pipeline is effectively dead.
+    /// 2. Child process hasn't exited (via `try_wait`).
+    pub fn is_running(&self) -> bool {
+        if !self.reader_alive.load(Ordering::Acquire) {
+            warn!("sidecar IPC reader task exited — treating client as dead");
             return false;
         }
-        match self._child.try_wait() {
+        let mut child = self.child.lock().expect("child mutex poisoned");
+        match child.try_wait() {
             Ok(Some(status)) => {
                 warn!("sidecar process exited with status: {}", status);
                 false
@@ -466,7 +564,7 @@ impl TranscriptionClient {
             Ok(None) => true, // still running
             Err(e) => {
                 warn!("failed to check sidecar process status: {}", e);
-                // Assume running if we can't check — channel state is the fallback
+                // Assume running if we can't check
                 true
             }
         }
@@ -476,21 +574,36 @@ impl TranscriptionClient {
     /// model/VAD configuration. The model is loaded eagerly by the sidecar
     /// on startup (via --model arg), so no separate load_model call is needed.
     /// `next_id` is preserved to keep request IDs unique across respawns.
+    ///
+    /// Takes `&mut self` because it tears down and replaces stdin and the
+    /// pending-response map — callers cannot race this with `transcribe_with`.
     pub async fn respawn(&mut self) -> Result<()> {
-        // Log the old process's exit status for diagnostics
-        match self._child.try_wait() {
-            Ok(Some(status)) => info!(
-                "respawning sidecar (previous exited with status: {})",
-                status
-            ),
-            Ok(None) => info!("respawning sidecar (previous still running — will kill)"),
-            Err(e) => info!(
-                "respawning sidecar (could not check previous status: {})",
-                e
-            ),
+        // Log the old process's exit status for diagnostics and kill it.
+        {
+            let mut child = self.child.lock().expect("child mutex poisoned");
+            match child.try_wait() {
+                Ok(Some(status)) => info!(
+                    "respawning sidecar (previous exited with status: {})",
+                    status
+                ),
+                Ok(None) => info!("respawning sidecar (previous still running — will kill)"),
+                Err(e) => info!(
+                    "respawning sidecar (could not check previous status: {})",
+                    e
+                ),
+            }
+            let _ = child.start_kill();
         }
 
-        let _ = self._child.start_kill();
+        // Any requests still pending on the old sidecar will never get a
+        // response — drop their senders so waiters wake with a SidecarError.
+        {
+            let mut map = self
+                .pending
+                .lock()
+                .expect("pending-response mutex poisoned");
+            map.clear();
+        }
 
         let parts = Self::spawn_sidecar(
             &self.sidecar_path,
@@ -502,15 +615,27 @@ impl TranscriptionClient {
         )
         .await?;
 
-        self.stdin = parts.stdin;
-        self.response_rx = parts.response_rx;
-        self._child = parts.child;
+        self.stdin = TokioMutex::new(parts.stdin);
+        self.pending = parts.pending;
+        self.reader_alive = parts.reader_alive;
+        *self.child.lock().expect("child mutex poisoned") = parts.child;
         // Don't reset next_id — keep incrementing for unique request IDs
         info!(
             "sidecar respawned successfully (next request id: {})",
-            self.next_id
+            self.next_id.load(Ordering::Relaxed)
         );
         Ok(())
+    }
+}
+
+/// Extract the request id from any `SidecarResponse` variant. Used by the
+/// reader task to route responses to per-id waiters.
+fn response_id(response: &SidecarResponse) -> Option<u64> {
+    match response {
+        SidecarResponse::Transcription { id, .. } => Some(*id),
+        SidecarResponse::ModelLoaded { id } => Some(*id),
+        SidecarResponse::Error { id, .. } => Some(*id),
+        SidecarResponse::Progress { id, .. } => Some(*id),
     }
 }
 
@@ -518,6 +643,8 @@ impl Drop for TranscriptionClient {
     fn drop(&mut self) {
         // Kill the sidecar process to prevent orphaned processes when the
         // client is dropped without an explicit shutdown() call.
-        let _ = self._child.start_kill();
+        if let Ok(mut child) = self.child.lock() {
+            let _ = child.start_kill();
+        }
     }
 }

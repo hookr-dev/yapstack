@@ -13,4 +13,7 @@ export type LiveSegmentEvent = {
   chunk_duration_seconds: number;
   accumulated_text: string;
   is_backfill: boolean;
+  /** Session this chunk belongs to. Late-arriving segments still persist to
+   * this session even after the frontend has cleared activeSessionId. */
+  session_id: string | null;
 };

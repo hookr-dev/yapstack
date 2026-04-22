@@ -1,6 +1,6 @@
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
 use futures_util::FutureExt;
@@ -20,7 +20,7 @@ use super::transcription::{TranscriptSegmentDto, TranscriptionClientState};
 
 // --- DTOs ---
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
 pub enum AudioSourceLabel {
     Mic,
     System,
@@ -100,6 +100,10 @@ pub struct LiveSegmentEvent {
     pub accumulated_text: String,
     /// Whether this chunk came from backfill processing (true) or live VAD (false).
     pub is_backfill: bool,
+    /// Session this chunk belongs to. Carried on the event so late-arriving
+    /// segments can still be persisted to the right session even if the
+    /// frontend has already cleared `activeSessionId` during finalization.
+    pub session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Type)]
@@ -156,8 +160,16 @@ struct SessionWavState {
 /// returned to shared state when the live transcription loop ends.
 #[derive(Clone)]
 struct TranscriptionContext {
-    /// Private client for the live transcription loop — zero contention.
-    transcription_client: Arc<Mutex<Option<yapstack_transcription::TranscriptionClient>>>,
+    /// Private client for the live transcription loop. Wrapped in an inner
+    /// `Arc` so concurrent chunk tasks (mic + system in the same poll tick)
+    /// can each briefly lock the outer mutex, clone the Arc, and then hold
+    /// the client by reference across their transcribe await without
+    /// contending on the outer mutex. The inner `TranscriptionClient` is
+    /// concurrent-safe by construction (per-id oneshot response routing).
+    ///
+    /// The `Option` layer remains so we can move the raw client back into
+    /// shared state on session end via `Arc::try_unwrap`.
+    transcription_client: Arc<Mutex<Option<Arc<yapstack_transcription::TranscriptionClient>>>>,
     /// Reference to the shared state so we can return the client when done.
     shared_transcription_state: TranscriptionClientState,
     app_handle: AppHandle,
@@ -172,13 +184,17 @@ struct ChunkResult {
     chunk_duration: f32,
 }
 
-/// Outcome of a transcription attempt — determines cursor management and loop control.
+/// Outcome of a transcription attempt — determines cursor management and
+/// loop control. Too-short and empty extractions are filtered before dispatch
+/// in `prepare_chunk_dispatch`, so we don't need a TooShort variant here.
 enum TranscribeOutcome {
     /// Transcription succeeded with segments.
     Success(ChunkResult),
-    /// Transcription failed non-fatally (chunk skipped, audio can be retried).
+    /// Transcription failed non-fatally (temp WAV write error, engine error,
+    /// timeout). The fire-and-forget dispatch path quarantines the audio
+    /// immediately — retries are not attempted in the concurrent design.
     Skipped,
-    /// Sidecar is dead and could not be restarted — loop should exit.
+    /// Sidecar is dead and could not be restarted — main loop exits.
     SidecarDead,
 }
 
@@ -200,6 +216,9 @@ struct ChunkInput<'a> {
 }
 
 /// Session-level mutable accumulators passed through transcription functions.
+///
+/// Shared across concurrent per-source chunk tasks via `Arc<StdMutex<_>>`.
+/// All mutation sites lock briefly; the mutex is never held across an await.
 struct SessionAccumulators {
     shared_prompt: String,
     total_chunks: u32,
@@ -211,9 +230,19 @@ struct SessionAccumulators {
 }
 
 /// A single chunk of backfill audio with its sample rate.
+#[allow(dead_code)] // retained as the pair with chunk_at_silence_boundaries
 struct BackfillChunk<'a> {
     samples: &'a [f32],
     sample_rate: u32,
+}
+
+/// One source's backfill data: the raw samples plus VAD-simulated chunk
+/// boundaries (start/end sample indices) produced by `vad_chunk_historical_audio`.
+struct VadBackfillSource {
+    label: AudioSourceLabel,
+    samples: Vec<f32>,
+    sample_rate: u32,
+    chunks: Vec<VadBackfillChunk>,
 }
 
 // --- Controller ---
@@ -258,8 +287,6 @@ struct SourceVadState {
     source_sample_rate: u32,
     /// Channel count of this source's ring buffer (interleaved).
     source_channels: u16,
-    /// Consecutive failures from the same speech_start_pos (for retry cap).
-    consecutive_failures: u32,
     /// Last observed write_pos for stall detection.
     last_seen_write_pos: usize,
     /// When last_seen_write_pos last advanced.
@@ -268,6 +295,17 @@ struct SourceVadState {
     restart_attempts: u32,
     /// When the last restart was attempted (for cooldown).
     last_restart_at: Option<Instant>,
+    /// True while a background chunk task is running for this source. VAD
+    /// state keeps updating (so second-utterance-during-in-flight is still
+    /// captured) but dispatch and idle-cursor advance are gated off.
+    /// Cleared when the task completes and the main loop applies its outcome.
+    has_in_flight_task: bool,
+    /// Lower bound for onset pre-roll adjustments. Prevents pre-roll from
+    /// pulling `speech_start_pos` before the last dispatched chunk's end,
+    /// which would cause the next chunk to re-transcribe the tail of the
+    /// previous one. Set to `new_pos` at every chunk dispatch and to
+    /// `session_start_pos` at loop entry (no prior dispatch to respect).
+    earliest_next_chunk_pos: usize,
 }
 
 impl SourceVadState {
@@ -279,6 +317,8 @@ impl SourceVadState {
         channels: u16,
     ) -> Self {
         Self {
+            has_in_flight_task: false,
+            earliest_next_chunk_pos: session_start_pos,
             label,
             is_speaking: false,
             speech_start_pos: initial_pos,
@@ -290,7 +330,6 @@ impl SourceVadState {
             session_start_pos,
             source_sample_rate: sample_rate,
             source_channels: channels,
-            consecutive_failures: 0,
             last_seen_write_pos: initial_pos,
             last_write_pos_advance: Instant::now(),
             restart_attempts: 0,
@@ -309,22 +348,80 @@ enum VadAction {
     ForceChunk,
 }
 
+/// Per-engine tuning for the VAD / chunking loop.
+///
+/// Whisper's values preserve the original dictation-tuned defaults and are
+/// intentionally unchanged — they work well for Whisper dictation and the
+/// `silence_duration_ms` field is still accepted from the frontend config
+/// as a user override.
+///
+/// Parakeet's values are dialogue-tuned for multi-speaker meeting capture:
+/// faster polling catches short interjections, a shorter silence window
+/// resolves turn boundaries quickly, onset/offset hysteresis prevents
+/// mid-word dropout, and pre-roll captures the leading plosives that sit
+/// just below the RMS threshold when the speaker starts talking.
+#[derive(Debug, Clone, Copy)]
+struct VadTuning {
+    /// RMS threshold above which audio is considered speech (onset).
+    silence_threshold: f32,
+    /// Offset threshold as a ratio of silence_threshold (hysteresis). Must
+    /// be in (0.0, 1.0]. 1.0 disables hysteresis.
+    offset_threshold_ratio: f32,
+    /// How long silence must hold before chunking.
+    silence_duration: Duration,
+    /// Force-chunk after this much continuous speech.
+    max_chunk_duration: Duration,
+    /// Inner poll cadence for energy checks + VAD transitions.
+    poll_interval: Duration,
+    /// Pre-onset capture: extraction starts this far *before* the point we
+    /// noticed energy cross the threshold, to catch leading plosives.
+    pre_roll: Duration,
+}
+
+fn vad_tuning_for(
+    engine: yapstack_common::types::EngineKind,
+    config: &LiveTranscriptionConfig,
+) -> VadTuning {
+    use yapstack_common::types::EngineKind;
+    match engine {
+        // Whisper: preserve existing dictation-proven defaults exactly.
+        // silence_duration honors the user's configured value (frontend
+        // default 800 ms); no hysteresis, no pre-roll, 300 ms poll cadence.
+        EngineKind::Whisper => VadTuning {
+            silence_threshold: config.silence_threshold,
+            offset_threshold_ratio: 1.0,
+            silence_duration: Duration::from_millis(config.silence_duration_ms as u64),
+            max_chunk_duration: Duration::from_secs_f32(config.max_chunk_seconds),
+            poll_interval: Duration::from_millis(POLL_INTERVAL_MS),
+            pre_roll: Duration::ZERO,
+        },
+        // Parakeet: dialogue-tuned. These values ignore the frontend's
+        // silence_duration_ms / poll cadence by design — they're engine-
+        // specific best practice, not user-facing knobs for this pass.
+        EngineKind::Parakeet => VadTuning {
+            silence_threshold: config.silence_threshold,
+            offset_threshold_ratio: 0.7,
+            silence_duration: Duration::from_millis(400),
+            max_chunk_duration: Duration::from_secs_f32(config.max_chunk_seconds),
+            poll_interval: Duration::from_millis(100),
+            pre_roll: Duration::from_millis(250),
+        },
+    }
+}
+
 /// Polls the VAD state machine for a single source.
 /// Manages `speech_start_time` internally on state transitions.
-fn poll_vad(
-    state: &mut SourceVadState,
-    energy: Option<f32>,
-    silence_threshold: f32,
-    silence_duration: Duration,
-    max_chunk_duration: Duration,
-) -> VadAction {
+/// Uses `tuning.silence_threshold` for onset detection and
+/// `tuning.silence_threshold * tuning.offset_threshold_ratio` for offset
+/// (hysteresis prevents mid-word dropout on quiet vowels).
+fn poll_vad(state: &mut SourceVadState, energy: Option<f32>, tuning: &VadTuning) -> VadAction {
     let Some(energy) = energy else {
         return VadAction::None;
     };
 
-    let is_loud = energy >= silence_threshold;
-
     if state.is_speaking {
+        let offset_threshold = tuning.silence_threshold * tuning.offset_threshold_ratio;
+        let is_loud = energy >= offset_threshold;
         if is_loud {
             state.silence_since = None;
 
@@ -332,24 +429,42 @@ fn poll_vad(
                 .speech_start_time
                 .map(|t| t.elapsed())
                 .unwrap_or_default();
-            if speech_elapsed >= max_chunk_duration {
+            if speech_elapsed >= tuning.max_chunk_duration {
                 return VadAction::ForceChunk;
             }
 
             VadAction::None
         } else {
             let silence_start = *state.silence_since.get_or_insert_with(Instant::now);
-            if silence_start.elapsed() >= silence_duration {
+            if silence_start.elapsed() >= tuning.silence_duration {
                 VadAction::Chunk
             } else {
                 VadAction::None
             }
         }
     } else {
+        let is_loud = energy >= tuning.silence_threshold;
         if is_loud {
             state.is_speaking = true;
             state.silence_since = None;
             state.speech_start_time = Some(Instant::now());
+            // Pre-roll: rewind speech_start_pos so the extracted chunk
+            // includes the audio immediately *before* we noticed energy
+            // cross the threshold. Clamped to `earliest_next_chunk_pos`
+            // (last dispatched chunk's end, or session_start_pos when no
+            // chunk has been dispatched yet) so we never re-transcribe the
+            // tail of a previous chunk when onset happens soon after a
+            // dispatch — e.g. a second utterance while the previous
+            // chunk's task is still in flight.
+            if tuning.pre_roll > Duration::ZERO {
+                let pre_roll_samples = (tuning.pre_roll.as_secs_f32()
+                    * state.source_sample_rate as f32
+                    * state.source_channels as f32) as usize;
+                state.speech_start_pos = state
+                    .speech_start_pos
+                    .saturating_sub(pre_roll_samples)
+                    .max(state.earliest_next_chunk_pos);
+            }
         }
         VadAction::None
     }
@@ -422,105 +537,238 @@ fn extract_source_audio(
     (Some((mono, buf.sample_rate())), new_pos)
 }
 
-/// Process a single source's chunk: extract audio, transcribe, emit events, reset state.
-/// Returns `true` if a fatal error occurred (sidecar dead) and the loop should exit.
-async fn process_source_chunk(
+/// Outcome returned from a background chunk task back to the main loop so it
+/// can restore per-source state (accumulated_text) and notice fatal failures.
+struct ChunkTaskOutcome {
+    source_label: AudioSourceLabel,
+    /// Returned so the main loop can write it back to `vad.accumulated_text`.
+    /// The task mutates a moved-in copy; moving back on completion is safe
+    /// because we gate VAD polling on `has_in_flight_task` — no concurrent
+    /// reader of `vad.accumulated_text` exists while the task runs.
+    accumulated_text: String,
+    /// True when the sidecar died and could not be restarted. Main loop
+    /// exits on receiving this.
+    sidecar_dead: bool,
+}
+
+/// Prepare a chunk for background transcription: extract audio, advance the
+/// source's VAD cursor/state optimistically (as if the task will succeed),
+/// and return the parameters needed to spawn the task. Returns `None` when
+/// there's no audio to transcribe yet (too short / empty extraction) so the
+/// caller skips task spawn and the next poll re-tries.
+///
+/// Sets `vad.has_in_flight_task = true` when a task is dispatched. The main
+/// loop clears it when the task's outcome lands.
+async fn prepare_chunk_dispatch(
     vad: &mut SourceVadState,
     audio_state: &AudioManagerState,
-    ctx: &TranscriptionContext,
     is_force_chunk: bool,
-    session: &mut SessionAccumulators,
-) -> bool {
-    // Single atomic read: extract audio AND capture write position together
+    is_backfill: bool,
+) -> Option<PreparedChunk> {
     let (extraction, new_pos) = {
         let manager = audio_state.lock().await;
         extract_source_audio(&manager, &vad.label, vad.speech_start_pos)
     };
 
-    let mut outcome = TranscribeOutcome::Skipped;
+    let Some((samples, sample_rate)) = extraction else {
+        // Nothing new in the buffer since last read — advance the cursor to
+        // the latest write_pos but leave speech_start_pos so we'll pick up
+        // the ongoing utterance on the next poll.
+        vad.cursor = new_pos;
+        return None;
+    };
 
-    if let Some((samples, sample_rate)) = extraction {
-        let chunk_duration = samples.len() as f32 / sample_rate as f32;
-        if chunk_duration >= MIN_CHUNK_DURATION_SECS {
-            // Deterministic offset from buffer position delta. No wall-clock drift.
-            let samples_since_start = vad.speech_start_pos.saturating_sub(vad.session_start_pos);
-            let audio_offset = samples_since_start as f32
-                / (vad.source_sample_rate as f32 * vad.source_channels as f32);
-
-            debug!(
-                "live chunk: source={:?} offset={:.2}s duration={:.2}s samples={} (pos: speech={} session_start={})",
-                vad.label,
-                audio_offset,
-                chunk_duration,
-                samples.len(),
-                vad.speech_start_pos,
-                vad.session_start_pos,
-            );
-
-            let input = ChunkInput {
-                samples: &samples,
-                sample_rate,
-                audio_offset_seconds: audio_offset,
-                source_label: vad.label,
-                is_backfill: false,
-            };
-            outcome = transcribe_and_emit_chunk(
-                ctx,
-                &input,
-                &mut vad.chunk_index,
-                &mut vad.accumulated_text,
-                session,
-            )
-            .await;
-        }
+    let chunk_duration = samples.len() as f32 / sample_rate as f32;
+    if chunk_duration < MIN_CHUNK_DURATION_SECS {
+        // Too short — don't dispatch yet and don't advance speech_start_pos.
+        // Next poll re-extracts this region together with whatever arrives.
+        vad.cursor = new_pos;
+        return None;
     }
 
-    // Manage cursor and VAD state based on outcome
-    match outcome {
-        TranscribeOutcome::Success(_) => {
-            vad.consecutive_failures = 0;
-            vad.cursor = new_pos;
-            if is_force_chunk {
-                vad.speech_start_pos = new_pos;
-                vad.silence_since = None;
-                vad.speech_start_time = Some(Instant::now());
-            } else {
-                vad.is_speaking = false;
-                vad.silence_since = None;
-                vad.speech_start_pos = new_pos;
-                vad.speech_start_time = None;
-            }
-            false
-        }
-        TranscribeOutcome::Skipped => {
-            vad.consecutive_failures += 1;
-            // Advance cursor but keep speech_start_pos for retry — the failed audio
-            // region will be included in the next chunk extraction.
-            vad.cursor = new_pos;
-            vad.is_speaking = false;
-            vad.silence_since = None;
-            vad.speech_start_time = None;
+    // Deterministic offset from buffer position delta.
+    let samples_since_start = vad.speech_start_pos.saturating_sub(vad.session_start_pos);
+    let audio_offset =
+        samples_since_start as f32 / (vad.source_sample_rate as f32 * vad.source_channels as f32);
 
-            // Retry cap: after MAX_CHUNK_RETRIES failures from the same speech_start_pos,
-            // abandon the chunk to prevent ever-growing extractions.
-            if vad.consecutive_failures >= MAX_CHUNK_RETRIES {
-                warn!(
-                    "live transcription: {} consecutive failures for source {:?} — abandoning chunk",
-                    vad.consecutive_failures, vad.label
-                );
-                vad.speech_start_pos = new_pos;
-                vad.consecutive_failures = 0;
-                let _ = ctx.app_handle.emit(
-                    "live-transcription-warning",
-                    LiveTranscriptionWarningEvent {
-                        message: "Some audio could not be transcribed and was skipped".into(),
-                    },
-                );
-            }
-            false
-        }
-        TranscribeOutcome::SidecarDead => true,
+    debug!(
+        "live chunk: source={:?} offset={:.2}s duration={:.2}s samples={} (pos: speech={} session_start={}, in-flight dispatch)",
+        vad.label,
+        audio_offset,
+        chunk_duration,
+        samples.len(),
+        vad.speech_start_pos,
+        vad.session_start_pos,
+    );
+
+    // Snapshot chunk_index for this task, increment our counter so the next
+    // chunk (if any) gets a unique id. The task emits events carrying this
+    // index; we don't need to write back.
+    let chunk_index = vad.chunk_index;
+    vad.chunk_index = vad.chunk_index.wrapping_add(1);
+
+    // Move accumulated_text into the task; the main loop restores it on
+    // outcome. Safe because VAD polling is gated off this source until then.
+    let accumulated_text = std::mem::take(&mut vad.accumulated_text);
+
+    // Optimistically advance cursor + VAD state as if the task will succeed.
+    // On transient failures we quarantine the audio rather than retry the
+    // same region — the main loop continues unblocked, and the user gets a
+    // visible warning with a recoverable WAV path.
+    vad.cursor = new_pos;
+    vad.is_speaking = false;
+    vad.silence_since = None;
+    vad.speech_start_pos = new_pos;
+    // Pre-roll for any subsequent onset must not pull speech_start_pos
+    // before this point, or the next chunk would redundantly transcribe
+    // the tail of the audio this task is about to send.
+    vad.earliest_next_chunk_pos = new_pos;
+    if is_force_chunk {
+        vad.speech_start_time = Some(Instant::now());
+    } else {
+        vad.speech_start_time = None;
     }
+
+    vad.has_in_flight_task = true;
+
+    Some(PreparedChunk {
+        samples,
+        sample_rate,
+        audio_offset_seconds: audio_offset,
+        source_label: vad.label,
+        chunk_index,
+        accumulated_text,
+        is_backfill,
+    })
+}
+
+/// Owned chunk data handed off to a spawned background task. Contains
+/// everything the task needs; no references into the main-loop state.
+struct PreparedChunk {
+    samples: Vec<f32>,
+    sample_rate: u32,
+    audio_offset_seconds: f32,
+    source_label: AudioSourceLabel,
+    chunk_index: u32,
+    accumulated_text: String,
+    is_backfill: bool,
+}
+
+/// Run a single chunk's transcription in a background task. Emits the
+/// segment event on success; quarantines the audio and emits a warning on
+/// failure. Returns the outcome so the main loop can restore
+/// `accumulated_text` and notice a dead sidecar.
+async fn run_chunk_task(
+    prepared: PreparedChunk,
+    ctx: TranscriptionContext,
+    session: Arc<StdMutex<SessionAccumulators>>,
+) -> ChunkTaskOutcome {
+    let source_label = prepared.source_label;
+    let chunk_index_for_quarantine = prepared.chunk_index;
+    let samples_snapshot = prepared.samples.clone();
+    let sample_rate_snapshot = prepared.sample_rate;
+
+    let input = ChunkInput {
+        samples: &prepared.samples,
+        sample_rate: prepared.sample_rate,
+        audio_offset_seconds: prepared.audio_offset_seconds,
+        source_label,
+        is_backfill: prepared.is_backfill,
+    };
+    let mut chunk_index_mut = prepared.chunk_index;
+    let mut accumulated_text = prepared.accumulated_text;
+
+    let outcome = transcribe_and_emit_chunk(
+        &ctx,
+        &input,
+        &mut chunk_index_mut,
+        &mut accumulated_text,
+        &session,
+    )
+    .await;
+
+    let sidecar_dead = matches!(outcome, TranscribeOutcome::SidecarDead);
+    let skipped = matches!(outcome, TranscribeOutcome::Skipped);
+
+    if skipped {
+        // Transient failure (temp WAV write error, engine error, timeout).
+        // Quarantine the audio immediately so the user can recover it, and
+        // emit a visible warning. No retry — retry-in-place doesn't help
+        // when the failure is persistent, and concurrent dispatch means the
+        // main loop isn't blocked waiting to retry.
+        let duration_s = samples_snapshot.len() as f32 / sample_rate_snapshot as f32;
+        let quarantine_path = quarantine_chunk_to_wav(
+            &ctx.app_handle,
+            ctx.config.session_id.as_deref(),
+            &source_label,
+            chunk_index_for_quarantine,
+            &samples_snapshot,
+            sample_rate_snapshot,
+        );
+        let path_str = quarantine_path
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "<no audio captured>".to_string());
+        warn!(
+            "live transcription: chunk failed for source {:?} — quarantined {:.2}s to {}",
+            source_label, duration_s, path_str
+        );
+        let _ = ctx.app_handle.emit(
+            "live-transcription-warning",
+            LiveTranscriptionWarningEvent {
+                message: format!(
+                    "{:.1}s of audio could not be transcribed; saved for debugging at {}",
+                    duration_s, path_str
+                ),
+            },
+        );
+    }
+
+    ChunkTaskOutcome {
+        source_label,
+        accumulated_text,
+        sidecar_dead,
+    }
+}
+
+/// Save an abandoned chunk's audio to the quarantine directory so the user/dev
+/// can inspect what was lost when retries exhausted. Returns the file path on
+/// success; logs (without the `?` operator) and returns `None` on any failure
+/// — quarantine is best-effort and must never break the live loop.
+fn quarantine_chunk_to_wav(
+    app: &AppHandle,
+    session_id: Option<&str>,
+    label: &AudioSourceLabel,
+    chunk_index: u32,
+    samples: &[f32],
+    sample_rate: u32,
+) -> Option<std::path::PathBuf> {
+    let base = match app.path().app_data_dir() {
+        Ok(d) => d.join("audio").join("quarantine"),
+        Err(e) => {
+            warn!("quarantine: cannot resolve app_data_dir: {}", e);
+            return None;
+        }
+    };
+    let dir = match session_id {
+        Some(sid) => base.join(sid),
+        None => base.join("dictation"),
+    };
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        warn!("quarantine: cannot create dir {}: {}", dir.display(), e);
+        return None;
+    }
+    let source_str = match label {
+        AudioSourceLabel::Mic => "mic",
+        AudioSourceLabel::System => "system",
+    };
+    let ts = chrono::Utc::now().format("%Y%m%dT%H%M%S%3fZ");
+    let path = dir.join(format!("{ts}_{source_str}_{chunk_index}.wav"));
+    if let Err(e) = yapstack_audio::export::write_wav(samples, sample_rate, 1, &path) {
+        warn!("quarantine: write_wav failed at {}: {}", path.display(), e);
+        return None;
+    }
+    Some(path)
 }
 
 /// Advance the idle cursor to the current write position when not speaking.
@@ -536,6 +784,7 @@ async fn advance_idle_cursor(vad: &mut SourceVadState, audio_state: &AudioManage
 /// Trim leading silence from mono audio. Returns (trimmed_slice, offset_seconds).
 /// Scans in small windows; keeps a pad before first detected energy to avoid
 /// clipping speech onset. Returns an empty slice if the chunk is entirely silent.
+#[allow(dead_code)] // kept for tests + potential fallback path
 fn trim_leading_silence(
     samples: &[f32],
     sample_rate: u32,
@@ -621,8 +870,6 @@ const WAV_FLUSH_WARNING_INTERVAL: u32 = 20;
 const WAV_FLUSH_DIAGNOSTIC_INTERVAL: u32 = 100;
 /// Maximum chars of accumulated transcription text kept per source.
 const MAX_ACCUMULATED_TEXT_CHARS: usize = 1000;
-/// Max consecutive failures from the same speech_start_pos before abandoning the chunk.
-const MAX_CHUNK_RETRIES: u32 = 3;
 /// Seconds of write_pos stall before triggering a stream restart.
 const STREAM_STALL_THRESHOLD_SECS: f32 = 2.0;
 /// Maximum auto-restart attempts per source before giving up.
@@ -784,10 +1031,118 @@ fn classify_empty_flush(source: CaptureSource, has_stream_error: bool) -> EmptyF
     }
 }
 
+/// One chunk produced by the backfill VAD simulation — carries the start
+/// sample index (for computing audio_offset_seconds relative to the backfill
+/// window) and the sample slice range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VadBackfillChunk {
+    start: usize,
+    end: usize,
+}
+
+/// Simulate the live VAD state machine over a historical audio buffer and
+/// produce chunks with the same boundaries the live loop would have picked.
+/// Using the same `VadTuning` the live loop uses gives backfill and live
+/// segmentation identical character — a session's first N seconds no longer
+/// look subtly different from the rest.
+///
+/// The state machine walks the samples in `tuning.poll_interval`-sized
+/// windows (same granularity the live loop polls energy). It tracks:
+/// - is_speaking (onset at `tuning.silence_threshold`, offset at
+///   `tuning.silence_threshold * tuning.offset_threshold_ratio` — hysteresis)
+/// - silence_run (elapsed silence while speaking; triggers a chunk when it
+///   passes `tuning.silence_duration`)
+/// - speech_run (elapsed continuous speech; triggers a force-chunk at
+///   `tuning.max_chunk_duration`)
+/// - pre-roll (onset rewinds the chunk start by `tuning.pre_roll`)
+///
+/// Any trailing speech that didn't naturally end in silence is emitted as a
+/// final chunk so the tail of the backfill window is never dropped.
+fn vad_chunk_historical_audio(
+    samples: &[f32],
+    sample_rate: u32,
+    tuning: &VadTuning,
+) -> Vec<VadBackfillChunk> {
+    let poll_secs = tuning.poll_interval.as_secs_f32().max(0.001);
+    let window_samples = (poll_secs * sample_rate as f32) as usize;
+    if window_samples == 0 || samples.is_empty() {
+        return Vec::new();
+    }
+
+    let onset_threshold = tuning.silence_threshold;
+    let offset_threshold = tuning.silence_threshold * tuning.offset_threshold_ratio;
+    let silence_windows = (tuning.silence_duration.as_secs_f32() / poll_secs).ceil() as usize;
+    let max_chunk_windows = (tuning.max_chunk_duration.as_secs_f32() / poll_secs).max(1.0) as usize;
+    let pre_roll_samples = (tuning.pre_roll.as_secs_f32() * sample_rate as f32) as usize;
+
+    let mut chunks: Vec<VadBackfillChunk> = Vec::new();
+    let mut is_speaking = false;
+    let mut speech_start: usize = 0;
+    let mut silence_run: usize = 0;
+    let mut speech_run: usize = 0;
+
+    let mut w_start = 0usize;
+    while w_start < samples.len() {
+        let w_end = (w_start + window_samples).min(samples.len());
+        let window = &samples[w_start..w_end];
+        let rms = (window.iter().map(|s| s * s).sum::<f32>() / window.len() as f32).sqrt();
+
+        if is_speaking {
+            speech_run += 1;
+            let is_loud = rms >= offset_threshold;
+            if is_loud {
+                silence_run = 0;
+                if speech_run >= max_chunk_windows {
+                    // Force chunk: close the current one and continue
+                    // speaking from here (live loop behaves the same).
+                    chunks.push(VadBackfillChunk {
+                        start: speech_start,
+                        end: w_end,
+                    });
+                    speech_start = w_end;
+                    speech_run = 0;
+                }
+            } else {
+                silence_run += 1;
+                if silence_run >= silence_windows {
+                    chunks.push(VadBackfillChunk {
+                        start: speech_start,
+                        end: w_end,
+                    });
+                    is_speaking = false;
+                    speech_run = 0;
+                    silence_run = 0;
+                }
+            }
+        } else {
+            let is_loud = rms >= onset_threshold;
+            if is_loud {
+                speech_start = w_start.saturating_sub(pre_roll_samples);
+                is_speaking = true;
+                speech_run = 1;
+                silence_run = 0;
+            }
+        }
+        w_start = w_end;
+    }
+
+    // Trailing speech that never resolved into silence — emit as final chunk
+    // so we don't lose the tail of the backfill window.
+    if is_speaking && speech_start < samples.len() {
+        chunks.push(VadBackfillChunk {
+            start: speech_start,
+            end: samples.len(),
+        });
+    }
+
+    chunks
+}
+
 /// Chunk audio into segments of approximately `chunk_size` samples, but refine
 /// boundaries by scanning backward from each split point to find a silence gap.
 /// This avoids splitting mid-word. Falls back to the fixed boundary if no silence
 /// gap is found within the last `search_window` samples.
+#[allow(dead_code)] // retained as fallback; backfill now uses vad_chunk_historical_audio
 fn chunk_at_silence_boundaries(
     samples: &[f32],
     chunk_size: usize,
@@ -858,111 +1213,116 @@ async fn process_backfill(
     ctx: TranscriptionContext,
     backfill_audio: Vec<(Vec<f32>, u32, AudioSourceLabel)>,
     backfill_done: Arc<AtomicBool>,
+    cancel: Arc<AtomicBool>,
+    tuning: VadTuning,
 ) {
     info!("backfill: starting concurrent processing");
 
-    // Build per-source chunk lists with soft boundaries at silence gaps
-    let mut source_entries: Vec<(AudioSourceLabel, Vec<BackfillChunk<'_>>)> = Vec::new();
+    // Build per-source chunk lists using the live VAD state machine. This
+    // gives backfill and live segmentation identical boundary choices —
+    // no more quality gap between a session's first N seconds (historical)
+    // and the rest (live). Uses the same engine-keyed `VadTuning`, so a
+    // Parakeet backfill gets dialogue-tuned cadence + pre-roll.
+    let mut source_entries: Vec<VadBackfillSource> = Vec::new();
     for (samples, sample_rate, label) in &backfill_audio {
-        let chunk_size = (ctx.config.max_chunk_seconds * *sample_rate as f32) as usize;
-        let chunks: Vec<BackfillChunk<'_>> = chunk_at_silence_boundaries(
-            samples,
-            chunk_size.max(1),
-            *sample_rate,
-            ctx.config.silence_threshold,
-        )
-        .into_iter()
-        .map(|c| BackfillChunk {
-            samples: c,
+        let chunks = vad_chunk_historical_audio(samples, *sample_rate, &tuning);
+        debug!(
+            "backfill: source={:?} {} chunks from {} samples ({:.1}s)",
+            label,
+            chunks.len(),
+            samples.len(),
+            samples.len() as f32 / *sample_rate as f32
+        );
+        source_entries.push(VadBackfillSource {
+            label: *label,
+            samples: samples.clone(),
             sample_rate: *sample_rate,
-        })
-        .collect();
-        source_entries.push((*label, chunks));
+            chunks,
+        });
     }
 
     // Per-source state
     let mut chunk_indices: Vec<u32> = vec![0; source_entries.len()];
     let mut accumulated_texts: Vec<String> = vec![String::new(); source_entries.len()];
-    let mut offsets: Vec<f32> = vec![0.0; source_entries.len()];
-    let mut session = SessionAccumulators {
+    let session = Arc::new(StdMutex::new(SessionAccumulators {
         shared_prompt: String::new(),
         total_chunks: 0,
         total_audio_seconds: 0.0,
         last_transcription_at: None,
-    };
+    }));
 
-    // Interleave: process window 0 for all sources, then window 1, etc.
-    let total_windows = source_entries
+    // Interleave: process chunk 0 for all sources, then chunk 1, etc. Keeps
+    // cross-source timestamps roughly interleaved instead of emitting all
+    // of one source before the other.
+    let total_chunks = source_entries
         .iter()
-        .map(|(_, chunks)| chunks.len())
+        .map(|s| s.chunks.len())
         .max()
         .unwrap_or(0);
 
-    for window_idx in 0..total_windows {
-        for (source_idx, (label, chunks)) in source_entries.iter().enumerate() {
-            if let Some(chunk) = chunks.get(window_idx) {
-                // Trim leading silence so the engine gets audio starting near speech
-                let (trimmed, trim_offset) = trim_leading_silence(
-                    chunk.samples,
-                    chunk.sample_rate,
-                    ctx.config.silence_threshold,
-                    0.2, // 200ms pad before detected speech
-                );
-                let adjusted_offset = offsets[source_idx] + trim_offset;
-
-                // Skip entirely silent chunks — nothing to transcribe
-                if trimmed.is_empty() {
-                    debug!(
-                        "backfill chunk: source={:?} window={} skipped (silent)",
-                        label, window_idx
-                    );
-                    offsets[source_idx] += chunk.samples.len() as f32 / chunk.sample_rate as f32;
-                    continue;
-                }
-
-                debug!(
-                    "backfill chunk: source={:?} window={} offset={:.2}s trim_offset={:.3}s trimmed_samples={}",
-                    label, window_idx, adjusted_offset, trim_offset, trimmed.len()
-                );
-
-                let input = ChunkInput {
-                    samples: trimmed,
-                    sample_rate: chunk.sample_rate,
-                    audio_offset_seconds: adjusted_offset,
-                    source_label: *label,
-                    is_backfill: true,
-                };
-                transcribe_and_emit_chunk(
-                    &ctx,
-                    &input,
-                    &mut chunk_indices[source_idx],
-                    &mut accumulated_texts[source_idx],
-                    &mut session,
-                )
-                .await;
-
-                // Advance by FULL original chunk duration (not trimmed)
-                offsets[source_idx] += chunk.samples.len() as f32 / chunk.sample_rate as f32;
+    'outer: for chunk_idx in 0..total_chunks {
+        if cancel.load(Ordering::Acquire) {
+            info!(
+                "backfill: cancel requested at chunk {} — exiting gracefully",
+                chunk_idx
+            );
+            break 'outer;
+        }
+        for (source_idx, source) in source_entries.iter().enumerate() {
+            if cancel.load(Ordering::Acquire) {
+                break 'outer;
             }
+            let Some(bounds) = source.chunks.get(chunk_idx) else {
+                continue;
+            };
+            let slice = &source.samples[bounds.start..bounds.end];
+            let audio_offset = bounds.start as f32 / source.sample_rate as f32;
+            debug!(
+                "backfill chunk: source={:?} idx={} offset={:.2}s samples={} ({:.2}s)",
+                source.label,
+                chunk_idx,
+                audio_offset,
+                slice.len(),
+                slice.len() as f32 / source.sample_rate as f32
+            );
+            let input = ChunkInput {
+                samples: slice,
+                sample_rate: source.sample_rate,
+                audio_offset_seconds: audio_offset,
+                source_label: source.label,
+                is_backfill: true,
+            };
+            transcribe_and_emit_chunk(
+                &ctx,
+                &input,
+                &mut chunk_indices[source_idx],
+                &mut accumulated_texts[source_idx],
+                &session,
+            )
+            .await;
         }
     }
 
-    info!(
-        "backfill: completed {} chunks, {:.1}s audio",
-        session.total_chunks, session.total_audio_seconds
-    );
+    {
+        let s = session.lock().expect("session mutex poisoned");
+        info!(
+            "backfill: completed {} chunks, {:.1}s audio",
+            s.total_chunks, s.total_audio_seconds
+        );
+    }
 
     // Bridge prompt context to live loop (Change 9: move instead of clone)
     {
         let mut prompt = ctx.bridged_prompt.lock().await;
         let max_prompt = ctx.config.prompt_context_chars.unwrap_or(350) as usize;
-        if session.shared_prompt.len() > max_prompt {
-            let boundary = session
+        let mut s = session.lock().expect("session mutex poisoned");
+        if s.shared_prompt.len() > max_prompt {
+            let boundary = s
                 .shared_prompt
-                .ceil_char_boundary(session.shared_prompt.len() - max_prompt);
-            *prompt = session.shared_prompt[boundary..].to_string();
+                .ceil_char_boundary(s.shared_prompt.len() - max_prompt);
+            *prompt = s.shared_prompt[boundary..].to_string();
         } else {
-            *prompt = std::mem::take(&mut session.shared_prompt);
+            *prompt = std::mem::take(&mut s.shared_prompt);
         }
     }
 
@@ -1110,9 +1470,26 @@ async fn live_transcription_loop(
     let check_mic = matches!(source, CaptureSource::MicOnly | CaptureSource::Mixed);
     let check_system = matches!(source, CaptureSource::SystemOnly | CaptureSource::Mixed);
 
-    let silence_threshold = ctx.config.silence_threshold;
-    let silence_duration = Duration::from_millis(ctx.config.silence_duration_ms as u64);
-    let max_chunk_duration = Duration::from_secs_f32(ctx.config.max_chunk_seconds);
+    // Resolve engine-keyed VAD tuning once at loop entry. Whisper uses the
+    // frontend-supplied silence_duration_ms / poll cadence; Parakeet uses its
+    // dialogue-tuned defaults (400 ms silence, 100 ms poll, 250 ms pre-roll,
+    // 0.7 offset-hysteresis ratio).
+    let engine_kind = {
+        let client_guard = ctx.transcription_client.lock().await;
+        client_guard
+            .as_ref()
+            .map(|c| c.as_ref().engine())
+            .unwrap_or(yapstack_common::types::EngineKind::Whisper)
+    };
+    let tuning = vad_tuning_for(engine_kind, &ctx.config);
+    debug!(
+        engine = engine_kind.as_str(),
+        silence_ms = tuning.silence_duration.as_millis() as u64,
+        poll_ms = tuning.poll_interval.as_millis() as u64,
+        pre_roll_ms = tuning.pre_roll.as_millis() as u64,
+        offset_ratio = tuning.offset_threshold_ratio,
+        "live transcription VAD tuning resolved"
+    );
 
     // Get initial cursor positions and build source list
     let (mut sources, backfill_audio) = {
@@ -1201,8 +1578,14 @@ async fn live_transcription_loop(
         (sources, backfill)
     };
 
-    // Spawn concurrent backfill processing
+    // Spawn concurrent backfill processing.
+    // `backfill_cancel` is a cooperative cancel flag. On stop we set it true
+    // and `process_backfill` finishes the in-flight chunk then exits cleanly
+    // instead of being killed mid-transcribe (which would silently drop the
+    // chunk's audio). We still keep an abort handle as a last-resort escape
+    // hatch if the task hangs past our grace period.
     let backfill_done = Arc::new(AtomicBool::new(false));
+    let backfill_cancel = Arc::new(AtomicBool::new(false));
     let backfill_handle = if !backfill_audio.is_empty() {
         // Namespace live chunk indices to avoid collision with backfill (0..N)
         for s in &mut sources {
@@ -1210,10 +1593,13 @@ async fn live_transcription_loop(
         }
         let backfill_ctx = ctx.clone();
         let backfill_done_clone = backfill_done.clone();
+        let backfill_cancel_clone = backfill_cancel.clone();
         let handle = tokio::spawn(process_backfill(
             backfill_ctx,
             backfill_audio,
             backfill_done_clone,
+            backfill_cancel_clone,
+            tuning,
         ));
         let abort_handle = handle.abort_handle();
         Some((handle, abort_handle))
@@ -1222,24 +1608,63 @@ async fn live_transcription_loop(
         None
     };
 
-    let mut session = SessionAccumulators {
+    let session = Arc::new(StdMutex::new(SessionAccumulators {
         shared_prompt: String::new(),
         total_chunks: 0,
         total_audio_seconds: 0.0,
         last_transcription_at: None,
-    };
+    }));
     let mut wav_flush_none_count: u32 = 0;
     let mut prompt_seeded_from_backfill = false;
 
     emit_status(&ctx.app_handle, LiveTranscriptionPhase::Running, 0, 0.0);
 
-    let poll_interval = tokio::time::Duration::from_millis(POLL_INTERVAL_MS);
-    let poll_energy_secs = POLL_INTERVAL_MS as f32 / 1000.0;
+    let poll_interval = tuning.poll_interval;
+    let poll_energy_secs = tuning.poll_interval.as_secs_f32();
     let mut exited_fatal = false;
 
+    // In-flight chunk transcription tasks. `FuturesUnordered` so we can
+    // wake the main loop the moment *any* task completes (via `.next()`
+    // in the select!), rather than waiting for the next natural tick.
+    // This cuts up to `poll_interval` of latency from the case where a
+    // deferred `Chunk` action is waiting for a task to finish before it
+    // can dispatch (e.g. a second utterance during the previous task's
+    // transcribe). Outcomes drained here are applied at the top of the
+    // tick below so VAD / dispatch see the updated per-source state.
+    let mut chunk_tasks: futures_util::stream::FuturesUnordered<
+        tokio::task::JoinHandle<ChunkTaskOutcome>,
+    > = futures_util::stream::FuturesUnordered::new();
+    let mut pending_outcomes: Vec<ChunkTaskOutcome> = Vec::new();
+
     loop {
+        use futures_util::stream::StreamExt;
+        use tokio::time::sleep;
+        // Wait for the earliest of: a natural tick, a chunk task finishing,
+        // or a stop signal. We recreate `sleep(poll_interval)` each
+        // iteration so the next natural tick resets to `poll_interval` from
+        // now — the tick cadence slides forward after an early wake, which
+        // is fine here because the VAD state machine uses wall-clock
+        // durations (Instant::now()), not tick count.
         let should_stop = tokio::select! {
-            _ = tokio::time::sleep(poll_interval) => false,
+            _ = sleep(poll_interval) => false,
+            Some(joined) = chunk_tasks.next(), if !chunk_tasks.is_empty() => {
+                match joined {
+                    Ok(outcome) => pending_outcomes.push(outcome),
+                    Err(e) => error!("chunk task join failed: {}", e),
+                }
+                // Drain any other tasks that happen to be ready in this
+                // same wakeup window without blocking.
+                loop {
+                    match chunk_tasks.next().now_or_never() {
+                        Some(Some(Ok(outcome))) => pending_outcomes.push(outcome),
+                        Some(Some(Err(e))) => {
+                            error!("chunk task join failed: {}", e)
+                        }
+                        _ => break,
+                    }
+                }
+                false
+            }
             _ = &mut stop_rx => true,
         };
 
@@ -1352,8 +1777,12 @@ async fn live_transcription_loop(
         if !prompt_seeded_from_backfill {
             let bridged = ctx.bridged_prompt.lock().await;
             if !bridged.is_empty() {
-                if session.shared_prompt.is_empty() {
-                    session.shared_prompt = bridged.clone();
+                {
+                    let mut s = session.lock().expect("session mutex poisoned");
+                    if s.shared_prompt.is_empty() {
+                        s.shared_prompt = bridged.clone();
+                    }
+                    s.last_transcription_at = Some(Instant::now());
                 }
                 for source in &mut sources {
                     if source.accumulated_text.is_empty() {
@@ -1361,7 +1790,6 @@ async fn live_transcription_loop(
                     }
                 }
                 prompt_seeded_from_backfill = true;
-                session.last_transcription_at = Some(Instant::now());
                 debug!(
                     "live loop: seeded prompt from backfill ({} chars)",
                     bridged.len()
@@ -1369,55 +1797,122 @@ async fn live_transcription_loop(
             }
         }
 
+        // First: drain any completed chunk tasks (both the ones collected
+        // by the `select!` wake above and any that finished during the
+        // subsequent awaits) and apply their outcomes so their sources
+        // become eligible for VAD polling again. We do this *before*
+        // polling VAD so a just-completed task's source gets a fresh
+        // poll_vad call (updated is_speaking / silence_since) this tick,
+        // not next tick.
         let mut fatal = false;
-        for source in &mut sources {
-            let energy = match source.label {
-                AudioSourceLabel::Mic => mic_energy,
-                AudioSourceLabel::System => system_energy,
-            };
-
-            let mut action = poll_vad(
-                source,
-                energy,
-                silence_threshold,
-                silence_duration,
-                max_chunk_duration,
-            );
-
-            if should_stop && source.is_speaking {
-                action = VadAction::Chunk;
+        // Drain any additional outcomes that became ready while the tick
+        // waited on other awaits (audio_state lock, WAV flush, etc).
+        loop {
+            match chunk_tasks.next().now_or_never() {
+                Some(Some(Ok(outcome))) => pending_outcomes.push(outcome),
+                Some(Some(Err(e))) => error!("chunk task join failed: {}", e),
+                _ => break,
             }
+        }
+        let drained = std::mem::take(&mut pending_outcomes);
+        for outcome in drained {
+            for source in sources.iter_mut() {
+                if source.label == outcome.source_label {
+                    source.has_in_flight_task = false;
+                    // Restore accumulated_text from the task. Safe because
+                    // has_in_flight_task gated all reads of this field
+                    // while the task was running.
+                    source.accumulated_text = outcome.accumulated_text;
+                    break;
+                }
+            }
+            if outcome.sidecar_dead {
+                fatal = true;
+            }
+        }
 
+        // Poll VAD for *every* source, including those with an in-flight
+        // task. The state machine needs to keep tracking is_speaking /
+        // silence_since against live energy so a second utterance that
+        // starts and ends during the in-flight window is captured: onset
+        // backdates `speech_start_pos` (via pre_roll), silence_since fires
+        // a pending Chunk action, and on the tick *after* the task lands
+        // we dispatch that chunk with the full accumulated range.
+        //
+        // Dispatch and idle-cursor advance are still gated on
+        // `has_in_flight_task`: we can't dispatch a second task for the
+        // same source, and `advance_idle_cursor` would drop
+        // `speech_start_pos` past audio that belongs to the next chunk.
+        let actions: Vec<VadAction> = sources
+            .iter_mut()
+            .map(|source| {
+                let energy = match source.label {
+                    AudioSourceLabel::Mic => mic_energy,
+                    AudioSourceLabel::System => system_energy,
+                };
+                let mut action = poll_vad(source, energy, &tuning);
+                if should_stop && source.is_speaking {
+                    action = VadAction::Chunk;
+                }
+                action
+            })
+            .collect();
+
+        // Dispatch new chunk tasks (fire and forget). Per-source state is
+        // advanced optimistically inside prepare_chunk_dispatch; the spawned
+        // task handles transcription, segment emission, and quarantining on
+        // failure. The main loop continues polling other sources next tick.
+        for (i, action) in actions.iter().enumerate() {
+            let in_flight = sources[i].has_in_flight_task;
             match action {
                 VadAction::Chunk | VadAction::ForceChunk => {
-                    let is_fatal = process_source_chunk(
-                        source,
-                        &audio_state,
-                        &ctx,
-                        matches!(action, VadAction::ForceChunk),
-                        &mut session,
-                    )
-                    .await;
-                    if is_fatal {
-                        fatal = true;
-                        break;
+                    if in_flight {
+                        // Can't dispatch while the previous task is running.
+                        // VAD state stays as poll_vad set it (is_speaking
+                        // cleared, silence_since armed), so the next tick
+                        // after the task lands will re-evaluate and fire a
+                        // fresh Chunk from the accumulated speech_start_pos
+                        // through the current write_pos.
+                        continue;
+                    }
+                    let is_force = matches!(action, VadAction::ForceChunk);
+                    let prepared =
+                        prepare_chunk_dispatch(&mut sources[i], &audio_state, is_force, false)
+                            .await;
+                    if let Some(prepared) = prepared {
+                        let task_ctx = ctx.clone();
+                        let task_session = session.clone();
+                        chunk_tasks.push(tokio::spawn(async move {
+                            run_chunk_task(prepared, task_ctx, task_session).await
+                        }));
                     }
                 }
-                VadAction::None if !source.is_speaking => {
-                    advance_idle_cursor(source, &audio_state).await;
+                VadAction::None => {
+                    // Only advance the idle cursor when there's no in-flight
+                    // task for this source AND we're confident no speech is
+                    // pending. `has_in_flight_task` means `speech_start_pos`
+                    // must stay frozen at the task's new_pos so any utterance
+                    // that happened during the in-flight window still gets
+                    // covered by the next chunk dispatch.
+                    if !in_flight && !sources[i].is_speaking {
+                        advance_idle_cursor(&mut sources[i], &audio_state).await;
+                    }
                 }
-                _ => {}
             }
         }
 
         if fatal {
             error!("live transcription: sidecar died and could not be restarted — stopping");
+            let (chunks, audio_secs) = {
+                let s = session.lock().expect("session mutex poisoned");
+                (s.total_chunks, s.total_audio_seconds)
+            };
             let _ = ctx.app_handle.emit(
                 "live-transcription-status",
                 LiveTranscriptionStatus {
                     phase: LiveTranscriptionPhase::Error,
-                    chunks_processed: session.total_chunks,
-                    total_audio_seconds: session.total_audio_seconds,
+                    chunks_processed: chunks,
+                    total_audio_seconds: audio_secs,
                     error_message: Some(
                         "Transcription engine stopped unexpectedly and could not be restarted"
                             .to_string(),
@@ -1433,24 +1928,69 @@ async fn live_transcription_loop(
         // Prompt decay: clear shared_prompt + accumulated_text when no transcription
         // has occurred for prompt_decay_silence_seconds (default 5s)
         let prompt_decay_secs = ctx.config.prompt_decay_silence_seconds.unwrap_or(5.0);
-        if check_prompt_decay(
-            &mut sources,
-            &mut session.shared_prompt,
-            prompt_decay_secs,
-            session.last_transcription_at,
-        ) {
+        let last_at = {
+            let s = session.lock().expect("session mutex poisoned");
+            s.last_transcription_at
+        };
+        let decayed = {
+            let mut s = session.lock().expect("session mutex poisoned");
+            check_prompt_decay(
+                &mut sources,
+                &mut s.shared_prompt,
+                prompt_decay_secs,
+                last_at,
+            )
+        };
+        if decayed {
             info!(
                 "prompt decay: cleared shared_prompt ({:.1}s since last transcription)",
-                session
-                    .last_transcription_at
-                    .map(|t| t.elapsed().as_secs_f32())
-                    .unwrap_or(0.0)
+                last_at.map(|t| t.elapsed().as_secs_f32()).unwrap_or(0.0)
             );
-            session.last_transcription_at = None;
+            session
+                .lock()
+                .expect("session mutex poisoned")
+                .last_transcription_at = None;
         }
 
         if should_stop {
             break;
+        }
+    }
+
+    // Drain any still-running chunk tasks so their segments land before we
+    // finalize the session. The `setLivePhase("Stopped")` finalizer on the
+    // frontend awaits `segmentQueueTail`, but for that to help we first
+    // need to actually *dispatch* the segment events — which only happens
+    // when each task's transcribe await completes.
+    if !chunk_tasks.is_empty() {
+        debug!(
+            "live transcription stop: draining {} in-flight chunk tasks",
+            chunk_tasks.len()
+        );
+        // Bounded wait so a hanging sidecar can't indefinitely block the
+        // stop path. The per-task timeout inside transcribe_with is 300s;
+        // we give the whole drain up to 10s past a stop request before
+        // giving up. In practice tasks finish in <5s on any live hardware.
+        use futures_util::stream::StreamExt;
+        let drain = async {
+            while let Some(joined) = chunk_tasks.next().await {
+                match joined {
+                    Ok(outcome) if outcome.sidecar_dead => {
+                        warn!("drained chunk task reported sidecar dead");
+                    }
+                    Ok(_) => {}
+                    Err(e) => error!("chunk task join error during drain: {}", e),
+                }
+            }
+        };
+        if tokio::time::timeout(Duration::from_secs(10), drain)
+            .await
+            .is_err()
+        {
+            warn!(
+                "live transcription stop: chunk task drain timed out after 10s; \
+                 any unfinished chunks will be dropped"
+            );
         }
     }
 
@@ -1515,30 +2055,40 @@ async fn live_transcription_loop(
         }
     }
 
-    // Wait for concurrent backfill to finish before emitting Stopped (30s timeout)
+    // Wait for concurrent backfill to finish before emitting Stopped.
+    // Signal the cooperative cancel flag so the task exits at the next window
+    // boundary instead of running to completion when the session is stopping.
+    // The abort handle is a last-resort escape hatch if the in-flight chunk
+    // hangs past the grace period.
     if let Some((handle, abort_handle)) = backfill_handle {
+        backfill_cancel.store(true, Ordering::Release);
         match tokio::time::timeout(Duration::from_secs(30), handle).await {
             Ok(_) => {}
             Err(_) => {
-                warn!("backfill task did not complete within 30s — aborting");
+                warn!("backfill task did not exit within 30s after cancel — aborting");
                 abort_handle.abort();
             }
         }
     }
+
+    let (final_chunks, final_audio_seconds) = {
+        let s = session.lock().expect("session mutex poisoned");
+        (s.total_chunks, s.total_audio_seconds)
+    };
 
     // Only emit Stopped if we didn't already emit Error (avoids duplicate finalization)
     if !exited_fatal {
         emit_status(
             &ctx.app_handle,
             LiveTranscriptionPhase::Stopped,
-            session.total_chunks,
-            session.total_audio_seconds,
+            final_chunks,
+            final_audio_seconds,
         );
     }
 
     info!(
         "live transcription stopped: {} chunks, {:.1}s total audio",
-        session.total_chunks, session.total_audio_seconds
+        final_chunks, final_audio_seconds
     );
 }
 
@@ -1552,7 +2102,7 @@ async fn transcribe_chunk(
     input: &ChunkInput<'_>,
     chunk_index: &mut u32,
     accumulated_text: &mut String,
-    session: &mut SessionAccumulators,
+    session: &Arc<StdMutex<SessionAccumulators>>,
 ) -> TranscribeOutcome {
     let chunk_duration = input.samples.len() as f32 / input.sample_rate as f32;
     if chunk_duration < MIN_CHUNK_DURATION_SECS {
@@ -1590,43 +2140,47 @@ async fn transcribe_chunk(
         Some(accumulated_text.as_str())
     };
 
-    let transcription_result = {
-        let mut client_guard = ctx.transcription_client.lock().await;
-        match client_guard.as_mut() {
-            Some(client) => {
-                // initial_prompt is Whisper-only — Parakeet's TDT decoder has no
-                // text-prompt input, so passing it would just be ignored. Drop it
-                // explicitly so the IPC payload is honest about what was sent.
-                let prompt_for_engine = match client.engine() {
-                    yapstack_common::types::EngineKind::Whisper => effective_prompt,
-                    yapstack_common::types::EngineKind::Parakeet => None,
-                };
-                client
-                    .transcribe_with(
-                        &wav_path,
-                        ctx.config.language.as_deref(),
-                        prompt_for_engine,
-                        ctx.config.diarization,
-                    )
-                    .await
-            }
-            None => {
-                error!("live transcription: transcription client not initialized");
-                let _ = ctx.app_handle.emit(
-                    "live-transcription-status",
-                    LiveTranscriptionStatus {
-                        phase: LiveTranscriptionPhase::Error,
-                        chunks_processed: *chunk_index,
-                        total_audio_seconds: 0.0,
-                        error_message: Some("transcription client not initialized".to_string()),
-                        session_id: ctx.config.session_id.clone(),
-                        effective_start_epoch_ms: None,
-                    },
-                );
-                return TranscribeOutcome::SidecarDead;
-            }
+    // Briefly lock the outer mutex just to clone the inner Arc<TranscriptionClient>.
+    // The actual `transcribe_with` await happens *without* holding any outer lock,
+    // so a concurrent chunk task (e.g. the other source) can proceed in parallel.
+    let client_arc = {
+        let client_guard = ctx.transcription_client.lock().await;
+        client_guard.as_ref().cloned()
+    };
+    let client = match client_arc {
+        Some(c) => c,
+        None => {
+            error!("live transcription: transcription client not initialized");
+            let _ = ctx.app_handle.emit(
+                "live-transcription-status",
+                LiveTranscriptionStatus {
+                    phase: LiveTranscriptionPhase::Error,
+                    chunks_processed: *chunk_index,
+                    total_audio_seconds: 0.0,
+                    error_message: Some("transcription client not initialized".to_string()),
+                    session_id: ctx.config.session_id.clone(),
+                    effective_start_epoch_ms: None,
+                },
+            );
+            return TranscribeOutcome::SidecarDead;
         }
     };
+    let engine_kind = client.engine();
+    // initial_prompt is Whisper-only — Parakeet's TDT decoder has no text-prompt
+    // input, so passing it would just be ignored. Drop it explicitly so the IPC
+    // payload is honest about what was sent.
+    let prompt_for_engine = match engine_kind {
+        yapstack_common::types::EngineKind::Whisper => effective_prompt,
+        yapstack_common::types::EngineKind::Parakeet => None,
+    };
+    let transcription_result = client
+        .transcribe_with(
+            &wav_path,
+            ctx.config.language.as_deref(),
+            prompt_for_engine,
+            ctx.config.diarization,
+        )
+        .await;
 
     // _wav_guard handles cleanup via Drop
 
@@ -1642,7 +2196,7 @@ async fn transcribe_chunk(
                 .segments
                 .iter()
                 .map(|s| s.text.as_str())
-                .filter(|t| !yapstack_common::hallucination::is_always_reject(t))
+                .filter(|t| !yapstack_common::hallucination::is_always_reject(t, engine_kind))
                 .collect::<Vec<_>>()
                 .join(" ");
 
@@ -1657,16 +2211,17 @@ async fn transcribe_chunk(
                         .ceil_char_boundary(accumulated_text.len() - MAX_ACCUMULATED_TEXT_CHARS);
                     *accumulated_text = accumulated_text[boundary..].to_string();
                 }
-                if !session.shared_prompt.is_empty() {
-                    session.shared_prompt.push(' ');
-                }
-                session.shared_prompt.push_str(&prompt_text);
                 let max_prompt = ctx.config.prompt_context_chars.unwrap_or(350) as usize;
-                if session.shared_prompt.len() > max_prompt {
-                    let boundary = session
+                let mut s = session.lock().expect("session mutex poisoned");
+                if !s.shared_prompt.is_empty() {
+                    s.shared_prompt.push(' ');
+                }
+                s.shared_prompt.push_str(&prompt_text);
+                if s.shared_prompt.len() > max_prompt {
+                    let boundary = s
                         .shared_prompt
-                        .ceil_char_boundary(session.shared_prompt.len() - max_prompt);
-                    session.shared_prompt = session.shared_prompt[boundary..].to_string();
+                        .ceil_char_boundary(s.shared_prompt.len() - max_prompt);
+                    s.shared_prompt = s.shared_prompt[boundary..].to_string();
                 }
             }
 
@@ -1700,6 +2255,7 @@ async fn transcribe_chunk(
                     chunk_duration_seconds: chunk_duration,
                     accumulated_text: accumulated_text.clone(),
                     is_backfill: input.is_backfill,
+                    session_id: ctx.config.session_id.clone(),
                 },
                 chunk_duration,
             })
@@ -1707,28 +2263,65 @@ async fn transcribe_chunk(
         Err(e) => {
             warn!("live transcription: chunk failed: {}, skipping", e);
 
+            // Drop our local Arc clone before attempting restart so the outer
+            // mutex holder can try_unwrap without racing us. `client` (the
+            // Arc we cloned above) went out of scope at the end of the Ok
+            // arm's destructor, but we still hold our `client_arc` binding
+            // from the transcribe section. Drop it explicitly.
+            drop(client);
+
             // Check if the sidecar process died — attempt auto-restart.
+            // respawn() needs &mut TranscriptionClient, so we take the Arc
+            // out of the Option, try_unwrap it, respawn, and put it back.
+            // If another task is still holding an Arc clone (e.g. a
+            // concurrent chunk still awaiting a response from the dead
+            // sidecar), try_unwrap fails and we fall through to Skipped —
+            // the other task will hit the same error and one of us will
+            // eventually win the race.
             let mut client_guard = ctx.transcription_client.lock().await;
-            if let Some(ref mut client) = *client_guard {
-                if !client.is_running() {
+            if let Some(arc_client) = client_guard.take() {
+                if !arc_client.is_running() {
                     warn!("sidecar process died — attempting restart");
-                    match client.respawn().await {
-                        Ok(()) => {
-                            info!("sidecar restarted successfully after transcription failure");
-                            let _ = ctx.app_handle.emit(
-                                "live-transcription-warning",
-                                LiveTranscriptionWarningEvent {
-                                    message: "Transcription engine restarted".into(),
-                                },
+                    match Arc::try_unwrap(arc_client) {
+                        Ok(mut client) => {
+                            match client.respawn().await {
+                                Ok(()) => {
+                                    info!(
+                                        "sidecar restarted successfully after transcription failure"
+                                    );
+                                    *client_guard = Some(Arc::new(client));
+                                    let _ = ctx.app_handle.emit(
+                                        "live-transcription-warning",
+                                        LiveTranscriptionWarningEvent {
+                                            message: "Transcription engine restarted".into(),
+                                        },
+                                    );
+                                    return TranscribeOutcome::Skipped;
+                                }
+                                Err(restart_err) => {
+                                    error!("sidecar restart failed: {}", restart_err);
+                                    // Put the client back so other tasks can
+                                    // see it as "not running" and try again.
+                                    *client_guard = Some(Arc::new(client));
+                                    return TranscribeOutcome::SidecarDead;
+                                }
+                            }
+                        }
+                        Err(still_shared) => {
+                            // Another task still holds the Arc. Put it back
+                            // untouched; that task will hit the same error
+                            // and we'll try again on the next chunk.
+                            *client_guard = Some(still_shared);
+                            debug!(
+                                "sidecar restart skipped: client still held by another chunk task"
                             );
                             return TranscribeOutcome::Skipped;
                         }
-                        Err(restart_err) => {
-                            error!("sidecar restart failed: {}", restart_err);
-                            return TranscribeOutcome::SidecarDead;
-                        }
                     }
                 }
+                // Sidecar still running — just a transient error. Put the
+                // Arc back and let the caller retry.
+                *client_guard = Some(arc_client);
             }
 
             TranscribeOutcome::Skipped
@@ -1747,14 +2340,19 @@ async fn transcribe_and_emit_chunk(
     input: &ChunkInput<'_>,
     chunk_index: &mut u32,
     accumulated_text: &mut String,
-    session: &mut SessionAccumulators,
+    session: &Arc<StdMutex<SessionAccumulators>>,
 ) -> TranscribeOutcome {
     let outcome = transcribe_chunk(ctx, input, chunk_index, accumulated_text, session).await;
 
     if let TranscribeOutcome::Success(ref result) = outcome {
-        session.total_chunks += 1;
-        session.total_audio_seconds += result.chunk_duration;
-        session.last_transcription_at = Some(Instant::now());
+        // Short critical section — no await held.
+        let (total_chunks, total_audio_seconds) = {
+            let mut s = session.lock().expect("session mutex poisoned");
+            s.total_chunks += 1;
+            s.total_audio_seconds += result.chunk_duration;
+            s.last_transcription_at = Some(Instant::now());
+            (s.total_chunks, s.total_audio_seconds)
+        };
 
         let _ = ctx
             .app_handle
@@ -1762,8 +2360,8 @@ async fn transcribe_and_emit_chunk(
         emit_status(
             &ctx.app_handle,
             LiveTranscriptionPhase::Running,
-            session.total_chunks,
-            session.total_audio_seconds,
+            total_chunks,
+            total_audio_seconds,
         );
     }
 
@@ -2001,7 +2599,7 @@ pub async fn start_live_transcription(
     };
 
     let ctx = TranscriptionContext {
-        transcription_client: Arc::new(Mutex::new(Some(extracted_client))),
+        transcription_client: Arc::new(Mutex::new(Some(Arc::new(extracted_client)))),
         shared_transcription_state: transcription_state_clone,
         app_handle,
         config,
@@ -2020,13 +2618,31 @@ pub async fn start_live_transcription(
             .catch_unwind()
             .await;
 
-            // Always return the transcription client to shared state, even after a panic.
+            // Always return the transcription client to shared state, even
+            // after a panic. The client is held as `Arc<TranscriptionClient>`
+            // during the loop so concurrent chunk tasks can each hold a ref;
+            // by the time we get here, the loop has joined and we should be
+            // the last Arc holder. If try_unwrap fails it means a task is
+            // leaking a clone — log loudly and drop, which is still safe
+            // (the Drop impl kills the sidecar process).
             {
                 let mut private_guard = ctx_guard.transcription_client.lock().await;
-                if let Some(client) = private_guard.take() {
-                    let mut shared_guard = ctx_guard.shared_transcription_state.lock().await;
-                    *shared_guard = Some(client);
-                    debug!("returned transcription client to shared state");
+                if let Some(arc_client) = private_guard.take() {
+                    match Arc::try_unwrap(arc_client) {
+                        Ok(client) => {
+                            let mut shared_guard =
+                                ctx_guard.shared_transcription_state.lock().await;
+                            *shared_guard = Some(client);
+                            debug!("returned transcription client to shared state");
+                        }
+                        Err(_still_shared) => {
+                            error!(
+                                "live transcription ended but a task still holds the \
+                                 transcription client — shared state left empty; \
+                                 next session will spawn a fresh sidecar"
+                            );
+                        }
+                    }
                 }
             }
 
@@ -2192,15 +2808,18 @@ mod tests {
 
     // --- VAD state machine tests ---
 
-    /// Shorthand for poll_vad with standard test thresholds.
+    /// Shorthand for poll_vad with standard Whisper-equivalent test thresholds.
+    /// Uses no hysteresis / no pre-roll so the original assertions still hold.
     fn poll(state: &mut SourceVadState, energy: Option<f32>) -> VadAction {
-        poll_vad(
-            state,
-            energy,
-            0.01,
-            Duration::from_millis(800),
-            Duration::from_secs(30),
-        )
+        let tuning = VadTuning {
+            silence_threshold: 0.01,
+            offset_threshold_ratio: 1.0,
+            silence_duration: Duration::from_millis(800),
+            max_chunk_duration: Duration::from_secs(30),
+            poll_interval: Duration::from_millis(300),
+            pre_roll: Duration::ZERO,
+        };
+        poll_vad(state, energy, &tuning)
     }
 
     #[test]
