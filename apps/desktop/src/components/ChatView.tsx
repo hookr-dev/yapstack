@@ -162,6 +162,9 @@ export function ChatView({
     if (e.button !== 0) return;
     const target = e.target as HTMLElement;
     if (target.closest("[data-segment-id]")) return;
+    // Block native text-selection (the blue highlight) during marquee —
+    // the drag is ours, not the browser's.
+    e.preventDefault();
     const container = e.currentTarget as HTMLElement;
     const rect = container.getBoundingClientRect();
     marqueeStartRef.current = {
@@ -176,6 +179,9 @@ export function ChatView({
   const handleContainerPointerMove = (e: React.PointerEvent) => {
     const start = marqueeStartRef.current;
     if (!start) return;
+    // Clear any stray native selection the browser may have kicked off
+    // before our preventDefault landed.
+    window.getSelection()?.removeAllRanges();
     const container = e.currentTarget as HTMLElement;
     const rect = container.getBoundingClientRect();
     const x = e.clientX - rect.left + container.scrollLeft;
@@ -255,7 +261,11 @@ export function ChatView({
     <div className="relative min-h-0 flex-1 select-text">
       <ScrollArea ref={scrollAreaRef} className="h-full">
         <div
-          className="relative space-y-2 px-3 py-2"
+          className={
+            marquee
+              ? "relative space-y-2 px-3 py-2 select-none"
+              : "relative space-y-2 px-3 py-2"
+          }
           onPointerDown={handleContainerPointerDown}
           onPointerMove={handleContainerPointerMove}
           onPointerUp={handleContainerPointerUp}
@@ -296,11 +306,7 @@ export function ChatView({
           <div ref={bottomRef} />
         </div>
       </ScrollArea>
-      <BulkActionsBar
-        sessionId={sessionId ?? null}
-        segments={segments}
-        readOnly={!isEditable}
-      />
+      <BulkActionsBar segments={segments} readOnly={!isEditable} />
       {userScrolled && currentPlaybackTime != null && (
         <button
           onClick={handleJumpToCurrent}

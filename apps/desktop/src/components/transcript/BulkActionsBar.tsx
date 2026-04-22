@@ -1,21 +1,15 @@
 import { useMemo } from "react";
 import { useAppStore } from "@/stores/appStore";
 import { Button } from "@/components/ui/button";
-import { Copy, Eye, EyeOff, FileDown, Trash2, X } from "lucide-react";
+import { Copy, Eye, EyeOff, Trash2, X } from "lucide-react";
 import { toast } from "sonner";
 import type { DbSegment } from "@/lib/db";
-import {
-  downloadTextFile,
-  segmentsToPlainText,
-  segmentsToSrt,
-} from "@/lib/export";
+import { segmentsToPlainText } from "@/lib/export";
 
 export function BulkActionsBar({
-  sessionId,
   segments,
   readOnly,
 }: {
-  sessionId: string | null;
   segments: DbSegment[];
   readOnly: boolean;
 }) {
@@ -33,9 +27,6 @@ export function BulkActionsBar({
 
   const anyVisible = selected.some((s) => s.hidden === 0);
   const ids = selected.map((s) => s.id);
-  const filenameBase = `transcript-${sessionId ?? "session"}-${new Date()
-    .toISOString()
-    .slice(0, 10)}`;
 
   const handleCopy = async () => {
     const text = segmentsToPlainText(selected);
@@ -54,14 +45,6 @@ export function BulkActionsBar({
 
   const handleHideToggle = async () => {
     await setSegmentsHidden(ids, anyVisible);
-  };
-
-  const handleExportTxt = () => {
-    downloadTextFile(`${filenameBase}.txt`, segmentsToPlainText(selected));
-  };
-
-  const handleExportSrt = () => {
-    downloadTextFile(`${filenameBase}.srt`, segmentsToSrt(selected));
   };
 
   return (
@@ -95,24 +78,6 @@ export function BulkActionsBar({
             {anyVisible ? "Hide" : "Unhide"}
           </Button>
         )}
-        <Button
-          size="sm"
-          variant="ghost"
-          className="h-7 gap-1.5 text-xs"
-          onClick={handleExportTxt}
-        >
-          <FileDown className="h-3.5 w-3.5" />
-          .txt
-        </Button>
-        <Button
-          size="sm"
-          variant="ghost"
-          className="h-7 gap-1.5 text-xs"
-          onClick={handleExportSrt}
-        >
-          <FileDown className="h-3.5 w-3.5" />
-          .srt
-        </Button>
         {!readOnly && (
           <Button
             size="sm"
