@@ -67,17 +67,17 @@ function LevelMeter({
         className={`h-3 w-3 shrink-0 ${active ? "text-foreground" : "text-muted-foreground/40"}`}
       />
       <span
-        className={`w-14 shrink-0 text-[10px] ${active ? "text-muted-foreground" : "text-muted-foreground/40"}`}
+        className={`w-12 shrink-0 text-[10px] ${active ? "text-muted-foreground" : "text-muted-foreground/40"}`}
       >
         {label}
       </span>
-      <div className="relative flex-1 h-1.5 overflow-hidden rounded-full bg-muted">
+      <div className="relative h-1.5 flex-1 overflow-hidden rounded-full bg-muted">
         <div
           className={`h-full transition-[width] duration-100 ${active ? "bg-green-500/70" : "bg-muted-foreground/20"}`}
           style={{ width: `${pct}%` }}
         />
       </div>
-      <span className="w-10 shrink-0 text-right font-mono text-[10px] tabular-nums text-muted-foreground/60">
+      <span className="w-9 shrink-0 text-right font-mono text-[10px] tabular-nums text-muted-foreground/60">
         {active && rms != null ? (rms * 100).toFixed(1) : "—"}
       </span>
     </div>
@@ -131,23 +131,37 @@ function BufferRow({
   );
 }
 
-function SectionLabel({
+/**
+ * Section wrapper. Header is `icon + UPPERCASE LABEL` on the left with an
+ * optional right-side slot (e.g. a source chip). Section content flows
+ * flush-left below — no indent, no visual offset. The icon acts as a
+ * section marker above the column; content lives on the same axis as
+ * everything else in the popover.
+ */
+function Section({
   icon: Icon,
-  children,
+  label,
   right,
+  children,
+  className,
 }: {
   icon: React.ElementType;
-  children: React.ReactNode;
+  label: React.ReactNode;
   right?: React.ReactNode;
+  children: React.ReactNode;
+  className?: string;
 }) {
   return (
-    <div className="flex items-center justify-between">
-      <div className="flex items-center gap-1.5 text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
-        <Icon className="h-2.5 w-2.5" />
-        {children}
+    <section className={`space-y-1.5 ${className ?? ""}`}>
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-1.5 text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
+          <Icon className="h-2.5 w-2.5" />
+          {label}
+        </div>
+        {right}
       </div>
-      {right}
-    </div>
+      {children}
+    </section>
   );
 }
 
@@ -374,132 +388,130 @@ export function StatusPopover() {
         <TabsContent value="metrics" className="mt-0">
           <div className="space-y-3 px-3 py-2.5">
             {/* Engine */}
-        <section className="space-y-1.5">
-          <SectionLabel icon={Cpu}>Engine</SectionLabel>
-          <div className="flex flex-wrap items-center gap-1">
-            <Badge variant="secondary" className="px-1.5 py-0 text-[10px]">
-              {selectedEngine}
-            </Badge>
-            <Badge variant="secondary" className="px-1.5 py-0 text-[10px]">
-              {modelLabel}
-            </Badge>
-            {selectedEngine === "Parakeet" && diarizationEnabled && (
-              <Badge className="border-purple-500/30 bg-purple-500/10 px-1.5 py-0 text-[10px] text-purple-500">
-                Diarization
-              </Badge>
-            )}
-          </div>
-        </section>
-
-        {/* Capture + levels */}
-        <section className="space-y-1.5">
-          <SectionLabel
-            icon={Radio}
-            right={
-              <span className="text-[10px] text-muted-foreground">
-                {sourceLabel}
-              </span>
-            }
-          >
-            Capture
-          </SectionLabel>
-          {micActive && (
-            <p className="truncate pl-3.5 text-[10px] text-muted-foreground/80">
-              <span className="text-muted-foreground/50">Device:</span>{" "}
-              {deviceName ?? "Default"}
-            </p>
-          )}
-          <div className="space-y-1">
-            <LevelMeter
-              label="Mic"
-              rms={rms.mic}
-              Icon={Mic}
-              active={micActive}
-            />
-            <LevelMeter
-              label="System"
-              rms={rms.system}
-              Icon={Speaker}
-              active={systemActive}
-            />
-          </div>
-        </section>
-
-        <Separator />
-
-        {/* Ring buffers */}
-        <section className="space-y-2">
-          <SectionLabel icon={HardDrive}>Ring Buffers</SectionLabel>
-          <BufferRow label="Microphone" info={bufferInfo?.mic ?? null} />
-          <BufferRow label="System Audio" info={bufferInfo?.system ?? null} />
-        </section>
-
-        {/* Live session (only when active) */}
-        {liveActive && (
-          <>
-            <Separator />
-            <section className="space-y-1.5">
-              <SectionLabel icon={Activity}>Live Session</SectionLabel>
-              <div className="grid grid-cols-2 gap-x-3 gap-y-1 text-[11px]">
-                <div className="flex items-center justify-between">
-                  <span className="text-muted-foreground/70">Phase</span>
-                  <span className="font-mono tabular-nums">
-                    {livePhase ?? "—"}
-                  </span>
-                </div>
-                <div className="flex items-center justify-between">
-                  <span className="text-muted-foreground/70">Elapsed</span>
-                  <span className="font-mono tabular-nums">
-                    {activeSessionStartTime ? formatElapsed(elapsedMs) : "—"}
-                  </span>
-                </div>
-                <div className="flex items-center justify-between">
-                  <span className="text-muted-foreground/70">Segments</span>
-                  <span className="font-mono tabular-nums">
-                    {activeSessionSegments.length}
-                  </span>
-                </div>
-                <div className="flex items-center justify-between">
-                  <span className="text-muted-foreground/70">Chunks</span>
-                  <span className="font-mono tabular-nums">
-                    {liveStatus?.chunks_processed ?? 0}
-                  </span>
-                </div>
-                <div className="col-span-2 flex items-center justify-between">
-                  <span className="text-muted-foreground/70">
-                    Audio processed
-                  </span>
-                  <span className="font-mono tabular-nums">
-                    {(liveStatus?.total_audio_seconds ?? 0).toFixed(1)}s
-                  </span>
-                </div>
-                {sessionIdShort && (
-                  <div className="col-span-2 flex items-center justify-between">
-                    <span className="flex items-center gap-1 text-muted-foreground/70">
-                      <Hash className="h-2.5 w-2.5" />
-                      Session
-                    </span>
-                    <span className="font-mono text-[10px] text-muted-foreground">
-                      {sessionIdShort}
-                    </span>
-                  </div>
+            <Section icon={Cpu} label="Engine">
+              <div className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5 text-[11px]">
+                <span className="font-medium">{selectedEngine}</span>
+                <span className="text-muted-foreground">{modelLabel}</span>
+                {selectedEngine === "Parakeet" && diarizationEnabled && (
+                  <span className="text-purple-500">+ Diarization</span>
                 )}
               </div>
-            </section>
-          </>
-        )}
+            </Section>
 
-        <Separator />
+            {/* Capture + levels */}
+            <Section
+              icon={Radio}
+              label="Capture"
+              right={
+                <span className="text-[10px] text-muted-foreground">
+                  {sourceLabel}
+                </span>
+              }
+            >
+              {micActive && (
+                <p className="truncate text-[10px] text-muted-foreground/80">
+                  <span className="text-muted-foreground/50">Device:</span>{" "}
+                  {deviceName ?? "Default"}
+                </p>
+              )}
+              <div className="mt-1.5 space-y-1">
+                <LevelMeter
+                  label="Mic"
+                  rms={rms.mic}
+                  Icon={Mic}
+                  active={micActive}
+                />
+                <LevelMeter
+                  label="System"
+                  rms={rms.system}
+                  Icon={Speaker}
+                  active={systemActive}
+                />
+              </div>
+            </Section>
 
-        <Button
-          variant="ghost"
-          size="sm"
-          className="h-6 w-full text-[10px]"
-          onClick={copyDebug}
-        >
-          <Copy className="mr-1 h-3 w-3" />
-          Copy debug info
-        </Button>
+            <Separator />
+
+            {/* Ring buffers */}
+            <Section icon={HardDrive} label="Ring Buffers" className="space-y-2">
+              <div className="space-y-2">
+                <BufferRow label="Microphone" info={bufferInfo?.mic ?? null} />
+                <BufferRow
+                  label="System Audio"
+                  info={bufferInfo?.system ?? null}
+                />
+              </div>
+            </Section>
+
+            {/* Live session (only when active) */}
+            {liveActive && (
+              <>
+                <Separator />
+                <Section icon={Activity} label="Live Session">
+                  <div className="grid grid-cols-2 gap-x-3 gap-y-1 text-[11px]">
+                    <div className="flex items-center justify-between">
+                      <span className="text-muted-foreground/70">Phase</span>
+                      <span className="font-mono tabular-nums">
+                        {livePhase ?? "—"}
+                      </span>
+                    </div>
+                    <div className="flex items-center justify-between">
+                      <span className="text-muted-foreground/70">Elapsed</span>
+                      <span className="font-mono tabular-nums">
+                        {activeSessionStartTime
+                          ? formatElapsed(elapsedMs)
+                          : "—"}
+                      </span>
+                    </div>
+                    <div className="flex items-center justify-between">
+                      <span className="text-muted-foreground/70">
+                        Segments
+                      </span>
+                      <span className="font-mono tabular-nums">
+                        {activeSessionSegments.length}
+                      </span>
+                    </div>
+                    <div className="flex items-center justify-between">
+                      <span className="text-muted-foreground/70">Chunks</span>
+                      <span className="font-mono tabular-nums">
+                        {liveStatus?.chunks_processed ?? 0}
+                      </span>
+                    </div>
+                    <div className="col-span-2 flex items-center justify-between">
+                      <span className="text-muted-foreground/70">
+                        Audio processed
+                      </span>
+                      <span className="font-mono tabular-nums">
+                        {(liveStatus?.total_audio_seconds ?? 0).toFixed(1)}s
+                      </span>
+                    </div>
+                    {sessionIdShort && (
+                      <div className="col-span-2 flex items-center justify-between">
+                        <span className="flex items-center gap-1 text-muted-foreground/70">
+                          <Hash className="h-2.5 w-2.5" />
+                          Session
+                        </span>
+                        <span className="font-mono text-[10px] text-muted-foreground">
+                          {sessionIdShort}
+                        </span>
+                      </div>
+                    )}
+                  </div>
+                </Section>
+              </>
+            )}
+
+            <Separator />
+
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-6 w-full text-[10px]"
+              onClick={copyDebug}
+            >
+              <Copy className="mr-1 h-3 w-3" />
+              Copy debug info
+            </Button>
           </div>
         </TabsContent>
 

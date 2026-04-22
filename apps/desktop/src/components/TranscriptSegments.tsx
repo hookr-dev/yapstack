@@ -86,7 +86,11 @@ interface TranscriptSegmentsProps {
   onTimestampClick?: (time: number) => void;
 }
 
-type Group = { speakerId: number | null; items: DbSegment[] };
+type Group = {
+  source: "Mic" | "System";
+  speakerId: number | null;
+  items: DbSegment[];
+};
 
 export function TranscriptSegments({
   sessionId,
@@ -100,22 +104,40 @@ export function TranscriptSegments({
     (s) => s.settings.speakerNames[sessionId],
   );
 
-  const groups = useMemo<Group[] | null>(() => {
-    if (!segments.some((s) => s.speaker_id != null)) return null;
-    const out: Group[] = [];
-    for (const seg of segments) {
-      const id = seg.speaker_id ?? null;
-      const tail = out[out.length - 1];
-      if (tail && tail.speakerId === id) {
-        tail.items.push(seg);
-      } else {
-        out.push({ speakerId: id, items: [seg] });
+  // Source-vs-source visual differentiation lives in `EditableSegment`
+  // (chat-bubble alignment / styling), so we don't add per-group "You" /
+  // "Other" headers here. Headers are reserved for Sortformer speakers
+  // (renamable via `setSpeakerName`); when diarization is wired in, groups
+  // with a `speaker_id` get a `SpeakerHeader`. With diarization off, the
+  // transcript renders flat and bubbles handle the rest.
+  const { groups, hasSpeakerIds } = useMemo(() => {
+    let speakerSeen = false;
+    for (const s of segments) {
+      if (s.speaker_id != null) {
+        speakerSeen = true;
+        break;
       }
     }
-    return out;
+    if (!speakerSeen) {
+      return { groups: [] as Group[], hasSpeakerIds: false };
+    }
+    // New group on either source change or speaker change so two adjacent
+    // same-id segments from different sources don't visually merge under
+    // one SpeakerHeader.
+    const out: Group[] = [];
+    for (const seg of segments) {
+      const speakerId = seg.speaker_id ?? null;
+      const tail = out[out.length - 1];
+      if (tail && tail.source === seg.source && tail.speakerId === speakerId) {
+        tail.items.push(seg);
+      } else {
+        out.push({ source: seg.source, speakerId, items: [seg] });
+      }
+    }
+    return { groups: out, hasSpeakerIds: true };
   }, [segments]);
 
-  if (groups === null) {
+  if (!hasSpeakerIds) {
     return segments.map((segment) => {
       const isActive = segment.id === activeSegmentId;
       return (

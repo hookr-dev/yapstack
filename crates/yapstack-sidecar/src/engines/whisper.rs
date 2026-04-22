@@ -152,7 +152,11 @@ impl TranscriptionBackend for WhisperBackend {
             let end_ts = segment.end_timestamp();
             let confidence = 1.0 - segment.no_speech_probability();
 
-            if !should_include_segment(&segment_text, confidence) {
+            if !should_include_segment(
+                &segment_text,
+                confidence,
+                yapstack_common::types::EngineKind::Whisper,
+            ) {
                 info!(
                     len = segment_text.trim().chars().count(),
                     confidence = confidence,
