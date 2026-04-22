@@ -85,12 +85,25 @@ export const EditableSegment = memo(forwardRef<
     setIsEditing(true);
   };
 
+  // Shift-click extends the native text selection on mousedown, *before*
+  // our click handler runs — that's what paints the blue highlight across
+  // bubbles. Cancel that at the mousedown stage when a modifier is held.
+  // (Plain mousedown is left alone so contenteditable focus still works.)
+  const handleBubbleMouseDown = (e: React.MouseEvent) => {
+    if (isEditing) return;
+    if (e.shiftKey || e.metaKey || e.ctrlKey) {
+      e.preventDefault();
+      window.getSelection()?.removeAllRanges();
+    }
+  };
+
   const handleBubbleClick = (e: React.MouseEvent) => {
     if (isEditing) return;
     const isRange = e.shiftKey;
     const isToggle = e.metaKey || e.ctrlKey;
     if (isRange || isToggle) {
       e.preventDefault();
+      window.getSelection()?.removeAllRanges();
       toggleSegmentSelected(
         segment.id,
         isRange ? "range" : "toggle",
@@ -168,6 +181,7 @@ export const EditableSegment = memo(forwardRef<
                     ? "cursor-default"
                     : "cursor-pointer",
               )}
+              onMouseDown={!isEditing ? handleBubbleMouseDown : undefined}
               onClick={!isEditing ? handleBubbleClick : undefined}
               onBlur={isEditing ? handleSave : undefined}
               onKeyDown={isEditing ? handleKeyDown : undefined}
