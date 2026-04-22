@@ -18,7 +18,7 @@ import {
 } from "@/components/ui/alert-dialog";
 import { Switch } from "@/components/ui/switch";
 import { Progress } from "@/components/ui/progress";
-import { PlayCircle, RefreshCw, Download, Loader2 } from "lucide-react";
+import { PlayCircle, RefreshCw, Download, Loader2, Trash2 } from "lucide-react";
 import { getVersion } from "@tauri-apps/api/app";
 import { toast } from "sonner";
 import { checkForUpdate, downloadAndInstallUpdate } from "@/lib/updater";
@@ -278,11 +278,22 @@ export function GeneralTab() {
       <Separator />
 
       {/* Data */}
-      <div className="space-y-2">
+      <div className="flex items-center justify-between">
+        <div className="space-y-0.5">
+          <Label className="text-xs">Clear All Sessions</Label>
+          <p className="text-[10px] text-muted-foreground">
+            Permanently delete all sessions and transcripts
+          </p>
+        </div>
         <AlertDialog>
           <AlertDialogTrigger asChild>
-            <Button variant="destructive" size="sm" className="w-full text-xs">
-              Clear All Sessions
+            <Button
+              variant="outline"
+              size="sm"
+              className="gap-1.5 border-destructive/40 text-xs text-destructive hover:bg-destructive hover:text-white"
+            >
+              <Trash2 className="h-3.5 w-3.5" />
+              Clear
             </Button>
           </AlertDialogTrigger>
           <AlertDialogContent>
