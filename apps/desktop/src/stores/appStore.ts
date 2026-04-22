@@ -189,6 +189,12 @@ interface AppState {
 
   // Active recording session
   activeSessionId: string | null;
+  // Dictation uses `startLiveTranscription` with its own synthetic session id
+  // that is *not* inserted into the `sessions` table. The same live-segment
+  // events fire through `onLiveSegment`, which would fail the segments FK.
+  // Track the dictation id so `onLiveSegment` can skip DB persistence for it.
+  dictationSessionId: string | null;
+  setDictationSessionId: (id: string | null) => void;
   activeSessionSegments: DbSegment[];
   activeSessionStartTime: number | null;
 
@@ -445,6 +451,7 @@ function createAppStore() {
       folderChildMap: new Map(),
       sessionFolderMap: {},
       activeSessionId: null,
+      dictationSessionId: null,
       activeSessionSegments: [],
       activeSessionStartTime: null,
       viewSessionSegments: [],
@@ -473,6 +480,7 @@ function createAppStore() {
       setCaptureStatus: (status) => set({ captureStatus: status }),
       setBufferInfo: (info) => set({ bufferInfo: info }),
       setModelDownloadProgress: (p) => set({ modelDownloadProgress: p }),
+      setDictationSessionId: (id) => set({ dictationSessionId: id }),
       setLivePhase: (phase) => {
         const active = phase === "Running";
         set({ livePhase: phase, liveTranscriptionActive: active });
@@ -556,9 +564,14 @@ function createAppStore() {
           // activeSessionId) still persist to the right session in the DB.
           // Fall back to ambient activeSessionId for backward compat with any
           // older event payload that didn't carry session_id.
-          const { activeSessionId } = get();
+          const { activeSessionId, dictationSessionId } = get();
           const targetSessionId = event.session_id ?? activeSessionId;
           if (!targetSessionId) return;
+          // Dictation runs live transcription against a synthetic session id
+          // that is never written to the `sessions` table; persisting here
+          // would fail the segments FK and fire a toast. Dictation consumes
+          // its own text via the raw live-segment listener in useDictation.
+          if (targetSessionId === dictationSessionId) return;
 
           // Create one segment per Whisper/Parakeet segment to preserve timestamps
           const newSegments: DbSegment[] = [];
@@ -632,6 +645,17 @@ function createAppStore() {
               }
             }
           } catch (e) {
+            // If the session row is gone (dictation, deleted session, or a
+            // very-late segment after the session was removed), the segments
+            // FK fails — log and drop, don't alarm the user.
+            const msg = e instanceof Error ? e.message : String(e);
+            if (/FOREIGN KEY|no such|segments_session/i.test(msg)) {
+              console.debug(
+                `[segment] dropped for missing session ${targetSessionId}:`,
+                msg,
+              );
+              return;
+            }
             console.error("Failed to persist live segment:", e);
             toast.error("Failed to save transcript segment", { id: "segment-write-error" });
           }

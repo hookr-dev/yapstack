@@ -146,6 +146,10 @@ export function useDictation() {
       dictationIdRef.current = crypto.randomUUID();
       accumulatedTextRef.current = "";
       wavInfoRef.current = null;
+      // Tell the main store which synthetic session id dictation is using so
+      // `onLiveSegment` can skip DB persistence for it (dictation session
+      // isn't in the `sessions` table, and the FK would fail the insert).
+      useAppStore.getState().setDictationSessionId(dictationIdRef.current);
 
       trackDictationStarted({
         slot_id: slot.id,
@@ -468,6 +472,7 @@ export function useDictation() {
 
     function setIdle() {
       stateRef.current = "idle";
+      useAppStore.getState().setDictationSessionId(null);
       // Notify toggle mode that dictation is done (clears toggle state)
       window.dispatchEvent(new CustomEvent("yapstack:dictation-idle"));
     }
