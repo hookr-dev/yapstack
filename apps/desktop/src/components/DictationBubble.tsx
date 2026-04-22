@@ -23,9 +23,9 @@ const stateConfig: Record<
   },
   processing: {
     label: "Processing",
-    ringColor: "ring-purple-500",
-    textColor: "text-purple-400",
-    glow: "shadow-[0_0_12px_rgba(168,85,247,0.5)]",
+    ringColor: "ring-amber-500",
+    textColor: "text-amber-400",
+    glow: "shadow-[0_0_12px_rgba(245,158,11,0.5)]",
     animate: "animate-pulse",
   },
   pasted: {

@@ -393,7 +393,7 @@ export function StatusPopover() {
                 <span className="font-medium">{selectedEngine}</span>
                 <span className="text-muted-foreground">{modelLabel}</span>
                 {selectedEngine === "Parakeet" && diarizationEnabled && (
-                  <span className="text-purple-500">+ Diarization</span>
+                  <span className="text-amber-600 dark:text-amber-400">+ Diarization</span>
                 )}
               </div>
             </Section>
