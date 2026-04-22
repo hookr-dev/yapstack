@@ -180,11 +180,18 @@ pub(crate) fn normalize_for_repetition(text: &str) -> String {
     result
 }
 
-/// Detect excessive repetition (`"the the the the"` or `"thank you thank you …"`).
+/// Detect excessive repetition (`"the the the the the the"` or
+/// `"thank you thank you …"`). Returns `true` when ≥6 consecutive identical
+/// words or ≥6 repeats of a short phrase are found.
+///
+/// The 6-repeat threshold (raised from 3) lets real conversational
+/// repetition like "no no no that's not what I meant" pass; the call site
+/// in `should_include_segment` additionally gates on confidence < 0.7 so
+/// high-confidence stutters survive on both engines.
 #[cfg(any(feature = "whisper", feature = "parakeet", test))]
 pub(crate) fn has_excessive_repetition(text: &str) -> bool {
     let words: Vec<&str> = text.split_whitespace().collect();
-    if words.len() < 3 {
+    if words.len() < 6 {
         return false;
     }
 
@@ -192,7 +199,7 @@ pub(crate) fn has_excessive_repetition(text: &str) -> bool {
     for pair in words.windows(2) {
         if pair[0].eq_ignore_ascii_case(pair[1]) {
             consecutive += 1;
-            if consecutive >= 3 {
+            if consecutive >= 6 {
                 return true;
             }
         } else {
@@ -208,7 +215,7 @@ pub(crate) fn has_excessive_repetition(text: &str) -> bool {
                 .zip(phrase.iter())
                 .all(|(a, b)| a.eq_ignore_ascii_case(b))
         });
-        if all_repeat && words.len() / phrase_len >= 3 {
+        if all_repeat && words.len() / phrase_len >= 6 {
             return true;
         }
     }
@@ -219,8 +226,17 @@ pub(crate) fn has_excessive_repetition(text: &str) -> bool {
 /// Whether a transcript segment should be kept. Filters out empty text,
 /// special tokens (`[BLANK_AUDIO]`), low-confidence segments, known YouTube
 /// hallucination patterns, and excessive repetition.
+///
+/// `engine` selects the per-engine hallucination tier (Whisper keeps the
+/// aggressive always-reject list; Parakeet uses a softer one). The repetition
+/// gate is shared but only fires at confidence < 0.7 so legitimate
+/// high-confidence stutters survive on both engines.
 #[cfg(any(feature = "whisper", feature = "parakeet", test))]
-pub(crate) fn should_include_segment(text: &str, confidence: f32) -> bool {
+pub(crate) fn should_include_segment(
+    text: &str,
+    confidence: f32,
+    engine: yapstack_common::types::EngineKind,
+) -> bool {
     let trimmed = text.trim();
 
     if trimmed.is_empty() {
@@ -235,29 +251,39 @@ pub(crate) fn should_include_segment(text: &str, confidence: f32) -> bool {
         return false;
     }
 
-    if has_excessive_repetition(trimmed) {
-        tracing::info!(len = trimmed.chars().count(), "repetition filtered");
-        return false;
-    }
-    let normalized = normalize_for_repetition(trimmed);
-    if has_excessive_repetition(&normalized) {
-        tracing::info!(
-            len = trimmed.chars().count(),
-            normalized_len = normalized.chars().count(),
-            "repetition filtered (normalized)"
-        );
-        return false;
+    // Repetition: only filter at marginal confidence. Real speech repetitions
+    // ("no no no no no no") at ≥0.7 confidence pass through; long hallucinated
+    // loops are typically much longer than 6 repeats AND low confidence.
+    if confidence < 0.7 {
+        if has_excessive_repetition(trimmed) {
+            tracing::info!(
+                len = trimmed.chars().count(),
+                confidence = confidence,
+                "repetition filtered"
+            );
+            return false;
+        }
+        let normalized = normalize_for_repetition(trimmed);
+        if has_excessive_repetition(&normalized) {
+            tracing::info!(
+                len = trimmed.chars().count(),
+                normalized_len = normalized.chars().count(),
+                confidence = confidence,
+                "repetition filtered (normalized)"
+            );
+            return false;
+        }
     }
 
     if confidence < 0.4 {
         return false;
     }
 
-    if yapstack_common::hallucination::is_always_reject(trimmed) {
+    if yapstack_common::hallucination::is_always_reject(trimmed, engine) {
         return false;
     }
 
-    if confidence < 0.6 && yapstack_common::hallucination::is_marginal_reject(trimmed) {
+    if confidence < 0.6 && yapstack_common::hallucination::is_marginal_reject(trimmed, engine) {
         return false;
     }
 
@@ -267,83 +293,127 @@ pub(crate) fn should_include_segment(text: &str, confidence: f32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use yapstack_common::types::EngineKind;
+
+    // Convenience: most pre-existing tests asserted Whisper behavior; keep
+    // them readable by defaulting to Whisper.
+    fn include_w(text: &str, confidence: f32) -> bool {
+        should_include_segment(text, confidence, EngineKind::Whisper)
+    }
+
+    fn include_p(text: &str, confidence: f32) -> bool {
+        should_include_segment(text, confidence, EngineKind::Parakeet)
+    }
 
     #[test]
     fn normal_text_high_confidence_included() {
-        assert!(should_include_segment("Hello, how are you?", 0.9));
+        assert!(include_w("Hello, how are you?", 0.9));
+        assert!(include_p("Hello, how are you?", 0.9));
     }
 
     #[test]
-    fn thank_you_low_confidence_excluded() {
-        assert!(!should_include_segment("Thank you.", 0.3));
+    fn whisper_thank_you_excluded_all_confidences() {
+        assert!(!include_w("Thank you.", 0.3));
+        assert!(!include_w("Thank you.", 0.8));
+        assert!(!include_w("Thank you!", 0.95));
+        assert!(!include_w("Thank you?", 0.9));
+        assert!(!include_w("Thank you", 0.99));
     }
 
     #[test]
-    fn thank_you_high_confidence_excluded() {
-        assert!(!should_include_segment("Thank you.", 0.8));
-        assert!(!should_include_segment("Thank you!", 0.95));
-        assert!(!should_include_segment("Thank you?", 0.9));
-        assert!(!should_include_segment("Thank you", 0.99));
+    fn parakeet_thank_you_high_confidence_included() {
+        // Demoted from always-reject to marginal — high-confidence "thank you"
+        // is real polite speech on Parakeet.
+        assert!(include_p("Thank you.", 0.95));
+        assert!(include_p("Thank you!", 0.9));
+    }
+
+    #[test]
+    fn parakeet_thank_you_low_confidence_excluded() {
+        // Marginal tier still drops at confidence < 0.6.
+        assert!(!include_p("Thank you.", 0.5));
+        assert!(!include_p("Thank you.", 0.3));
     }
 
     #[test]
     fn empty_text_excluded() {
-        assert!(!should_include_segment("", 0.9));
-        assert!(!should_include_segment("   ", 0.9));
+        assert!(!include_w("", 0.9));
+        assert!(!include_w("   ", 0.9));
     }
 
     #[test]
     fn blank_audio_token_excluded() {
-        assert!(!should_include_segment("[BLANK_AUDIO]", 0.9));
+        assert!(!include_w("[BLANK_AUDIO]", 0.9));
     }
 
     #[test]
-    fn you_always_excluded() {
-        assert!(!should_include_segment("you", 0.5));
-        assert!(!should_include_segment("you", 0.9));
+    fn whisper_you_always_excluded() {
+        assert!(!include_w("you", 0.5));
+        assert!(!include_w("you", 0.9));
+    }
+
+    #[test]
+    fn parakeet_you_marginal_only() {
+        // Demoted: high-confidence "you" passes on Parakeet.
+        assert!(include_p("you", 0.9));
+        assert!(!include_p("you", 0.5));
     }
 
     #[test]
     fn longer_sentence_with_you_included() {
-        assert!(should_include_segment("You should try this", 0.7));
+        assert!(include_w("You should try this", 0.7));
+        assert!(include_p("You should try this", 0.7));
     }
 
     #[test]
     fn below_confidence_threshold_excluded() {
-        assert!(!should_include_segment("Some random text", 0.35));
+        assert!(!include_w("Some random text", 0.35));
+        assert!(!include_p("Some random text", 0.35));
     }
 
     #[test]
-    fn hallucination_at_boundary_confidence() {
-        assert!(!should_include_segment("Thank you.", 0.6));
-        assert!(!should_include_segment("Thank you.", 0.59));
-        assert!(should_include_segment("Yeah", 0.6));
-        assert!(!should_include_segment("Yeah", 0.59));
+    fn whisper_hallucination_at_boundary_confidence() {
+        assert!(!include_w("Thank you.", 0.6));
+        assert!(!include_w("Thank you.", 0.59));
+        assert!(include_w("Yeah", 0.6));
+        assert!(!include_w("Yeah", 0.59));
     }
 
     #[test]
     fn special_tokens_excluded() {
-        assert!(!should_include_segment("[MUSIC]", 0.9));
-        assert!(!should_include_segment("[NOISE]", 0.9));
+        assert!(!include_w("[MUSIC]", 0.9));
+        assert!(!include_w("[NOISE]", 0.9));
     }
 
     #[test]
-    fn hallucination_patterns_case_insensitive() {
-        assert!(!should_include_segment("THANK YOU.", 0.9));
-        assert!(!should_include_segment("Bye.", 0.9));
-        assert!(!should_include_segment("Subscribe.", 0.9));
+    fn whisper_youtube_outros_case_insensitive() {
+        assert!(!include_w("THANK YOU.", 0.9));
+        assert!(!include_w("Bye.", 0.9));
+        assert!(!include_w("Subscribe.", 0.9));
     }
 
     #[test]
-    fn single_word_repetition_detected() {
-        assert!(has_excessive_repetition("the the the the"));
-        assert!(has_excessive_repetition("hello hello hello"));
+    fn parakeet_youtube_outros_long_form_still_excluded() {
+        // Long unambiguous YouTube canned phrases are always-rejected on
+        // Parakeet too.
+        assert!(!include_p("Thanks for watching.", 0.9));
+        assert!(!include_p("Subtitles by the Amara.org community", 0.9));
     }
 
     #[test]
-    fn phrase_repetition_detected() {
-        assert!(has_excessive_repetition("thank you thank you thank you"));
-        assert!(has_excessive_repetition("I think I think I think"));
+    fn single_word_repetition_threshold_six() {
+        // Threshold raised from 3 to 6 — short stutters pass.
+        assert!(!has_excessive_repetition("the the the the"));
+        assert!(!has_excessive_repetition("hello hello hello"));
+        assert!(has_excessive_repetition("the the the the the the"));
+    }
+
+    #[test]
+    fn phrase_repetition_threshold_six() {
+        assert!(!has_excessive_repetition("thank you thank you thank you"));
+        assert!(has_excessive_repetition(
+            "thank you thank you thank you thank you thank you thank you"
+        ));
     }
 
     #[test]
@@ -359,42 +429,58 @@ mod tests {
     }
 
     #[test]
-    fn repetition_filtered_by_should_include() {
-        assert!(!should_include_segment("the the the the", 0.9));
-        assert!(!should_include_segment(
-            "thank you thank you thank you",
-            0.9
-        ));
+    fn real_speech_repetition_high_confidence_passes() {
+        // "no no no that's not what I meant" is real speech — must not be
+        // dropped at high confidence on either engine.
+        assert!(include_w("no no no that's not what I meant", 0.85));
+        assert!(include_p("no no no that's not what I meant", 0.85));
+    }
+
+    #[test]
+    fn long_repetition_low_confidence_filtered() {
+        // 6+ reps at confidence < 0.7 still drops — Whisper stuck-loop defense.
+        assert!(!include_w("the the the the the the the the the", 0.5));
+    }
+
+    #[test]
+    fn long_repetition_high_confidence_passes() {
+        // 6+ reps at confidence ≥ 0.7 passes — extreme but treated as real.
+        assert!(include_w("the the the the the the the the the", 0.85));
     }
 
     #[test]
     fn conversational_fillers_not_filtered_at_high_confidence() {
-        assert!(should_include_segment("So", 0.7));
-        assert!(should_include_segment("Okay.", 0.7));
-        assert!(should_include_segment("Uh", 0.7));
-        assert!(should_include_segment("Um", 0.7));
-        assert!(should_include_segment("Hmm.", 0.7));
-        assert!(should_include_segment("You know", 0.7));
-        assert!(should_include_segment("I mean", 0.7));
-        assert!(should_include_segment("Yeah", 0.7));
-        assert!(should_include_segment("Right.", 0.7));
+        assert!(include_w("So", 0.7));
+        assert!(include_w("Okay.", 0.7));
+        assert!(include_w("Uh", 0.7));
+        assert!(include_w("Um", 0.7));
+        assert!(include_w("Hmm.", 0.7));
+        assert!(include_w("You know", 0.7));
+        assert!(include_w("I mean", 0.7));
+        assert!(include_w("Yeah", 0.7));
+        assert!(include_w("Right.", 0.7));
     }
 
     #[test]
     fn filler_patterns_filtered_at_marginal_confidence() {
-        assert!(!should_include_segment("Yeah", 0.5));
-        assert!(!should_include_segment("yeah.", 0.5));
-        assert!(!should_include_segment("Okay.", 0.5));
-        assert!(!should_include_segment("Um", 0.5));
-        assert!(!should_include_segment("So", 0.5));
-        assert!(!should_include_segment("Right.", 0.5));
+        assert!(!include_w("Yeah", 0.5));
+        assert!(!include_w("yeah.", 0.5));
+        assert!(!include_w("Okay.", 0.5));
+        assert!(!include_w("Um", 0.5));
+        assert!(!include_w("So", 0.5));
+        assert!(!include_w("Right.", 0.5));
     }
 
     #[test]
-    fn punctuation_joined_repetition_detected() {
-        assert!(!should_include_segment("Yeah.Yeah.Yeah.", 0.9));
-        assert!(!should_include_segment("No.No.No.No.", 0.9));
-        assert!(!should_include_segment("Okay,Okay,Okay,", 0.9));
+    fn punctuation_joined_short_repetition_passes_high_conf() {
+        // 3 reps at high confidence used to be filtered; now they pass.
+        assert!(include_w("Yeah.Yeah.Yeah.", 0.9));
+        assert!(include_w("No.No.No.No.", 0.9));
+    }
+
+    #[test]
+    fn punctuation_joined_long_repetition_low_conf_filtered() {
+        assert!(!include_w("Yeah.Yeah.Yeah.Yeah.Yeah.Yeah.Yeah.", 0.5));
     }
 
     #[test]
@@ -492,15 +578,15 @@ mod tests {
 
     #[test]
     fn punctuation_only_segments_excluded() {
-        assert!(!should_include_segment("...", 0.9));
-        assert!(!should_include_segment("---", 0.9));
-        assert!(!should_include_segment(",", 0.9));
-        assert!(!should_include_segment("\u{266A}", 0.9));
+        assert!(!include_w("...", 0.9));
+        assert!(!include_w("---", 0.9));
+        assert!(!include_w(",", 0.9));
+        assert!(!include_w("\u{266A}", 0.9));
     }
 
     #[test]
     fn text_with_punctuation_still_included() {
-        assert!(should_include_segment("Hello, world.", 0.9));
-        assert!(should_include_segment("Wait, what?", 0.9));
+        assert!(include_w("Hello, world.", 0.9));
+        assert!(include_w("Wait, what?", 0.9));
     }
 }
