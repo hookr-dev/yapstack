@@ -8,7 +8,11 @@ import {
   getAllModelsGrouped,
   DEFAULT_AI_SETTINGS,
 } from "@/lib/ai";
-import type { AIProvider, AISettings } from "@/lib/ai";
+import type { AIProvider, AIProviderConfig, AISettings } from "@/lib/ai";
+import {
+  CustomBaseUrlField,
+  CustomModelField,
+} from "@/components/ai/CustomProviderFields";
 import {
   eventToGlobalBinding,
   shortcutCaptureActive,
@@ -403,12 +407,16 @@ function AIStep({
   }
 
   function updateProviderConfig(field: string, value: string) {
+    updateProviderConfigPartial({ [field]: value });
+  }
+
+  function updateProviderConfigPartial(updates: Partial<AIProviderConfig>) {
     updateSettings({
       ai: {
         ...ai,
         providers: {
           ...ai.providers,
-          [provider]: { ...config, [field]: value },
+          [provider]: { ...config, ...updates },
         },
       },
     });
@@ -497,56 +505,61 @@ function AIStep({
           </div>
         </div>
 
-        {/* Model */}
-        <div className="space-y-1.5">
-          <Label className="text-xs text-muted-foreground">Model</Label>
-          {models ? (
-            <Select
-              value={config.model}
-              onValueChange={(v) => updateProviderConfig("model", v)}
-            >
-              <SelectTrigger className="h-8 text-xs">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                {getAllModelsGrouped(provider).map((group) => (
-                  <SelectGroup key={group.provider}>
-                    <SelectLabel className="text-[9px] text-muted-foreground/50 uppercase">
-                      {group.providerLabel}
-                    </SelectLabel>
-                    {group.models.map((m) => (
-                      <SelectItem
-                        key={`${group.provider}:${m.id}`}
-                        value={m.id}
-                        className="text-xs"
-                        disabled={!m.available}
-                      >
-                        <span className="flex items-center gap-2">
-                          {m.label}
-                          {m.recommended && m.available && (
-                            <Badge
-                              variant="secondary"
-                              className="text-[9px] px-1 py-0"
-                            >
-                              Recommended
-                            </Badge>
-                          )}
-                        </span>
-                      </SelectItem>
-                    ))}
-                  </SelectGroup>
-                ))}
-              </SelectContent>
-            </Select>
-          ) : (
-            <Input
-              value={config.model}
-              onChange={(e) => updateProviderConfig("model", e.target.value)}
-              placeholder="model-name"
-              className="h-8 text-xs"
+        {/* Base URL (custom only) + Model */}
+        {provider === "custom" ? (
+          <>
+            <CustomBaseUrlField
+              config={config}
+              onUpdate={updateProviderConfigPartial}
             />
-          )}
-        </div>
+            <CustomModelField
+              config={config}
+              onUpdate={updateProviderConfigPartial}
+            />
+          </>
+        ) : (
+          <div className="space-y-1.5">
+            <Label className="text-xs text-muted-foreground">Model</Label>
+            {models && (
+              <Select
+                value={config.model}
+                onValueChange={(v) => updateProviderConfig("model", v)}
+              >
+                <SelectTrigger className="h-8 text-xs">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {getAllModelsGrouped(provider, config).map((group) => (
+                    <SelectGroup key={group.provider}>
+                      <SelectLabel className="text-[9px] text-muted-foreground/50 uppercase">
+                        {group.providerLabel}
+                      </SelectLabel>
+                      {group.models.map((m) => (
+                        <SelectItem
+                          key={`${group.provider}:${m.id}`}
+                          value={m.id}
+                          className="text-xs"
+                        >
+                          <span className="flex items-center gap-2">
+                            {m.label}
+                            {m.recommended && (
+                              <Badge
+                                variant="secondary"
+                                className="text-[9px] px-1 py-0"
+                              >
+                                Recommended
+                              </Badge>
+                            )}
+                          </span>
+                        </SelectItem>
+                      ))}
+                    </SelectGroup>
+                  ))}
+                </SelectContent>
+              </Select>
+            )}
+          </div>
+        )}
 
         {/* Test Connection */}
         <div className="space-y-1.5">

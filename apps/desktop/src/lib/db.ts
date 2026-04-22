@@ -383,6 +383,29 @@ export async function toggleSegmentHidden(id: string): Promise<void> {
   );
 }
 
+export async function softDeleteSegments(ids: string[]): Promise<void> {
+  if (ids.length === 0) return;
+  const db = await getDb();
+  const placeholders = ids.map((_, i) => `$${i + 1}`).join(",");
+  await db.execute(
+    `UPDATE segments SET deleted_at = datetime('now') WHERE id IN (${placeholders})`,
+    ids,
+  );
+}
+
+export async function setSegmentsHidden(
+  ids: string[],
+  hidden: boolean,
+): Promise<void> {
+  if (ids.length === 0) return;
+  const db = await getDb();
+  const placeholders = ids.map((_, i) => `$${i + 2}`).join(",");
+  await db.execute(
+    `UPDATE segments SET hidden = $1 WHERE id IN (${placeholders})`,
+    [hidden ? 1 : 0, ...ids],
+  );
+}
+
 // --- Notes CRUD ---
 
 export async function getNote(sessionId: string): Promise<DbNote | null> {

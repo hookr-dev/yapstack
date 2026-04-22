@@ -192,28 +192,35 @@ export function TranscriptionTab() {
 
   return (
     <>
-      {/* Engine radio — peer engines, no recommended badge */}
+      {/* Engine — Parakeet is the recommended default. The chip shows on
+          the non-active engine so we nudge toward Parakeet without shouting
+          at users who already picked it. */}
       <div className="space-y-2">
         <Label className="text-xs text-muted-foreground">
           Transcription engine
         </Label>
         <div className="flex gap-1.5">
-          {(["Whisper", "Parakeet"] as const).map((kind) => (
+          {(["Parakeet", "Whisper"] as const).map((kind) => (
             <Button
               key={kind}
               size="sm"
               variant={selectedEngine === kind ? "default" : "outline"}
-              className="flex-1 text-xs"
+              className="relative flex-1 text-xs"
               onClick={() => handleEngineChange(kind)}
             >
               {kind}
+              {kind === "Parakeet" && selectedEngine !== "Parakeet" && (
+                <span className="ml-1.5 rounded-full bg-primary/15 px-1.5 py-0.5 text-[9px] font-medium text-primary">
+                  Recommended
+                </span>
+              )}
             </Button>
           ))}
         </div>
         <p className="text-[10px] text-muted-foreground/60">
-          {selectedEngine === "Whisper"
-            ? "OpenAI Whisper — 99 languages, hallucination filters tuned for podcasts."
-            : "NVIDIA Parakeet TDT v3 — 25 European languages, 3–5× faster, optional speaker diarization."}
+          {selectedEngine === "Parakeet"
+            ? "NVIDIA Parakeet TDT v3 — fastest and most accurate for English and 24 other European languages."
+            : "OpenAI Whisper — broader language coverage (99 languages) when Parakeet's language set isn't enough."}
         </p>
       </div>
 

@@ -5,16 +5,17 @@ import {
   PopoverTrigger,
   PopoverContent,
 } from "@/components/ui/popover";
-import { Check, ChevronDown, Zap } from "lucide-react";
+import { Check, ChevronDown, Settings, Zap } from "lucide-react";
 import { getAllModelsGrouped, DEFAULT_AI_SETTINGS } from "@/lib/ai";
 import { cn } from "@/lib/utils";
 
 export function ModelPickerPill() {
   const ai = useAppStore((s) => s.settings.ai) ?? DEFAULT_AI_SETTINGS;
   const updateSettings = useAppStore((s) => s.updateSettings);
+  const navigateTo = useAppStore((s) => s.navigateTo);
   const provider = ai.activeProvider;
   const config = ai.providers[provider];
-  const groups = getAllModelsGrouped(provider);
+  const groups = getAllModelsGrouped(provider, config);
   const [open, setOpen] = useState(false);
 
   const currentLabel = (() => {
@@ -38,21 +39,17 @@ export function ModelPickerPill() {
     setOpen(false);
   }
 
-  if (groups.length === 0) {
-    return (
-      <span className="inline-flex items-center gap-1 rounded-md border border-muted-foreground/20 px-2 py-0.5 text-[9px] text-muted-foreground">
-        <Zap className="h-2.5 w-2.5" />
-        {currentLabel || "No model"}
-      </span>
-    );
-  }
+  const openSettings = () => {
+    setOpen(false);
+    navigateTo("settings");
+  };
 
   return (
     <Popover open={open} onOpenChange={setOpen}>
       <PopoverTrigger asChild>
         <button className="inline-flex items-center gap-1 rounded-md border border-muted-foreground/20 px-2 py-0.5 text-[9px] text-muted-foreground hover:border-foreground/40 hover:text-foreground transition-colors">
           <Zap className="h-2.5 w-2.5" />
-          {currentLabel}
+          {currentLabel || "No model"}
           <ChevronDown className="h-2 w-2" />
         </button>
       </PopoverTrigger>
@@ -63,14 +60,30 @@ export function ModelPickerPill() {
         sideOffset={4}
         collisionPadding={8}
       >
-        {groups.map((group, gi) => (
-          <div key={group.provider}>
-            {gi > 0 && <div className="border-t my-1" />}
-            <div className="text-[9px] text-muted-foreground/50 uppercase px-2 pt-2 pb-1 select-none">
-              {group.providerLabel}
-            </div>
-            {group.models.map((m) =>
-              m.available ? (
+        {groups.length === 0 ? (
+          <div className="px-2 py-3 text-center">
+            <p className="text-[10px] text-muted-foreground mb-2">
+              {provider === "custom"
+                ? "No custom models fetched yet."
+                : "No models configured."}
+            </p>
+            <button
+              type="button"
+              onClick={openSettings}
+              className="inline-flex items-center gap-1 text-[11px] text-primary hover:underline"
+            >
+              <Settings className="h-3 w-3" />
+              Open AI settings
+            </button>
+          </div>
+        ) : (
+          groups.map((group, gi) => (
+            <div key={group.provider}>
+              {gi > 0 && <div className="border-t my-1" />}
+              <div className="text-[9px] text-muted-foreground/50 uppercase px-2 pt-2 pb-1 select-none">
+                {group.providerLabel}
+              </div>
+              {group.models.map((m) => (
                 <button
                   key={m.id}
                   onClick={() => selectModel(m.id)}
@@ -93,17 +106,10 @@ export function ModelPickerPill() {
                     )}
                   </span>
                 </button>
-              ) : (
-                <div
-                  key={m.id}
-                  className="flex items-center w-full px-2 py-1.5 text-xs text-muted-foreground opacity-40 cursor-default pointer-events-none"
-                >
-                  {m.label}
-                </div>
-              ),
-            )}
-          </div>
-        ))}
+              ))}
+            </div>
+          ))
+        )}
       </PopoverContent>
     </Popover>
   );

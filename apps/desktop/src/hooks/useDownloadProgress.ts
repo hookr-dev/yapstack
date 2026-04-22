@@ -10,7 +10,9 @@ export function useDownloadProgress() {
 
   useEffect(() => {
     const unlisten = listenEvent(EVENTS.MODEL_DOWNLOAD_PROGRESS, (payload) => {
-      setModelDownloadProgress(payload.percent);
+      // Backend emits percent as a [0.0, 1.0] ratio; UI consumers (Progress
+      // component, TitleBar text, SetupBanner) all expect 0–100.
+      setModelDownloadProgress(Math.round(payload.percent * 100));
     });
 
     return () => {

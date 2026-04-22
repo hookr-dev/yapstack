@@ -119,6 +119,11 @@ export function ParakeetModelSection() {
               <Badge variant="secondary" className="text-xs">
                 {formatBytes(model.approximate_size_bytes)}
               </Badge>
+              {model.variant === "TdtV3" && (
+                <Badge className="bg-primary/15 text-[10px] text-primary border-primary/20">
+                  Recommended
+                </Badge>
+              )}
             </div>
 
             <div className="flex items-center gap-1">

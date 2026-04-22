@@ -17,10 +17,13 @@ import {
   testConnection,
   getModelsForProvider,
   getAllModelsGrouped,
-  fetchCustomModels,
 } from "@/lib/ai";
 import { DEFAULT_AI_SETTINGS } from "@/lib/ai";
-import type { AIProvider, AISettings } from "@/lib/ai";
+import type { AIProvider, AIProviderConfig, AISettings } from "@/lib/ai";
+import {
+  CustomBaseUrlField,
+  CustomModelField,
+} from "@/components/ai/CustomProviderFields";
 import { Eye, EyeOff, ExternalLink, Loader2 } from "lucide-react";
 import { trackAIProviderChanged, trackAIConnectionTested } from "@/lib/analytics";
 
@@ -36,12 +39,6 @@ const MODEL_PLACEHOLDERS: Record<AIProvider, string> = {
   custom: "model-name",
 };
 
-const CUSTOM_URL_PRESETS: { label: string; url: string }[] = [
-  { label: "llama.cpp", url: "http://127.0.0.1:8080/v1" },
-  { label: "LM Studio", url: "http://127.0.0.1:1234/v1" },
-  { label: "Ollama", url: "http://127.0.0.1:11434/v1" },
-];
-
 export function AITab() {
   const ai = useAppStore((s) => s.settings.ai) ?? DEFAULT_AI_SETTINGS;
   const updateSettings = useAppStore((s) => s.updateSettings);
@@ -51,9 +48,6 @@ export function AITab() {
     ok: boolean;
     error?: string;
   } | null>(null);
-  const [fetchingModels, setFetchingModels] = useState(false);
-  const [fetchedModels, setFetchedModels] = useState<string[] | null>(null);
-  const [fetchError, setFetchError] = useState<string | null>(null);
   const provider = ai.activeProvider;
   const config = ai.providers[provider];
   const models = getModelsForProvider(provider);
@@ -65,8 +59,6 @@ export function AITab() {
     const m = getModelsForProvider(provider);
     const known = m?.some((opt) => opt.id === config.model) ?? false;
     setCustomMode(!known && !!m);
-    setFetchedModels(null);
-    setFetchError(null);
     setTestResult(null);
   }, [provider]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -75,12 +67,16 @@ export function AITab() {
   }
 
   function updateProviderConfig(field: string, value: string) {
+    updateProviderConfigPartial({ [field]: value });
+  }
+
+  function updateProviderConfigPartial(updates: Partial<AIProviderConfig>) {
     updateSettings({
       ai: {
         ...ai,
         providers: {
           ...ai.providers,
-          [provider]: { ...config, [field]: value },
+          [provider]: { ...config, ...updates },
         },
       },
     });
@@ -93,22 +89,6 @@ export function AITab() {
     trackAIConnectionTested({ provider, success: result.ok ? 1 : 0 });
     setTestResult(result);
     setTesting(false);
-  }
-
-  async function handleFetchModels() {
-    setFetchingModels(true);
-    setFetchError(null);
-    setFetchedModels(null);
-    try {
-      const ids = await fetchCustomModels(config.baseUrl);
-      setFetchedModels(ids);
-      if (ids.length > 0 && !ids.includes(config.model)) {
-        updateProviderConfig("model", ids[0]);
-      }
-    } catch (e) {
-      setFetchError(e instanceof Error ? e.message : String(e));
-    }
-    setFetchingModels(false);
   }
 
   const providerField = (
@@ -192,36 +172,20 @@ export function AITab() {
     </div>
   );
 
-  const baseUrlField = (
-    <div className="space-y-2">
-      <Label className="text-xs text-muted-foreground">Base URL</Label>
-      <Input
-        value={config.baseUrl}
-        onChange={(e) => updateProviderConfig("baseUrl", e.target.value)}
-        readOnly={provider !== "custom"}
-        placeholder="http://127.0.0.1:8080/v1"
-        className="h-8 text-xs"
-      />
-      {provider === "custom" && (
-        <div className="flex flex-wrap gap-1">
-          {CUSTOM_URL_PRESETS.map((p) => (
-            <button
-              key={p.url}
-              type="button"
-              onClick={() => updateProviderConfig("baseUrl", p.url)}
-              className={`text-[10px] px-2 py-0.5 rounded border transition-colors ${
-                config.baseUrl === p.url
-                  ? "bg-muted border-border text-foreground"
-                  : "border-border/50 text-muted-foreground hover:bg-muted hover:text-foreground"
-              }`}
-            >
-              {p.label}
-            </button>
-          ))}
-        </div>
-      )}
-    </div>
-  );
+  const baseUrlField =
+    provider === "custom" ? (
+      <CustomBaseUrlField config={config} onUpdate={updateProviderConfigPartial} />
+    ) : (
+      <div className="space-y-2">
+        <Label className="text-xs text-muted-foreground">Base URL</Label>
+        <Input
+          value={config.baseUrl}
+          readOnly
+          placeholder="http://127.0.0.1:8080/v1"
+          className="h-8 text-xs"
+        />
+      </div>
+    );
 
   const knownModelField = models ? (
     <div className="space-y-2">
@@ -241,7 +205,7 @@ export function AITab() {
           <SelectValue />
         </SelectTrigger>
         <SelectContent>
-          {getAllModelsGrouped(provider).map((group) => (
+          {getAllModelsGrouped(provider, config).map((group) => (
             <SelectGroup key={group.provider}>
               <SelectLabel className="text-[9px] text-muted-foreground/50 uppercase">
                 {group.providerLabel}
@@ -251,11 +215,10 @@ export function AITab() {
                   key={`${group.provider}:${m.id}`}
                   value={m.id}
                   className="text-xs"
-                  disabled={!m.available}
                 >
                   <span className="flex items-center gap-2">
                     {m.label}
-                    {m.recommended && m.available && (
+                    {m.recommended && (
                       <Badge variant="secondary" className="text-[9px] px-1 py-0">
                         Recommended
                       </Badge>
@@ -282,52 +245,7 @@ export function AITab() {
   ) : null;
 
   const customModelField = (
-    <div className="space-y-2">
-      <Label className="text-xs text-muted-foreground">Model</Label>
-      <Button
-        size="sm"
-        variant="outline"
-        className="w-full text-xs"
-        onClick={handleFetchModels}
-        disabled={fetchingModels || !config.baseUrl}
-      >
-        {fetchingModels && <Loader2 className="mr-1.5 h-3 w-3 animate-spin" />}
-        {fetchedModels ? "Refresh Models" : "Fetch Models from Server"}
-      </Button>
-      {fetchedModels && fetchedModels.length > 0 && (
-        <Select
-          value={fetchedModels.includes(config.model) ? config.model : ""}
-          onValueChange={(v) => updateProviderConfig("model", v)}
-        >
-          <SelectTrigger className="h-8 w-full text-xs">
-            <SelectValue placeholder="Pick a fetched model..." />
-          </SelectTrigger>
-          <SelectContent>
-            {fetchedModels.map((id) => (
-              <SelectItem key={id} value={id} className="text-xs">
-                {id}
-              </SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
-      )}
-      <Input
-        value={config.model}
-        onChange={(e) => updateProviderConfig("model", e.target.value)}
-        placeholder={MODEL_PLACEHOLDERS[provider]}
-        className="h-8 text-xs"
-      />
-      {fetchError && (
-        <Badge variant="destructive" className="text-[10px] w-full justify-center">
-          {fetchError}
-        </Badge>
-      )}
-      {fetchedModels && fetchedModels.length === 0 && !fetchError && (
-        <Badge variant="secondary" className="text-[10px] w-full justify-center">
-          Server returned no models
-        </Badge>
-      )}
-    </div>
+    <CustomModelField config={config} onUpdate={updateProviderConfigPartial} />
   );
 
   const testButton = (

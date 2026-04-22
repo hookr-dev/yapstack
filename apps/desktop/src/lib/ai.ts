@@ -43,6 +43,10 @@ export interface AIProviderConfig {
   apiKey: string;
   model: string;
   baseUrl: string;
+  // Populated by `fetchCustomModels` for OpenAI-compatible local/remote
+  // servers. Persisted so both Settings and the chat model-picker read
+  // from the same source. Undefined until the user fetches at least once.
+  fetchedModels?: string[];
 }
 
 export interface AISettings {
@@ -141,28 +145,43 @@ export function getModelsForProvider(provider: AIProvider): ModelOption[] | null
 export interface GroupedModels {
   provider: AIProvider;
   providerLabel: string;
-  models: (ModelOption & { available: boolean })[];
+  models: ModelOption[];
 }
 
 const PROVIDER_DISPLAY: Record<string, string> = {
   openai: "OpenAI",
   openrouter: "OpenRouter",
+  custom: "Custom",
 };
 
-export function getAllModelsGrouped(activeProvider: AIProvider): GroupedModels[] {
-  const groups: GroupedModels[] = [];
-  const providers = Object.keys(MODEL_CATALOG) as AIProvider[];
-  const sorted = [activeProvider, ...providers.filter((p) => p !== activeProvider)];
-  for (const p of sorted) {
-    const models = MODEL_CATALOG[p];
-    if (!models) continue;
-    groups.push({
-      provider: p,
-      providerLabel: PROVIDER_DISPLAY[p] ?? p,
-      models: models.map((m) => ({ ...m, available: p === activeProvider })),
-    });
+/// Returns model groups to display for the *active* provider only. For
+/// built-in providers this reads `MODEL_CATALOG`; for `custom` it reads
+/// the persisted `config.fetchedModels`. Cross-provider models are
+/// deliberately omitted — the old greyed-out UX confused users.
+export function getAllModelsGrouped(
+  activeProvider: AIProvider,
+  activeConfig?: AIProviderConfig,
+): GroupedModels[] {
+  if (activeProvider === "custom") {
+    const fetched = activeConfig?.fetchedModels ?? [];
+    if (fetched.length === 0) return [];
+    return [
+      {
+        provider: "custom",
+        providerLabel: PROVIDER_DISPLAY.custom,
+        models: fetched.map((id) => ({ id, label: id })),
+      },
+    ];
   }
-  return groups;
+  const models = MODEL_CATALOG[activeProvider];
+  if (!models) return [];
+  return [
+    {
+      provider: activeProvider,
+      providerLabel: PROVIDER_DISPLAY[activeProvider] ?? activeProvider,
+      models,
+    },
+  ];
 }
 
 // ----- Client -----

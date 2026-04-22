@@ -83,6 +83,8 @@ interface TranscriptSegmentsProps {
   isEditable: boolean;
   activeSegmentId: string | null;
   activeRef?: RefObject<HTMLDivElement | null>;
+  selectedSegmentIds?: Set<string>;
+  orderedIds?: string[];
   onTimestampClick?: (time: number) => void;
 }
 
@@ -98,8 +100,11 @@ export function TranscriptSegments({
   isEditable,
   activeSegmentId,
   activeRef,
+  selectedSegmentIds,
+  orderedIds,
   onTimestampClick,
 }: TranscriptSegmentsProps) {
+  const selectionActive = (selectedSegmentIds?.size ?? 0) > 0;
   const speakerNames = useAppStore(
     (s) => s.settings.speakerNames[sessionId],
   );
@@ -140,12 +145,16 @@ export function TranscriptSegments({
   if (!hasSpeakerIds) {
     return segments.map((segment) => {
       const isActive = segment.id === activeSegmentId;
+      const isSelected = selectedSegmentIds?.has(segment.id) ?? false;
       return (
         <EditableSegment
           key={segment.id}
           segment={segment}
           isActive={isActive}
+          isSelected={isSelected}
+          selectionActive={selectionActive}
           readOnly={!isEditable}
+          orderedIds={orderedIds}
           onTimestampClick={onTimestampClick}
           ref={isActive ? activeRef : undefined}
         />
@@ -166,12 +175,16 @@ export function TranscriptSegments({
           )}
           {group.items.map((segment) => {
             const isActive = segment.id === activeSegmentId;
+            const isSelected = selectedSegmentIds?.has(segment.id) ?? false;
             return (
               <EditableSegment
                 key={segment.id}
                 segment={segment}
                 isActive={isActive}
+                isSelected={isSelected}
+                selectionActive={selectionActive}
                 readOnly={!isEditable}
+                orderedIds={orderedIds}
                 onTimestampClick={onTimestampClick}
                 ref={isActive ? activeRef : undefined}
               />
