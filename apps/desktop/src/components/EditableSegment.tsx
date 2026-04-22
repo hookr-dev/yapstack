@@ -22,13 +22,29 @@ export const EditableSegment = memo(forwardRef<
   {
     segment: DbSegment;
     isActive?: boolean;
+    isSelected?: boolean;
+    selectionActive?: boolean;
     readOnly?: boolean;
+    orderedIds?: string[];
     onTimestampClick?: (time: number) => void;
   }
->(function EditableSegment({ segment, isActive, readOnly, onTimestampClick }, ref) {
+>(function EditableSegment(
+  {
+    segment,
+    isActive,
+    isSelected,
+    selectionActive,
+    readOnly,
+    orderedIds,
+    onTimestampClick,
+  },
+  ref,
+) {
   const editSegmentText = useAppStore((s) => s.editSegmentText);
   const deleteSegment = useAppStore((s) => s.deleteSegment);
   const toggleSegmentHidden = useAppStore((s) => s.toggleSegmentHidden);
+  const toggleSegmentSelected = useAppStore((s) => s.toggleSegmentSelected);
+  const clearSegmentSelection = useAppStore((s) => s.clearSegmentSelection);
 
   const [isEditing, setIsEditing] = useState(false);
   const bubbleRef = useRef<HTMLDivElement | null>(null);
@@ -69,6 +85,29 @@ export const EditableSegment = memo(forwardRef<
     setIsEditing(true);
   };
 
+  const handleBubbleClick = (e: React.MouseEvent) => {
+    if (isEditing) return;
+    const isRange = e.shiftKey;
+    const isToggle = e.metaKey || e.ctrlKey;
+    if (isRange || isToggle) {
+      e.preventDefault();
+      toggleSegmentSelected(
+        segment.id,
+        isRange ? "range" : "toggle",
+        orderedIds ?? [],
+      );
+      return;
+    }
+    if (selectionActive) {
+      // Bare click with an active selection: clear it, don't enter edit
+      // mode on a segment the user might have been trying to deselect away
+      // from. Second click enters edit mode.
+      clearSegmentSelection();
+      return;
+    }
+    if (!readOnly) handleStartEdit();
+  };
+
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
@@ -103,6 +142,7 @@ export const EditableSegment = memo(forwardRef<
       <ContextMenuTrigger asChild>
         <div
           ref={ref}
+          data-segment-id={segment.id}
           className={cn(
             "flex",
             isMic ? "justify-end" : "justify-start",
@@ -121,13 +161,14 @@ export const EditableSegment = memo(forwardRef<
                   : "bg-muted text-foreground rounded-bl-md",
                 isLowConfidence && "opacity-60",
                 isActive && "ring-2 ring-ring shadow-md scale-[1.02]",
+                isSelected && "ring-2 ring-primary/60 shadow-sm",
                 isEditing
                   ? "outline-none ring-2 ring-ring cursor-text"
                   : readOnly
                     ? "cursor-default"
                     : "cursor-pointer",
               )}
-              onClick={!isEditing && !readOnly ? handleStartEdit : undefined}
+              onClick={!isEditing ? handleBubbleClick : undefined}
               onBlur={isEditing ? handleSave : undefined}
               onKeyDown={isEditing ? handleKeyDown : undefined}
             >

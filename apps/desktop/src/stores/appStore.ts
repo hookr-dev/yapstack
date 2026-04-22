@@ -33,7 +33,9 @@ import {
   updateFolder as dbUpdateFolder,
   updateSegmentText as dbUpdateSegmentText,
   softDeleteSegment as dbSoftDeleteSegment,
+  softDeleteSegments as dbSoftDeleteSegments,
   toggleSegmentHidden as dbToggleSegmentHidden,
+  setSegmentsHidden as dbSetSegmentsHidden,
   createManualSession as dbCreateManualSession,
   deleteFolder as dbDeleteFolder,
   updateFolderParent as dbUpdateFolderParent,
@@ -303,6 +305,19 @@ interface AppState {
   setShowHiddenSegments: (show: boolean) => void;
   refreshViewSessionSegments: () => Promise<void>;
 
+  // Segment multi-selection (ephemeral; not persisted). Reset on session change.
+  selectedSegmentIds: Set<string>;
+  lastSelectedSegmentId: string | null;
+  toggleSegmentSelected: (
+    segmentId: string,
+    mode: "toggle" | "range" | "replace",
+    orderedIds: string[],
+  ) => void;
+  setSegmentSelection: (ids: Set<string>) => void;
+  clearSegmentSelection: () => void;
+  deleteSegments: (ids: string[]) => Promise<void>;
+  setSegmentsHidden: (ids: string[], hidden: boolean) => Promise<void>;
+
   // Sidebar
   toggleSidebar: () => void;
 
@@ -343,9 +358,11 @@ function enqueueSegmentWork(fn: () => Promise<void>): void {
 const defaultSettings: Settings = {
   captureSource: "Mixed",
   selectedMicDeviceId: null,
-  // Whisper stays the default for fresh installs and for upgrade users
-  // (the migration adds this field without changing the active engine).
-  selectedEngine: "Whisper",
+  // Parakeet is the recommended default for fresh installs. Upgrade users
+  // keep whatever engine they had — the v22 migration fallback below still
+  // initializes pre-v22 users to "Whisper" so we don't silently swap
+  // engines under anyone who chose Whisper explicitly.
+  selectedEngine: "Parakeet",
   selectedModelSize: "Small",
   selectedParakeetVariant: "TdtV3",
   diarizationEnabled: false,
@@ -449,6 +466,8 @@ function createAppStore() {
       parakeetModels: [],
       sortformerStatus: null,
       showHiddenSegments: false,
+      selectedSegmentIds: new Set<string>(),
+      lastSelectedSegmentId: null,
 
       // Setters
       setCaptureStatus: (status) => set({ captureStatus: status }),
@@ -1541,6 +1560,85 @@ function createAppStore() {
         } catch (e) {
           console.error("Failed to toggle segment visibility:", e);
           toast.error("Failed to toggle segment visibility");
+        }
+      },
+
+      toggleSegmentSelected: (segmentId, mode, orderedIds) => {
+        const state = get();
+        const existing = state.selectedSegmentIds;
+        if (mode === "replace") {
+          set({
+            selectedSegmentIds: new Set([segmentId]),
+            lastSelectedSegmentId: segmentId,
+          });
+          return;
+        }
+        if (mode === "toggle") {
+          const next = new Set(existing);
+          if (next.has(segmentId)) next.delete(segmentId);
+          else next.add(segmentId);
+          set({
+            selectedSegmentIds: next,
+            lastSelectedSegmentId: segmentId,
+          });
+          return;
+        }
+        // range: select everything between lastSelected (or segmentId itself)
+        // and segmentId inclusive, using the provided display order.
+        const anchor = state.lastSelectedSegmentId ?? segmentId;
+        const a = orderedIds.indexOf(anchor);
+        const b = orderedIds.indexOf(segmentId);
+        if (a === -1 || b === -1) {
+          set({
+            selectedSegmentIds: new Set([segmentId]),
+            lastSelectedSegmentId: segmentId,
+          });
+          return;
+        }
+        const [lo, hi] = a < b ? [a, b] : [b, a];
+        const next = new Set(existing);
+        for (let i = lo; i <= hi; i++) next.add(orderedIds[i]);
+        set({ selectedSegmentIds: next, lastSelectedSegmentId: segmentId });
+      },
+
+      setSegmentSelection: (ids) => {
+        set({
+          selectedSegmentIds: ids,
+          lastSelectedSegmentId: ids.size > 0 ? Array.from(ids).pop()! : null,
+        });
+      },
+
+      clearSegmentSelection: () => {
+        if (get().selectedSegmentIds.size === 0) return;
+        set({
+          selectedSegmentIds: new Set(),
+          lastSelectedSegmentId: null,
+        });
+      },
+
+      deleteSegments: async (ids) => {
+        if (ids.length === 0) return;
+        try {
+          await dbSoftDeleteSegments(ids);
+          set({
+            selectedSegmentIds: new Set(),
+            lastSelectedSegmentId: null,
+          });
+          await get().refreshViewSessionSegments();
+        } catch (e) {
+          console.error("Failed to delete segments:", e);
+          toast.error("Failed to delete segments");
+        }
+      },
+
+      setSegmentsHidden: async (ids, hidden) => {
+        if (ids.length === 0) return;
+        try {
+          await dbSetSegmentsHidden(ids, hidden);
+          await get().refreshViewSessionSegments();
+        } catch (e) {
+          console.error("Failed to update segment visibility:", e);
+          toast.error("Failed to update segment visibility");
         }
       },
 
