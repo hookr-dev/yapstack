@@ -151,11 +151,24 @@ impl TranscriptionBackend for ParakeetBackend {
         let mut text = String::new();
         let mut filtered: Vec<TranscriptSegment> = Vec::with_capacity(segments.len());
         for seg in segments {
-            // Parakeet doesn't expose per-segment confidence.
+            // parakeet-rs's `TimedToken` has no logprob/confidence field — the
+            // library doesn't expose one. We pass 1.0 so the shared
+            // `should_include_segment` contract still works, and accept the
+            // consequence: the confidence-gated branches (marginal-reject at
+            // < 0.6, repetition filter at < 0.7) never fire for Parakeet
+            // output. Parakeet's narrower always-reject list was designed as
+            // the sole filter precisely because Parakeet doesn't hallucinate
+            // the YouTube artifacts Whisper does. If a future parakeet-rs
+            // release exposes token probabilities we should route a derived
+            // confidence here so the lower tiers start firing.
             let confidence = 1.0_f32;
             let normalized = normalize_spacing(seg.text.trim());
             let sanitized = sanitize_text(&normalized);
-            if !should_include_segment(&sanitized, confidence) {
+            if !should_include_segment(
+                &sanitized,
+                confidence,
+                yapstack_common::types::EngineKind::Parakeet,
+            ) {
                 info!(len = sanitized.chars().count(), "parakeet segment filtered");
                 continue;
             }
@@ -197,6 +210,22 @@ impl TranscriptionBackend for ParakeetBackend {
 }
 
 impl ParakeetBackend {
+    /// Run Sortformer diarization on a single chunk's audio.
+    ///
+    /// **Known limitation — chunk-local speaker IDs.** Sortformer::diarize()
+    /// resets internal state per call, so the `speaker_id` values returned
+    /// here are only consistent *within this chunk*. The frontend treats
+    /// speaker_id as a session-stable identity (groups + renames by id), so
+    /// the same person can end up labeled Speaker 0 in one chunk and
+    /// Speaker 1 in the next. This is why diarization is currently off by
+    /// default in Settings and the UI falls back to source-based labels.
+    ///
+    /// Before re-enabling diarization for users, we need one of:
+    ///   - Streaming Sortformer state across calls (parakeet-rs feature),
+    ///   - A post-session pass that runs Sortformer once on the full WAV
+    ///     and retro-annotates segments, or
+    ///   - An embedding-based speaker registry that maps chunk-local IDs to
+    ///     session-stable IDs via similarity matching.
     fn run_diarization(&mut self, mono_16k: Vec<f32>) -> Result<Vec<SpeakerSegment>, String> {
         let sortformer = self.ensure_sortformer()?;
         sortformer

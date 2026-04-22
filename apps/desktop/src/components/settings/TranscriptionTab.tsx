@@ -136,9 +136,11 @@ function ButtonGroupSetting({
 export function TranscriptionTab() {
   const language = useAppStore((s) => s.settings.language);
   const selectedEngine = useAppStore((s) => s.settings.selectedEngine);
-  const diarizationEnabled = useAppStore(
-    (s) => s.settings.diarizationEnabled,
-  );
+  // diarizationEnabled is intentionally not read here — the Speaker
+  // diarization toggle is hard-locked to off pending session-stable
+  // speaker IDs (see setDiarizationEnabled). The persisted value is still
+  // forced to false on upgrade via migration v23, and the store action
+  // throws if anything tries to enable it.
   const engineCatalogue = useAppStore((s) => s.engineCatalogue);
   const maxChunkSeconds = useAppStore((s) => s.settings.maxChunkSeconds);
   const silenceDurationMs = useAppStore((s) => s.settings.silenceDurationMs);
@@ -248,7 +250,12 @@ export function TranscriptionTab() {
 
       <Separator />
 
-      {/* Diarization toggle */}
+      {/* Diarization toggle — currently locked off because Sortformer's
+          per-chunk reset produces unstable speaker IDs across the session.
+          Plumbing stays so re-enable is a one-line change once session-
+          stable IDs land. The toggle is shown (not removed) so users can
+          see the feature exists and that it's coming, with a tooltip
+          explaining why it's disabled. */}
       <div className="space-y-2">
         <div className="flex items-center justify-between">
           <Label className="text-xs text-muted-foreground">
@@ -259,8 +266,8 @@ export function TranscriptionTab() {
               <TooltipTrigger asChild>
                 <span>
                   <Switch
-                    checked={diarizationEnabled}
-                    disabled={!supportsDiarization}
+                    checked={false}
+                    disabled
                     onCheckedChange={async (checked) => {
                       try {
                         await setDiarizationEnabled(checked);
@@ -273,17 +280,18 @@ export function TranscriptionTab() {
                   />
                 </span>
               </TooltipTrigger>
-              {!supportsDiarization && (
-                <TooltipContent side="left">
-                  Diarization requires the Parakeet engine
-                </TooltipContent>
-              )}
+              <TooltipContent side="left">
+                {!supportsDiarization
+                  ? "Diarization requires the Parakeet engine"
+                  : "Coming soon — currently disabled while we ship session-stable speaker IDs"}
+              </TooltipContent>
             </Tooltip>
           </TooltipProvider>
         </div>
         <p className="text-[10px] text-muted-foreground/60">
-          Identifies up to 4 distinct speakers using NVIDIA Sortformer
-          (~50&nbsp;MB, downloaded on first enable).
+          Will identify distinct speakers in mixed-source recordings.
+          Temporarily disabled — chunk-local speaker IDs cause unstable
+          labels across long sessions.
         </p>
       </div>
 
