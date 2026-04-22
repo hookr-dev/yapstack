@@ -6,10 +6,10 @@ import { Pencil } from "lucide-react";
 import { Input } from "@/components/ui/input";
 
 const SPEAKER_COLORS = [
-  "bg-sky-500/10 text-sky-700 dark:text-sky-300 border-sky-500/30",
-  "bg-emerald-500/10 text-emerald-700 dark:text-emerald-300 border-emerald-500/30",
+  "bg-teal-500/10 text-teal-700 dark:text-teal-300 border-teal-500/30",
+  "bg-rose-500/10 text-rose-700 dark:text-rose-300 border-rose-500/30",
   "bg-amber-500/10 text-amber-700 dark:text-amber-300 border-amber-500/30",
-  "bg-violet-500/10 text-violet-700 dark:text-violet-300 border-violet-500/30",
+  "bg-emerald-500/10 text-emerald-700 dark:text-emerald-300 border-emerald-500/30",
 ] as const;
 
 function speakerColor(speakerId: number): string {

@@ -43,10 +43,10 @@ import { ICON_MAP } from "@/lib/folder-constants";
 function TypeBadge({ type }: { type: "session" | "note" | "segment" | "folder" | "dictation" }) {
   const styles: Record<string, string> = {
     session: "bg-blue-500/15 text-blue-600 dark:text-blue-400",
-    note: "bg-green-500/15 text-green-600 dark:text-green-400",
+    note: "bg-emerald-500/15 text-emerald-600 dark:text-emerald-400",
     segment: "bg-amber-500/15 text-amber-600 dark:text-amber-400",
-    folder: "bg-purple-500/15 text-purple-600 dark:text-purple-400",
-    dictation: "bg-pink-500/15 text-pink-600 dark:text-pink-400",
+    folder: "bg-muted text-muted-foreground",
+    dictation: "bg-teal-500/15 text-teal-600 dark:text-teal-400",
   };
   const labels: Record<string, string> = {
     session: "Session",
