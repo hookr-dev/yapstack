@@ -12,3 +12,10 @@ tracing = { workspace = true }
 hound = { workspace = true }
 tempfile = { workspace = true }
 mp3lame-encoder = { workspace = true }
+
+# CoreAudio FFI for default-device-change property listeners. Used by the
+# system::device_watcher module to receive push notifications when the user
+# switches default input/output device mid-session. Same crate cpal uses
+# transitively, so Cargo deduplicates to a single build.
+[target."cfg(target_os = \"macos\")".dependencies]
+coreaudio-sys = { version = "0.2", default-features = false, features = ["core_audio"] }

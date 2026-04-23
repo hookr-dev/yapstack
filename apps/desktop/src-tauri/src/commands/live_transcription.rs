@@ -296,6 +296,10 @@ struct SourceVadState {
     restart_attempts: u32,
     /// When the last restart was attempted (for cooldown).
     last_restart_at: Option<Instant>,
+    /// When the defensive device-identity drift poll last ran. Throttled to
+    /// a few seconds so the `cpal::default_host()` call isn't made on every
+    /// ~100–300 ms loop tick.
+    last_device_check_at: Option<Instant>,
     /// True while a background chunk task is running for this source. VAD
     /// state keeps updating (so second-utterance-during-in-flight is still
     /// captured) but dispatch and idle-cursor advance are gated off.
@@ -339,6 +343,7 @@ impl SourceVadState {
             last_write_pos_advance: Instant::now(),
             restart_attempts: 0,
             last_restart_at: None,
+            last_device_check_at: None,
             silero: SileroSource::new(initial_pos),
         }
     }
@@ -899,6 +904,12 @@ const STREAM_STALL_THRESHOLD_SECS: f32 = 2.0;
 const STREAM_RESTART_MAX_ATTEMPTS: u32 = 3;
 /// Minimum seconds between restart attempts for the same source.
 const STREAM_RESTART_COOLDOWN_SECS: f32 = 5.0;
+/// Throttle for the defensive device-identity drift poll. Primary detection
+/// is the push-based CoreAudio property listener (Layer 0); this poll only
+/// covers the rare case where listener registration fails or the OS drops
+/// an event. A short throttle caps the cost of the periodic
+/// `cpal::default_host()` lookup.
+const DEVICE_IDENTITY_POLL_INTERVAL_SECS: f32 = 3.0;
 
 // --- Pure stream health decision helpers ---
 
@@ -1433,19 +1444,50 @@ async fn check_stream_health(
         }
 
         let mut needs_restart = false;
-        let mut reason = "";
+        let mut reason: String = String::new();
 
         {
             let manager = audio_state.lock().await;
 
-            // Layer 1: cpal error callback flag (instant detection)
-            let has_error = match source.label {
-                AudioSourceLabel::Mic => manager.mic_has_stream_error(),
-                AudioSourceLabel::System => manager.system_has_stream_error(),
+            // Layer 0: CoreAudio push notification — the OS tells us the
+            // default device changed (AirPods connect, Sound Settings toggle,
+            // another app grabs exclusive output). This is the primary fix
+            // for mid-session silent death; earlier watchdog layers were
+            // symptom detectors that missed the zero-sample-on-old-device
+            // failure mode entirely.
+            let default_changed = match source.label {
+                AudioSourceLabel::Mic => manager.mic_default_changed(),
+                AudioSourceLabel::System => manager.system_audio_default_changed(),
             };
-            if has_error {
+            if default_changed {
                 needs_restart = true;
-                reason = "stream error callback fired";
+                let bound = match source.label {
+                    AudioSourceLabel::Mic => manager.mic_bound_device(),
+                    AudioSourceLabel::System => manager.system_audio_bound_device(),
+                }
+                .map(str::to_string)
+                .unwrap_or_else(|| "<unknown>".into());
+                info!(
+                    "default {} device changed (was '{}'), rebinding",
+                    match source.label {
+                        AudioSourceLabel::Mic => "input",
+                        AudioSourceLabel::System => "output",
+                    },
+                    bound
+                );
+                reason = "default device changed".into();
+            }
+
+            // Layer 1: cpal error callback flag (instant detection)
+            if !needs_restart {
+                let has_error = match source.label {
+                    AudioSourceLabel::Mic => manager.mic_has_stream_error(),
+                    AudioSourceLabel::System => manager.system_has_stream_error(),
+                };
+                if has_error {
+                    needs_restart = true;
+                    reason = "stream error callback fired".into();
+                }
             }
 
             // Layer 2: write_pos stall detection (~2s latency)
@@ -1463,7 +1505,39 @@ async fn check_stream_health(
                     && should_stall_restart(&source.label)
                 {
                     needs_restart = true;
-                    reason = "write position stalled";
+                    reason = "write position stalled".into();
+                }
+            }
+
+            // Layer 3: defensive device-identity drift poll. Only runs when
+            // earlier layers cleared and the throttle has elapsed. Primary
+            // detection is Layer 0; this catches the rare case where the
+            // listener registration silently failed or the OS missed a
+            // property-change notification.
+            if !needs_restart {
+                let should_check = source.last_device_check_at.is_none_or(|t| {
+                    t.elapsed() > Duration::from_secs_f32(DEVICE_IDENTITY_POLL_INTERVAL_SECS)
+                });
+                if should_check {
+                    source.last_device_check_at = Some(Instant::now());
+                    let drift = match source.label {
+                        AudioSourceLabel::Mic => manager.mic_input_drifted(),
+                        AudioSourceLabel::System => manager.system_audio_output_drifted(),
+                    };
+                    if let Some(new_name) = drift {
+                        let bound = match source.label {
+                            AudioSourceLabel::Mic => manager.mic_bound_device(),
+                            AudioSourceLabel::System => manager.system_audio_bound_device(),
+                        }
+                        .map(str::to_string)
+                        .unwrap_or_else(|| "<unknown>".into());
+                        warn!(
+                            "device identity drift without listener event: '{}' → '{}' (rebinding)",
+                            bound, new_name
+                        );
+                        needs_restart = true;
+                        reason = "device identity drift (listener missed)".into();
+                    }
                 }
             }
         }
