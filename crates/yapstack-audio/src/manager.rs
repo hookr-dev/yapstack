@@ -13,6 +13,7 @@ use crate::export;
 use crate::mic::MicrophoneCapture;
 use crate::mixer::{self, MixConfig};
 use crate::ring_buffer::{AudioRingBuffer, RingBufferInfo, SharedAudioRingBuffer};
+use crate::system::device_watcher::{DefaultDeviceKind, DefaultDeviceWatcher};
 use crate::system::SystemAudioCapture;
 
 type Result<T> = std::result::Result<T, AudioError>;
@@ -26,23 +27,29 @@ pub struct AudioManager {
     mic_buffer: Option<SharedAudioRingBuffer>,
     system_buffer: Option<SharedAudioRingBuffer>,
     session_mark: Option<SessionMark>,
+    /// Push-based default-device change listeners (macOS only; no-op stubs
+    /// elsewhere). `None` if CoreAudio rejected listener registration — the
+    /// capture path degrades to the write-pos stall watchdog in that case.
+    input_watcher: Option<DefaultDeviceWatcher>,
+    output_watcher: Option<DefaultDeviceWatcher>,
 }
 
 impl AudioManager {
     pub fn new() -> Self {
-        Self {
-            config: AudioConfig::default(),
-            mic: MicrophoneCapture::new(),
-            system: SystemAudioCapture::new(),
-            state: CaptureState::Idle,
-            error_message: None,
-            mic_buffer: None,
-            system_buffer: None,
-            session_mark: None,
-        }
+        Self::from_config(AudioConfig::default())
     }
 
     pub fn with_config(config: AudioConfig) -> Self {
+        Self::from_config(config)
+    }
+
+    fn from_config(config: AudioConfig) -> Self {
+        let input_watcher = DefaultDeviceWatcher::new(DefaultDeviceKind::Input)
+            .map_err(|e| warn!("input default-device listener unavailable: {}", e))
+            .ok();
+        let output_watcher = DefaultDeviceWatcher::new(DefaultDeviceKind::Output)
+            .map_err(|e| warn!("output default-device listener unavailable: {}", e))
+            .ok();
         Self {
             config,
             mic: MicrophoneCapture::new(),
@@ -52,6 +59,8 @@ impl AudioManager {
             mic_buffer: None,
             system_buffer: None,
             session_mark: None,
+            input_watcher,
+            output_watcher,
         }
     }
 
@@ -793,6 +802,89 @@ impl AudioManager {
         self.system.start(buffer)?;
         Ok(())
     }
+
+    /// Returns `true` if the OS has pushed a default-output-device change
+    /// notification since the last call *and* system audio capture is
+    /// currently running. Consumes the pending flag.
+    pub fn system_audio_default_changed(&self) -> bool {
+        self.system.is_running()
+            && self
+                .output_watcher
+                .as_ref()
+                .map(|w| w.take_change())
+                .unwrap_or(false)
+    }
+
+    /// Returns `true` if the OS has pushed a default-input-device change
+    /// notification since the last call *and* mic capture is currently
+    /// running. Consumes the pending flag.
+    pub fn mic_default_changed(&self) -> bool {
+        self.mic.is_running()
+            && self
+                .input_watcher
+                .as_ref()
+                .map(|w| w.take_change())
+                .unwrap_or(false)
+    }
+
+    /// Returns the device name the system audio stream is currently bound to,
+    /// or `None` if not running / identity unknown. Used by the defensive
+    /// device-identity drift poll.
+    pub fn system_audio_bound_device(&self) -> Option<&str> {
+        self.system.last_device_name()
+    }
+
+    /// Returns the device name the microphone stream is currently bound to,
+    /// or `None` if not running / identity unknown.
+    pub fn mic_bound_device(&self) -> Option<&str> {
+        self.mic.last_device_name()
+    }
+
+    /// Defensive device-identity drift check. Returns `Some(current_default_name)`
+    /// when the currently-bound system-audio output device differs from the
+    /// OS default output device, else `None`. Only meaningful when system
+    /// capture is running. This is the fallback for the push listener —
+    /// the listener should fire first under normal conditions.
+    pub fn system_audio_output_drifted(&self) -> Option<String> {
+        if !self.system.is_running() {
+            return None;
+        }
+        let bound = self.system.last_device_name()?;
+        let current = current_default_output_name()?;
+        if current != bound {
+            Some(current)
+        } else {
+            None
+        }
+    }
+
+    /// Defensive device-identity drift check for the microphone. Returns
+    /// `Some(current_default_name)` when the currently-bound input device
+    /// differs from the OS default input device, else `None`.
+    pub fn mic_input_drifted(&self) -> Option<String> {
+        if !self.mic.is_running() {
+            return None;
+        }
+        let bound = self.mic.last_device_name()?;
+        let current = current_default_input_name()?;
+        if current != bound {
+            Some(current)
+        } else {
+            None
+        }
+    }
+}
+
+fn current_default_output_name() -> Option<String> {
+    use cpal::traits::{DeviceTrait, HostTrait};
+    let device = cpal::default_host().default_output_device()?;
+    device.description().ok().map(|d| d.name().to_string())
+}
+
+fn current_default_input_name() -> Option<String> {
+    use cpal::traits::{DeviceTrait, HostTrait};
+    let device = cpal::default_host().default_input_device()?;
+    device.description().ok().map(|d| d.name().to_string())
 }
 
 impl Default for AudioManager {
@@ -1354,6 +1446,30 @@ mod tests {
         let manager = AudioManager::new();
         assert!(!manager.mic_has_stream_error());
         assert!(!manager.system_has_stream_error());
+    }
+
+    #[test]
+    fn test_default_changed_is_false_when_not_running() {
+        // Idle manager should never report a default-device change — the
+        // flag is gated on `is_running()` so stale listener signals from a
+        // previous session can't cause spurious restarts.
+        let manager = AudioManager::new();
+        assert!(!manager.system_audio_default_changed());
+        assert!(!manager.mic_default_changed());
+    }
+
+    #[test]
+    fn test_bound_device_none_when_not_running() {
+        let manager = AudioManager::new();
+        assert!(manager.system_audio_bound_device().is_none());
+        assert!(manager.mic_bound_device().is_none());
+    }
+
+    #[test]
+    fn test_drift_none_when_not_running() {
+        let manager = AudioManager::new();
+        assert!(manager.system_audio_output_drifted().is_none());
+        assert!(manager.mic_input_drifted().is_none());
     }
 
     #[test]

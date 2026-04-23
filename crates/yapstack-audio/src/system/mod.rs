@@ -1,3 +1,5 @@
+pub mod device_watcher;
+
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -17,6 +19,12 @@ pub struct SystemAudioCapture {
     stream: Option<SendStream>,
     is_running: bool,
     stream_error: Arc<AtomicBool>,
+    /// The output device ID used for the current/last loopback capture.
+    last_device_id: Option<String>,
+    /// The output device name used for the current/last loopback capture.
+    /// Stored on successful start so the default-device-drift watchdog can
+    /// compare the currently-bound device against the system default.
+    last_device_name: Option<String>,
 }
 
 impl SystemAudioCapture {
@@ -25,6 +33,8 @@ impl SystemAudioCapture {
             stream: None,
             is_running: false,
             stream_error: Arc::new(AtomicBool::new(false)),
+            last_device_id: None,
+            last_device_name: None,
         }
     }
 
@@ -97,8 +107,22 @@ impl SystemAudioCapture {
 
         self.stream = Some(SendStream::new(stream));
         self.is_running = true;
+        // Persist resolved device identity so the default-device watchdog can
+        // compare it against the current default output on each health tick.
+        self.last_device_id = device.id().ok().map(|id| id.to_string());
+        self.last_device_name = Some(device_name);
 
         Ok(())
+    }
+
+    /// Returns the device ID used for the current/last loopback session.
+    pub fn last_device_id(&self) -> Option<&str> {
+        self.last_device_id.as_deref()
+    }
+
+    /// Returns the device name used for the current/last loopback session.
+    pub fn last_device_name(&self) -> Option<&str> {
+        self.last_device_name.as_deref()
     }
 
     pub fn stop(&mut self) -> Result<()> {
@@ -149,6 +173,8 @@ mod tests {
     fn test_new_system_audio_capture() {
         let capture = SystemAudioCapture::new();
         assert!(!capture.is_running());
+        assert!(capture.last_device_name().is_none());
+        assert!(capture.last_device_id().is_none());
     }
 
     #[test]
