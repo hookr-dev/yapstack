@@ -395,14 +395,29 @@ fn vad_tuning_for(
             poll_interval: Duration::from_millis(POLL_INTERVAL_MS),
             pre_roll: Duration::ZERO,
         },
-        // Parakeet: dialogue-tuned. These values ignore the frontend's
-        // silence_duration_ms / poll cadence by design — they're engine-
-        // specific best practice, not user-facing knobs for this pass.
+        // Parakeet: dialogue-tuned and aggressively chunked. These values
+        // ignore the frontend's silence_duration_ms / max_chunk_seconds /
+        // poll cadence by design — they're engine-specific best practice,
+        // not user-facing knobs. Parakeet's low RTFx and non-autoregressive
+        // decoder mean shorter chunks have effectively zero throughput cost,
+        // so we bias for responsive on-screen updates and tight per-
+        // utterance timestamps over long coherent windows.
+        //
+        // - silence_duration 200 ms: splits on the natural pauses between
+        //   sentences and short breaths, without clipping comma-pauses
+        //   (which are usually <150 ms).
+        // - max_chunk_duration 10 s: force-chunks continuous speech every
+        //   ~10 s so a long monologue renders incrementally instead of all
+        //   at once when the speaker finally pauses. At Parakeet RTFx 4-8×,
+        //   a 10 s chunk transcribes in ~1-2 s.
+        // - offset_threshold_ratio 0.7 (hysteresis) + pre_roll 250 ms:
+        //   unchanged; they prevent mid-word dropout and leading-plosive
+        //   clipping on speech onset.
         EngineKind::Parakeet => VadTuning {
             silence_threshold: config.silence_threshold,
             offset_threshold_ratio: 0.7,
-            silence_duration: Duration::from_millis(400),
-            max_chunk_duration: Duration::from_secs_f32(config.max_chunk_seconds),
+            silence_duration: Duration::from_millis(200),
+            max_chunk_duration: Duration::from_secs(10),
             poll_interval: Duration::from_millis(100),
             pre_roll: Duration::from_millis(250),
         },
@@ -3175,5 +3190,62 @@ mod tests {
                 i, source, has_error, expected, result
             );
         }
+    }
+
+    // --- VAD tuning guard tests ---
+
+    fn dummy_config() -> LiveTranscriptionConfig {
+        LiveTranscriptionConfig {
+            silence_threshold: 0.01,
+            silence_duration_ms: 800,
+            max_chunk_seconds: 30.0,
+            backfill_seconds: 0.0,
+            source: CaptureSourceDto::MicOnly,
+            mix_config: None,
+            language: None,
+            prompt_context_chars: None,
+            prompt_decay_silence_seconds: None,
+            session_id: None,
+            audio_save_location: None,
+            audio_export_format: None,
+            mp3_bitrate: None,
+            diarization: false,
+        }
+    }
+
+    #[test]
+    fn test_vad_tuning_whisper_honors_user_silence_duration() {
+        use yapstack_common::types::EngineKind;
+        let mut cfg = dummy_config();
+        cfg.silence_duration_ms = 600;
+        cfg.max_chunk_seconds = 25.0;
+        let t = vad_tuning_for(EngineKind::Whisper, &cfg);
+        assert_eq!(t.silence_duration, Duration::from_millis(600));
+        assert_eq!(t.max_chunk_duration, Duration::from_secs_f32(25.0));
+        assert!((t.offset_threshold_ratio - 1.0).abs() < f32::EPSILON);
+        assert_eq!(t.pre_roll, Duration::ZERO);
+    }
+
+    #[test]
+    fn test_vad_tuning_parakeet_ignores_user_knobs() {
+        // Parakeet tuning is engine-specific backend policy — even if the
+        // user sets silence_duration_ms=800 and max_chunk_seconds=30 in the
+        // frontend, Parakeet uses its dialogue-aggressive defaults.
+        use yapstack_common::types::EngineKind;
+        let cfg = dummy_config();
+        let t = vad_tuning_for(EngineKind::Parakeet, &cfg);
+        assert_eq!(
+            t.silence_duration,
+            Duration::from_millis(200),
+            "Parakeet silence window should be 200ms for responsive splitting"
+        );
+        assert_eq!(
+            t.max_chunk_duration,
+            Duration::from_secs(10),
+            "Parakeet should force-chunk at 10s of continuous speech"
+        );
+        assert_eq!(t.poll_interval, Duration::from_millis(100));
+        assert_eq!(t.pre_roll, Duration::from_millis(250));
+        assert!((t.offset_threshold_ratio - 0.7).abs() < 1e-6);
     }
 }
