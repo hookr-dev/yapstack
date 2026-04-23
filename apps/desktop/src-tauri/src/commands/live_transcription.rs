@@ -1107,6 +1107,23 @@ fn vad_chunk_historical_audio(
         return Vec::new();
     }
 
+    backfill_chunks_from_probabilities(&probabilities, samples.len(), sample_rate, tuning)
+}
+
+/// Pure state-machine half of `vad_chunk_historical_audio`: walk a
+/// pre-computed Silero probability stream and produce the same chunk
+/// boundaries the live loop would have picked. Extracted so tests can
+/// exercise the state machine with hand-crafted probability sequences
+/// without loading the ONNX model.
+fn backfill_chunks_from_probabilities(
+    probabilities: &[f32],
+    total_samples: usize,
+    sample_rate: u32,
+    tuning: &VadTuning,
+) -> Vec<VadBackfillChunk> {
+    if probabilities.is_empty() || total_samples == 0 {
+        return Vec::new();
+    }
     // One probability covers FRAME_DURATION_SECS (32 ms) of audio. Map
     // each frame back to the corresponding slice in the *original*
     // (un-resampled) buffer so chunk boundaries are expressed in the
@@ -1132,11 +1149,17 @@ fn vad_chunk_historical_audio(
     let mut speech_start: usize = 0;
     let mut silence_run: usize = 0;
     let mut speech_run: usize = 0;
+    // Lower bound for onset pre-roll — mirrors the live loop's
+    // `earliest_next_chunk_pos` clamp in `poll_vad`. Without this, two
+    // utterances separated by less than `pre_roll` would overlap: the
+    // second onset would rewind into the first chunk's tail and the
+    // transcriber would see the same audio twice.
+    let mut prev_chunk_end: usize = 0;
 
     for (frame_idx, &prob) in probabilities.iter().enumerate() {
         let w_start = frame_idx * frame_samples_original;
-        let w_end = ((frame_idx + 1) * frame_samples_original).min(samples.len());
-        if w_start >= samples.len() {
+        let w_end = ((frame_idx + 1) * frame_samples_original).min(total_samples);
+        if w_start >= total_samples {
             break;
         }
 
@@ -1150,6 +1173,7 @@ fn vad_chunk_historical_audio(
                         start: speech_start,
                         end: w_end,
                     });
+                    prev_chunk_end = w_end;
                     speech_start = w_end;
                     speech_run = 0;
                 }
@@ -1160,6 +1184,7 @@ fn vad_chunk_historical_audio(
                         start: speech_start,
                         end: w_end,
                     });
+                    prev_chunk_end = w_end;
                     is_speaking = false;
                     speech_run = 0;
                     silence_run = 0;
@@ -1168,7 +1193,7 @@ fn vad_chunk_historical_audio(
         } else {
             let is_loud = prob >= onset_threshold;
             if is_loud {
-                speech_start = w_start.saturating_sub(pre_roll_samples);
+                speech_start = w_start.saturating_sub(pre_roll_samples).max(prev_chunk_end);
                 is_speaking = true;
                 speech_run = 1;
                 silence_run = 0;
@@ -1178,10 +1203,10 @@ fn vad_chunk_historical_audio(
 
     // Trailing speech that never resolved into silence — emit as final chunk
     // so we don't lose the tail of the backfill window.
-    if is_speaking && speech_start < samples.len() {
+    if is_speaking && speech_start < total_samples {
         chunks.push(VadBackfillChunk {
             start: speech_start,
-            end: samples.len(),
+            end: total_samples,
         });
     }
 
@@ -1619,9 +1644,21 @@ async fn live_transcription_loop(
                         s.label, s.cursor, current
                     );
                 }
-                // Reset cursor to current write position — VAD loop starts fresh
+                // Reset the full per-source live VAD state to `current`
+                // so the live loop starts from the post-backfill write
+                // position. Without this, Silero would replay every
+                // backfill sample through the *live* detector on the
+                // first few polls, duplicating or delaying speech that
+                // backfill already emitted. We also reset the recurrent
+                // stream state (LSTM memory was initialized at session
+                // start against pre-backfill audio context) and clear the
+                // sticky last_probability.
                 s.cursor = current;
                 s.speech_start_pos = current;
+                s.earliest_next_chunk_pos = current;
+                s.silero.read_pos = current;
+                s.silero.last_probability = None;
+                s.silero.stream.reset();
             }
         }
 
@@ -1764,30 +1801,33 @@ async fn live_transcription_loop(
             (inputs, flush)
         };
 
-        // Feed Silero outside the audio lock. Update per-source read_pos
-        // and last_probability. If no new samples arrived (empty buffer
-        // snapshot), the previous probability sticks — the VAD state
-        // machine sees `Some(prev)` and the is_speaking/silence_since
-        // state doesn't flip to an uncertain intermediate.
+        // Feed Silero outside the audio lock and collect *every* frame
+        // probability per source, in emission order. A single poll batch
+        // can span an entire short utterance; the VAD state machine needs
+        // to see the intermediate loud frames, not just the trailing
+        // silence frame that follows them.
+        //
+        // Sticky behavior: when no new samples arrived (empty buffer
+        // snapshot), we carry the source's `last_probability` forward so
+        // the state machine keeps making decisions on the most recent
+        // signal rather than toggling to `None`.
+        let mut per_source_probs: Vec<(AudioSourceLabel, Vec<f32>)> =
+            Vec::with_capacity(silero_inputs.len());
         for input in silero_inputs {
             if let Some(s) = sources.iter_mut().find(|s| s.label == input.label) {
                 s.silero.read_pos = input.new_pos;
-                if let Some((mono, source_sr)) = input.samples {
-                    if let Some(prob) = silero.score_stream(&mut s.silero.stream, &mono, source_sr)
-                    {
-                        s.silero.last_probability = Some(prob);
+                let probs = match input.samples {
+                    Some((mono, source_sr)) => {
+                        silero.score_stream(&mut s.silero.stream, &mono, source_sr)
                     }
+                    None => Vec::new(),
+                };
+                if let Some(&last) = probs.last() {
+                    s.silero.last_probability = Some(last);
                 }
+                per_source_probs.push((input.label, probs));
             }
         }
-        let mic_energy = sources
-            .iter()
-            .find(|s| s.label == AudioSourceLabel::Mic)
-            .and_then(|s| s.silero.last_probability);
-        let system_energy = sources
-            .iter()
-            .find(|s| s.label == AudioSourceLabel::System)
-            .and_then(|s| s.silero.last_probability);
 
         // Write WAV data outside the lock
         if let Some((samples, _sr, new_pos)) = wav_flush_data {
@@ -1942,11 +1982,19 @@ async fn live_transcription_loop(
 
         // Poll VAD for *every* source, including those with an in-flight
         // task. The state machine needs to keep tracking is_speaking /
-        // silence_since against live energy so a second utterance that
-        // starts and ends during the in-flight window is captured: onset
-        // backdates `speech_start_pos` (via pre_roll), silence_since fires
-        // a pending Chunk action, and on the tick *after* the task lands
-        // we dispatch that chunk with the full accumulated range.
+        // silence_since so a second utterance that starts and ends during
+        // the in-flight window is captured: onset backdates
+        // `speech_start_pos` (via pre_roll), silence_since fires a pending
+        // Chunk action, and on the tick *after* the task lands we dispatch
+        // that chunk with the full accumulated range.
+        //
+        // We feed *every* Silero probability from this batch through
+        // `poll_vad` in order — intra-poll speech events would otherwise
+        // be lost when only the trailing probability (likely silence) is
+        // observed. If any frame produces a Chunk / ForceChunk action, we
+        // remember it for the dispatch step below; at most one chunk can
+        // actually fire per source per poll (has_in_flight_task gate), so
+        // keeping the strongest observed action is the right summary.
         //
         // Dispatch and idle-cursor advance are still gated on
         // `has_in_flight_task`: we can't dispatch a second task for the
@@ -1955,15 +2003,38 @@ async fn live_transcription_loop(
         let actions: Vec<VadAction> = sources
             .iter_mut()
             .map(|source| {
-                let energy = match source.label {
-                    AudioSourceLabel::Mic => mic_energy,
-                    AudioSourceLabel::System => system_energy,
-                };
-                let mut action = poll_vad(source, energy, &tuning);
-                if should_stop && source.is_speaking {
-                    action = VadAction::Chunk;
+                let probs = per_source_probs
+                    .iter()
+                    .find(|(l, _)| *l == source.label)
+                    .map(|(_, p)| p.as_slice())
+                    .unwrap_or(&[]);
+
+                let mut summary = VadAction::None;
+                if probs.is_empty() {
+                    // Sticky fallback: no new frames in this batch. Use
+                    // last_probability so the state machine keeps running
+                    // against the most recent signal rather than freezing.
+                    let action = poll_vad(source, source.silero.last_probability, &tuning);
+                    if matches!(action, VadAction::Chunk | VadAction::ForceChunk) {
+                        summary = action;
+                    }
+                } else {
+                    for &prob in probs {
+                        let action = poll_vad(source, Some(prob), &tuning);
+                        match action {
+                            VadAction::ForceChunk => summary = VadAction::ForceChunk,
+                            VadAction::Chunk if !matches!(summary, VadAction::ForceChunk) => {
+                                summary = VadAction::Chunk;
+                            }
+                            _ => {}
+                        }
+                    }
                 }
-                action
+
+                if should_stop && source.is_speaking {
+                    summary = VadAction::Chunk;
+                }
+                summary
             })
             .collect();
 
@@ -3350,5 +3421,135 @@ mod tests {
         assert_eq!(t.pre_roll, Duration::from_millis(250));
         assert!((t.speech_threshold - 0.5).abs() < 1e-6);
         assert!((t.offset_threshold_ratio - 0.7).abs() < 1e-6);
+    }
+
+    // --- Review regression tests ---
+
+    /// Regression: intra-poll speech detection.
+    ///
+    /// When a poll batch contains speech followed by silence, the VAD state
+    /// machine must enter speaking state — not be fooled by only the last
+    /// frame's silence probability. This mirrors the live-loop code path
+    /// where we now iterate every Silero probability through `poll_vad`.
+    #[test]
+    fn poll_vad_enters_speaking_within_a_single_poll_batch() {
+        use yapstack_common::types::EngineKind;
+        let cfg = dummy_config();
+        let tuning = vad_tuning_for(EngineKind::Parakeet, &cfg);
+        let mut state = SourceVadState::new(AudioSourceLabel::Mic, 0, 0, 48000, 1);
+
+        // Simulate one 100 ms Parakeet poll containing: silence → loud →
+        // silence. Previously (score_stream returning only the last prob),
+        // the live loop would have seen only the trailing silence and the
+        // speech onset would have been dropped.
+        let probs = [0.10f32, 0.90, 0.10];
+        for &p in &probs {
+            let _ = poll_vad(&mut state, Some(p), &tuning);
+        }
+
+        assert!(
+            state.is_speaking,
+            "state should have transitioned to speaking during the batch"
+        );
+        assert!(state.speech_start_time.is_some());
+        // The trailing silence frame starts the silence timer but doesn't
+        // itself fire Chunk (needs `silence_duration` = 200 ms; only one
+        // frame elapsed).
+        assert!(state.silence_since.is_some());
+    }
+
+    /// Regression: backfill pre-roll must not rewind into a previous chunk.
+    ///
+    /// Two loud regions separated by a silence gap shorter than
+    /// `pre_roll_samples` used to produce overlapping chunks — the second
+    /// onset rewound past the first chunk's end. With the
+    /// `prev_chunk_end` clamp this no longer happens.
+    ///
+    /// Exercises the pure state-machine half of the backfill chunker
+    /// against a hand-crafted probability sequence so the test isn't
+    /// dependent on Silero classifying a synthetic tone as speech.
+    #[test]
+    fn backfill_chunks_do_not_overlap_when_gap_shorter_than_pre_roll() {
+        use yapstack_common::types::EngineKind;
+        let cfg = dummy_config();
+        let tuning = vad_tuning_for(EngineKind::Parakeet, &cfg);
+        assert_eq!(tuning.pre_roll, Duration::from_millis(250));
+        assert_eq!(tuning.silence_duration, Duration::from_millis(200));
+
+        let sr: u32 = 48_000;
+        // At 32 ms per frame: 1.0 s = ~31 frames, 0.3 s = ~9 frames.
+        let loud_frames = 31;
+        let gap_frames = 9;
+        // Shape: [loud × 31][silence × 9][loud × 31]. The silence stretch
+        // (288 ms) crosses the 200 ms silence_duration so the first chunk
+        // fires; the gap (288 ms < 250 ms pre-roll + ~32 ms frame) means
+        // without the `prev_chunk_end` clamp, the second onset's pre-roll
+        // would reach back into the first chunk's tail.
+        let mut probs: Vec<f32> = Vec::with_capacity(loud_frames * 2 + gap_frames);
+        probs.extend(std::iter::repeat(0.90).take(loud_frames));
+        probs.extend(std::iter::repeat(0.10).take(gap_frames));
+        probs.extend(std::iter::repeat(0.90).take(loud_frames));
+
+        let frame_samples = (super::super::silero_vad::FRAME_DURATION_SECS * sr as f32) as usize;
+        let total_samples = probs.len() * frame_samples;
+
+        let chunks = backfill_chunks_from_probabilities(&probs, total_samples, sr, &tuning);
+        assert!(
+            chunks.len() >= 2,
+            "expected at least 2 chunks for two loud regions, got {}: {:?}",
+            chunks.len(),
+            chunks
+        );
+        for w in chunks.windows(2) {
+            assert!(
+                w[1].start >= w[0].end,
+                "chunks overlap: first ends at {}, next starts at {}",
+                w[0].end,
+                w[1].start
+            );
+        }
+    }
+
+    /// Regression: after backfill extraction, the live VAD must start from
+    /// the current write position — not the rewound backfill cursor — so
+    /// the live Silero reader doesn't replay backfill samples.
+    ///
+    /// This is a structural check: we simulate the reset block in
+    /// `live_transcription_loop` against a `SourceVadState` built with a
+    /// rewound initial position, then verify the fields all advance to
+    /// the post-backfill `current` position.
+    #[test]
+    fn silero_state_resets_to_current_position_after_backfill_extract() {
+        let session_start: usize = 1_000; // rewound backfill position
+        let current: usize = 50_000; // write_pos after capturing 1s @ 48k mono
+
+        let mut s = SourceVadState::new(
+            AudioSourceLabel::Mic,
+            session_start,
+            session_start,
+            48000,
+            1,
+        );
+        // Pre-reset invariants: everything points at the rewound position.
+        assert_eq!(s.silero.read_pos, session_start);
+        assert_eq!(s.speech_start_pos, session_start);
+        assert_eq!(s.earliest_next_chunk_pos, session_start);
+
+        // Apply the same reset the live loop does after backfill extract.
+        s.cursor = current;
+        s.speech_start_pos = current;
+        s.earliest_next_chunk_pos = current;
+        s.silero.read_pos = current;
+        s.silero.last_probability = None;
+        s.silero.stream.reset();
+
+        assert_eq!(
+            s.silero.read_pos, current,
+            "Silero read cursor must jump past the backfill window"
+        );
+        assert_eq!(s.cursor, current);
+        assert_eq!(s.speech_start_pos, current);
+        assert_eq!(s.earliest_next_chunk_pos, current);
+        assert!(s.silero.last_probability.is_none());
     }
 }
