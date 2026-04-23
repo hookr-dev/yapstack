@@ -16,6 +16,7 @@ use yapstack_common::types::CaptureSource;
 use super::error::{validate_session_id, CommandError};
 
 use super::audio::{AudioManagerState, CaptureSourceDto, MixConfigDto};
+use super::silero_vad::{SileroSource, SileroVad, SILENCE_THRESHOLD, SPEECH_THRESHOLD};
 use super::transcription::{TranscriptSegmentDto, TranscriptionClientState};
 
 // --- DTOs ---
@@ -306,6 +307,10 @@ struct SourceVadState {
     /// previous one. Set to `new_pos` at every chunk dispatch and to
     /// `session_start_pos` at loop entry (no prior dispatch to respect).
     earliest_next_chunk_pos: usize,
+    /// Silero VAD streaming state and VAD-only read cursor for this source.
+    /// Populated regardless of engine — Silero replaces RMS for both
+    /// Whisper and Parakeet live sessions.
+    silero: SileroSource,
 }
 
 impl SourceVadState {
@@ -334,6 +339,7 @@ impl SourceVadState {
             last_write_pos_advance: Instant::now(),
             restart_attempts: 0,
             last_restart_at: None,
+            silero: SileroSource::new(initial_pos),
         }
     }
 }
@@ -350,28 +356,38 @@ enum VadAction {
 
 /// Per-engine tuning for the VAD / chunking loop.
 ///
-/// Whisper's values preserve the original dictation-tuned defaults and are
-/// intentionally unchanged — they work well for Whisper dictation and the
-/// `silence_duration_ms` field is still accepted from the frontend config
-/// as a user override.
+/// The detector itself (Silero VAD V5) is shared across engines — it's a
+/// speech-trained neural model that outperforms the old RMS threshold on
+/// music, keyboard clicks, HVAC noise, and quiet speech. Only the
+/// *timing* knobs are engine-specific:
 ///
-/// Parakeet's values are dialogue-tuned for multi-speaker meeting capture:
-/// faster polling catches short interjections, a shorter silence window
-/// resolves turn boundaries quickly, onset/offset hysteresis prevents
-/// mid-word dropout, and pre-roll captures the leading plosives that sit
-/// just below the RMS threshold when the speaker starts talking.
+/// - Whisper: the original dictation-tuned cadence (honors the user's
+///   frontend `silence_duration_ms`, 300 ms poll, no pre-roll). Values
+///   preserve the proven Whisper dictation feel — Silero only changes
+///   *what* we detect as speech, not *how long* we wait before chunking.
+/// - Parakeet: dialogue-aggressive cadence (200 ms silence, 10 s max
+///   chunk, 100 ms poll, 250 ms pre-roll). Parakeet's low RTFx and
+///   non-autoregressive decoder make short chunks free; we bias for
+///   responsive on-screen updates.
+///
+/// `speech_threshold` / `offset_threshold_ratio` are now Silero
+/// *probability* thresholds (V5 defaults: 0.5 / 0.35) rather than RMS
+/// energy thresholds. They're held per-tuning so a future engine could
+/// override them if needed, but today both engines use the same values.
 #[derive(Debug, Clone, Copy)]
 struct VadTuning {
-    /// RMS threshold above which audio is considered speech (onset).
-    silence_threshold: f32,
-    /// Offset threshold as a ratio of silence_threshold (hysteresis). Must
-    /// be in (0.0, 1.0]. 1.0 disables hysteresis.
+    /// Speech-probability threshold at or above which a frame is
+    /// considered speech (Silero V5 default 0.5).
+    speech_threshold: f32,
+    /// End-of-speech threshold as a ratio of `speech_threshold`. Must be
+    /// in (0.0, 1.0]. 0.7 yields the V5-default 0.35 end threshold
+    /// (hysteresis — prevents flapping on short probability dips).
     offset_threshold_ratio: f32,
     /// How long silence must hold before chunking.
     silence_duration: Duration,
     /// Force-chunk after this much continuous speech.
     max_chunk_duration: Duration,
-    /// Inner poll cadence for energy checks + VAD transitions.
+    /// Inner poll cadence for VAD probability checks + transitions.
     poll_interval: Duration,
     /// Pre-onset capture: extraction starts this far *before* the point we
     /// noticed energy cross the threshold, to catch leading plosives.
@@ -384,38 +400,24 @@ fn vad_tuning_for(
 ) -> VadTuning {
     use yapstack_common::types::EngineKind;
     match engine {
-        // Whisper: preserve existing dictation-proven defaults exactly.
-        // silence_duration honors the user's configured value (frontend
-        // default 800 ms); no hysteresis, no pre-roll, 300 ms poll cadence.
+        // Whisper: preserve existing dictation-proven *timing* exactly.
+        // Silence window honors the user's `silence_duration_ms` (frontend
+        // default 800 ms); 300 ms poll cadence; no pre-roll. Only the
+        // detector swaps RMS → Silero — all timing constants stay put.
         EngineKind::Whisper => VadTuning {
-            silence_threshold: config.silence_threshold,
-            offset_threshold_ratio: 1.0,
+            speech_threshold: SPEECH_THRESHOLD,
+            offset_threshold_ratio: SILENCE_THRESHOLD / SPEECH_THRESHOLD,
             silence_duration: Duration::from_millis(config.silence_duration_ms as u64),
             max_chunk_duration: Duration::from_secs_f32(config.max_chunk_seconds),
             poll_interval: Duration::from_millis(POLL_INTERVAL_MS),
             pre_roll: Duration::ZERO,
         },
-        // Parakeet: dialogue-tuned and aggressively chunked. These values
-        // ignore the frontend's silence_duration_ms / max_chunk_seconds /
-        // poll cadence by design — they're engine-specific best practice,
-        // not user-facing knobs. Parakeet's low RTFx and non-autoregressive
-        // decoder mean shorter chunks have effectively zero throughput cost,
-        // so we bias for responsive on-screen updates and tight per-
-        // utterance timestamps over long coherent windows.
-        //
-        // - silence_duration 200 ms: splits on the natural pauses between
-        //   sentences and short breaths, without clipping comma-pauses
-        //   (which are usually <150 ms).
-        // - max_chunk_duration 10 s: force-chunks continuous speech every
-        //   ~10 s so a long monologue renders incrementally instead of all
-        //   at once when the speaker finally pauses. At Parakeet RTFx 4-8×,
-        //   a 10 s chunk transcribes in ~1-2 s.
-        // - offset_threshold_ratio 0.7 (hysteresis) + pre_roll 250 ms:
-        //   unchanged; they prevent mid-word dropout and leading-plosive
-        //   clipping on speech onset.
+        // Parakeet: dialogue-aggressive. Ignores frontend silence / chunk /
+        // poll knobs — those are engine-specific best practice, not
+        // user-facing tuning. See live_transcription docs for rationale.
         EngineKind::Parakeet => VadTuning {
-            silence_threshold: config.silence_threshold,
-            offset_threshold_ratio: 0.7,
+            speech_threshold: SPEECH_THRESHOLD,
+            offset_threshold_ratio: SILENCE_THRESHOLD / SPEECH_THRESHOLD,
             silence_duration: Duration::from_millis(200),
             max_chunk_duration: Duration::from_secs(10),
             poll_interval: Duration::from_millis(100),
@@ -424,19 +426,22 @@ fn vad_tuning_for(
     }
 }
 
-/// Polls the VAD state machine for a single source.
+/// Polls the VAD state machine for a single source. The `probability`
+/// input is Silero's per-frame speech probability in [0, 1]; `None`
+/// means no full frame accumulated during this poll window (in which
+/// case the state machine stays put — no toggles on missing data).
 /// Manages `speech_start_time` internally on state transitions.
-/// Uses `tuning.silence_threshold` for onset detection and
-/// `tuning.silence_threshold * tuning.offset_threshold_ratio` for offset
-/// (hysteresis prevents mid-word dropout on quiet vowels).
-fn poll_vad(state: &mut SourceVadState, energy: Option<f32>, tuning: &VadTuning) -> VadAction {
-    let Some(energy) = energy else {
+/// Uses `tuning.speech_threshold` for onset detection and
+/// `tuning.speech_threshold * tuning.offset_threshold_ratio` for offset
+/// (hysteresis prevents mid-word dropout on short probability dips).
+fn poll_vad(state: &mut SourceVadState, probability: Option<f32>, tuning: &VadTuning) -> VadAction {
+    let Some(probability) = probability else {
         return VadAction::None;
     };
 
     if state.is_speaking {
-        let offset_threshold = tuning.silence_threshold * tuning.offset_threshold_ratio;
-        let is_loud = energy >= offset_threshold;
+        let offset_threshold = tuning.speech_threshold * tuning.offset_threshold_ratio;
+        let is_loud = probability >= offset_threshold;
         if is_loud {
             state.silence_since = None;
 
@@ -458,7 +463,7 @@ fn poll_vad(state: &mut SourceVadState, energy: Option<f32>, tuning: &VadTuning)
             }
         }
     } else {
-        let is_loud = energy >= tuning.silence_threshold;
+        let is_loud = probability >= tuning.speech_threshold;
         if is_loud {
             state.is_speaking = true;
             state.silence_since = None;
@@ -506,7 +511,10 @@ fn emit_status(
     );
 }
 
-/// Reconstruct `BufferPositions` from the source vec for `peek_energy_rms`.
+/// Reconstruct `BufferPositions` from the source vec. Retained as a
+/// general helper and exercised by tests; the live loop no longer needs
+/// it now that Silero VAD extracts samples per-source via `extract_source_audio`.
+#[allow(dead_code)]
 fn build_cursor(sources: &[SourceVadState]) -> BufferPositions {
     let mut pos = BufferPositions::default();
     for s in sources {
@@ -1061,33 +1069,62 @@ struct VadBackfillChunk {
 /// segmentation identical character — a session's first N seconds no longer
 /// look subtly different from the rest.
 ///
-/// The state machine walks the samples in `tuning.poll_interval`-sized
-/// windows (same granularity the live loop polls energy). It tracks:
-/// - is_speaking (onset at `tuning.silence_threshold`, offset at
-///   `tuning.silence_threshold * tuning.offset_threshold_ratio` — hysteresis)
-/// - silence_run (elapsed silence while speaking; triggers a chunk when it
-///   passes `tuning.silence_duration`)
-/// - speech_run (elapsed continuous speech; triggers a force-chunk at
-///   `tuning.max_chunk_duration`)
-/// - pre-roll (onset rewinds the chunk start by `tuning.pre_roll`)
+/// Runs Silero VAD across the buffer up-front (one probability per 32 ms
+/// frame), then walks the probability stream with the same state machine
+/// the live loop uses:
+/// - is_speaking (onset at `tuning.speech_threshold`, offset at
+///   `tuning.speech_threshold * tuning.offset_threshold_ratio` — hysteresis)
+/// - silence_run / speech_run counted in Silero frames
+/// - pre-roll rewinds the chunk start by `tuning.pre_roll`
 ///
 /// Any trailing speech that didn't naturally end in silence is emitted as a
-/// final chunk so the tail of the backfill window is never dropped.
+/// final chunk so the tail of the backfill window is never dropped. If
+/// Silero init fails (e.g. ort runtime unavailable), falls back to treating
+/// the whole buffer as a single chunk — better than silently losing the
+/// backfill audio.
 fn vad_chunk_historical_audio(
     samples: &[f32],
     sample_rate: u32,
     tuning: &VadTuning,
 ) -> Vec<VadBackfillChunk> {
-    let poll_secs = tuning.poll_interval.as_secs_f32().max(0.001);
-    let window_samples = (poll_secs * sample_rate as f32) as usize;
-    if window_samples == 0 || samples.is_empty() {
+    if samples.is_empty() {
         return Vec::new();
     }
 
-    let onset_threshold = tuning.silence_threshold;
-    let offset_threshold = tuning.silence_threshold * tuning.offset_threshold_ratio;
-    let silence_windows = (tuning.silence_duration.as_secs_f32() / poll_secs).ceil() as usize;
-    let max_chunk_windows = (tuning.max_chunk_duration.as_secs_f32() / poll_secs).max(1.0) as usize;
+    let mut silero = match SileroVad::new() {
+        Ok(v) => v,
+        Err(e) => {
+            warn!("backfill: Silero init failed ({e}) — single-chunk fallback");
+            return vec![VadBackfillChunk {
+                start: 0,
+                end: samples.len(),
+            }];
+        }
+    };
+
+    let probabilities = silero.score_all(samples, sample_rate);
+    if probabilities.is_empty() {
+        return Vec::new();
+    }
+
+    // One probability covers FRAME_DURATION_SECS (32 ms) of audio. Map
+    // each frame back to the corresponding slice in the *original*
+    // (un-resampled) buffer so chunk boundaries are expressed in the
+    // caller's coordinate system.
+    let frame_samples_original =
+        (super::silero_vad::FRAME_DURATION_SECS * sample_rate as f32) as usize;
+    if frame_samples_original == 0 {
+        return Vec::new();
+    }
+
+    let onset_threshold = tuning.speech_threshold;
+    let offset_threshold = tuning.speech_threshold * tuning.offset_threshold_ratio;
+    let silence_windows = (tuning.silence_duration.as_secs_f32()
+        / super::silero_vad::FRAME_DURATION_SECS)
+        .ceil() as usize;
+    let max_chunk_windows = (tuning.max_chunk_duration.as_secs_f32()
+        / super::silero_vad::FRAME_DURATION_SECS)
+        .max(1.0) as usize;
     let pre_roll_samples = (tuning.pre_roll.as_secs_f32() * sample_rate as f32) as usize;
 
     let mut chunks: Vec<VadBackfillChunk> = Vec::new();
@@ -1096,20 +1133,19 @@ fn vad_chunk_historical_audio(
     let mut silence_run: usize = 0;
     let mut speech_run: usize = 0;
 
-    let mut w_start = 0usize;
-    while w_start < samples.len() {
-        let w_end = (w_start + window_samples).min(samples.len());
-        let window = &samples[w_start..w_end];
-        let rms = (window.iter().map(|s| s * s).sum::<f32>() / window.len() as f32).sqrt();
+    for (frame_idx, &prob) in probabilities.iter().enumerate() {
+        let w_start = frame_idx * frame_samples_original;
+        let w_end = ((frame_idx + 1) * frame_samples_original).min(samples.len());
+        if w_start >= samples.len() {
+            break;
+        }
 
         if is_speaking {
             speech_run += 1;
-            let is_loud = rms >= offset_threshold;
+            let is_loud = prob >= offset_threshold;
             if is_loud {
                 silence_run = 0;
                 if speech_run >= max_chunk_windows {
-                    // Force chunk: close the current one and continue
-                    // speaking from here (live loop behaves the same).
                     chunks.push(VadBackfillChunk {
                         start: speech_start,
                         end: w_end,
@@ -1130,7 +1166,7 @@ fn vad_chunk_historical_audio(
                 }
             }
         } else {
-            let is_loud = rms >= onset_threshold;
+            let is_loud = prob >= onset_threshold;
             if is_loud {
                 speech_start = w_start.saturating_sub(pre_roll_samples);
                 is_speaking = true;
@@ -1138,7 +1174,6 @@ fn vad_chunk_historical_audio(
                 silence_run = 0;
             }
         }
-        w_start = w_end;
     }
 
     // Trailing speech that never resolved into silence — emit as final chunk
@@ -1635,8 +1670,23 @@ async fn live_transcription_loop(
     emit_status(&ctx.app_handle, LiveTranscriptionPhase::Running, 0, 0.0);
 
     let poll_interval = tuning.poll_interval;
-    let poll_energy_secs = tuning.poll_interval.as_secs_f32();
     let mut exited_fatal = false;
+
+    // Silero VAD runs in-process (bundled V5 ONNX). Single session shared
+    // across sources; per-source streaming state lives on each VAD state's
+    // `silero` field. `Session` is `Send` but not `Sync`, so we hold it
+    // `mut` locally and feed sources sequentially inside each poll.
+    let mut silero = match SileroVad::new() {
+        Ok(v) => v,
+        Err(e) => {
+            error!(
+                "live transcription: failed to initialize Silero VAD — bailing out: {}",
+                e
+            );
+            emit_status(&ctx.app_handle, LiveTranscriptionPhase::Error, 0, 0.0);
+            return;
+        }
+    };
 
     // In-flight chunk transcription tasks. `FuturesUnordered` so we can
     // wake the main loop the moment *any* task completes (via `.next()`
@@ -1686,15 +1736,58 @@ async fn live_transcription_loop(
             _ = &mut stop_rx => true,
         };
 
-        // Single lock: energy check + WAV flush extraction
-        let (mic_energy, system_energy, wav_flush_data) = {
+        // Single lock: per-source audio extraction for Silero VAD +
+        // WAV flush extraction. We pull raw mono samples (not just RMS)
+        // for each source since the source's `silero.read_pos`, then feed
+        // them through Silero outside the lock so the manager isn't held
+        // while the ONNX session runs.
+        struct SileroPollInput {
+            label: AudioSourceLabel,
+            samples: Option<(Vec<f32>, u32)>,
+            new_pos: usize,
+        }
+        let (silero_inputs, wav_flush_data): (Vec<SileroPollInput>, _) = {
             let manager = audio_state.lock().await;
-            let energies = manager.peek_energy_rms(&build_cursor(&sources), poll_energy_secs);
+            let mut inputs: Vec<SileroPollInput> = Vec::with_capacity(sources.len());
+            for s in &sources {
+                let (samples, new_pos) =
+                    extract_source_audio(&manager, &s.label, s.silero.read_pos);
+                inputs.push(SileroPollInput {
+                    label: s.label,
+                    samples,
+                    new_pos,
+                });
+            }
             let flush = session_wav_state.as_ref().and_then(|ws| {
                 manager.extract_since(&ws.flush_positions, ws.source, ws.mix_config.as_ref())
             });
-            (energies.0, energies.1, flush)
+            (inputs, flush)
         };
+
+        // Feed Silero outside the audio lock. Update per-source read_pos
+        // and last_probability. If no new samples arrived (empty buffer
+        // snapshot), the previous probability sticks — the VAD state
+        // machine sees `Some(prev)` and the is_speaking/silence_since
+        // state doesn't flip to an uncertain intermediate.
+        for input in silero_inputs {
+            if let Some(s) = sources.iter_mut().find(|s| s.label == input.label) {
+                s.silero.read_pos = input.new_pos;
+                if let Some((mono, source_sr)) = input.samples {
+                    if let Some(prob) = silero.score_stream(&mut s.silero.stream, &mono, source_sr)
+                    {
+                        s.silero.last_probability = Some(prob);
+                    }
+                }
+            }
+        }
+        let mic_energy = sources
+            .iter()
+            .find(|s| s.label == AudioSourceLabel::Mic)
+            .and_then(|s| s.silero.last_probability);
+        let system_energy = sources
+            .iter()
+            .find(|s| s.label == AudioSourceLabel::System)
+            .and_then(|s| s.silero.last_probability);
 
         // Write WAV data outside the lock
         if let Some((samples, _sr, new_pos)) = wav_flush_data {
@@ -2853,25 +2946,28 @@ mod tests {
 
     // --- VAD state machine tests ---
 
-    /// Shorthand for poll_vad with standard Whisper-equivalent test thresholds.
-    /// Uses no hysteresis / no pre-roll so the original assertions still hold.
-    fn poll(state: &mut SourceVadState, energy: Option<f32>) -> VadAction {
+    /// Shorthand for poll_vad under the Silero-based state machine.
+    /// `energy` here is now a *Silero speech probability* in [0, 1], not
+    /// an RMS value. Test assertions that previously used 0.005 / 0.05
+    /// RMS values are paired with `scale_probability` below which maps
+    /// them onto probabilities around the threshold.
+    fn poll(state: &mut SourceVadState, probability: Option<f32>) -> VadAction {
         let tuning = VadTuning {
-            silence_threshold: 0.01,
+            speech_threshold: 0.5,
             offset_threshold_ratio: 1.0,
             silence_duration: Duration::from_millis(800),
             max_chunk_duration: Duration::from_secs(30),
             poll_interval: Duration::from_millis(300),
             pre_roll: Duration::ZERO,
         };
-        poll_vad(state, energy, &tuning)
+        poll_vad(state, probability, &tuning)
     }
 
     #[test]
     fn test_poll_vad_silence_returns_none() {
         let mut state = SourceVadState::new(AudioSourceLabel::Mic, 0, 0, 48000, 1);
         // Below threshold while not speaking → None, stays not-speaking
-        let action = poll(&mut state, Some(0.005));
+        let action = poll(&mut state, Some(0.10));
         assert!(matches!(action, VadAction::None));
         assert!(!state.is_speaking);
     }
@@ -2880,7 +2976,7 @@ mod tests {
     fn test_poll_vad_speech_onset() {
         let mut state = SourceVadState::new(AudioSourceLabel::Mic, 0, 0, 48000, 1);
         // Above threshold while not speaking → transitions to speaking
-        let action = poll(&mut state, Some(0.05));
+        let action = poll(&mut state, Some(0.90));
         assert!(matches!(action, VadAction::None));
         assert!(state.is_speaking);
         assert!(state.speech_start_time.is_some());
@@ -2893,7 +2989,7 @@ mod tests {
         state.speech_start_time = Some(Instant::now());
         state.silence_since = Some(Instant::now()); // had some silence accumulating
                                                     // Above threshold while speaking, below max duration → clears silence_since
-        let action = poll(&mut state, Some(0.05));
+        let action = poll(&mut state, Some(0.90));
         assert!(matches!(action, VadAction::None));
         assert!(state.silence_since.is_none());
     }
@@ -2901,8 +2997,8 @@ mod tests {
     #[test]
     fn test_poll_vad_energy_at_exact_threshold() {
         let mut state = SourceVadState::new(AudioSourceLabel::Mic, 0, 0, 48000, 1);
-        // Exactly at threshold (0.01) while not speaking — uses >=, so SHOULD trigger onset
-        let action = poll(&mut state, Some(0.01));
+        // Exactly at threshold (0.50) while not speaking — uses >=, so SHOULD trigger onset
+        let action = poll(&mut state, Some(0.50));
         assert!(matches!(action, VadAction::None));
         assert!(state.is_speaking);
         assert!(state.speech_start_time.is_some());
@@ -2914,7 +3010,7 @@ mod tests {
         state.is_speaking = true;
         state.speech_start_time = Some(Instant::now());
         // Below threshold while speaking → sets silence_since but not long enough yet
-        let action = poll(&mut state, Some(0.005));
+        let action = poll(&mut state, Some(0.10));
         assert!(matches!(action, VadAction::None));
         assert!(state.silence_since.is_some());
     }
@@ -2926,7 +3022,7 @@ mod tests {
         state.speech_start_time = Some(Instant::now());
         // Silence started longer ago than the threshold
         state.silence_since = Some(Instant::now() - Duration::from_secs(2));
-        let action = poll(&mut state, Some(0.005));
+        let action = poll(&mut state, Some(0.10));
         assert!(matches!(action, VadAction::Chunk));
     }
 
@@ -2936,7 +3032,7 @@ mod tests {
         state.is_speaking = true;
         state.speech_start_time = Some(Instant::now() - Duration::from_secs(31));
         // Above threshold while speaking past max_chunk_duration → ForceChunk
-        let action = poll(&mut state, Some(0.05));
+        let action = poll(&mut state, Some(0.90));
         assert!(matches!(action, VadAction::ForceChunk));
     }
 
@@ -3215,6 +3311,10 @@ mod tests {
 
     #[test]
     fn test_vad_tuning_whisper_honors_user_silence_duration() {
+        // Whisper still honors the user's frontend silence_duration_ms
+        // and max_chunk_seconds — only the detector (RMS → Silero) swaps.
+        // Threshold values are now Silero probabilities (0.5 / 0.35),
+        // shared across engines.
         use yapstack_common::types::EngineKind;
         let mut cfg = dummy_config();
         cfg.silence_duration_ms = 600;
@@ -3222,7 +3322,9 @@ mod tests {
         let t = vad_tuning_for(EngineKind::Whisper, &cfg);
         assert_eq!(t.silence_duration, Duration::from_millis(600));
         assert_eq!(t.max_chunk_duration, Duration::from_secs_f32(25.0));
-        assert!((t.offset_threshold_ratio - 1.0).abs() < f32::EPSILON);
+        assert!((t.speech_threshold - 0.5).abs() < 1e-6);
+        // 0.35 / 0.5 = 0.7 hysteresis ratio
+        assert!((t.offset_threshold_ratio - 0.7).abs() < 1e-6);
         assert_eq!(t.pre_roll, Duration::ZERO);
     }
 
@@ -3246,6 +3348,7 @@ mod tests {
         );
         assert_eq!(t.poll_interval, Duration::from_millis(100));
         assert_eq!(t.pre_roll, Duration::from_millis(250));
+        assert!((t.speech_threshold - 0.5).abs() < 1e-6);
         assert!((t.offset_threshold_ratio - 0.7).abs() < 1e-6);
     }
 }
