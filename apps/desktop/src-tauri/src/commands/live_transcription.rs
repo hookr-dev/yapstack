@@ -1631,9 +1631,21 @@ async fn live_transcription_loop(
     // can dispatch (e.g. a second utterance during the previous task's
     // transcribe). Outcomes drained here are applied at the top of the
     // tick below so VAD / dispatch see the updated per-source state.
-    let mut chunk_tasks: futures_util::stream::FuturesUnordered<
-        tokio::task::JoinHandle<ChunkTaskOutcome>,
-    > = futures_util::stream::FuturesUnordered::new();
+    //
+    // Each spawn is wrapped in an async block that traps `JoinError` and
+    // synthesizes a fallback `ChunkTaskOutcome`. This guarantees the
+    // invariant "every spawned task → exactly one outcome observed",
+    // which keeps `has_in_flight_task` from leaking on panic/cancel and
+    // would otherwise silently kill dispatch for that source forever.
+    type ChunkTaskFuture =
+        std::pin::Pin<Box<dyn std::future::Future<Output = ChunkTaskOutcome> + Send>>;
+    let mut chunk_tasks: futures_util::stream::FuturesUnordered<ChunkTaskFuture> =
+        futures_util::stream::FuturesUnordered::new();
+    // Parallel handles so stop can `.abort()` slow tasks immediately —
+    // otherwise an in-flight `transcribe_with` past the 10s drain would
+    // hold an `Arc<TranscriptionClient>` clone, blocking try_unwrap and
+    // leaving shared state empty (next session/dictation = NotInitialized).
+    let mut chunk_aborts: Vec<tokio::task::AbortHandle> = Vec::new();
     let mut pending_outcomes: Vec<ChunkTaskOutcome> = Vec::new();
 
     loop {
@@ -1647,21 +1659,12 @@ async fn live_transcription_loop(
         // durations (Instant::now()), not tick count.
         let should_stop = tokio::select! {
             _ = sleep(poll_interval) => false,
-            Some(joined) = chunk_tasks.next(), if !chunk_tasks.is_empty() => {
-                match joined {
-                    Ok(outcome) => pending_outcomes.push(outcome),
-                    Err(e) => error!("chunk task join failed: {}", e),
-                }
+            Some(outcome) = chunk_tasks.next(), if !chunk_tasks.is_empty() => {
+                pending_outcomes.push(outcome);
                 // Drain any other tasks that happen to be ready in this
                 // same wakeup window without blocking.
-                loop {
-                    match chunk_tasks.next().now_or_never() {
-                        Some(Some(Ok(outcome))) => pending_outcomes.push(outcome),
-                        Some(Some(Err(e))) => {
-                            error!("chunk task join failed: {}", e)
-                        }
-                        _ => break,
-                    }
+                while let Some(Some(outcome)) = chunk_tasks.next().now_or_never() {
+                    pending_outcomes.push(outcome);
                 }
                 false
             }
@@ -1806,14 +1809,12 @@ async fn live_transcription_loop(
         // not next tick.
         let mut fatal = false;
         // Drain any additional outcomes that became ready while the tick
-        // waited on other awaits (audio_state lock, WAV flush, etc).
-        loop {
-            match chunk_tasks.next().now_or_never() {
-                Some(Some(Ok(outcome))) => pending_outcomes.push(outcome),
-                Some(Some(Err(e))) => error!("chunk task join failed: {}", e),
-                _ => break,
-            }
+        // waited on other awaits (audio_state lock, WAV flush, etc). Also
+        // prune finished abort handles to keep the vec bounded.
+        while let Some(Some(outcome)) = chunk_tasks.next().now_or_never() {
+            pending_outcomes.push(outcome);
         }
+        chunk_aborts.retain(|h| !h.is_finished());
         let drained = std::mem::take(&mut pending_outcomes);
         for outcome in drained {
             for source in sources.iter_mut() {
@@ -1882,8 +1883,28 @@ async fn live_transcription_loop(
                     if let Some(prepared) = prepared {
                         let task_ctx = ctx.clone();
                         let task_session = session.clone();
-                        chunk_tasks.push(tokio::spawn(async move {
+                        let source_label = prepared.source_label;
+                        let fallback_text = prepared.accumulated_text.clone();
+                        let handle = tokio::spawn(async move {
                             run_chunk_task(prepared, task_ctx, task_session).await
+                        });
+                        chunk_aborts.push(handle.abort_handle());
+                        chunk_tasks.push(Box::pin(async move {
+                            match handle.await {
+                                Ok(outcome) => outcome,
+                                Err(e) => {
+                                    error!(
+                                        "chunk task panicked or was cancelled for source {:?}: {} \
+                                         — synthesizing outcome to free dispatch",
+                                        source_label, e
+                                    );
+                                    ChunkTaskOutcome {
+                                        source_label,
+                                        accumulated_text: fallback_text,
+                                        sidecar_dead: false,
+                                    }
+                                }
+                            }
                         }));
                     }
                 }
@@ -1967,19 +1988,26 @@ async fn live_transcription_loop(
             "live transcription stop: draining {} in-flight chunk tasks",
             chunk_tasks.len()
         );
+        // Cancel everything still running so the drain completes promptly
+        // and each task's `Arc<TranscriptionClient>` clone is released —
+        // otherwise the post-loop try_unwrap fails and shared state is
+        // left empty, which surfaces as "transcription client not
+        // initialized" on the next session/dictation. transcribe_with
+        // awaits a oneshot internally; abort drops the receiver cleanly,
+        // and the sidecar's eventual response is harmlessly orphaned by
+        // the reader task.
+        for ah in chunk_aborts.drain(..) {
+            ah.abort();
+        }
         // Bounded wait so a hanging sidecar can't indefinitely block the
-        // stop path. The per-task timeout inside transcribe_with is 300s;
-        // we give the whole drain up to 10s past a stop request before
-        // giving up. In practice tasks finish in <5s on any live hardware.
+        // stop path. With abort above, tasks normally complete in <1s.
+        // The per-task timeout inside transcribe_with is 300s; the 10s
+        // outer cap stays as a belt-and-suspenders measure.
         use futures_util::stream::StreamExt;
         let drain = async {
-            while let Some(joined) = chunk_tasks.next().await {
-                match joined {
-                    Ok(outcome) if outcome.sidecar_dead => {
-                        warn!("drained chunk task reported sidecar dead");
-                    }
-                    Ok(_) => {}
-                    Err(e) => error!("chunk task join error during drain: {}", e),
+            while let Some(outcome) = chunk_tasks.next().await {
+                if outcome.sidecar_dead {
+                    warn!("drained chunk task reported sidecar dead");
                 }
             }
         };
@@ -2639,7 +2667,9 @@ pub async fn start_live_transcription(
                             error!(
                                 "live transcription ended but a task still holds the \
                                  transcription client — shared state left empty; \
-                                 next session will spawn a fresh sidecar"
+                                 subsequent sessions and dictation will fail with \
+                                 NotInitialized until the app restarts. This means a \
+                                 chunk task did not respond to abort; please report."
                             );
                         }
                     }
