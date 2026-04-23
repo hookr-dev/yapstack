@@ -41,6 +41,11 @@ tauri-plugin-process = "2"
 tauri-plugin-aptabase = { git = "https://github.com/Claytonn/tauri-plugin-aptabase", branch = "fix/tokio-runtime-panic" }
 percent-encoding = "2"
 tauri-plugin-http = "2.5.8"
+# Silero VAD (V5 ONNX, bundled via the `bundled` default feature) replaces
+# the hand-rolled RMS energy detector in the live-transcription loop for
+# both engines. Speech-trained; robust to background noise, music, and
+# quiet speech that RMS would either miss or false-trigger on.
+silero = "0.2"
 
 [target."cfg(target_os = \"macos\")".dependencies]
 tauri-nspanel = { git = "https://github.com/ahkohd/tauri-nspanel", branch = "v2.1" }

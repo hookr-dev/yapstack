@@ -5,6 +5,7 @@ pub mod error;
 pub mod live_transcription;
 pub mod logs;
 pub mod permissions;
+pub mod silero_vad;
 pub mod transcription;
 
 use serde::Serialize;
