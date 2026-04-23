@@ -189,10 +189,18 @@ Frontend: start_live_transcription(config)
     Track 2 — Live VAD loop (runs concurrently; per-call diarization gated on
               ctx.config.diarization, initial_prompt gated on
               client.engine() == EngineKind::Whisper):
-        1. Poll every 300ms
-        2. Single lock: peek_energy_rms() + extract_since() for WAV flush
-        3. Write WAV samples outside the lock (disk I/O doesn't hold AudioManager)
-        4. poll_vad() per source — state machine for speech/silence transitions
+        1. Poll every tuning.poll_interval (Whisper 300ms; Parakeet 100ms)
+        2. Single lock: per-source extract_source_audio() for Silero +
+           extract_since() for WAV flush. Raw mono samples, not RMS.
+        3. Outside the lock:
+            a. Write WAV samples (disk I/O doesn't hold AudioManager)
+            b. Feed each source's samples through the shared Silero V5
+               session via score_stream() — returns one probability per
+               32 ms frame, maintained across polls by per-source LSTM
+               state in SileroSource
+        4. poll_vad() per source, once per Silero frame — state machine
+           iterates every probability so intra-poll speech isn't missed.
+           Best-action summary (ForceChunk > Chunk > None) picked per tick.
         5. On VadAction::Chunk (silence detected) or ForceChunk (max duration):
             a. extract_sources_since()
             b. write_wav_to_temp() → temp WAV

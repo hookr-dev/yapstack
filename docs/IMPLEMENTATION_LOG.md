@@ -986,6 +986,54 @@ For comparison, FluidAudio (Swift + CoreML + ANE) reportedly hits 155-237× real
 
 ---
 
+## Phase 25 — Live Transcription Pipeline Overhaul: Silero VAD + Scheduler + Parakeet Tuning
+
+Three tightly related changes, each on its own branch:
+1. `feat/transcription-scheduler` — priority scheduler in front of the sidecar lane.
+2. `feat/silero-vad-parakeet` — replaces RMS energy detector with Silero V5 VAD for both engines; tightens Parakeet chunk cadence.
+
+### What was built
+
+| File | Change |
+|---|---|
+| `apps/desktop/src-tauri/src/commands/transcription_scheduler.rs` | New. `TranscriptionScheduler` wraps the `TranscriptionClient` and serves jobs through three priority queues (`FinalFlush > Live > Backfill`) with mic/system round-robin at the Live tier. Single worker task feeds the sidecar serially so priority ordering isn't defeated by the sidecar's FIFO stdin queue. Retries once after sidecar respawn; drains cleanly on shutdown and hands the raw client back to shared state. |
+| `apps/desktop/src-tauri/src/commands/silero_vad.rs` | New. `SileroVad` (shared `silero::Session`, V5 ONNX bundled in-binary via the `silero` crate, ~2 MB) + `SileroSource` (per-source `StreamState` + VAD-only read cursor + sticky `last_probability` for empty polls). `score_stream` returns every 32 ms frame's probability — not just the last — so intra-poll speech (onset+offset inside one batch) isn't lost. `score_all` for backfill batch-scoring. Resampling delegates to `yapstack_common::audio::resample` (rubato sinc). |
+| `apps/desktop/src-tauri/src/commands/live_transcription.rs` | Replaced RMS (`peek_energy_rms`) with Silero per-source scoring. `VadTuning.silence_threshold` (RMS) renamed → `speech_threshold` (probability). Parakeet tuning: 200 ms silence / 10 s max chunk / 100 ms poll / 250 ms pre-roll. Whisper keeps the user's `silence_duration_ms` (300 ms poll, no pre-roll). `vad_chunk_historical_audio` now batch-scores through Silero and walks a pure state machine (`backfill_chunks_from_probabilities`) over the probability stream; `prev_chunk_end` clamp prevents pre-roll from rewinding into a previous chunk. Backfill-to-live handoff now resets all per-source Silero state (`read_pos`, `stream`, `last_probability`, `earliest_next_chunk_pos`) to the post-backfill write position. Added `LiveSegmentEvent.event_sequence` + `origin` for stable frontend ordering. Removed the stop-time `chunk_aborts.abort()` loop — final chunks are submitted as `FinalFlush` priority and drained with a bounded timeout instead. |
+| `apps/desktop/src/stores/appStore.ts` | `activeSessionBackfillSegments` bucket — backfill chunks live here until `backfill-complete` merges them into `activeSessionSegments`, so a late backfill chunk can't shove already-rendered live rows downward. `stableInsertSegments` replaces the per-event full-array sort; existing segments never reorder. Exports `awaitLiveTranscriptSettled(sessionId)` that drains the in-memory segment write queue before returning the current transcript. |
+| `apps/desktop/src/lib/ai-context.ts` | Session transcript / tool context now use `awaitLiveTranscriptSettled` so AI chat sees the latest spoken sentence instead of a stale SQLite snapshot. |
+| `apps/desktop/src/lib/db.ts` | `getSessionSegments` ORDER BY made deterministic (`audio_offset, chunk_index, source, created_at, id`) to match the in-memory comparator. |
+
+### Key decisions
+
+- **One Silero session, two source streams**. The `silero::Session` is `Send` but not `!Sync`, so we feed mic and system sequentially inside each poll. Per-source `StreamState` keeps their LSTM memories independent. Building two sessions would fragment acceleration and double the model load.
+- **Silero replaces RMS for both engines, but only the detector changes**. Whisper keeps its tuned timing values (`silence_duration_ms`, 300 ms poll, no pre-roll); only the speech signal is different. This was an explicit memory rule: don't retune Whisper when tuning Parakeet.
+- **Thresholds are V5 defaults**. `speech_threshold = 0.5`, `offset_threshold_ratio = 0.7` (→ 0.35 end threshold). Matches the upstream Python silero-vad reference.
+- **Reuse the canonical resampler**. `silero_vad.rs` calls `yapstack_common::audio::resample` (the same rubato-backed sinc path used by `yapstack-sidecar` and `yapstack-audio::mixer`) rather than shipping a hand-rolled decimator. Silero is robust to mild aliasing but consistency with the workspace idiom is worth the line count.
+- **Backfill bucket in the frontend, not just a stripe**. Keeping backfill out of `activeSessionSegments` until `backfill-complete` is the only way to prevent the "live row jumps down" visual churn when a late backfill chunk arrives with a smaller `audio_offset_seconds`.
+- **Pure state-machine helper for tests**. `backfill_chunks_from_probabilities` is extracted from `vad_chunk_historical_audio` so unit tests can feed hand-crafted probability sequences without loading the ONNX model — particularly important for the pre-roll-clamp regression test, since Silero won't classify synthetic tones as speech.
+
+### What was learned
+
+- **Intra-poll speech events are real**. A 100 ms Parakeet poll can contain an entire short utterance; if `score_stream` returns only the trailing probability (silence), the VAD state machine never sees the onset. The fix is straightforward — return `Vec<f32>` and iterate `poll_vad` per frame — but the bug is easy to miss in review.
+- **The sidecar's stdin queue is FIFO**. Multiple concurrent `transcribe_with` calls don't pipeline on the model side; they queue in order received. That made "parallel" mic/system dispatch useless for prioritization and necessitated the scheduler.
+- **Backfill-to-live handoff is more than just the extraction cursor**. Resetting `cursor` + `speech_start_pos` isn't enough; the Silero read cursor, the LSTM stream state, the sticky last_probability, and `earliest_next_chunk_pos` all have to move with them or the live detector replays the backfill window.
+- **Pre-roll needs the same clamp in backfill as in live**. The live loop already bounded pre-roll by `earliest_next_chunk_pos`; the backfill chunker didn't, so two utterances separated by less than ~250 ms could produce overlapping chunks.
+
+### Test coverage
+
+- `commands::transcription_scheduler::tests` — priority ordering, mic/system round-robin, single-source drain, final-flush preemption, cancel-all.
+- `commands::silero_vad::tests` — bundled ONNX session loads and returns valid probabilities for silence; 32 ms frame cadence (512 samples × N → N probabilities).
+- `commands::live_transcription::tests` — Silero-era `poll_vad` state-machine tests (thresholds are now probabilities); intra-poll speech onset regression; backfill-reset structural guard; no-overlap regression for the `prev_chunk_end` clamp.
+- Frontend: `stableInsertSegments` tests for stable merge behavior under late-arriving backfill.
+
+### Not yet done
+
+- Optional: reuse the SincFixedIn resampler across polls instead of rebuilding on each call (rubato's recommended streaming pattern). Current cost is dominated by Silero inference, so not urgent.
+- Optional: two-tier endpointing (soft at 200 ms for interim segments, confirmed at 600 ms for finals) — Deepgram's pattern. Would reduce perceived latency but requires an interim-segment protocol between sidecar and frontend.
+- Optional: adaptive noise floor for environments where the 0.5 speech probability is regularly exceeded by non-speech (e.g. loud HVAC). Silero is robust to this in practice; revisit only if users report false triggers.
+
+---
+
 ## What's Not Yet Built
 
 - **End-to-end integration tests** — capture audio, transcribe, verify text (unit + component tests now exist; integration tests still needed)
