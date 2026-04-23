@@ -47,38 +47,41 @@ impl SileroVad {
     }
 
     /// Feed new audio samples (at `source_sample_rate`) into `stream`'s
-    /// rolling Silero state and return the *latest* speech probability
-    /// produced during the call, or `None` if no full 32 ms frame landed
-    /// yet (remaining samples stay buffered inside the stream state for
-    /// the next call).
+    /// rolling Silero state and return *every* speech probability produced
+    /// during the call, in emission order. Returns an empty vec if no full
+    /// 32 ms frame landed yet (remaining samples stay buffered inside the
+    /// stream state for the next call).
     ///
-    /// For VAD decisions we only care about the most-recent probability
-    /// in each poll window — we don't need to aggregate intra-poll
-    /// probabilities. Silero's own recurrent state smooths across frames.
+    /// The live loop needs all frames — not just the last — because a
+    /// poll window can straddle a complete speech event. A 300 ms Whisper
+    /// poll or even a 100 ms Parakeet poll can contain an utterance that
+    /// starts and ends inside the batch; if we returned only the trailing
+    /// probability (silence), the VAD state machine would never see the
+    /// speech onset.
     pub fn score_stream(
         &mut self,
         stream: &mut StreamState,
         samples: &[f32],
         source_sample_rate: u32,
-    ) -> Option<f32> {
+    ) -> Vec<f32> {
         if samples.is_empty() {
-            return None;
+            return Vec::new();
         }
         let resampled = resample_to_16k(samples, source_sample_rate);
         if resampled.is_empty() {
-            return None;
+            return Vec::new();
         }
-        let mut latest: Option<f32> = None;
+        let mut probs: Vec<f32> = Vec::new();
         if let Err(e) = self
             .session
-            .process_stream(stream, &resampled, |p| latest = Some(p))
+            .process_stream(stream, &resampled, |p| probs.push(p))
         {
             // Don't crash the live loop on a transient inference error —
             // the next poll tick will retry with fresh audio.
             warn!("silero inference failed: {e}");
-            return None;
+            return Vec::new();
         }
-        latest
+        probs
     }
 
     /// Batch-score a full historical buffer (backfill use case). Returns
@@ -243,18 +246,43 @@ mod tests {
             return;
         };
         let mut source = SileroSource::new(0);
-        // 100 ms of silence at 16 kHz = 1600 samples
+        // 100 ms of silence at 16 kHz = 1600 samples → 3 Silero frames (3 × 512).
         let silence = vec![0.0f32; 1_600];
-        let prob = vad.score_stream(&mut source.stream, &silence, 16_000);
-        let prob = prob.expect("should produce >=1 probability for 100ms input");
+        let probs = vad.score_stream(&mut source.stream, &silence, 16_000);
         assert!(
-            (0.0..=1.0).contains(&prob),
-            "probability must be in [0,1], got {prob}"
+            !probs.is_empty(),
+            "expected >=1 probability for 100ms input"
         );
-        // Silence should score well below the speech threshold.
-        assert!(
-            prob < SPEECH_THRESHOLD,
-            "pure silence should not cross speech threshold; got {prob}"
+        for p in &probs {
+            assert!(
+                (0.0..=1.0).contains(p),
+                "probability must be in [0,1], got {p}"
+            );
+            assert!(
+                *p < SPEECH_THRESHOLD,
+                "pure silence should not cross speech threshold; got {p}"
+            );
+        }
+    }
+
+    #[test]
+    fn silero_emits_one_prob_per_32ms_frame() {
+        // Guard the frame cadence — Silero V5 at 16 kHz emits one prob per
+        // 512-sample (32 ms) chunk. We rely on this in the live loop to
+        // feed each frame into the VAD state machine separately.
+        let Ok(mut vad) = SileroVad::new() else {
+            eprintln!("skipping: Silero session init failed (ort unavailable)");
+            return;
+        };
+        let mut source = SileroSource::new(0);
+        // Exactly 5 frames (5 × 512 = 2560 samples at 16 kHz = 160 ms).
+        let silence = vec![0.0f32; 512 * 5];
+        let probs = vad.score_stream(&mut source.stream, &silence, 16_000);
+        assert_eq!(
+            probs.len(),
+            5,
+            "expected 5 probs for 5 × 512 samples; got {}",
+            probs.len()
         );
     }
 }
