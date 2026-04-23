@@ -1149,11 +1149,8 @@ fn backfill_chunks_from_probabilities(
     let mut speech_start: usize = 0;
     let mut silence_run: usize = 0;
     let mut speech_run: usize = 0;
-    // Lower bound for onset pre-roll — mirrors the live loop's
-    // `earliest_next_chunk_pos` clamp in `poll_vad`. Without this, two
-    // utterances separated by less than `pre_roll` would overlap: the
-    // second onset would rewind into the first chunk's tail and the
-    // transcriber would see the same audio twice.
+    // Pre-roll must not rewind past the last emitted chunk's end, or the
+    // next chunk would re-transcribe the tail of the previous one.
     let mut prev_chunk_end: usize = 0;
 
     for (frame_idx, &prob) in probabilities.iter().enumerate() {
@@ -2009,22 +2006,22 @@ async fn live_transcription_loop(
                     .map(|(_, p)| p.as_slice())
                     .unwrap_or(&[]);
 
-                let mut summary = VadAction::None;
+                let mut best_action = VadAction::None;
                 if probs.is_empty() {
                     // Sticky fallback: no new frames in this batch. Use
                     // last_probability so the state machine keeps running
                     // against the most recent signal rather than freezing.
                     let action = poll_vad(source, source.silero.last_probability, &tuning);
                     if matches!(action, VadAction::Chunk | VadAction::ForceChunk) {
-                        summary = action;
+                        best_action = action;
                     }
                 } else {
                     for &prob in probs {
                         let action = poll_vad(source, Some(prob), &tuning);
                         match action {
-                            VadAction::ForceChunk => summary = VadAction::ForceChunk,
-                            VadAction::Chunk if !matches!(summary, VadAction::ForceChunk) => {
-                                summary = VadAction::Chunk;
+                            VadAction::ForceChunk => best_action = VadAction::ForceChunk,
+                            VadAction::Chunk if !matches!(best_action, VadAction::ForceChunk) => {
+                                best_action = VadAction::Chunk;
                             }
                             _ => {}
                         }
@@ -2032,9 +2029,9 @@ async fn live_transcription_loop(
                 }
 
                 if should_stop && source.is_speaking {
-                    summary = VadAction::Chunk;
+                    best_action = VadAction::Chunk;
                 }
-                summary
+                best_action
             })
             .collect();
 
