@@ -49,6 +49,9 @@ pub enum AudioError {
 
     #[error("MP3 encoding failed: {0}")]
     Mp3Encode(String),
+
+    #[error("invalid MP3 bitrate: {0} kbps (allowed: 8, 16, 24, 32, 40, 48, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320)")]
+    InvalidBitrate(u16),
 }
 
 impl From<cpal::DevicesError> for AudioError {

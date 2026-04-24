@@ -6,6 +6,14 @@ use yapstack_common::types::CaptureSource;
 pub struct CapturedAudio {
     pub mic_samples: Vec<f32>,
     pub system_samples: Vec<f32>,
+    /// Rate of `mic_samples` when present. Callers routing mic-only output must
+    /// use this rather than the catch-all `sample_rate` field.
+    pub mic_sample_rate: Option<u32>,
+    /// Rate of `system_samples` when present. Callers routing system-only
+    /// output must use this rather than the catch-all `sample_rate` field.
+    pub system_sample_rate: Option<u32>,
+    /// Representative rate for mixed output (mic preferred). Do not use for
+    /// SystemOnly exports when a stale mic buffer may be present.
     pub sample_rate: u32,
     pub channels: u16,
     pub duration_seconds: f32,

@@ -196,7 +196,13 @@ impl From<TranscriptionResult> for TranscriptionResultDto {
 // --- State types ---
 
 pub type ModelManagerState = Arc<Mutex<ModelManager>>;
-pub type TranscriptionClientState = Arc<Mutex<Option<TranscriptionClient>>>;
+/// The transcription client is wrapped in `Arc` so `transcribe_audio` can
+/// clone a handle out of the state and drop the outer mutex guard before
+/// awaiting the sidecar round-trip. `TranscriptionClient` serializes stdin
+/// writes internally and demuxes responses via per-request oneshots, so
+/// multiple concurrent `&self` calls are safe — the outer mutex only guards
+/// initialization and teardown.
+pub type TranscriptionClientState = Arc<Mutex<Option<Arc<TranscriptionClient>>>>;
 
 // --- Commands ---
 
@@ -276,8 +282,16 @@ pub async fn transcribe_audio(
     initial_prompt: Option<String>,
 ) -> Result<TranscriptionResultDto, CommandError> {
     info!(path = %audio_path, language = ?language, "transcribing audio");
-    let mut client_guard = state.lock().await;
-    let client = client_guard.as_mut().ok_or(CommandError::NotInitialized {
+    // Clone the Arc<TranscriptionClient> out of the mutex and release the
+    // outer guard immediately. The sidecar round-trip can take seconds;
+    // holding the guard across it would serialize every other consumer of
+    // the client (shutdown, init, live transcription startup) behind this
+    // single transcribe call.
+    let client = {
+        let client_guard = state.lock().await;
+        client_guard.as_ref().cloned()
+    }
+    .ok_or(CommandError::NotInitialized {
         message: "transcription engine not initialized".into(),
     })?;
 
@@ -308,11 +322,18 @@ pub async fn shutdown_transcription_client(
     state: tauri::State<'_, TranscriptionClientState>,
 ) -> Result<(), CommandError> {
     info!("shutting down transcription client");
-    let mut client_guard = state.lock().await;
-    if let Some(ref mut client) = *client_guard {
+    // Take the Arc out of the state so new `transcribe_audio` calls see None,
+    // then request graceful shutdown. `shutdown` takes `&self` (it writes a
+    // shutdown request through the internal tokio mutex on stdin), so any
+    // concurrent handle held by an in-flight transcribe still sees a clean
+    // sidecar wind-down rather than a hard process kill.
+    let arc_client = {
+        let mut client_guard = state.lock().await;
+        client_guard.take()
+    };
+    if let Some(client) = arc_client {
         client.shutdown().await.map_err(CommandError::from)?;
     }
-    *client_guard = None;
     Ok(())
 }
 
@@ -588,7 +609,7 @@ pub async fn init_transcription_client(
     })?;
 
     let mut guard = transcription_state.lock().await;
-    *guard = Some(client);
+    *guard = Some(Arc::new(client));
     info!(
         "transcription client initialized: engine={}",
         engine_kind.as_str()

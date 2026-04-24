@@ -4,10 +4,43 @@ use std::mem::MaybeUninit;
 use std::path::{Path, PathBuf};
 
 use hound::{SampleFormat, WavSpec, WavWriter};
-use mp3lame_encoder::{Builder as LameBuilder, FlushNoGap, InterleavedPcm, MonoPcm};
+use mp3lame_encoder::{Bitrate, Builder as LameBuilder, FlushNoGap, InterleavedPcm, MonoPcm};
 use tempfile::Builder;
 
 use crate::error::AudioError;
+
+/// Command-boundary validator: returns `Ok(())` for a valid MP3 bitrate,
+/// `Err(AudioError::InvalidBitrate)` otherwise. Callers that accept a user
+/// bitrate should invoke this *before* doing any export work so a rejection
+/// doesn't leave a half-written WAV on disk or consume the session's audio.
+pub fn validate_mp3_bitrate(kbps: u16) -> Result<()> {
+    mp3_bitrate_from_kbps(kbps).map(|_| ())
+}
+
+/// Maps a user-supplied MP3 bitrate (kbps) to the exact `Bitrate` enum variant.
+/// Rejects any kbps value not matching a valid MP3 bitrate, so callers cannot
+/// smuggle arbitrary u16 values into the LAME encoder.
+fn mp3_bitrate_from_kbps(kbps: u16) -> Result<Bitrate> {
+    Ok(match kbps {
+        8 => Bitrate::Kbps8,
+        16 => Bitrate::Kbps16,
+        24 => Bitrate::Kbps24,
+        32 => Bitrate::Kbps32,
+        40 => Bitrate::Kbps40,
+        48 => Bitrate::Kbps48,
+        64 => Bitrate::Kbps64,
+        80 => Bitrate::Kbps80,
+        96 => Bitrate::Kbps96,
+        112 => Bitrate::Kbps112,
+        128 => Bitrate::Kbps128,
+        160 => Bitrate::Kbps160,
+        192 => Bitrate::Kbps192,
+        224 => Bitrate::Kbps224,
+        256 => Bitrate::Kbps256,
+        320 => Bitrate::Kbps320,
+        _ => return Err(AudioError::InvalidBitrate(kbps)),
+    })
+}
 
 type Result<T> = std::result::Result<T, AudioError>;
 
@@ -122,9 +155,7 @@ pub fn convert_wav_to_mp3(wav_path: &Path, bitrate_kbps: u16) -> Result<PathBuf>
     encoder
         .set_num_channels(spec.channels as u8)
         .map_err(|e| AudioError::Mp3Encode(format!("set_num_channels: {e:?}")))?;
-    // Safety: Bitrate is repr(u16) with variants matching standard MP3 bitrates.
-    // The caller must pass a valid MP3 bitrate (e.g. 64, 128, 192, 256, 320).
-    let bitrate: mp3lame_encoder::Bitrate = unsafe { std::mem::transmute(bitrate_kbps) };
+    let bitrate = mp3_bitrate_from_kbps(bitrate_kbps)?;
     encoder
         .set_brate(bitrate)
         .map_err(|e| AudioError::Mp3Encode(format!("set_brate: {e:?}")))?;
@@ -136,51 +167,63 @@ pub fn convert_wav_to_mp3(wav_path: &Path, bitrate_kbps: u16) -> Result<PathBuf>
         .build()
         .map_err(|e| AudioError::Mp3Encode(format!("build: {e:?}")))?;
 
-    let samples: Vec<i16> = match spec.sample_format {
-        SampleFormat::Int => reader
-            .samples::<i16>()
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|e| AudioError::Mp3Encode(e.to_string()))?,
-        SampleFormat::Float => reader
-            .samples::<f32>()
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|e| AudioError::Mp3Encode(e.to_string()))?
-            .iter()
-            .map(|&s| f32_to_i16(s))
-            .collect(),
-    };
-
     let mp3_path = wav_path.with_extension("mp3");
     let mut mp3_file =
         BufWriter::new(File::create(&mp3_path).map_err(|e| AudioError::Mp3Encode(e.to_string()))?);
 
-    const CHUNK_SIZE: usize = 8192;
-    let max_buf = mp3lame_encoder::max_required_buffer_size(CHUNK_SIZE * spec.channels as usize);
+    const CHUNK_FRAMES: usize = 8192;
+    let samples_per_chunk = CHUNK_FRAMES * spec.channels as usize;
+    let max_buf = mp3lame_encoder::max_required_buffer_size(samples_per_chunk);
     let mut mp3_buf: Vec<MaybeUninit<u8>> = vec![MaybeUninit::uninit(); max_buf];
+    let mut sample_buf: Vec<i16> = Vec::with_capacity(samples_per_chunk);
 
-    if spec.channels == 1 {
-        for chunk in samples.chunks(CHUNK_SIZE) {
-            let bytes_written = encoder
-                .encode(MonoPcm(chunk), &mut mp3_buf)
-                .map_err(|e| AudioError::Mp3Encode(format!("encode: {e:?}")))?;
-            let written =
-                unsafe { std::slice::from_raw_parts(mp3_buf.as_ptr().cast::<u8>(), bytes_written) };
-            mp3_file
-                .write_all(written)
-                .map_err(|e| AudioError::Mp3Encode(e.to_string()))?;
+    let flush_chunk = |sample_buf: &mut Vec<i16>,
+                       encoder: &mut mp3lame_encoder::Encoder,
+                       mp3_buf: &mut Vec<MaybeUninit<u8>>,
+                       mp3_file: &mut BufWriter<File>|
+     -> Result<()> {
+        if sample_buf.is_empty() {
+            return Ok(());
         }
-    } else {
-        for chunk in samples.chunks(CHUNK_SIZE * spec.channels as usize) {
-            let bytes_written = encoder
-                .encode(InterleavedPcm(chunk), &mut mp3_buf)
-                .map_err(|e| AudioError::Mp3Encode(format!("encode: {e:?}")))?;
-            let written =
-                unsafe { std::slice::from_raw_parts(mp3_buf.as_ptr().cast::<u8>(), bytes_written) };
-            mp3_file
-                .write_all(written)
-                .map_err(|e| AudioError::Mp3Encode(e.to_string()))?;
+        let bytes_written = if spec.channels == 1 {
+            encoder
+                .encode(MonoPcm(sample_buf), mp3_buf)
+                .map_err(|e| AudioError::Mp3Encode(format!("encode: {e:?}")))?
+        } else {
+            encoder
+                .encode(InterleavedPcm(sample_buf), mp3_buf)
+                .map_err(|e| AudioError::Mp3Encode(format!("encode: {e:?}")))?
+        };
+        let written =
+            unsafe { std::slice::from_raw_parts(mp3_buf.as_ptr().cast::<u8>(), bytes_written) };
+        mp3_file
+            .write_all(written)
+            .map_err(|e| AudioError::Mp3Encode(e.to_string()))?;
+        sample_buf.clear();
+        Ok(())
+    };
+
+    match spec.sample_format {
+        SampleFormat::Int => {
+            for sample in reader.samples::<i16>() {
+                let s = sample.map_err(|e| AudioError::Mp3Encode(e.to_string()))?;
+                sample_buf.push(s);
+                if sample_buf.len() >= samples_per_chunk {
+                    flush_chunk(&mut sample_buf, &mut encoder, &mut mp3_buf, &mut mp3_file)?;
+                }
+            }
+        }
+        SampleFormat::Float => {
+            for sample in reader.samples::<f32>() {
+                let s = sample.map_err(|e| AudioError::Mp3Encode(e.to_string()))?;
+                sample_buf.push(f32_to_i16(s));
+                if sample_buf.len() >= samples_per_chunk {
+                    flush_chunk(&mut sample_buf, &mut encoder, &mut mp3_buf, &mut mp3_file)?;
+                }
+            }
         }
     }
+    flush_chunk(&mut sample_buf, &mut encoder, &mut mp3_buf, &mut mp3_file)?;
 
     let mut flush_buf: Vec<MaybeUninit<u8>> =
         vec![MaybeUninit::uninit(); mp3lame_encoder::max_required_buffer_size(0)];
@@ -377,6 +420,43 @@ mod tests {
         assert!(mp3_path.exists());
         assert!(!wav_path.exists(), "original WAV should be deleted");
         assert!(fs::metadata(&mp3_path).unwrap().len() > 0);
+    }
+
+    #[test]
+    fn test_convert_wav_to_mp3_rejects_invalid_bitrate() {
+        let dir = tempfile::tempdir().unwrap();
+        let wav_path = dir.path().join("invalid_bitrate.wav");
+        let samples = vec![0.0f32; 16000];
+        write_wav(&samples, 16000, 1, &wav_path).unwrap();
+
+        // 100 kbps is not a valid MP3 bitrate.
+        let err = convert_wav_to_mp3(&wav_path, 100).unwrap_err();
+        assert!(matches!(err, AudioError::InvalidBitrate(100)));
+    }
+
+    #[test]
+    fn test_mp3_bitrate_mapping_accepts_all_valid_kbps() {
+        for kbps in [
+            8, 16, 24, 32, 40, 48, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320,
+        ] {
+            assert!(
+                mp3_bitrate_from_kbps(kbps).is_ok(),
+                "{kbps} kbps should be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn test_mp3_bitrate_mapping_rejects_invalid_kbps() {
+        for kbps in [0, 1, 100, 200, 321, 1000] {
+            assert!(
+                matches!(
+                    mp3_bitrate_from_kbps(kbps),
+                    Err(AudioError::InvalidBitrate(_))
+                ),
+                "{kbps} kbps should be rejected"
+            );
+        }
     }
 
     #[test]
