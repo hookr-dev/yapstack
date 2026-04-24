@@ -149,8 +149,9 @@ struct SessionWavState {
     flush_count: u32,
     /// Sample rate the WAV file's header was opened with. If a source's
     /// ring buffer gets replaced at a different sample rate mid-session
-    /// (device format change), the archived WAV will have a speed artifact
-    /// for the new segment — we warn but don't try to resample.
+    /// (device format change), subsequent extracted samples are resampled
+    /// to this rate before `write_samples` so the archived file plays at
+    /// a single consistent speed.
     wav_sample_rate: u32,
 }
 
@@ -1667,8 +1668,8 @@ async fn check_stream_health(
                             AudioSourceLabel::System => ws.flush_positions.system_pos = new_pos,
                         }
                         if sr != ws.wav_sample_rate {
-                            warn!(
-                                "WAV sample-rate mismatch on {} rebind: writer={}Hz, new buffer={}Hz — archived audio from this point will play at the writer's rate",
+                            info!(
+                                "WAV sample-rate mismatch on {} rebind: writer={}Hz, new buffer={}Hz — extracted samples will be resampled on write",
                                 source_name, ws.wav_sample_rate, sr
                             );
                         }
@@ -2006,13 +2007,38 @@ async fn live_transcription_loop(
         }
 
         // Write WAV data outside the lock
-        if let Some((samples, _sr, new_pos)) = wav_flush_data {
+        if let Some((samples, sr, new_pos)) = wav_flush_data {
             wav_flush_none_count = 0;
             if let Some(ref mut ws) = session_wav_state {
-                if let Err(e) = ws.writer.write_samples(&samples) {
+                // If a mid-session buffer rebind left the extraction at a
+                // different sample rate than the WAV header, resample before
+                // appending so the archived file plays at a single consistent
+                // speed. `yapstack_common::audio::resample` zero-copies when
+                // `sr == ws.wav_sample_rate`.
+                let to_write: std::borrow::Cow<[f32]> = if sr == ws.wav_sample_rate {
+                    std::borrow::Cow::Borrowed(&samples)
+                } else {
+                    match yapstack_common::audio::resample(&samples, sr, ws.wav_sample_rate) {
+                        Ok(cow) => std::borrow::Cow::Owned(cow.into_owned()),
+                        Err(e) => {
+                            error!(
+                                "WAV resample {}Hz → {}Hz failed, dropping {} samples: {}",
+                                sr,
+                                ws.wav_sample_rate,
+                                samples.len(),
+                                e
+                            );
+                            // Advance positions regardless — retrying would
+                            // re-extract the same samples next tick.
+                            ws.flush_positions = new_pos;
+                            continue;
+                        }
+                    }
+                };
+                if let Err(e) = ws.writer.write_samples(&to_write) {
                     error!(
                         "session WAV write error ({} samples may be lost): {}",
-                        samples.len(),
+                        to_write.len(),
                         e
                     );
                 }
@@ -2390,9 +2416,25 @@ async fn live_transcription_loop(
             let manager = audio_state.lock().await;
             manager.extract_since(&ws.flush_positions, ws.source, ws.mix_config.as_ref())
         };
-        if let Some((samples, _sr, _new_pos)) = final_flush {
-            if let Err(e) = ws.writer.write_samples(&samples) {
-                error!("session WAV final flush write failed: {}", e);
+        if let Some((samples, sr, _new_pos)) = final_flush {
+            let to_write: std::borrow::Cow<[f32]> = if sr == ws.wav_sample_rate {
+                std::borrow::Cow::Borrowed(&samples)
+            } else {
+                match yapstack_common::audio::resample(&samples, sr, ws.wav_sample_rate) {
+                    Ok(cow) => std::borrow::Cow::Owned(cow.into_owned()),
+                    Err(e) => {
+                        error!(
+                            "session WAV final flush resample {}Hz → {}Hz failed, dropping {} samples: {}",
+                            sr, ws.wav_sample_rate, samples.len(), e
+                        );
+                        std::borrow::Cow::Owned(Vec::new())
+                    }
+                }
+            };
+            if !to_write.is_empty() {
+                if let Err(e) = ws.writer.write_samples(&to_write) {
+                    error!("session WAV final flush write failed: {}", e);
+                }
             }
         }
 
