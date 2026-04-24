@@ -2375,37 +2375,101 @@ async fn live_transcription_loop(
             "live transcription stop: draining {} in-flight chunk tasks",
             chunk_tasks.len()
         );
-        // Cancel everything still running so the drain completes promptly
-        // and each task's `Arc<TranscriptionClient>` clone is released —
-        // otherwise the post-loop try_unwrap fails and shared state is
-        // left empty, which surfaces as "transcription client not
-        // initialized" on the next session/dictation. transcribe_with
-        // awaits a oneshot internally; abort drops the receiver cleanly,
-        // and the sidecar's eventual response is harmlessly orphaned by
-        // the reader task.
-        for ah in chunk_aborts.drain(..) {
-            ah.abort();
-        }
-        // Bounded wait so a hanging sidecar can't indefinitely block the
-        // stop path. With abort above, tasks normally complete in <1s.
-        // The per-task timeout inside transcribe_with is 300s; the 10s
-        // outer cap stays as a belt-and-suspenders measure.
         use futures_util::stream::StreamExt;
-        let drain = async {
-            while let Some(outcome) = chunk_tasks.next().await {
-                if outcome.sidecar_dead {
-                    warn!("drained chunk task reported sidecar dead");
+
+        // Phase 1 — graceful drain. `should_stop` already forced a final chunk
+        // for any actively-speaking source earlier in the loop, *unless* that
+        // source already had a task in-flight (the in_flight gate skipped it).
+        // Collect outcomes so source state can be restored and the blocked
+        // source can issue its deferred final chunk in Phase 3.
+        let mut drained_outcomes: Vec<ChunkTaskOutcome> = Vec::new();
+        let graceful_timed_out = {
+            let drain = async {
+                while let Some(outcome) = chunk_tasks.next().await {
+                    if outcome.sidecar_dead {
+                        warn!("drained chunk task reported sidecar dead");
+                    }
+                    drained_outcomes.push(outcome);
+                }
+            };
+            tokio::time::timeout(Duration::from_secs(10), drain)
+                .await
+                .is_err()
+        };
+
+        // Restore source state from completed outcomes so a source whose
+        // final-chunk dispatch was gated by `has_in_flight_task` becomes
+        // eligible to dispatch its pending speech in Phase 3.
+        for outcome in drained_outcomes {
+            for source in sources.iter_mut() {
+                if source.label == outcome.source_label {
+                    source.has_in_flight_task = false;
+                    source.accumulated_text = outcome.accumulated_text;
+                    break;
                 }
             }
-        };
-        if tokio::time::timeout(Duration::from_secs(10), drain)
-            .await
-            .is_err()
-        {
+        }
+
+        // Phase 2 — abort only on timeout. A hanging sidecar can't indefinitely
+        // block the stop path; we also need each task's `Arc<TranscriptionClient>`
+        // clone released so the post-loop try_unwrap succeeds and shared state is
+        // restored. transcribe_with awaits a oneshot internally; abort drops the
+        // receiver cleanly and the sidecar's response is harmlessly orphaned.
+        if graceful_timed_out {
             warn!(
-                "live transcription stop: chunk task drain timed out after 10s; \
-                 any unfinished chunks will be dropped"
+                "live transcription stop: chunk task drain exceeded 10s; \
+                 aborting remaining tasks to reclaim shared state"
             );
+            for ah in chunk_aborts.drain(..) {
+                ah.abort();
+            }
+            let _ = tokio::time::timeout(Duration::from_secs(2), async {
+                while chunk_tasks.next().await.is_some() {}
+            })
+            .await;
+        }
+    }
+
+    // Phase 3 — final pending-speech dispatch. Any source whose stop-time
+    // `VadAction::Chunk` was skipped because a previous task was still
+    // running now has un-transcribed audio between its frozen
+    // `speech_start_pos` and the current write_pos. Dispatch one synchronous
+    // chunk per source so the final segment lands before we finalize.
+    for source in sources.iter_mut() {
+        if source.has_in_flight_task {
+            // Phase 2 timeout path — we aborted without an outcome landing.
+            // Skipping is safe: the source's state is already considered lost.
+            continue;
+        }
+        let has_pending = {
+            let manager = audio_state.lock().await;
+            let write_pos = source_write_pos(&manager, &source.label);
+            write_pos > source.speech_start_pos
+        };
+        if !has_pending {
+            continue;
+        }
+        debug!(
+            "live transcription stop: dispatching final pending chunk for {:?} \
+             (speech_start_pos={}, blocked by prior in-flight task)",
+            source.label, source.speech_start_pos
+        );
+        let prepared = prepare_chunk_dispatch(source, &audio_state, true, false).await;
+        if let Some(prepared) = prepared {
+            let task_ctx = ctx.clone();
+            let task_session = session.clone();
+            let source_label = prepared.source_label;
+            let final_task = run_chunk_task(prepared, task_ctx, task_session);
+            if tokio::time::timeout(Duration::from_secs(10), final_task)
+                .await
+                .is_err()
+            {
+                warn!(
+                    "live transcription stop: final pending chunk for {:?} exceeded 10s — \
+                     segment may be lost",
+                    source_label
+                );
+            }
         }
     }
 
@@ -2849,6 +2913,18 @@ pub async fn start_live_transcription(
             });
         }
     }
+    // Validate MP3 bitrate now so a misconfigured session doesn't fail late,
+    // after the buffer has been drained into the session WAV with no recovery.
+    let will_write_mp3 = config.audio_export_format.as_deref().unwrap_or("mp3") != "wav";
+    if will_write_mp3 {
+        if let Some(kbps) = config.mp3_bitrate {
+            yapstack_audio::export::validate_mp3_bitrate(kbps).map_err(|e| {
+                CommandError::InvalidInput {
+                    message: e.to_string(),
+                }
+            })?;
+        }
+    }
 
     // Pre-flight: restart any silently-stalled capture streams before we
     // read backfill or spawn the loop. Without this, the first dictation
@@ -3023,6 +3099,9 @@ pub async fn start_live_transcription(
 
     // Extract the transcription client only after all fallible setup above
     // succeeds. This avoids losing the client on early-return setup errors.
+    // The client is already `Arc<TranscriptionClient>` in shared state —
+    // take() moves the Arc into the live context so other commands that
+    // `lock + as_ref().cloned()` see `None` while the live loop owns it.
     let extracted_client = {
         let mut client_guard = transcription_state.lock().await;
         client_guard.take().ok_or(CommandError::NotInitialized {
@@ -3031,7 +3110,7 @@ pub async fn start_live_transcription(
     };
 
     let ctx = TranscriptionContext {
-        transcription_client: Arc::new(Mutex::new(Some(Arc::new(extracted_client)))),
+        transcription_client: Arc::new(Mutex::new(Some(extracted_client))),
         shared_transcription_state: transcription_state_clone,
         app_handle,
         config,
@@ -3051,32 +3130,16 @@ pub async fn start_live_transcription(
             .await;
 
             // Always return the transcription client to shared state, even
-            // after a panic. The client is held as `Arc<TranscriptionClient>`
-            // during the loop so concurrent chunk tasks can each hold a ref;
-            // by the time we get here, the loop has joined and we should be
-            // the last Arc holder. If try_unwrap fails it means a task is
-            // leaking a clone — log loudly and drop, which is still safe
-            // (the Drop impl kills the sidecar process).
+            // after a panic. Both private and shared state hold
+            // `Arc<TranscriptionClient>`, so the Arc moves straight back —
+            // no `try_unwrap` dance, and a chunk task that leaked a clone
+            // won't strand shared state empty.
             {
                 let mut private_guard = ctx_guard.transcription_client.lock().await;
                 if let Some(arc_client) = private_guard.take() {
-                    match Arc::try_unwrap(arc_client) {
-                        Ok(client) => {
-                            let mut shared_guard =
-                                ctx_guard.shared_transcription_state.lock().await;
-                            *shared_guard = Some(client);
-                            debug!("returned transcription client to shared state");
-                        }
-                        Err(_still_shared) => {
-                            error!(
-                                "live transcription ended but a task still holds the \
-                                 transcription client — shared state left empty; \
-                                 subsequent sessions and dictation will fail with \
-                                 NotInitialized until the app restarts. This means a \
-                                 chunk task did not respond to abort; please report."
-                            );
-                        }
-                    }
+                    let mut shared_guard = ctx_guard.shared_transcription_state.lock().await;
+                    *shared_guard = Some(arc_client);
+                    debug!("returned transcription client to shared state");
                 }
             }
 

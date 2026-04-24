@@ -108,52 +108,38 @@ pub async fn export_session_wav(
 ) -> Result<SessionWavResultDto, CommandError> {
     validate_session_id(&session_id)?;
     info!(session_id = %session_id, duration = duration_seconds, "exporting session WAV");
-    let manager = state.lock().await;
 
-    // Get all available audio from the buffers
-    let captured = manager.extract_captured_audio(duration_seconds);
-    drop(manager);
-
-    let mix = mix_config.map(|c| c.into());
-    let samples = match source.into() {
-        yapstack_common::types::CaptureSource::MicOnly => {
-            if captured.mic_samples.is_empty() {
-                return Err(CommandError::Audio {
-                    message: "No mic audio available".into(),
-                });
+    // Reject invalid MP3 bitrate *before* we read the buffer and write any
+    // WAV data; otherwise an invalid kbps would fail inside conversion after
+    // the audio is already drained, leaving a stranded WAV on disk.
+    let use_mp3 = audio_export_format.as_deref().unwrap_or("mp3") != "wav";
+    let effective_bitrate = mp3_bitrate.unwrap_or(64);
+    if use_mp3 {
+        yapstack_audio::export::validate_mp3_bitrate(effective_bitrate).map_err(|e| {
+            CommandError::InvalidInput {
+                message: e.to_string(),
             }
-            captured.mic_samples
-        }
-        yapstack_common::types::CaptureSource::SystemOnly => {
-            if captured.system_samples.is_empty() {
-                return Err(CommandError::Audio {
-                    message: "No system audio available".into(),
-                });
-            }
-            captured.system_samples
-        }
-        yapstack_common::types::CaptureSource::Mixed => {
-            if captured.mic_samples.is_empty() && captured.system_samples.is_empty() {
-                return Err(CommandError::Audio {
-                    message: "No audio available".into(),
-                });
-            }
-            let config = mix.unwrap_or_default();
-            yapstack_audio::mixer::mix_to_mono(
-                &captured.mic_samples,
-                &captured.system_samples,
-                &config,
-            )
-        }
-    };
-
-    if samples.is_empty() {
-        return Err(CommandError::Audio {
-            message: "No audio data to export".into(),
-        });
+        })?;
     }
 
-    let duration = samples.len() as f32 / captured.sample_rate as f32;
+    let manager = state.lock().await;
+
+    let mix = mix_config.map(|c| c.into());
+    let domain_source: yapstack_common::types::CaptureSource = source.into();
+    let (samples, sample_rate) = manager
+        .extract_source_samples(duration_seconds, domain_source, mix.as_ref())
+        .map_err(|_| CommandError::Audio {
+            message: match domain_source {
+                yapstack_common::types::CaptureSource::MicOnly => "No mic audio available".into(),
+                yapstack_common::types::CaptureSource::SystemOnly => {
+                    "No system audio available".into()
+                }
+                yapstack_common::types::CaptureSource::Mixed => "No audio available".into(),
+            },
+        })?;
+    drop(manager);
+
+    let duration = samples.len() as f32 / sample_rate as f32;
 
     // Write to persistent path
     let audio_dir = if let Some(ref custom_dir) = audio_save_location {
@@ -170,12 +156,11 @@ pub async fn export_session_wav(
     std::fs::create_dir_all(&audio_dir)?;
 
     let wav_path = audio_dir.join(format!("{session_id}.wav"));
-    yapstack_audio::export::write_wav(&samples, captured.sample_rate, 1, &wav_path)
+    yapstack_audio::export::write_wav(&samples, sample_rate, 1, &wav_path)
         .map_err(CommandError::from)?;
 
-    let use_mp3 = audio_export_format.as_deref().unwrap_or("mp3") != "wav";
     let final_path = if use_mp3 {
-        yapstack_audio::export::convert_wav_to_mp3(&wav_path, mp3_bitrate.unwrap_or(64))
+        yapstack_audio::export::convert_wav_to_mp3(&wav_path, effective_bitrate)
             .map_err(CommandError::from)?
     } else {
         wav_path

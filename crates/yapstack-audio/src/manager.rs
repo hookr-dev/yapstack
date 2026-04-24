@@ -258,6 +258,31 @@ impl AudioManager {
             .unwrap_or(yapstack_common::config::DEFAULT_SAMPLE_RATE)
     }
 
+    /// Returns the sample rate tied to the buffer whose samples the caller
+    /// actually receives for `source`. Using `active_sample_rate()` here would
+    /// return the mic rate even for SystemOnly callers with a stale mic buffer
+    /// present, producing wrong-rate WAV metadata. For Mixed, mic's rate wins
+    /// because `resample_and_mix` upsamples system to mic's rate.
+    fn sample_rate_for_source(&self, source: CaptureSource) -> u32 {
+        match source {
+            CaptureSource::MicOnly => self
+                .mic_buffer
+                .as_ref()
+                .map(|b| b.sample_rate())
+                .unwrap_or_else(|| self.active_sample_rate()),
+            CaptureSource::SystemOnly => self
+                .system_buffer
+                .as_ref()
+                .map(|b| b.sample_rate())
+                .unwrap_or_else(|| self.active_sample_rate()),
+            CaptureSource::Mixed => match (self.mic_buffer.as_ref(), self.system_buffer.as_ref()) {
+                (Some(mb), _) => mb.sample_rate(),
+                (None, Some(sb)) => sb.sample_rate(),
+                (None, None) => self.active_sample_rate(),
+            },
+        }
+    }
+
     /// Resample system audio to match mic rate (if different) and mix to mono.
     /// Used by instant capture, extract_since, and end_session.
     /// On resample failure, logs the error and falls back to mic-only audio.
@@ -305,27 +330,31 @@ impl AudioManager {
     /// callers must resample before mixing — see `trigger_instant_capture` and
     /// `end_session` for examples.
     pub fn extract_captured_audio(&self, duration_seconds: f32) -> CapturedAudio {
-        let mic_samples = self
-            .mic_buffer
-            .as_ref()
-            .map(|b| {
-                let sample_count =
-                    (duration_seconds * b.sample_rate() as f32 * b.channels() as f32) as usize;
-                let raw = b.snapshot_samples(sample_count);
-                mixer::deinterleave_to_mono(&raw, b.channels()).into_owned()
-            })
-            .unwrap_or_default();
+        let mic = self.mic_buffer.as_ref().map(|b| {
+            let sample_count =
+                (duration_seconds * b.sample_rate() as f32 * b.channels() as f32) as usize;
+            let raw = b.snapshot_samples(sample_count);
+            (
+                mixer::deinterleave_to_mono(&raw, b.channels()).into_owned(),
+                b.sample_rate(),
+            )
+        });
 
-        let system_samples = self
-            .system_buffer
-            .as_ref()
-            .map(|b| {
-                let sample_count =
-                    (duration_seconds * b.sample_rate() as f32 * b.channels() as f32) as usize;
-                let raw = b.snapshot_samples(sample_count);
-                mixer::deinterleave_to_mono(&raw, b.channels()).into_owned()
-            })
-            .unwrap_or_default();
+        let system = self.system_buffer.as_ref().map(|b| {
+            let sample_count =
+                (duration_seconds * b.sample_rate() as f32 * b.channels() as f32) as usize;
+            let raw = b.snapshot_samples(sample_count);
+            (
+                mixer::deinterleave_to_mono(&raw, b.channels()).into_owned(),
+                b.sample_rate(),
+            )
+        });
+
+        let mic_sample_rate = mic.as_ref().map(|(_, r)| *r);
+        let system_sample_rate = system.as_ref().map(|(_, r)| *r);
+
+        let mic_samples = mic.map(|(s, _)| s).unwrap_or_default();
+        let system_samples = system.map(|(s, _)| s).unwrap_or_default();
 
         let sample_rate = self.active_sample_rate();
 
@@ -335,23 +364,26 @@ impl AudioManager {
         CapturedAudio {
             mic_samples,
             system_samples,
+            mic_sample_rate,
+            system_sample_rate,
             sample_rate,
             channels: 1,
             duration_seconds: actual_duration,
         }
     }
 
-    /// Performs an instant capture of the last N seconds, writing to a temp WAV file.
-    ///
-    /// All audio is deinterleaved to mono before export. The WAV file is always
-    /// single-channel at the buffer's native sample rate.
-    pub fn trigger_instant_capture(
+    /// Extracts mono audio for a single source over the last `seconds` window
+    /// and returns `(samples, sample_rate)`. For Mixed, resamples system to
+    /// mic's rate before mixing. Returns `Err(NoBufferAvailable)` if the
+    /// requested source has no data.
+    pub fn extract_source_samples(
         &self,
         seconds: f32,
         source: CaptureSource,
         mix_config: Option<&MixConfig>,
-    ) -> Result<CaptureResult> {
+    ) -> Result<(Vec<f32>, u32)> {
         let captured = self.extract_captured_audio(seconds);
+        let sample_rate = self.sample_rate_for_source(source);
 
         let samples = match source {
             CaptureSource::MicOnly => {
@@ -378,13 +410,28 @@ impl AudioManager {
             return Err(AudioError::NoBufferAvailable);
         }
 
-        let duration_seconds = samples.len() as f32 / captured.sample_rate as f32;
-        let file_path = export::write_wav_to_temp(&samples, captured.sample_rate, 1)?;
+        Ok((samples, sample_rate))
+    }
+
+    /// Performs an instant capture of the last N seconds, writing to a temp WAV file.
+    ///
+    /// All audio is deinterleaved to mono before export. The WAV file is always
+    /// single-channel at the buffer's native sample rate.
+    pub fn trigger_instant_capture(
+        &self,
+        seconds: f32,
+        source: CaptureSource,
+        mix_config: Option<&MixConfig>,
+    ) -> Result<CaptureResult> {
+        let (samples, sample_rate) = self.extract_source_samples(seconds, source, mix_config)?;
+
+        let duration_seconds = samples.len() as f32 / sample_rate as f32;
+        let file_path = export::write_wav_to_temp(&samples, sample_rate, 1)?;
 
         Ok(CaptureResult {
             file_path,
             duration_seconds,
-            sample_rate: captured.sample_rate,
+            sample_rate,
             source,
         })
     }
@@ -706,7 +753,7 @@ impl AudioManager {
             })
             .unwrap_or_default();
 
-        let sample_rate = self.active_sample_rate();
+        let sample_rate = self.sample_rate_for_source(source);
 
         let samples = match source {
             CaptureSource::MicOnly => mic_samples,
@@ -1666,6 +1713,58 @@ mod tests {
             .extract_since(&pos, CaptureSource::SystemOnly, None)
             .expect("system extraction returns samples");
         assert_eq!(reported_sr, 48000, "SystemOnly must report system rate");
+    }
+
+    #[test]
+    fn test_extract_source_samples_system_only_reports_system_rate_with_stale_mic() {
+        // Mirror of the extract_since test for the instant-capture / session-export path.
+        // trigger_instant_capture previously used `active_sample_rate()` (mic-preferred),
+        // which wrote SystemOnly audio under the mic rate when a stale mic buffer was
+        // present — garbled duration and playback speed in the exported WAV.
+        let mut manager = AudioManager::new();
+        let mic_buf = Arc::new(AudioRingBuffer::with_duration(10.0, 44100, 1));
+        let sys_buf = Arc::new(AudioRingBuffer::with_duration(10.0, 48000, 2));
+        manager.mic_buffer = Some(Arc::clone(&mic_buf));
+        manager.system_buffer = Some(Arc::clone(&sys_buf));
+        sys_buf.write(&vec![0.3_f32; 9600]); // ~100ms of stereo audio @ 48k
+
+        let (_samples, reported_sr) = manager
+            .extract_source_samples(1.0, CaptureSource::SystemOnly, None)
+            .expect("system extraction returns samples");
+        assert_eq!(
+            reported_sr, 48000,
+            "SystemOnly must report system rate, not mic rate"
+        );
+    }
+
+    #[test]
+    fn test_extract_source_samples_mic_only_reports_mic_rate_with_stale_system() {
+        let mut manager = AudioManager::new();
+        let mic_buf = Arc::new(AudioRingBuffer::with_duration(10.0, 44100, 1));
+        let sys_buf = Arc::new(AudioRingBuffer::with_duration(10.0, 48000, 2));
+        manager.mic_buffer = Some(Arc::clone(&mic_buf));
+        manager.system_buffer = Some(Arc::clone(&sys_buf));
+        mic_buf.write(&vec![0.3_f32; 4410]);
+
+        let (_samples, reported_sr) = manager
+            .extract_source_samples(1.0, CaptureSource::MicOnly, None)
+            .expect("mic extraction returns samples");
+        assert_eq!(reported_sr, 44100, "MicOnly must report mic rate");
+    }
+
+    #[test]
+    fn test_captured_audio_carries_per_source_rates() {
+        let mut manager = AudioManager::new();
+        let mic_buf = Arc::new(AudioRingBuffer::with_duration(10.0, 44100, 1));
+        let sys_buf = Arc::new(AudioRingBuffer::with_duration(10.0, 48000, 2));
+        manager.mic_buffer = Some(Arc::clone(&mic_buf));
+        manager.system_buffer = Some(Arc::clone(&sys_buf));
+        mic_buf.write(&vec![0.2_f32; 100]);
+        sys_buf.write(&vec![0.2_f32; 200]);
+
+        let captured = manager.extract_captured_audio(0.01);
+        assert_eq!(captured.mic_sample_rate, Some(44100));
+        assert_eq!(captured.system_sample_rate, Some(48000));
     }
 
     #[test]
