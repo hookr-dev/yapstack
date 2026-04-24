@@ -347,6 +347,27 @@ impl SourceVadState {
             silero: SileroSource::new(initial_pos),
         }
     }
+
+    /// Resets all buffer-position, VAD, and source-format state after the
+    /// underlying ring buffer has been replaced (e.g. on a device-format
+    /// change during restart). Positions from the old buffer are not
+    /// meaningful against the new one, and the sample rate / channel count
+    /// must track the new device's format so extraction and WAV writes stay
+    /// correct. Preserves cross-buffer state: chunk_index, accumulated_text.
+    fn reset_for_buffer_replacement(&mut self, new_pos: usize, sample_rate: u32, channels: u16) {
+        self.is_speaking = false;
+        self.speech_start_pos = new_pos;
+        self.cursor = new_pos;
+        self.speech_start_time = None;
+        self.silence_since = None;
+        self.session_start_pos = new_pos;
+        self.source_sample_rate = sample_rate;
+        self.source_channels = channels;
+        self.last_seen_write_pos = new_pos;
+        self.last_write_pos_advance = Instant::now();
+        self.earliest_next_chunk_pos = new_pos;
+        self.silero = SileroSource::new(new_pos);
+    }
 }
 
 /// Describes what action the VAD state machine wants to take.
@@ -954,7 +975,22 @@ async fn preflight_stream_health(
         return Ok(());
     }
 
-    let (mic_initial, sys_initial, mic_err, sys_err, has_mic_buf, has_sys_buf) = {
+    // Snapshot symptom-layer state + consume any pending default-device-
+    // change notification. Consuming the flag here means a listener event
+    // fired between sessions still triggers a rebind on preflight, before
+    // first extraction reads stale audio.
+    let (
+        mic_initial,
+        sys_initial,
+        mic_err,
+        sys_err,
+        has_mic_buf,
+        has_sys_buf,
+        mic_default_changed,
+        sys_default_changed,
+        mic_drift,
+        sys_drift,
+    ) = {
         let m = audio_state.lock().await;
         (
             m.mic_write_pos(),
@@ -963,6 +999,10 @@ async fn preflight_stream_health(
             m.system_has_stream_error(),
             m.mic_buffer().is_some(),
             m.system_buffer().is_some(),
+            m.mic_default_changed(),
+            m.system_audio_default_changed(),
+            m.mic_input_drifted(),
+            m.system_audio_output_drifted(),
         )
     };
 
@@ -981,13 +1021,14 @@ async fn preflight_stream_health(
     if check_mic {
         let mic_now = manager.mic_write_pos();
         let stalled = mic_now == mic_initial && should_stall_restart(&AudioSourceLabel::Mic);
-        if mic_err || stalled {
+        let device_changed = mic_default_changed || mic_drift.is_some();
+        if mic_err || stalled || device_changed {
             warn!(
-                "preflight: mic stream needs restart (error={}, stalled={})",
-                mic_err, stalled
+                "preflight: mic stream needs restart (error={}, stalled={}, device_changed={})",
+                mic_err, stalled, device_changed
             );
             match manager.restart_mic() {
-                Ok(()) => restarted.push(AudioSourceLabel::Mic),
+                Ok(_) => restarted.push(AudioSourceLabel::Mic),
                 Err(e) => {
                     error!("preflight: mic restart failed: {}", e);
                     return Err(CommandError::from(e));
@@ -999,13 +1040,14 @@ async fn preflight_stream_health(
     if check_system {
         let sys_now = manager.system_write_pos();
         let stalled = sys_now == sys_initial && should_stall_restart(&AudioSourceLabel::System);
-        if sys_err || stalled {
+        let device_changed = sys_default_changed || sys_drift.is_some();
+        if sys_err || stalled || device_changed {
             warn!(
-                "preflight: system stream needs restart (error={}, stalled={})",
-                sys_err, stalled
+                "preflight: system stream needs restart (error={}, stalled={}, device_changed={})",
+                sys_err, stalled, device_changed
             );
             match manager.restart_system_audio() {
-                Ok(()) => restarted.push(AudioSourceLabel::System),
+                Ok(_) => restarted.push(AudioSourceLabel::System),
                 Err(e) => {
                     error!("preflight: system restart failed: {}", e);
                     if matches!(source, CaptureSource::SystemOnly) {
@@ -1436,25 +1478,18 @@ async fn check_stream_health(
             continue; // Already exhausted retries for this source
         }
 
-        // Cooldown: skip if we recently attempted a restart for this source
-        if let Some(last) = source.last_restart_at {
-            if last.elapsed() < Duration::from_secs_f32(STREAM_RESTART_COOLDOWN_SECS) {
-                continue;
-            }
-        }
-
         let mut needs_restart = false;
         let mut reason: String = String::new();
 
+        // Layer 0: CoreAudio push notification — the OS tells us the
+        // default device changed (AirPods connect, Sound Settings toggle,
+        // another app grabs exclusive output). This is an authoritative
+        // rebind signal and bypasses cooldown — unlike the symptom-based
+        // layers below, a listener event is a real OS push, not a
+        // speculative retry. The restart_attempts ceiling above still
+        // guards against runaway loops if every rebind somehow fails.
         {
             let manager = audio_state.lock().await;
-
-            // Layer 0: CoreAudio push notification — the OS tells us the
-            // default device changed (AirPods connect, Sound Settings toggle,
-            // another app grabs exclusive output). This is the primary fix
-            // for mid-session silent death; earlier watchdog layers were
-            // symptom detectors that missed the zero-sample-on-old-device
-            // failure mode entirely.
             let default_changed = match source.label {
                 AudioSourceLabel::Mic => manager.mic_default_changed(),
                 AudioSourceLabel::System => manager.system_audio_default_changed(),
@@ -1477,17 +1512,25 @@ async fn check_stream_health(
                 );
                 reason = "default device changed".into();
             }
+        }
+
+        // Cooldown only gates the speculative layers below. Listener events
+        // above are honored immediately because they're OS-authoritative.
+        let in_cooldown = source
+            .last_restart_at
+            .is_some_and(|t| t.elapsed() < Duration::from_secs_f32(STREAM_RESTART_COOLDOWN_SECS));
+
+        if !needs_restart && !in_cooldown {
+            let manager = audio_state.lock().await;
 
             // Layer 1: cpal error callback flag (instant detection)
-            if !needs_restart {
-                let has_error = match source.label {
-                    AudioSourceLabel::Mic => manager.mic_has_stream_error(),
-                    AudioSourceLabel::System => manager.system_has_stream_error(),
-                };
-                if has_error {
-                    needs_restart = true;
-                    reason = "stream error callback fired".into();
-                }
+            let has_error = match source.label {
+                AudioSourceLabel::Mic => manager.mic_has_stream_error(),
+                AudioSourceLabel::System => manager.system_has_stream_error(),
+            };
+            if has_error {
+                needs_restart = true;
+                reason = "stream error callback fired".into();
             }
 
             // Layer 2: write_pos stall detection (~2s latency)
@@ -1566,10 +1609,38 @@ async fn check_stream_health(
         };
 
         match restart_result {
-            Ok(()) => {
-                info!("stream health: {} restarted successfully", source_name);
+            Ok(outcome) => {
+                info!(
+                    "stream health: {} restarted successfully (outcome: {:?})",
+                    source_name, outcome
+                );
                 source.restart_attempts = 0;
                 source.last_write_pos_advance = Instant::now();
+
+                if outcome == yapstack_audio::manager::RestartOutcome::BufferReplaced {
+                    // Read the fresh buffer's metadata and reset all cursors.
+                    // The new buffer starts at write_pos = 0, so session /
+                    // cursor / speech-start positions must follow.
+                    let (new_pos, sr, ch) = {
+                        let manager = audio_state.lock().await;
+                        let info = match source.label {
+                            AudioSourceLabel::Mic => manager.mic_buffer_info(),
+                            AudioSourceLabel::System => manager.system_buffer_info(),
+                        };
+                        let pos = source_write_pos(&manager, &source.label);
+                        info.map(|i| (pos, i.sample_rate, i.channels)).unwrap_or((
+                            pos,
+                            source.source_sample_rate,
+                            source.source_channels,
+                        ))
+                    };
+                    source.reset_for_buffer_replacement(new_pos, sr, ch);
+                    warn!(
+                        "{} buffer replaced on restart ({}Hz/{}ch) — source state reset",
+                        source_name, sr, ch
+                    );
+                }
+
                 let _ = app_handle.emit(
                     "stream-health",
                     StreamHealthEvent {
