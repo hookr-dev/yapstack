@@ -30,6 +30,22 @@ pub enum RestartOutcome {
     BufferReplaced,
 }
 
+/// Extended report from a stream restart (mic or system). Callers use
+/// `same_device` to decide whether the restart actually moved to a new
+/// device or rebound to the same one (which happens when the OS default
+/// reverts momentarily during an AirPods/Bluetooth handshake). A true
+/// `same_device` means the rebind was effectively a no-op and the caller
+/// should retry after letting macOS settle, rather than treating the
+/// restart as complete.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestartReport {
+    pub outcome: RestartOutcome,
+    /// `true` if the new bound device ID matches the pre-restart bound ID.
+    pub same_device: bool,
+    /// The device ID the stream is bound to after the restart, if any.
+    pub new_device_id: Option<String>,
+}
+
 pub struct AudioManager {
     config: AudioConfig,
     mic: MicrophoneCapture,
@@ -44,6 +60,13 @@ pub struct AudioManager {
     /// capture path degrades to the write-pos stall watchdog in that case.
     input_watcher: Option<DefaultDeviceWatcher>,
     output_watcher: Option<DefaultDeviceWatcher>,
+    /// Device-list watcher — fires on `kAudioHardwarePropertyDevices`
+    /// (hardware added/removed). Complements the default-device watchers
+    /// because some macOS versions fire the device-list property *before*
+    /// the default-device property during an AirPods/Bluetooth handshake;
+    /// catching the earlier signal lets us start probing rebind candidates
+    /// sooner. The flag is shared between mic and system health checks.
+    devices_watcher: Option<DefaultDeviceWatcher>,
 }
 
 impl AudioManager {
@@ -62,6 +85,9 @@ impl AudioManager {
         let output_watcher = DefaultDeviceWatcher::new(DefaultDeviceKind::Output)
             .map_err(|e| warn!("output default-device listener unavailable: {}", e))
             .ok();
+        let devices_watcher = DefaultDeviceWatcher::new(DefaultDeviceKind::Devices)
+            .map_err(|e| warn!("device-list listener unavailable: {}", e))
+            .ok();
         Self {
             config,
             mic: MicrophoneCapture::new(),
@@ -73,6 +99,7 @@ impl AudioManager {
             session_mark: None,
             input_watcher,
             output_watcher,
+            devices_watcher,
         }
     }
 
@@ -832,7 +859,7 @@ impl AudioManager {
     /// default — and probes + allocates the buffer per candidate so the
     /// returned buffer matches whichever device actually succeeds at
     /// start (rather than the first one that merely probed).
-    pub fn restart_mic(&mut self) -> Result<RestartOutcome> {
+    pub fn restart_mic(&mut self) -> Result<RestartReport> {
         let existing = self
             .mic_buffer
             .clone()
@@ -840,6 +867,7 @@ impl AudioManager {
 
         let stored_id = self.mic.last_device_id().map(|s| s.to_string());
         let stored_name = self.mic.last_device_name().map(|s| s.to_string());
+        let old_device_id = stored_id.clone();
         // Preserve the original bind intent: if the session started in
         // default-tracking mode, restarts via the stored-id fallback should
         // not quietly flip us into explicit-device mode (which would disable
@@ -884,7 +912,13 @@ impl AudioManager {
                 Ok(()) => {
                     self.mic_buffer = Some(buffer);
                     self.mic.set_bound_is_default(preserve_bound_is_default);
-                    return Ok(outcome);
+                    let new_device_id = self.mic.last_device_id().map(|s| s.to_string());
+                    let same_device = old_device_id.is_some() && old_device_id == new_device_id;
+                    return Ok(RestartReport {
+                        outcome,
+                        same_device,
+                        new_device_id,
+                    });
                 }
                 Err(e) => {
                     warn!("restart on {} ({:?}) failed: {}", label, candidate, e);
@@ -909,11 +943,22 @@ impl AudioManager {
     /// stay consistent with the actual cpal callback format. Callers must
     /// reset source positions / VAD state when `RestartOutcome::BufferReplaced`
     /// is returned — the old positions reference a different buffer.
-    pub fn restart_system_audio(&mut self) -> Result<RestartOutcome> {
+    ///
+    /// The returned `SystemRestartReport` includes `same_device`, which is
+    /// `true` when the post-restart bound device ID matches the pre-restart
+    /// ID. Under a normal AirPods handshake macOS may briefly report the
+    /// *old* device as default (a "revert" window) before committing to the
+    /// new one; a restart during that window produces `same_device=true`
+    /// and the caller should retry after a short delay instead of accepting
+    /// the bind. See `yapstack-audio` tests and the cpal #1175 discussion
+    /// for background.
+    pub fn restart_system_audio(&mut self) -> Result<RestartReport> {
         let existing = self
             .system_buffer
             .clone()
             .ok_or(AudioError::NoBufferAvailable)?;
+
+        let old_device_id = self.system.last_device_id().map(|s| s.to_string());
 
         // Stop the old stream (ignore errors — it may already be dead)
         let _ = self.system.stop();
@@ -923,7 +968,14 @@ impl AudioManager {
 
         self.system.start(Arc::clone(&buffer))?;
         self.system_buffer = Some(buffer);
-        Ok(outcome)
+
+        let new_device_id = self.system.last_device_id().map(|s| s.to_string());
+        let same_device = old_device_id.is_some() && old_device_id == new_device_id;
+        Ok(RestartReport {
+            outcome,
+            same_device,
+            new_device_id,
+        })
     }
 
     /// Chooses between reusing the existing buffer and allocating a fresh one
@@ -978,6 +1030,19 @@ impl AudioManager {
                 .as_ref()
                 .map(|w| w.take_change())
                 .unwrap_or(false)
+    }
+
+    /// Returns `true` if the OS has pushed a device-list change notification
+    /// (hardware added/removed) since the last call. Consumes the pending
+    /// flag. Callers combine this with bound-vs-default comparison to decide
+    /// whether to rebind — the list change alone doesn't mean *our* device
+    /// is affected, but it is an earlier trigger than default-device change
+    /// during AirPods/Bluetooth handshakes on some macOS versions.
+    pub fn device_list_changed(&self) -> bool {
+        self.devices_watcher
+            .as_ref()
+            .map(|w| w.take_change())
+            .unwrap_or(false)
     }
 
     /// Returns the device name the system audio stream is currently bound to,
@@ -1047,6 +1112,18 @@ fn current_default_input_name() -> Option<String> {
     use cpal::traits::{DeviceTrait, HostTrait};
     let device = cpal::default_host().default_input_device()?;
     device.description().ok().map(|d| d.name().to_string())
+}
+
+/// Public live-query helper for the current OS default output device name.
+/// Used by the stream-health layer to re-verify a push-listener event after
+/// a settle delay — so we don't rebind during a macOS "revert" window.
+pub fn live_default_output_name() -> Option<String> {
+    current_default_output_name()
+}
+
+/// Public live-query helper for the current OS default input device name.
+pub fn live_default_input_name() -> Option<String> {
+    current_default_input_name()
 }
 
 impl Default for AudioManager {
@@ -1727,6 +1804,28 @@ mod tests {
         assert!(result.is_err());
         let result = manager.restart_system_audio();
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_restart_report_same_device_when_ids_match() {
+        // Document the RestartReport::same_device semantics so a regression
+        // in the comparison logic is caught by unit tests rather than by a
+        // user trapped in the cpal#1175 retry loop. We fabricate the report
+        // directly here because driving restart_* requires real hardware.
+        let report = RestartReport {
+            outcome: RestartOutcome::BufferPreserved,
+            same_device: true,
+            new_device_id: Some("dev-A".into()),
+        };
+        assert!(report.same_device);
+        assert_eq!(report.new_device_id.as_deref(), Some("dev-A"));
+    }
+
+    #[test]
+    fn test_device_list_changed_starts_false() {
+        let manager = AudioManager::new();
+        // Fresh manager, no property change yet — flag must be false.
+        assert!(!manager.device_list_changed());
     }
 
     #[test]

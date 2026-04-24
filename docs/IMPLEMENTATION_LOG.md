@@ -1034,6 +1034,36 @@ Three tightly related changes, each on its own branch:
 
 ---
 
+## Phase 26 — CoreAudio device listener + bulletproofing against cpal#1175
+
+Users reported mid-session silent death of system-audio capture when toggling AirPods / Bluetooth output, and separately a false-positive drift error repeating every few seconds for users who had explicitly picked a non-default mic. Both traced to the same upstream gap: **cpal does not auto-reroute streams when the default device changes**, and its error callback does not fire for that case either.
+
+### Upstream status to monitor
+
+- **[cpal#1175](https://github.com/RustAudio/cpal/issues/1175)** — "default devices don't get automatically rerouted upon disconnection" (maintainer confirmed 2026-04-22, filed against cpal master post-[PR #1003](https://github.com/RustAudio/cpal/pull/1003)). No fix merged yet. Proposed direction is a new `DeviceChanged` error-callback variant.
+- Related history: [cpal#704](https://github.com/RustAudio/cpal/issues/704), [cpal#1012](https://github.com/RustAudio/cpal/issues/1012), [cpal#1030](https://github.com/RustAudio/cpal/issues/1030).
+
+**When cpal lands a fix, delete `yapstack-audio/src/system/device_watcher.rs` and simplify `check_stream_health` in `live_transcription.rs`** — the CoreAudio listener, the `device_list_changed` signal, the settle-and-verify loop, and the `RestartReport::same_device` retry path all exist only to work around cpal#1175.
+
+### What was built
+
+| Area | Mechanism |
+|------|-----------|
+| Push signal (primary) | `DefaultDeviceWatcher` registers CoreAudio property listeners on `kAudioHardwarePropertyDefaultInputDevice`, `kAudioHardwarePropertyDefaultOutputDevice`, and `kAudioHardwarePropertyDevices`. The device-list listener fires earliest during AirPods/Bluetooth handshake on some macOS versions. |
+| Settle-and-verify | Before acting on a listener event, sleep 200 ms and re-query the current default. macOS can briefly revert to the old device during the handshake; rebinding during that window would pin us to a dead device. |
+| Restart reporting | `RestartReport { outcome, same_device, new_device_id }` returned by both `restart_mic` and `restart_system_audio`. `same_device == true` means the rebind landed on the pre-restart device (macOS hadn't committed yet). |
+| Retry on same-device | When `same_device` is true, the health layer increments `restart_attempts` (still capped at `STREAM_RESTART_MAX_ATTEMPTS`), clears `last_restart_at` so the next poll retries immediately, and preserves `last_write_pos_advance` so Layer 2 (stall) can also fire. |
+| Drift-check gate | `mic_input_drifted` skips the comparison when `bound_is_default == false` — users who explicitly pick a non-default mic no longer get a "device identity drift (listener missed)" restart fired on every 3 s poll. |
+
+### Layer map after this phase
+
+0. **CoreAudio listener** (push, macOS) — default-device change *or* device-list change, verified with a 200 ms settle re-query.
+1. **cpal error callback** — rare on macOS for default-device change; retained for other failure modes.
+2. **`write_pos` stall** — 2 s threshold, gated by 5 s cooldown (bypassed when layer 0's restart rebound to same device).
+3. **Device-identity drift poll** — 3 s throttle, skipped for non-default-bound mic streams.
+
+---
+
 ## What's Not Yet Built
 
 - **End-to-end integration tests** — capture audio, transcribe, verify text (unit + component tests now exist; integration tests still needed)

@@ -5,23 +5,81 @@
 //! USB mic unplug, Sound Settings toggle, exclusive-mode grab) and the cpal
 //! stream is left bound to a device that no longer carries audio.
 //!
-//! The same primitive handles input and output — CoreAudio exposes them as
-//! two property selectors on the same system object. Construct one
-//! `DefaultDeviceWatcher` per direction.
+//! The same primitive handles input, output, and device-list (hardware
+//! added/removed) via three property selectors on the same system object.
+//! Construct one `DefaultDeviceWatcher` per kind.
 //!
 //! On non-macOS builds this is a no-op stub so call sites don't need
 //! `#[cfg]` gates.
+//!
+//! # Why we do this in-house instead of relying on cpal
+//!
+//! cpal 0.17.x (and as of this writing, cpal master too) **does not
+//! automatically reroute a stream when the default device changes**. The
+//! stream stays bound to the device it was created against and silently
+//! produces either nothing (output loopback when the underlying device is
+//! no longer actively playing) or zero-filled callbacks (input). Upstream
+//! tracking:
+//!
+//! - [`cpal#1175`](https://github.com/RustAudio/cpal/issues/1175) — "default
+//!   devices don't get automatically rerouted upon disconnection"
+//!   (confirmed by maintainer 2026-04-22). Filed against the newer
+//!   `AudioHardwareCreateProcessTap` path from
+//!   [PR #1003](https://github.com/RustAudio/cpal/pull/1003), so upgrading
+//!   cpal does *not* fix this.
+//! - [`cpal#704`](https://github.com/RustAudio/cpal/issues/704),
+//!   [`cpal#1012`](https://github.com/RustAudio/cpal/issues/1012),
+//!   [`cpal#1030`](https://github.com/RustAudio/cpal/issues/1030) — related
+//!   older reports of silent fallback on input disconnect and loopback
+//!   edge cases.
+//!
+//! **If cpal ever lands a `DeviceChanged` error-callback variant or native
+//! auto-rerouting**, reassess whether this watcher is still needed. Until
+//! then, this is the authoritative signal; cpal's error callback is a
+//! backup (Layer 1) and `write_pos` stall detection is a second backup
+//! (Layer 2).
+//!
+//! # Known edge case: default-output "revert" during AirPods handshake
+//!
+//! On AirPods / Bluetooth output connect, macOS briefly reports the *old*
+//! device as default for a window of ~100-200 ms while the AVAudioEngine
+//! aggregate is being set up (cf. AirPods + AVAudioEngine
+//! [notes](https://supermegaultragroovy.com/2021/01/28/more-on-avaudioengine-airpods/)
+//! and Apple [DF thread 763583](https://developer.apple.com/forums/thread/763583)).
+//! A naive listener-driven restart that re-queries `default_output_device()`
+//! during that revert window binds back to the same dead device.
+//!
+//! Our workaround in the health-check path:
+//! 1. Sleep ~200 ms after the listener fires to let macOS settle.
+//! 2. Re-query the current default and compare to the bound device. If
+//!    unchanged, treat the listener event as spurious (don't restart).
+//! 3. If the restart does rebind to the same device anyway
+//!    ([`RestartReport::same_device`](crate::manager::RestartReport)),
+//!    skip the cooldown and retry on the next poll; cap at
+//!    `STREAM_RESTART_MAX_ATTEMPTS`.
+//!
+//! We also subscribe to `kAudioHardwarePropertyDevices` (device-list
+//! change) because it fires earlier than the default-output property on
+//! some macOS versions during Bluetooth handshake.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crate::error::AudioError;
 
-/// Which default device a `DefaultDeviceWatcher` is observing.
+/// Which CoreAudio system property a `DefaultDeviceWatcher` is observing.
+///
+/// `Input` / `Output` subscribe to the default-device selectors; `Devices`
+/// subscribes to the device-list selector, which fires when hardware is
+/// added or removed from the system (e.g. AirPods connect). On some macOS
+/// versions the device-list notification precedes the default-device
+/// notification during AirPods handshake, so it serves as an earlier
+/// trigger for rebind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DefaultDeviceKind {
     Input,
     Output,
+    Devices,
 }
 
 #[cfg(target_os = "macos")]
@@ -29,9 +87,10 @@ mod imp {
     use super::*;
     use coreaudio_sys::{
         kAudioHardwarePropertyDefaultInputDevice, kAudioHardwarePropertyDefaultOutputDevice,
-        kAudioObjectPropertyElementMaster, kAudioObjectPropertyScopeGlobal,
-        kAudioObjectSystemObject, noErr, AudioObjectAddPropertyListener, AudioObjectID,
-        AudioObjectPropertyAddress, AudioObjectPropertySelector, AudioObjectRemovePropertyListener,
+        kAudioHardwarePropertyDevices, kAudioObjectPropertyElementMaster,
+        kAudioObjectPropertyScopeGlobal, kAudioObjectSystemObject, noErr,
+        AudioObjectAddPropertyListener, AudioObjectID, AudioObjectPropertyAddress,
+        AudioObjectPropertySelector, AudioObjectRemovePropertyListener,
     };
     use std::ffi::c_void;
     use tracing::{info, warn};
@@ -70,6 +129,7 @@ mod imp {
         match kind {
             DefaultDeviceKind::Input => kAudioHardwarePropertyDefaultInputDevice,
             DefaultDeviceKind::Output => kAudioHardwarePropertyDefaultOutputDevice,
+            DefaultDeviceKind::Devices => kAudioHardwarePropertyDevices,
         }
     }
 
@@ -210,5 +270,23 @@ mod tests {
         output.flag.store(true, Ordering::Release);
         assert!(!input.take_change());
         assert!(output.take_change());
+    }
+
+    #[test]
+    fn take_change_starts_false_for_devices() {
+        let w =
+            DefaultDeviceWatcher::new(DefaultDeviceKind::Devices).expect("devices kind registers");
+        assert!(!w.take_change());
+    }
+
+    #[test]
+    fn devices_flag_is_independent_from_default_flags() {
+        let default_out =
+            DefaultDeviceWatcher::new(DefaultDeviceKind::Output).expect("output registers");
+        let devices =
+            DefaultDeviceWatcher::new(DefaultDeviceKind::Devices).expect("devices registers");
+        devices.flag.store(true, Ordering::Release);
+        assert!(!default_out.take_change());
+        assert!(devices.take_change());
     }
 }
