@@ -442,7 +442,33 @@ impl AudioManager {
             })
             .unwrap_or((None, positions.system_pos));
 
-        let sample_rate = self.active_sample_rate();
+        // Source-specific output rate. Using `active_sample_rate()` here
+        // previously returned the mic buffer's rate unconditionally, so a
+        // SystemOnly session with a stale mic buffer would report the mic
+        // rate even though the returned samples come from the system
+        // buffer — callers (e.g. the session WAV writer's resample step)
+        // would then skip or miscompute conversion. Tie the rate to the
+        // buffer the returned samples actually come from.
+        let sample_rate = match source {
+            CaptureSource::MicOnly => self
+                .mic_buffer
+                .as_ref()
+                .map(|b| b.sample_rate())
+                .unwrap_or_else(|| self.active_sample_rate()),
+            CaptureSource::SystemOnly => self
+                .system_buffer
+                .as_ref()
+                .map(|b| b.sample_rate())
+                .unwrap_or_else(|| self.active_sample_rate()),
+            // Mixed mode: `resample_and_mix` resamples system to mic's rate
+            // and returns mic-rate output when both buffers are present.
+            // When only one buffer is present, the sole source's rate wins.
+            CaptureSource::Mixed => match (self.mic_buffer.as_ref(), self.system_buffer.as_ref()) {
+                (Some(mb), _) => mb.sample_rate(),
+                (None, Some(sb)) => sb.sample_rate(),
+                (None, None) => self.active_sample_rate(),
+            },
+        };
 
         let samples = match source {
             CaptureSource::MicOnly => {
@@ -1619,6 +1645,44 @@ mod tests {
         assert!(result.is_err());
         let result = manager.restart_system_audio();
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_extract_since_system_only_reports_system_rate_with_stale_mic_buffer() {
+        // A SystemOnly session with a stale mic buffer at a different rate
+        // must report the system buffer's rate, not the mic buffer's. The
+        // WAV writer relies on this to decide whether to resample before
+        // appending samples.
+        let mut manager = AudioManager::new();
+        let mic_buf = Arc::new(AudioRingBuffer::with_duration(10.0, 44100, 1));
+        let sys_buf = Arc::new(AudioRingBuffer::with_duration(10.0, 48000, 2));
+        manager.mic_buffer = Some(Arc::clone(&mic_buf));
+        manager.system_buffer = Some(Arc::clone(&sys_buf));
+
+        let pos = manager.buffer_positions();
+        sys_buf.write(&vec![0.3_f32; 400]); // 200 mono frames
+
+        let (_samples, reported_sr, _new_pos) = manager
+            .extract_since(&pos, CaptureSource::SystemOnly, None)
+            .expect("system extraction returns samples");
+        assert_eq!(reported_sr, 48000, "SystemOnly must report system rate");
+    }
+
+    #[test]
+    fn test_extract_since_mic_only_reports_mic_rate_with_stale_system_buffer() {
+        let mut manager = AudioManager::new();
+        let mic_buf = Arc::new(AudioRingBuffer::with_duration(10.0, 44100, 1));
+        let sys_buf = Arc::new(AudioRingBuffer::with_duration(10.0, 48000, 2));
+        manager.mic_buffer = Some(Arc::clone(&mic_buf));
+        manager.system_buffer = Some(Arc::clone(&sys_buf));
+
+        let pos = manager.buffer_positions();
+        mic_buf.write(&vec![0.3_f32; 200]);
+
+        let (_samples, reported_sr, _new_pos) = manager
+            .extract_since(&pos, CaptureSource::MicOnly, None)
+            .expect("mic extraction returns samples");
+        assert_eq!(reported_sr, 44100, "MicOnly must report mic rate");
     }
 
     #[test]
