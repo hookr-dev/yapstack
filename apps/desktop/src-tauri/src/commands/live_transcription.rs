@@ -1495,34 +1495,83 @@ async fn check_stream_health(
 
         // Layer 0: CoreAudio push notification — the OS tells us the
         // default device changed (AirPods connect, Sound Settings toggle,
-        // another app grabs exclusive output). This is an authoritative
-        // rebind signal and bypasses cooldown — unlike the symptom-based
-        // layers below, a listener event is a real OS push, not a
-        // speculative retry. The restart_attempts ceiling above still
+        // another app grabs exclusive output) or the device list changed
+        // (hardware added/removed, which is an earlier signal than the
+        // default-device flip on some macOS versions). This is an
+        // authoritative rebind signal and bypasses cooldown — unlike the
+        // symptom-based layers below, a listener event is a real OS push,
+        // not a speculative retry. The restart_attempts ceiling above still
         // guards against runaway loops if every rebind somehow fails.
-        {
+        //
+        // Before committing to a restart, sleep briefly and re-query the
+        // current default. macOS may report the *old* device as default
+        // momentarily during an AirPods/Bluetooth handshake (cpal#1175);
+        // restarting during that revert window would rebind to the same
+        // dead device. The settle delay lets the OS finish its transition
+        // and the re-check confirms the default is genuinely different
+        // from what we're bound to.
+        let listener_fired = {
             let manager = audio_state.lock().await;
             let default_changed = match source.label {
                 AudioSourceLabel::Mic => manager.mic_default_changed(),
                 AudioSourceLabel::System => manager.system_audio_default_changed(),
             };
-            if default_changed {
-                needs_restart = true;
-                let bound = match source.label {
-                    AudioSourceLabel::Mic => manager.mic_bound_device(),
-                    AudioSourceLabel::System => manager.system_audio_bound_device(),
+            // Device-list change is a shared signal (consumed once per
+            // tick). Fold it into the listener-fired decision for the first
+            // source that inspects it; subsequent sources in the same tick
+            // see it as already-consumed.
+            let devices_changed = manager.device_list_changed();
+            default_changed || devices_changed
+        };
+        if listener_fired {
+            // Settle delay — small enough that recovery is fast, long enough
+            // that macOS has committed to the new default device before we
+            // probe again.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+
+            let manager = audio_state.lock().await;
+            let bound = match source.label {
+                AudioSourceLabel::Mic => manager.mic_bound_device(),
+                AudioSourceLabel::System => manager.system_audio_bound_device(),
+            }
+            .map(str::to_string);
+            let current_default = match source.label {
+                AudioSourceLabel::Mic => yapstack_audio::manager::live_default_input_name(),
+                AudioSourceLabel::System => yapstack_audio::manager::live_default_output_name(),
+            };
+            let direction = match source.label {
+                AudioSourceLabel::Mic => "input",
+                AudioSourceLabel::System => "output",
+            };
+            match (bound.as_deref(), current_default.as_deref()) {
+                (Some(b), Some(c)) if b != c => {
+                    needs_restart = true;
+                    info!(
+                        "default {} device change confirmed after settle: '{}' → '{}', rebinding",
+                        direction, b, c
+                    );
+                    reason = "default device changed".into();
                 }
-                .map(str::to_string)
-                .unwrap_or_else(|| "<unknown>".into());
-                info!(
-                    "default {} device changed (was '{}'), rebinding",
-                    match source.label {
-                        AudioSourceLabel::Mic => "input",
-                        AudioSourceLabel::System => "output",
-                    },
-                    bound
-                );
-                reason = "default device changed".into();
+                (Some(b), Some(c)) => {
+                    // Listener fired but default is unchanged once the OS
+                    // finished settling — spurious / transient signal.
+                    // Don't restart; let the stall watchdog (Layer 2) catch
+                    // a real disconnect.
+                    debug!(
+                        "listener fired for {} but default unchanged after settle (still '{}' ≈ '{}') — skipping restart",
+                        direction, b, c
+                    );
+                }
+                _ => {
+                    // Bound name unavailable (stream never started or no
+                    // device resolved). Trust the listener and rebind.
+                    needs_restart = true;
+                    info!(
+                        "default {} device changed (bound='{:?}', current='{:?}'), rebinding",
+                        direction, bound, current_default
+                    );
+                    reason = "default device changed".into();
+                }
             }
         }
 
@@ -1621,14 +1670,39 @@ async fn check_stream_health(
         };
 
         match restart_result {
-            Ok(outcome) => {
+            Ok(report) => {
                 info!(
-                    "stream health: {} restarted successfully (outcome: {:?})",
-                    source_name, outcome
+                    "stream health: {} restarted successfully (outcome: {:?}, same_device: {}, new_id: {:?})",
+                    source_name, report.outcome, report.same_device, report.new_device_id
                 );
-                source.restart_attempts = 0;
-                source.last_write_pos_advance = Instant::now();
 
+                // When the restart rebound to the same device, macOS was
+                // likely still settling after an AirPods/Bluetooth handshake
+                // (cpal#1175: default-device property can revert momentarily).
+                // Treat it like a partial failure: keep incrementing
+                // restart_attempts so the outer MAX_ATTEMPTS cap applies, and
+                // clear the cooldown so the next health tick can retry
+                // immediately instead of waiting 5 s. Do NOT reset
+                // last_write_pos_advance — the stream hasn't actually
+                // recovered, and we want Layer 2 (stall) to fire on the next
+                // tick if the write_pos isn't advancing.
+                if report.same_device {
+                    warn!(
+                        "{} restart rebound to the same device ({:?}) — macOS likely still settling; \
+                         retrying on next poll (attempt {}/{})",
+                        source_name,
+                        report.new_device_id,
+                        source.restart_attempts + 1,
+                        STREAM_RESTART_MAX_ATTEMPTS
+                    );
+                    source.restart_attempts += 1;
+                    source.last_restart_at = None;
+                } else {
+                    source.restart_attempts = 0;
+                    source.last_write_pos_advance = Instant::now();
+                }
+
+                let outcome = report.outcome;
                 if outcome == yapstack_audio::manager::RestartOutcome::BufferReplaced {
                     // Read the fresh buffer's metadata and reset all cursors.
                     // The new buffer starts at write_pos = 0, so session /
