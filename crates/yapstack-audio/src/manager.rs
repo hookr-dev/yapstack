@@ -755,69 +755,73 @@ impl AudioManager {
     /// allocates a fresh buffer so extraction and WAV metadata stay
     /// consistent with the actual cpal callback format.
     ///
-    /// Tries to restart on the same device (stored ID) that was originally selected.
-    /// If that fails (e.g. device disconnected), falls back to the stored device name,
-    /// then to the system default.
+    /// Tries restart candidates in order — stored ID, stored name, system
+    /// default — and probes + allocates the buffer per candidate so the
+    /// returned buffer matches whichever device actually succeeds at
+    /// start (rather than the first one that merely probed).
     pub fn restart_mic(&mut self) -> Result<RestartOutcome> {
         let existing = self
             .mic_buffer
             .clone()
             .ok_or(AudioError::NoBufferAvailable)?;
 
-        // Stop the old stream (ignore errors — it may already be dead)
-        let _ = self.mic.stop();
-
         let stored_id = self.mic.last_device_id().map(|s| s.to_string());
         let stored_name = self.mic.last_device_name().map(|s| s.to_string());
 
-        // Probe the config that would be used for the restart so we can
-        // decide up-front whether the existing buffer's metadata is still
-        // valid. Probe the primary candidate (stored id → stored name →
-        // default). Any probe failure falls through to the default.
-        let probed = MicrophoneCapture::query_device_config(stored_id.as_deref())
-            .or_else(|_| MicrophoneCapture::query_device_config(stored_name.as_deref()))
-            .or_else(|_| MicrophoneCapture::query_device_config(None))?;
+        // Stop the old stream (ignore errors — it may already be dead)
+        let _ = self.mic.stop();
 
-        let (buffer, outcome) = self.pick_buffer_for_restart(&existing, probed);
+        // Candidate order: original id → stored name → system default.
+        // Each candidate is probed independently so its buffer matches the
+        // device we'll actually hand to cpal — probing the first and starting
+        // the second can leave the buffer metadata out of sync with the live
+        // stream.
+        let candidates: [(Option<&str>, &str); 3] = [
+            (stored_id.as_deref(), "original device id"),
+            (stored_name.as_deref(), "stored device name"),
+            (None, "system default"),
+        ];
 
-        // Try the previously used device first (by ID)
-        if stored_id.is_some() {
-            match self.mic.start(stored_id.as_deref(), Arc::clone(&buffer)) {
+        let mut last_err: Option<AudioError> = None;
+        let mut tried_any = false;
+        for (candidate, label) in candidates {
+            // Skip blank intermediate candidates — only the final `None`
+            // (system default) is a valid empty candidate.
+            if candidate.is_none() && label != "system default" {
+                continue;
+            }
+            tried_any = true;
+
+            let probed = match MicrophoneCapture::query_device_config(candidate) {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!("restart: probing {} ({:?}) failed: {}", label, candidate, e);
+                    last_err = Some(e);
+                    continue;
+                }
+            };
+
+            let (buffer, outcome) = self.pick_buffer_for_restart(&existing, probed);
+            match self.mic.start(candidate, Arc::clone(&buffer)) {
                 Ok(()) => {
                     self.mic_buffer = Some(buffer);
                     return Ok(outcome);
                 }
                 Err(e) => {
-                    warn!(
-                        "restart on original device (id={:?}) failed ({}), trying name fallback",
-                        stored_id, e
-                    );
+                    warn!("restart on {} ({:?}) failed: {}", label, candidate, e);
+                    last_err = Some(e);
+                    continue;
                 }
             }
         }
 
-        // Fallback: resolve by stored name (covers macOS device ID changes on replug)
-        if stored_name.is_some() {
-            if let Ok(_dev) = crate::device::resolve_input_device(None, stored_name.as_deref()) {
-                match self.mic.start(stored_name.as_deref(), Arc::clone(&buffer)) {
-                    Ok(()) => {
-                        self.mic_buffer = Some(buffer);
-                        return Ok(outcome);
-                    }
-                    Err(e) => {
-                        warn!(
-                            "restart on device name {:?} failed ({}), falling back to default",
-                            stored_name, e
-                        );
-                    }
-                }
-            }
-        }
-
-        // Final fallback: system default
-        self.mic.start(None, Arc::clone(&buffer))?;
-        self.mic_buffer = Some(buffer);
-        Ok(outcome)
+        Err(last_err.unwrap_or_else(|| {
+            AudioError::DeviceInit(if tried_any {
+                "all mic restart candidates failed".into()
+            } else {
+                "no mic restart candidates available".into()
+            })
+        }))
     }
 
     /// Restarts the system audio stream. Reuses the existing ring buffer
