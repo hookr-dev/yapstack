@@ -15,8 +15,20 @@ use crate::mixer::{self, MixConfig};
 use crate::ring_buffer::{AudioRingBuffer, RingBufferInfo, SharedAudioRingBuffer};
 use crate::system::device_watcher::{DefaultDeviceKind, DefaultDeviceWatcher};
 use crate::system::SystemAudioCapture;
+use crate::DeviceStreamConfig;
 
 type Result<T> = std::result::Result<T, AudioError>;
+
+/// Signals whether a stream restart was able to keep the existing ring
+/// buffer or had to allocate a new one. Callers must reset any cursors
+/// or VAD state tied to the previous buffer when `BufferReplaced` is
+/// returned — positions from the old buffer are not meaningful against
+/// the new one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestartOutcome {
+    BufferPreserved,
+    BufferReplaced,
+}
 
 pub struct AudioManager {
     config: AudioConfig,
@@ -738,14 +750,16 @@ impl AudioManager {
         self.mic.last_device_id()
     }
 
-    /// Restarts the microphone stream, reusing the existing ring buffer.
-    /// The buffer retains all previously captured audio — only the cpal stream is recycled.
+    /// Restarts the microphone stream. Reuses the existing ring buffer when
+    /// the new device's sample rate / channel count match; otherwise
+    /// allocates a fresh buffer so extraction and WAV metadata stay
+    /// consistent with the actual cpal callback format.
     ///
     /// Tries to restart on the same device (stored ID) that was originally selected.
     /// If that fails (e.g. device disconnected), falls back to the stored device name,
     /// then to the system default.
-    pub fn restart_mic(&mut self) -> Result<()> {
-        let buffer = self
+    pub fn restart_mic(&mut self) -> Result<RestartOutcome> {
+        let existing = self
             .mic_buffer
             .clone()
             .ok_or(AudioError::NoBufferAvailable)?;
@@ -753,11 +767,26 @@ impl AudioManager {
         // Stop the old stream (ignore errors — it may already be dead)
         let _ = self.mic.stop();
 
-        // Try the previously used device first (by ID)
         let stored_id = self.mic.last_device_id().map(|s| s.to_string());
+        let stored_name = self.mic.last_device_name().map(|s| s.to_string());
+
+        // Probe the config that would be used for the restart so we can
+        // decide up-front whether the existing buffer's metadata is still
+        // valid. Probe the primary candidate (stored id → stored name →
+        // default). Any probe failure falls through to the default.
+        let probed = MicrophoneCapture::query_device_config(stored_id.as_deref())
+            .or_else(|_| MicrophoneCapture::query_device_config(stored_name.as_deref()))
+            .or_else(|_| MicrophoneCapture::query_device_config(None))?;
+
+        let (buffer, outcome) = self.pick_buffer_for_restart(&existing, probed);
+
+        // Try the previously used device first (by ID)
         if stored_id.is_some() {
             match self.mic.start(stored_id.as_deref(), Arc::clone(&buffer)) {
-                Ok(()) => return Ok(()),
+                Ok(()) => {
+                    self.mic_buffer = Some(buffer);
+                    return Ok(outcome);
+                }
                 Err(e) => {
                     warn!(
                         "restart on original device (id={:?}) failed ({}), trying name fallback",
@@ -768,11 +797,13 @@ impl AudioManager {
         }
 
         // Fallback: resolve by stored name (covers macOS device ID changes on replug)
-        let stored_name = self.mic.last_device_name().map(|s| s.to_string());
         if stored_name.is_some() {
             if let Ok(_dev) = crate::device::resolve_input_device(None, stored_name.as_deref()) {
                 match self.mic.start(stored_name.as_deref(), Arc::clone(&buffer)) {
-                    Ok(()) => return Ok(()),
+                    Ok(()) => {
+                        self.mic_buffer = Some(buffer);
+                        return Ok(outcome);
+                    }
                     Err(e) => {
                         warn!(
                             "restart on device name {:?} failed ({}), falling back to default",
@@ -784,14 +815,19 @@ impl AudioManager {
         }
 
         // Final fallback: system default
-        self.mic.start(None, buffer)?;
-        Ok(())
+        self.mic.start(None, Arc::clone(&buffer))?;
+        self.mic_buffer = Some(buffer);
+        Ok(outcome)
     }
 
-    /// Restarts the system audio stream, reusing the existing ring buffer.
-    /// The buffer retains all previously captured audio — only the cpal stream is recycled.
-    pub fn restart_system_audio(&mut self) -> Result<()> {
-        let buffer = self
+    /// Restarts the system audio stream. Reuses the existing ring buffer
+    /// when the new default output's sample rate / channel count match;
+    /// otherwise allocates a fresh buffer so extraction and WAV metadata
+    /// stay consistent with the actual cpal callback format. Callers must
+    /// reset source positions / VAD state when `RestartOutcome::BufferReplaced`
+    /// is returned — the old positions reference a different buffer.
+    pub fn restart_system_audio(&mut self) -> Result<RestartOutcome> {
+        let existing = self
             .system_buffer
             .clone()
             .ok_or(AudioError::NoBufferAvailable)?;
@@ -799,8 +835,42 @@ impl AudioManager {
         // Stop the old stream (ignore errors — it may already be dead)
         let _ = self.system.stop();
 
-        self.system.start(buffer)?;
-        Ok(())
+        let probed = SystemAudioCapture::query_device_config()?;
+        let (buffer, outcome) = self.pick_buffer_for_restart(&existing, probed);
+
+        self.system.start(Arc::clone(&buffer))?;
+        self.system_buffer = Some(buffer);
+        Ok(outcome)
+    }
+
+    /// Chooses between reusing the existing buffer and allocating a fresh one
+    /// sized for the probed device config. Shared between mic and system
+    /// restart paths because the decision is identical: match sample rate and
+    /// channel count, else replace so downstream metadata stays correct.
+    fn pick_buffer_for_restart(
+        &self,
+        existing: &SharedAudioRingBuffer,
+        probed: DeviceStreamConfig,
+    ) -> (SharedAudioRingBuffer, RestartOutcome) {
+        let format_matches =
+            existing.sample_rate() == probed.sample_rate && existing.channels() == probed.channels;
+        if format_matches {
+            (Arc::clone(existing), RestartOutcome::BufferPreserved)
+        } else {
+            warn!(
+                "device format changed on restart: {}Hz/{}ch → {}Hz/{}ch — allocating fresh buffer",
+                existing.sample_rate(),
+                existing.channels(),
+                probed.sample_rate,
+                probed.channels,
+            );
+            let fresh = Arc::new(AudioRingBuffer::with_duration(
+                self.config.capture_history_seconds,
+                probed.sample_rate,
+                probed.channels,
+            ));
+            (fresh, RestartOutcome::BufferReplaced)
+        }
     }
 
     /// Returns `true` if the OS has pushed a default-output-device change
@@ -1474,31 +1544,68 @@ mod tests {
 
     #[test]
     #[cfg_attr(target_os = "windows", ignore)] // WASAPI COM cleanup crashes on CI
-    fn test_restart_mic_preserves_buffer() {
+    fn test_restart_mic_keeps_buffer_slot() {
+        // After restart the mic_buffer slot stays populated regardless of
+        // outcome — either the original Arc (format match) or a fresh buffer
+        // (format mismatch, e.g. device changed between 48 kHz stereo and
+        // 44.1 kHz mono). The slot staying populated is what the live loop
+        // relies on for `RestartOutcome` reset logic.
         let mut manager = AudioManager::new();
         let buffer = Arc::new(AudioRingBuffer::with_duration(10.0, 16000, 1));
         buffer.write(&[0.1, 0.2, 0.3]);
         manager.mic_buffer = Some(Arc::clone(&buffer));
 
-        // Restart without a running stream should fail at start (no hardware)
-        // but the buffer should remain intact
-        let _result = manager.restart_mic();
-        // Buffer is preserved regardless of restart outcome
+        let _ = manager.restart_mic();
         assert!(manager.mic_buffer.is_some());
-        assert_eq!(manager.mic_buffer.as_ref().unwrap().samples_written(), 3);
     }
 
     #[test]
     #[cfg_attr(target_os = "windows", ignore)] // WASAPI COM cleanup crashes on CI
-    fn test_restart_system_preserves_buffer() {
+    fn test_restart_system_keeps_buffer_slot() {
         let mut manager = AudioManager::new();
         let buffer = Arc::new(AudioRingBuffer::with_duration(10.0, 48000, 2));
         buffer.write(&[0.1, 0.2, 0.3, 0.4]);
         manager.system_buffer = Some(Arc::clone(&buffer));
 
-        let _result = manager.restart_system_audio();
+        let _ = manager.restart_system_audio();
         assert!(manager.system_buffer.is_some());
-        assert_eq!(manager.system_buffer.as_ref().unwrap().samples_written(), 4);
+    }
+
+    #[test]
+    fn test_pick_buffer_replaces_on_sample_rate_mismatch() {
+        let manager = AudioManager::new();
+        let existing = Arc::new(AudioRingBuffer::with_duration(10.0, 48000, 2));
+        let probed = DeviceStreamConfig {
+            sample_rate: 44100,
+            channels: 2,
+        };
+        let (_buf, outcome) = manager.pick_buffer_for_restart(&existing, probed);
+        assert_eq!(outcome, RestartOutcome::BufferReplaced);
+    }
+
+    #[test]
+    fn test_pick_buffer_replaces_on_channel_mismatch() {
+        let manager = AudioManager::new();
+        let existing = Arc::new(AudioRingBuffer::with_duration(10.0, 48000, 2));
+        let probed = DeviceStreamConfig {
+            sample_rate: 48000,
+            channels: 1,
+        };
+        let (_buf, outcome) = manager.pick_buffer_for_restart(&existing, probed);
+        assert_eq!(outcome, RestartOutcome::BufferReplaced);
+    }
+
+    #[test]
+    fn test_pick_buffer_preserves_on_format_match() {
+        let manager = AudioManager::new();
+        let existing = Arc::new(AudioRingBuffer::with_duration(10.0, 48000, 2));
+        let probed = DeviceStreamConfig {
+            sample_rate: 48000,
+            channels: 2,
+        };
+        let (buf, outcome) = manager.pick_buffer_for_restart(&existing, probed);
+        assert_eq!(outcome, RestartOutcome::BufferPreserved);
+        assert!(Arc::ptr_eq(&buf, &existing));
     }
 
     #[test]
