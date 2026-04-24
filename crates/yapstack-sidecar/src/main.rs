@@ -187,10 +187,17 @@ async fn main() {
     #[cfg(any(feature = "whisper", feature = "parakeet"))]
     if let (Some(b), Some(model_path)) = (backend.as_mut(), cli.initial_model_path.as_ref()) {
         info!("loading initial model: {}", model_path.display());
-        match b.load_model(model_path) {
-            Ok(()) => info!("model loaded successfully"),
-            Err(e) => error!("failed to load initial model: {}", e),
+        if let Err(e) = b.load_model(model_path) {
+            // Fail fast so the parent's `TranscriptionClient::spawn` observes
+            // a dead child rather than an apparently-healthy sidecar that
+            // rejects every transcribe request. The previous behaviour logged
+            // the error then proceeded to "sidecar ready", which caused the
+            // Tauri state to report the client as initialized while the
+            // backend carried no model.
+            error!("failed to load initial model: {}; exiting", e);
+            std::process::exit(1);
         }
+        info!("model loaded successfully");
     }
 
     #[cfg(not(any(feature = "whisper", feature = "parakeet")))]

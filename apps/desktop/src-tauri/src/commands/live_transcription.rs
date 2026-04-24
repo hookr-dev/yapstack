@@ -2885,10 +2885,12 @@ pub async fn start_live_transcription(
         }
     }
 
-    // Validate config values
-    if config.silence_threshold <= 0.0 {
+    // Validate config values. Use `is_finite` alongside the sign checks
+    // because NaN comparisons all return false — raw `<= 0.0` silently
+    // admits NaN payloads which would later panic in sample-count math.
+    if !config.silence_threshold.is_finite() || config.silence_threshold <= 0.0 {
         return Err(CommandError::InvalidInput {
-            message: "silence_threshold must be > 0".into(),
+            message: "silence_threshold must be finite and > 0".into(),
         });
     }
     if config.silence_duration_ms == 0 {
@@ -2896,20 +2898,20 @@ pub async fn start_live_transcription(
             message: "silence_duration_ms must be > 0".into(),
         });
     }
-    if config.max_chunk_seconds <= 0.0 {
+    if !config.max_chunk_seconds.is_finite() || config.max_chunk_seconds <= 0.0 {
         return Err(CommandError::InvalidInput {
-            message: "max_chunk_seconds must be > 0".into(),
+            message: "max_chunk_seconds must be finite and > 0".into(),
         });
     }
-    if config.backfill_seconds < 0.0 {
+    if !config.backfill_seconds.is_finite() || config.backfill_seconds < 0.0 {
         return Err(CommandError::InvalidInput {
-            message: "backfill_seconds must be >= 0".into(),
+            message: "backfill_seconds must be finite and >= 0".into(),
         });
     }
     if let Some(decay) = config.prompt_decay_silence_seconds {
-        if decay < 0.0 {
+        if !decay.is_finite() || decay < 0.0 {
             return Err(CommandError::InvalidInput {
-                message: "prompt_decay_silence_seconds must be >= 0".into(),
+                message: "prompt_decay_silence_seconds must be finite and >= 0".into(),
             });
         }
     }

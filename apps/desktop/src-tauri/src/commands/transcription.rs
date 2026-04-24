@@ -543,53 +543,58 @@ pub async fn init_transcription_client(
         }
     }
 
-    let (model_path, sidecar_path, vad_model_path, sortformer_model_path, coreml_cache_dir) = {
-        let manager = model_manager_state.lock().await;
-        let sp = find_sidecar_path()?;
+    // Clone the model manager so ensure_vad_model / ensure_sortformer awaits
+    // don't hold the outer ModelManagerState lock — those can take seconds
+    // on a cold fetch and would otherwise serialize every other consumer.
+    // ModelManager is cheap to clone (PathBuf-backed).
+    let manager = {
+        let guard = model_manager_state.lock().await;
+        guard.clone()
+    };
+    let sidecar_path = find_sidecar_path()?;
 
-        match engine {
-            EngineKindDto::Whisper => {
-                let size: ModelSize = whisper_model
-                    .ok_or(CommandError::NotFound {
-                        message: "whisper_model required when engine=Whisper".into(),
-                    })?
-                    .into();
-                let mp = manager.model_path(size).ok_or(CommandError::NotFound {
-                    message: format!("whisper model {:?} not downloaded", size),
-                })?;
-                let vad = match manager.ensure_vad_model().await {
-                    Ok(p) => Some(p),
-                    Err(e) => {
-                        error!("ensure_vad_model failed: {}, proceeding without VAD", e);
-                        None
-                    }
-                };
-                (mp, sp, vad, None, None)
-            }
-            EngineKindDto::Parakeet => {
-                let variant: ParakeetVariant = parakeet_variant
-                    .ok_or(CommandError::NotFound {
-                        message: "parakeet_variant required when engine=Parakeet".into(),
-                    })?
-                    .into();
-                if !manager.parakeet_is_available(variant) {
-                    return Err(CommandError::NotFound {
-                        message: format!("parakeet variant {:?} not downloaded", variant),
-                    });
-                }
-                let mp = manager.parakeet_model_dir(variant);
-                let sortformer = if enable_diarization {
-                    Some(manager.ensure_sortformer(SortformerVariant::V2_1).await?)
-                } else {
+    let (model_path, vad_model_path, sortformer_model_path, coreml_cache_dir) = match engine {
+        EngineKindDto::Whisper => {
+            let size: ModelSize = whisper_model
+                .ok_or(CommandError::NotFound {
+                    message: "whisper_model required when engine=Whisper".into(),
+                })?
+                .into();
+            let mp = manager.model_path(size).ok_or(CommandError::NotFound {
+                message: format!("whisper model {:?} not downloaded", size),
+            })?;
+            let vad = match manager.ensure_vad_model().await {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    error!("ensure_vad_model failed: {}, proceeding without VAD", e);
                     None
-                };
-                let cache_dir = app_handle
-                    .path()
-                    .app_data_dir()
-                    .ok()
-                    .map(|d| d.join("cache").join("coreml"));
-                (mp, sp, None, sortformer, cache_dir)
+                }
+            };
+            (mp, vad, None, None)
+        }
+        EngineKindDto::Parakeet => {
+            let variant: ParakeetVariant = parakeet_variant
+                .ok_or(CommandError::NotFound {
+                    message: "parakeet_variant required when engine=Parakeet".into(),
+                })?
+                .into();
+            if !manager.parakeet_is_available(variant) {
+                return Err(CommandError::NotFound {
+                    message: format!("parakeet variant {:?} not downloaded", variant),
+                });
             }
+            let mp = manager.parakeet_model_dir(variant);
+            let sortformer = if enable_diarization {
+                Some(manager.ensure_sortformer(SortformerVariant::V2_1).await?)
+            } else {
+                None
+            };
+            let cache_dir = app_handle
+                .path()
+                .app_data_dir()
+                .ok()
+                .map(|d| d.join("cache").join("coreml"));
+            (mp, None, sortformer, cache_dir)
         }
     };
 
