@@ -22,6 +22,13 @@ pub struct MicrophoneCapture {
     /// The device name used for the current/last capture session.
     /// Stored on successful start so restarts can target the same device.
     last_device_name: Option<String>,
+    /// True when `start()` was called without an explicit `device_id`, so we
+    /// intentionally bound whatever the OS default input was at that moment.
+    /// Used by the drift-poll defense (`mic_input_drifted`): if the user
+    /// explicitly picked a non-default device, a mismatch against the
+    /// current default is the configured state, not drift, and the check
+    /// would otherwise fire on every poll.
+    bound_is_default: bool,
 }
 
 impl MicrophoneCapture {
@@ -32,6 +39,7 @@ impl MicrophoneCapture {
             stream_error: Arc::new(AtomicBool::new(false)),
             last_device_id: None,
             last_device_name: None,
+            bound_is_default: false,
         }
     }
 
@@ -91,8 +99,27 @@ impl MicrophoneCapture {
         // Persist resolved device info so restarts can target the same device.
         self.last_device_id = device.id().ok().map(|id| id.to_string());
         self.last_device_name = Some(device_actual_name);
+        self.bound_is_default = device_id.is_none();
 
         Ok(())
+    }
+
+    /// Returns `true` when the current/last capture bound whatever the OS
+    /// default input device was at start-time (i.e. caller passed no device
+    /// selection). Callers use this to gate drift-based defenses which are
+    /// only meaningful under default-tracking mode.
+    pub fn bound_is_default(&self) -> bool {
+        self.bound_is_default
+    }
+
+    /// Overrides the `bound_is_default` flag. Used by `restart_mic` to
+    /// preserve the caller's original tracking intent when a restart
+    /// falls through candidates — without this, restarting via the stored
+    /// device-id path (even when that device *is* currently the OS default)
+    /// would flip the flag off and silently disable the drift check for
+    /// the remainder of the session.
+    pub fn set_bound_is_default(&mut self, value: bool) {
+        self.bound_is_default = value;
     }
 
     /// Returns the device ID used for the current/last capture session, if any.

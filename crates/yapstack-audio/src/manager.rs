@@ -840,6 +840,11 @@ impl AudioManager {
 
         let stored_id = self.mic.last_device_id().map(|s| s.to_string());
         let stored_name = self.mic.last_device_name().map(|s| s.to_string());
+        // Preserve the original bind intent: if the session started in
+        // default-tracking mode, restarts via the stored-id fallback should
+        // not quietly flip us into explicit-device mode (which would disable
+        // the drift defense for the remainder of the session).
+        let preserve_bound_is_default = self.mic.bound_is_default();
 
         // Stop the old stream (ignore errors — it may already be dead)
         let _ = self.mic.stop();
@@ -878,6 +883,7 @@ impl AudioManager {
             match self.mic.start(candidate, Arc::clone(&buffer)) {
                 Ok(()) => {
                     self.mic_buffer = Some(buffer);
+                    self.mic.set_bound_is_default(preserve_bound_is_default);
                     return Ok(outcome);
                 }
                 Err(e) => {
@@ -1008,8 +1014,17 @@ impl AudioManager {
     /// Defensive device-identity drift check for the microphone. Returns
     /// `Some(current_default_name)` when the currently-bound input device
     /// differs from the OS default input device, else `None`.
+    ///
+    /// Skipped when the mic was bound to a user-selected non-default device:
+    /// the drift check exists to catch a missed CoreAudio default-device
+    /// notification, which is only meaningful if we're tracking the default.
+    /// Without this guard the check reports drift on every poll for users
+    /// who explicitly pick a non-default mic, producing a restart storm.
     pub fn mic_input_drifted(&self) -> Option<String> {
         if !self.mic.is_running() {
+            return None;
+        }
+        if !self.mic.bound_is_default() {
             return None;
         }
         let bound = self.mic.last_device_name()?;
@@ -1617,6 +1632,26 @@ mod tests {
         let manager = AudioManager::new();
         assert!(manager.system_audio_output_drifted().is_none());
         assert!(manager.mic_input_drifted().is_none());
+    }
+
+    #[test]
+    fn test_mic_bound_is_default_defaults_to_false() {
+        // A fresh MicrophoneCapture hasn't been started, so we can't yet
+        // claim to be tracking the default. The drift check's early-return
+        // must honor this to avoid false positives before start().
+        let manager = AudioManager::new();
+        assert!(!manager.mic.bound_is_default());
+    }
+
+    #[test]
+    fn test_mic_set_bound_is_default_setter() {
+        // Used by restart_mic to preserve the original bind intent through
+        // a candidate fallback — verify the setter round-trips.
+        let mut manager = AudioManager::new();
+        manager.mic.set_bound_is_default(true);
+        assert!(manager.mic.bound_is_default());
+        manager.mic.set_bound_is_default(false);
+        assert!(!manager.mic.bound_is_default());
     }
 
     #[test]
