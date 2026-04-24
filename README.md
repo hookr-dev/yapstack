@@ -116,7 +116,16 @@ Tauri v2 app with a Rust backend and React frontend. Five crates handle distinct
 | `yapstack-sidecar` | Standalone Whisper inference binary |
 | `yapstack-desktop` | Tauri command layer, live transcription controller |
 
-See [`docs/`](docs/) for detailed architecture, API reference, and development guides.
+Detailed docs under [`docs/`](docs/):
+
+- [`ARCHITECTURE.md`](docs/ARCHITECTURE.md) — data flow, crates, IPC, state, analytics.
+- [`API_REFERENCE.md`](docs/API_REFERENCE.md) — Rust library + Tauri command signatures.
+- [`DEVELOPMENT.md`](docs/DEVELOPMENT.md) — build, feature flags, test setup.
+- [`FRONTEND.md`](docs/FRONTEND.md) — Tailwind tokens, shadcn inventory, framework stack, shortcuts, UX patterns.
+- [`AI_CONTEXT.md`](docs/AI_CONTEXT.md) — AI chat context, tool registry + how to add a tool, folders, pending tags schema.
+- [`PRINCIPLES.md`](docs/PRINCIPLES.md) — design, testing, and coding posture.
+- [`LOCAL_LLM.md`](docs/LOCAL_LLM.md) — llama.cpp, LM Studio, Ollama integration.
+- [`IMPLEMENTATION_LOG.md`](docs/IMPLEMENTATION_LOG.md) — phase-by-phase build history.
 
 ## Tech Stack
 
