@@ -147,6 +147,11 @@ struct SessionWavState {
     mix_config: Option<yapstack_audio::MixConfig>,
     session_id: String,
     flush_count: u32,
+    /// Sample rate the WAV file's header was opened with. If a source's
+    /// ring buffer gets replaced at a different sample rate mid-session
+    /// (device format change), the archived WAV will have a speed artifact
+    /// for the new segment — we warn but don't try to resample.
+    wav_sample_rate: u32,
 }
 
 // --- Shared context ---
@@ -1468,10 +1473,16 @@ fn source_display_name(label: &AudioSourceLabel) -> &'static str {
 
 /// Checks stream health for all sources and triggers restarts if needed.
 /// Returns `true` if any source was restarted (caller may want to skip VAD this tick).
+///
+/// `session_wav_state` must be passed so that a buffer-replacing restart
+/// can reset the WAV writer's flush position for the affected source —
+/// otherwise the old position against the new buffer stalls WAV writes
+/// until `write_pos` climbs past the stale counter.
 async fn check_stream_health(
     sources: &mut [SourceVadState],
     audio_state: &AudioManagerState,
     app_handle: &AppHandle,
+    mut session_wav_state: Option<&mut SessionWavState>,
 ) {
     for source in sources.iter_mut() {
         if source.restart_attempts >= STREAM_RESTART_MAX_ATTEMPTS {
@@ -1639,6 +1650,29 @@ async fn check_stream_health(
                         "{} buffer replaced on restart ({}Hz/{}ch) — source state reset",
                         source_name, sr, ch
                     );
+
+                    // The WAV writer's flush_positions point into the old
+                    // buffer; against the new buffer those positions are
+                    // meaningless (new write_pos starts near 0, so
+                    // `snapshot_since` would return nothing until the new
+                    // buffer's counter climbs past the stale position).
+                    // Reset just the affected source's flush position and
+                    // warn if the sample rate no longer matches the WAV
+                    // header — resampling mid-session is deferred; the
+                    // archived WAV will have a speed artifact for the new
+                    // segment but won't stall or crash.
+                    if let Some(ref mut ws) = session_wav_state {
+                        match source.label {
+                            AudioSourceLabel::Mic => ws.flush_positions.mic_pos = new_pos,
+                            AudioSourceLabel::System => ws.flush_positions.system_pos = new_pos,
+                        }
+                        if sr != ws.wav_sample_rate {
+                            warn!(
+                                "WAV sample-rate mismatch on {} rebind: writer={}Hz, new buffer={}Hz — archived audio from this point will play at the writer's rate",
+                                source_name, ws.wav_sample_rate, sr
+                            );
+                        }
+                    }
                 }
 
                 let _ = app_handle.emit(
@@ -2062,7 +2096,13 @@ async fn live_transcription_loop(
         // Triggers auto-restart if a stream has died silently.
         // restart_mic() tries the previously stored device first, then falls back to
         // the provided name (None = system default).
-        check_stream_health(&mut sources, &audio_state, &ctx.app_handle).await;
+        check_stream_health(
+            &mut sources,
+            &audio_state,
+            &ctx.app_handle,
+            session_wav_state.as_mut(),
+        )
+        .await;
 
         // Seed live prompt from backfill context once available.
         // Must seed both shared_prompt AND each source's accumulated_text,
@@ -2921,6 +2961,7 @@ pub async fn start_live_transcription(
             mix_config,
             session_id: session_id.clone(),
             flush_count: 0,
+            wav_sample_rate: sample_rate,
         })
     } else {
         None
