@@ -270,6 +270,25 @@ Startup also runs `db::ensure_runtime_schema()` *before* tauri-plugin-sql wires 
 - **Close-to-minimize**: Main window `closeRequested` event is intercepted — window hides instead of closing. Cmd+Q still exits (OS-level). Tray "Quit" calls `app.exit(0)`.
 - **Cross-platform overlay windows**: Dictation and recording-indicator windows are converted to NSPanels on macOS via `tauri-nspanel` (`#[cfg(target_os = "macos")]`). NSPanel config: `PanelLevel::MainMenu`, non-activating (`StyleMask::nonactivating_panel`), stationary + `move_to_active_space` + `full_screen_auxiliary` collection behavior. On non-macOS: `visibleOnAllWorkspaces: true` in `tauri.conf.json` + standard WebviewWindow show/hide. Frontend uses `commands.showOverlayPanel(label)` / `commands.hideOverlayPanel(label)` — platform-agnostic.
 
+### Primitives
+
+The persisted domain model. All writes flow through `tauri-plugin-sql` via `lib/db.ts`; the DB file lives in the app data dir.
+
+- **Sessions** (`sessions`) — capture + transcription root. Owns a title, pinned flag, start/end timestamps, optional audio file path (`{id}.wav`), and optional note via `notes.session_id` FK. Session type distinguishes `"capture"` from `"manual"` (no transcript).
+- **Segments** (`segments`) — transcript rows: `(session_id, audio_offset_seconds, text, speaker_id?, is_backfill)`. Writes serialize through the `segmentQueueTail` promise queue to prevent backfill / live races. `speaker_id` is added by `db::ensure_runtime_schema()` at startup (outside the migration list — see note above).
+- **Notes** (`notes`) + **note versions** (`note_versions`) — rich-text body (Tiptap HTML). Versions persist the history for restore. One note per session.
+- **Folders** (`folders`) — nested via `parent_id` (root has null). Carry `icon`, `color`, `description`. The `description` feeds the AI multi-session system prompt as an organizational layer (see `AI_CONTEXT.md`).
+- **Session ↔ folder junction** (`session_folders`) — many-to-many. A session can live in multiple folders; branch conflicts detected by `findBranchConflicts()` in `lib/folder-tree.ts`.
+- **Chat messages** (`chat_messages`) — per-session and per-list history (session, folder, all, pinned, dictation). Keyed by `chatContextKey()`.
+- **Dictation history** (`dictation_history`) — per-slot entries with audio path, transcript, and AI-processed output.
+- **Tags** — not yet on `main`. See [`AI_CONTEXT.md`](./AI_CONTEXT.md) § Tags for the pending schema on `feature/knowledge-management` (migration v11 adds `tags` + `session_tags` tables with `manual` / `auto` source and confidence).
+
+### See also
+
+- [`FRONTEND.md`](./FRONTEND.md) — Tailwind tokens, shadcn inventory, framework stack, keyboard shortcuts, UX interaction language.
+- [`AI_CONTEXT.md`](./AI_CONTEXT.md) — AI chat context surfaces, tool registry, how to add a new tool, folder hierarchy → prompt mapping, pending tags schema.
+- [`PRINCIPLES.md`](./PRINCIPLES.md) — Design, testing, and coding posture.
+
 ## AI Chat & Tool Calling
 
 ### Overview

@@ -1,0 +1,78 @@
+# Principles
+
+Design, testing, and coding posture for YapStack. Short and opinionated. When you're unsure whether to add something, this doc should tell you.
+
+---
+
+## Design
+
+**DTO boundary at the Tauri layer.** Library crates (`yapstack-common`, `yapstack-audio`, `yapstack-transcription`, `yapstack-sidecar`) use `serde` only. `specta::Type` lives in `apps/desktop/src-tauri/src/commands/` — each command defines a DTO with a `From<DomainType>` impl. Do not pull `specta` or `tauri` into the `yapstack-*` crates; it couples business logic to the command shell and bloats compile times.
+
+**Lock-free audio path.** The capture hot path (mic / system) writes into an SPSC ring buffer with `Release`/`Acquire` orderings on a monotonic `write_pos`. Never introduce a mutex on this path. Consumers read via `snapshot_since(pos)` — if you need coordination, add a position counter, not a lock.
+
+**Per-engine tuning.** VAD thresholds, chunk sizes, and hallucination filters are **per-engine** on the backend. When you tune Parakeet, do not touch Whisper's proven values, and vice versa. Whisper keeps the aggressive always-reject hallucination list; Parakeet uses the softened variant. This asymmetry is intentional — Parakeet has fewer hallucinations but a softer filter still catches the real ones without dropping good output.
+
+**Frontend state has one cache: the DB.** Zustand owns UI state (view, filters, selection, settings). SQLite owns persisted entities (sessions, segments, notes, folders, chat, dictation). There is no query cache — no React Query, no SWR. If you're reading the same data in two components, lift into the store or into a single parent. Adding a second caching layer in the frontend is a refactor, not a feature.
+
+**`tauri-plugin-sql` is authoritative.** Don't maintain parallel in-memory mirrors of DB state. If you need derived data, select it fresh or cache a minimal projection in the store — don't duplicate the row.
+
+**Segment writes serialize through one queue.** Backfill and live transcription both emit segments. `onLiveSegment` in `stores/appStore.ts` serializes through `segmentQueueTail` (a promise chain) to prevent concurrent writes from racing on the same session. Don't bypass this queue; extend it.
+
+**Tokens, not hex.** Frontend styling consumes `--background`, `--primary`, etc. from `apps/desktop/src/index.css`. No inline hex values in components. If you need a new color, add a token first — see [`FRONTEND.md`](./FRONTEND.md).
+
+**Don't persist speculative state.** Split-pane resize, scroll position, ephemeral UI toggles stay in memory. Only persist settings the user would miss across restarts. Every new persisted field is a migration risk — a `Zustand` store bump *and* a potential SQLite migration.
+
+**Feature flags over back-compat shims.** When an old code path is replaced, delete it cleanly. Don't leave `// removed` breadcrumbs, renamed-with-underscore stubs, or dual implementations guarded by env vars that never flip. For truly staged rollouts, use a real feature flag and schedule a cleanup follow-up.
+
+---
+
+## Testing
+
+**`pnpm check` is the gate.** Runs Rust build + test + fmt + clippy + TypeScript typecheck + ESLint + Vitest. If it fails, the PR isn't ready.
+
+**Rust:** `cargo test --all` via `pnpm test:rust`. Hardware-dependent tests are marked `#[ignore]` and run explicitly with `cargo test -- --ignored`. Don't mark a flaky test `#[ignore]` to hide it — fix it or delete it.
+
+**Frontend:** `vitest@4` + `@testing-library/react`. Tauri commands are stubbed via `apps/desktop/src/test/tauri-mocks.ts`. Add to the mocks when you add a command — a test that relies on an unmocked command will hang on `invoke()`.
+
+**Integration tests touching migrations hit a real SQLite.** Do not mock `tauri-plugin-sql` for migration logic. Past incident: a mocked test passed while the prod migration silently broke `segments` because the mock tolerated a column order the real sqlx-migrate step rejected. The runtime schema-repair hook in `db::ensure_runtime_schema()` exists *because* mock/prod divergence has bitten us — don't repeat the experiment.
+
+**Don't mock the sidecar in transcription tests.** The IPC protocol is where correctness lives. If you need to test a backend in isolation, spawn the real sidecar with a tiny model or fixture WAV. The `#[ignore]`-gated hardware tests exist for exactly this.
+
+**Test what changes behavior.** Snapshot tests on UI trees are noise — they fail on innocuous refactors and pass on real regressions. Prefer interaction tests (`userEvent` + assertions on DOM state) over snapshots.
+
+---
+
+## Coding
+
+**No speculative abstractions.** Three similar lines is better than a premature helper. Write the third occurrence before you extract the abstraction — you'll know more then.
+
+**No error handling for cases that can't happen.** Validate at system boundaries: user input, external APIs, sidecar IPC, DB schema. Trust internal code and framework guarantees. Adding `try/catch` around internal calls obscures real bugs.
+
+**Feature-gated code for missing feature flags is an error, not a fallback.** If the sidecar is built without the `parakeet` feature and the user selects Parakeet, return a clear error per request (`engines/mod.rs` dispatcher does this today). Don't silently fall back to Whisper — that hides the misconfiguration.
+
+**Comments explain WHY, not WHAT.** Code says what. Comments explain hidden constraints, workarounds for specific bugs, surprising invariants. Do not write `// used by X` — that belongs in the commit message or PR description and rots as the codebase evolves.
+
+**Delete, don't deprecate.** If a function is unused, remove it. Don't rename with a leading underscore, don't add `/** @deprecated */`, don't add a re-export. Unused code is dead weight; git history is the archive.
+
+**Prefer dedicated tools over raw shell.** In agent prompts and workflows: use `Read`, `Edit`, `Write` instead of `cat`, `sed`, `echo`. Same discipline applies in scripts — a Rust/TS helper beats a bash one-liner for anything non-trivial.
+
+**Branch posture: merge before cleanup.** For cleanup passes that span open PRs, merge the in-flight PRs first, branch off `main`, apply simplifications in one commit, and open one follow-up PR. Splitting a cleanup across three branches-of-branches always hurts more than it helps.
+
+**Commits: create new, don't amend.** If a pre-commit hook fails, the commit didn't happen — `--amend` would modify the *previous* commit. Fix, re-stage, create a new commit. Don't `--no-verify` to bypass a failing hook; fix the underlying issue.
+
+---
+
+## Monorepo
+
+**YapStack is one repo.** Server, mobile, web, shared packages all live here — no multi-repo splits. Cross-concern refactors should land as a single PR that updates everything atomically; there is no "types package" that needs to be published and consumed across repos.
+
+---
+
+## When in doubt
+
+- If you're adding a file, ask whether an existing one can absorb the change.
+- If you're adding a dependency, ask whether three lines of code would do.
+- If you're adding a layer of indirection, ask whether the caller can just do the thing.
+- If you're writing a comment longer than two lines, ask whether the code itself can be clearer.
+
+Measure twice, cut once.
