@@ -129,6 +129,7 @@ export function createSessionTools(sessionId: string): AIContextTools {
       "add_session_to_folder",
       "search_sessions",
       "get_session_context",
+      "search_dictations",
     ],
     contextType: "session",
     getToolContext: async (): Promise<ToolContext> => {
@@ -248,7 +249,12 @@ export function createMultiSessionTools(
     // and expand sessions on demand instead of having all candidates dumped
     // into the prompt. No mutating tools here — those need a single
     // sessionId and would need a different ToolContext.
-    availableToolIds: ["search_sessions", "get_session_context", "search_folders"],
+    availableToolIds: [
+      "search_sessions",
+      "get_session_context",
+      "search_folders",
+      "search_dictations",
+    ],
     contextType: "multi-session",
     // Retrieval tools don't read from session-scoped ToolContext; they hit
     // the DB directly. The session-meta fields go unused; allowedSessionIds

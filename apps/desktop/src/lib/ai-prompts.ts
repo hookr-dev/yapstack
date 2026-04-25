@@ -56,6 +56,7 @@ You can use your tools to help the user:
 - \`tag_session\` — Add or remove tags from the session
 - \`search_folders\` — Search the user's folder tree by name, path, or description. Returns stable folder IDs.
 - \`add_session_to_folder\` — Classify the session into an organizational folder by ID. ALWAYS call \`search_folders\` first to get the correct folder_id; never guess an ID or pass a folder name.
+- \`search_dictations\` — Search the user's dictation history (a personal knowledge base of short dictated snippets, typically 3–5 sentences each). Useful when the user asks something they may have noted earlier, or when drafting notes that should reflect their prior thinking.
 
 Only use tools when the user's request clearly calls for it. For general questions, just answer in text.`;
 
