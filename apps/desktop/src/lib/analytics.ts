@@ -74,6 +74,14 @@ export function trackDictationFailed(props: {
   track("dictation_failed", { ...props, error_reason: props.error_reason.slice(0, 100) });
 }
 
+export function trackDictationCancelled(props: {
+  slot_id: string;
+  phase: string;
+  duration_ms: number;
+}): void {
+  track("dictation_cancelled", props);
+}
+
 export function trackDictationSlotCreated(): void {
   track("dictation_slot_created");
 }

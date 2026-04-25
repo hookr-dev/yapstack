@@ -2,6 +2,7 @@ import { useEffect, useRef } from "react";
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { currentMonitor } from "@tauri-apps/api/window";
 import { PhysicalPosition } from "@tauri-apps/api/dpi";
+import { register as registerGlobalShortcut, unregister as unregisterGlobalShortcut } from "@tauri-apps/plugin-global-shortcut";
 import { useAppStore } from "@/stores/appStore";
 import { commands } from "@/lib/tauri";
 import { EVENTS, WINDOWS, listenEvent, emitEvent, type BubbleState } from "@/lib/events";
@@ -9,9 +10,16 @@ import { createAIClient, getActiveConfig, isAIConfigured } from "@/lib/ai";
 import { buildVocabularyHints } from "@/lib/transcription";
 import { createManualSession as dbCreateManualSession, saveNote, insertDictationHistory, listFolders, listTags } from "@/lib/db";
 import { toast } from "sonner";
-import { trackDictationStarted, trackDictationCompleted, trackDictationFailed } from "@/lib/analytics";
+import { trackDictationStarted, trackDictationCompleted, trackDictationFailed, trackDictationCancelled } from "@/lib/analytics";
 
-type DictationState = "idle" | "recording" | "transcribing" | "processing" | "done";
+type DictationState = "idle" | "recording" | "transcribing" | "processing" | "cancelling" | "done";
+
+// How long the bubble shows "Cancelled" before hiding. Mirrors the existing
+// no-speech / error self-hide window.
+const CANCEL_DISPLAY_MS = 450;
+// How long to wait after stopLiveTranscription for the streamed Session WAV
+// to be finalized (so we can delete it on cancel). Past this we give up.
+const CANCEL_WAV_GRACE_MS = 1500;
 
 const BUBBLE_WIDTH = 220;
 const BUBBLE_HEIGHT = 96;
@@ -68,6 +76,28 @@ async function emitBubbleState(state: BubbleState, slotName?: string) {
   await emitEvent(EVENTS.DICTATION_STATE, { state, slotName }).catch(() => {});
 }
 
+async function registerCancelHotkey() {
+  try {
+    await registerGlobalShortcut(["Escape"], (event) => {
+      if (event.state === "Pressed") {
+        window.dispatchEvent(new CustomEvent("yapstack:dictation-cancel"));
+      }
+    });
+  } catch (e) {
+    // Escape may already be registered (e.g. by another in-flight dictation)
+    // or rejected by the OS; cancel via in-app focus still works.
+    console.debug("Failed to register Escape cancel hotkey:", e);
+  }
+}
+
+async function unregisterCancelHotkey() {
+  try {
+    await unregisterGlobalShortcut("Escape");
+  } catch {
+    // Not registered, or already unregistered — fine.
+  }
+}
+
 async function focusMainWindow() {
   try {
     const win = await WebviewWindow.getByLabel(WINDOWS.MAIN);
@@ -98,6 +128,11 @@ export function useDictation() {
   const noInputShownRef = useRef(false);
 
   useEffect(() => {
+    // Typed read defeats TS control-flow narrowing of stateRef.current after
+    // intermediate assignments (e.g. = "transcribing"), so cancel bail-points
+    // can compare against "cancelling".
+    const phase = (): DictationState => stateRef.current;
+
     function cleanupListeners() {
       unlistenSegmentRef.current?.();
       unlistenSegmentRef.current = null;
@@ -147,6 +182,10 @@ export function useDictation() {
       dictationIdRef.current = crypto.randomUUID();
       accumulatedTextRef.current = "";
       wavInfoRef.current = null;
+
+      // Register Escape as a Global hotkey for the duration of this Dictation
+      // so the user can cancel from any app, not just YapStack's main window.
+      registerCancelHotkey();
       // Tell the main store which synthetic session id dictation is using so
       // `onLiveSegment` can skip DB persistence for it (dictation session
       // isn't in the `sessions` table, and the FK would fail the insert).
@@ -241,11 +280,13 @@ export function useDictation() {
         return;
       }
 
-      // Guard: if handleStop fired while startLiveTranscription was in-flight,
-      // stateRef will no longer be "recording" — tear down the ghost transcription.
+      // Guard: if handleStop or handleCancel fired while startLiveTranscription was
+      // in-flight, stateRef will no longer be "recording" — tear down the ghost
+      // transcription. Cancel owns its own cleanup; only run cleanup here when
+      // we're in the handleStop ghost case.
       if (stateRef.current !== "recording") {
         await commands.stopLiveTranscription().catch(() => {});
-        cleanupListeners();
+        if (stateRef.current !== "cancelling") cleanupListeners();
         return;
       }
 
@@ -310,12 +351,14 @@ export function useDictation() {
         emitBubbleState("transcribing", slot.name);
 
         await commands.stopLiveTranscription();
+        if (phase() === "cancelling") return;
 
         // Wait for "Stopped" event (final chunks will have been emitted)
         if (stoppedDeferredRef.current) {
           const timeout = new Promise<void>((resolve) => setTimeout(resolve, 5000));
           await Promise.race([stoppedDeferredRef.current.promise, timeout]);
         }
+        if (phase() === "cancelling") return;
 
         let text = accumulatedTextRef.current.trim();
         const inputText = text; // Capture raw transcription before AI
@@ -366,6 +409,8 @@ export function useDictation() {
           }
         }
 
+        if (phase() === "cancelling") return;
+
         // Output based on slot action
         const action = slot.outputAction ?? "paste";
 
@@ -405,6 +450,8 @@ export function useDictation() {
           }
         }
 
+        if (phase() === "cancelling") return;
+
         trackDictationCompleted({
           slot_id: slotIdRef.current,
           duration_ms: Date.now() - startTimeRef.current,
@@ -417,6 +464,8 @@ export function useDictation() {
         if (!wavInfoRef.current) {
           await new Promise((r) => setTimeout(r, 500));
         }
+
+        if (phase() === "cancelling") return;
 
         // Persist dictation history (awaited so refresh sees the new entry)
         try {
@@ -475,20 +524,80 @@ export function useDictation() {
     function setIdle() {
       stateRef.current = "idle";
       useAppStore.getState().setDictationSessionId(null);
+      unregisterCancelHotkey();
       // Notify toggle mode that dictation is done (clears toggle state)
       window.dispatchEvent(new CustomEvent("yapstack:dictation-idle"));
     }
 
+    async function handleCancel() {
+      const startPhase = phase();
+
+      // Nothing to cancel.
+      if (startPhase === "idle" || startPhase === "cancelling") return;
+
+      // Post-success / post-error display window: just dismiss the bubble fast.
+      // No teardown work remains.
+      if (startPhase === "done") {
+        await hideBubble();
+        setIdle();
+        return;
+      }
+
+      // Take ownership of the lifecycle. Any in-flight handleStart guard or
+      // handleStop bail-point will see "cancelling" and exit without running
+      // its own teardown.
+      stateRef.current = "cancelling";
+
+      abortRef.current?.abort();
+      // Unblock handleStop's wait on the Stopped/Error status event.
+      stoppedDeferredRef.current?.resolve();
+
+      emitBubbleState("cancelled");
+
+      trackDictationCancelled({
+        slot_id: slotIdRef.current,
+        phase: startPhase,
+        duration_ms: Date.now() - startTimeRef.current,
+      });
+
+      // Stop live transcription — finalizes the streamed Session WAV and emits
+      // "Stopped". Capture itself is app-wide and stays running.
+      await commands.stopLiveTranscription().catch(() => {});
+
+      // Wait briefly for the Session WAV to finalize so we can delete it.
+      // wavInfoRef populates from the SESSION_WAV_READY listener, which is
+      // still mounted at this point.
+      const wavDeadline = Date.now() + CANCEL_WAV_GRACE_MS;
+      while (!wavInfoRef.current && Date.now() < wavDeadline) {
+        await new Promise((r) => setTimeout(r, 100));
+      }
+
+      if (wavInfoRef.current) {
+        await commands.deleteSessionWav(dictationIdRef.current, null).catch(() => {});
+      }
+
+      cleanupListeners();
+      abortRef.current = null;
+
+      // Hold the "Cancelled" bubble briefly for visual confirmation, then hide.
+      await new Promise((r) => setTimeout(r, CANCEL_DISPLAY_MS));
+      await hideBubble();
+      setIdle();
+    }
+
     window.addEventListener("yapstack:dictation-start", handleStart);
     window.addEventListener("yapstack:dictation-stop", handleStop);
+    window.addEventListener("yapstack:dictation-cancel", handleCancel);
 
     return () => {
       window.removeEventListener("yapstack:dictation-start", handleStart);
       window.removeEventListener("yapstack:dictation-stop", handleStop);
+      window.removeEventListener("yapstack:dictation-cancel", handleCancel);
       abortRef.current?.abort();
       // Stop live transcription if dictation is active on teardown
-      if (stateRef.current === "recording") {
+      if (stateRef.current !== "idle" && stateRef.current !== "done") {
         commands.stopLiveTranscription().catch(() => {});
+        unregisterCancelHotkey();
       }
       cleanupListeners();
     };

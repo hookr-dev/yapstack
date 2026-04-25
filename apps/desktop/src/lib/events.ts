@@ -42,7 +42,7 @@ export type StreamHealthEvent = {
 export type BubbleState =
   | "recording" | "transcribing" | "processing"
   | "pasted" | "copied" | "note-created"
-  | "no-speech" | "no-input" | "error";
+  | "no-speech" | "no-input" | "error" | "cancelled";
 
 export type DictationStateEvent = {
   state: BubbleState;
