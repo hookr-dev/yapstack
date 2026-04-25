@@ -361,7 +361,11 @@ export function useChatMessages(
             ),
           );
 
-          const toolCtx = await ctxTools.getToolContext();
+          // Re-fetch between mutating calls inside the same batch — see the
+          // refresh after `executeTool` below — so the second mutation can
+          // observe the first one's pre-state (folder memberships, tag rows,
+          // pin state).
+          let toolCtx = await ctxTools.getToolContext();
           const toolResultMessages: ChatCompletionMessageParam[] = [];
 
           const assistantToolCalls = turnToolCalls.map((call) => ({
@@ -406,6 +410,18 @@ export function useChatMessages(
                 call.arguments,
                 toolCtx,
               );
+              // After a mutating tool runs, the snapshot the orchestrator
+              // captured at the start of this batch (folder ids, tag rows,
+              // pin state) is stale. Refresh before the next call so the
+              // following tool sees the post-mutation world. Read-only tools
+              // can't move state, so skip the round trip for them.
+              if (
+                getToolKind(call.name) === "mutate" &&
+                ctxTools.getToolContext &&
+                ci + 1 < turnToolCalls.length
+              ) {
+                toolCtx = await ctxTools.getToolContext();
+              }
               if (result) {
                 result.toolCallId = call.id;
                 trackChatToolExecuted({ tool_name: call.name });
