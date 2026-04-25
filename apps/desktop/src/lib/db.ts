@@ -95,12 +95,34 @@ export interface DbChatMessage {
   id: string;
   context_key: string;
   session_id: string | null;
-  role: "user" | "assistant";
+  role: "user" | "assistant" | "tool";
+  /**
+   * Empty string for assistant rows that emit only `tool_calls` (the
+   * underlying SQLite column is NOT NULL). The TS layer treats `""` as
+   * "no prose" — see `chat-history.ts`.
+   */
   content: string;
   action: string | null;
   created_at: string;
-  /** JSON-serialized PersistedToolCall[] from a Chat assistant turn. */
+  /**
+   * Legacy column (v13). For the per-LLM-response shape (v14+), assistant
+   * rows carry their OpenAI tool_calls list as JSON here:
+   *   `[{ id, name, arguments, label, status, detail, observation }]`
+   * `id` matches the `tool_call_id` of the corresponding tool row.
+   * Pre-v14 rows may carry the older flat shape (no `id`); the assembler
+   * treats those as legacy and skips tool replay.
+   */
   tool_calls: string | null;
+  /** Groups all rows derived from one user send. NULL on pre-v14 rows. */
+  send_id: string | null;
+  /** Order within `send_id`. NULL on pre-v14 rows. */
+  sequence: number | null;
+  /** Set on `role='tool'`; references the parent assistant's tool_calls[].id. */
+  tool_call_id: string | null;
+  /** Structured ToolObservation JSON. Set on `role='tool'`. */
+  observation: string | null;
+  /** `'done' | 'error'`. Set on `role='tool'`. */
+  status: string | null;
 }
 
 // --- Singleton ---
@@ -130,6 +152,34 @@ async function ensureRuntimeSchema(db: Database): Promise<void> {
     .catch(() => {});
   await db
     .execute("ALTER TABLE chat_messages ADD COLUMN tool_calls TEXT")
+    .catch(() => {});
+  // v14: per-LLM-response shape for tool replay.
+  await db
+    .execute("ALTER TABLE chat_messages ADD COLUMN send_id TEXT")
+    .catch(() => {});
+  await db
+    .execute("ALTER TABLE chat_messages ADD COLUMN sequence INTEGER")
+    .catch(() => {});
+  await db
+    .execute("ALTER TABLE chat_messages ADD COLUMN tool_call_id TEXT")
+    .catch(() => {});
+  await db
+    .execute("ALTER TABLE chat_messages ADD COLUMN observation TEXT")
+    .catch(() => {});
+  await db
+    .execute("ALTER TABLE chat_messages ADD COLUMN status TEXT")
+    .catch(() => {});
+  // Backfill legacy rows so they have a self-consistent send group.
+  await db
+    .execute("UPDATE chat_messages SET send_id = id WHERE send_id IS NULL")
+    .catch(() => {});
+  await db
+    .execute("UPDATE chat_messages SET sequence = 0 WHERE sequence IS NULL")
+    .catch(() => {});
+  await db
+    .execute(
+      "CREATE INDEX IF NOT EXISTS idx_chat_messages_send ON chat_messages(context_key, send_id, sequence)",
+    )
     .catch(() => {});
 
   // FTS5 search tables. Created idempotently; backfilled only when the FTS
@@ -900,7 +950,10 @@ export async function createManualSession(
 export async function insertChatMessage(msg: DbChatMessage): Promise<void> {
   const db = await getDb();
   await db.execute(
-    "INSERT INTO chat_messages (id, context_key, session_id, role, content, action, tool_calls) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+    `INSERT INTO chat_messages
+       (id, context_key, session_id, role, content, action, tool_calls,
+        send_id, sequence, tool_call_id, observation, status)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
     [
       msg.id,
       msg.context_key,
@@ -909,6 +962,11 @@ export async function insertChatMessage(msg: DbChatMessage): Promise<void> {
       msg.content,
       msg.action,
       msg.tool_calls,
+      msg.send_id,
+      msg.sequence,
+      msg.tool_call_id,
+      msg.observation,
+      msg.status,
     ],
   );
 }
@@ -917,8 +975,13 @@ export async function getChatMessages(
   contextKey: string,
 ): Promise<DbChatMessage[]> {
   const db = await getDb();
+  // (send_id, sequence) is the load-bearing order. Fall back to created_at
+  // for legacy pre-v14 rows where sequence is NULL — COALESCE so nulls sort
+  // first within their send group, matching insertion order.
   return await db.select<DbChatMessage[]>(
-    "SELECT * FROM chat_messages WHERE context_key = $1 ORDER BY created_at ASC",
+    `SELECT * FROM chat_messages
+     WHERE context_key = $1
+     ORDER BY created_at ASC, COALESCE(sequence, 0) ASC`,
     [contextKey],
   );
 }
