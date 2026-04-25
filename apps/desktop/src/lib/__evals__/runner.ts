@@ -32,6 +32,7 @@ export interface EvalDbStub {
     segments: Map<string, DbSegment[]>;
     tags: DbTag[];
     sessionTags: DbSessionTag[];
+    dictations: DbDictationHistory[];
   };
   module: Record<string, unknown>;
 }
@@ -47,6 +48,7 @@ export function buildEvalDbStub(fixture: EvalFixture): EvalDbStub {
     ),
     tags: fixture.tags.map((t) => ({ ...t })),
     sessionTags: fixture.sessionTags.map((st) => ({ ...st })),
+    dictations: (fixture.dictations ?? []).map((d) => ({ ...d })),
   };
 
   // Lightweight LIKE substring match used for searches in the stub. The
@@ -205,10 +207,40 @@ export function buildEvalDbStub(fixture: EvalFixture): EvalDbStub {
         .filter((f) => matches(f.name, query))
         .map((f) => ({ id: f.id, name: f.name })),
     searchDictations: async (
-      _query: string,
-    ): Promise<DictationSearchResult[]> => [],
+      query: string,
+    ): Promise<DictationSearchResult[]> => {
+      const out: DictationSearchResult[] = [];
+      for (const d of state.dictations) {
+        if (matches(d.output_text, query) || matches(d.input_text, query)) {
+          out.push({
+            dictationId: d.id,
+            slotName: d.slot_name,
+            // Mirror the production `searchDictations` which prefers
+            // output_text when the match is there, else input_text.
+            snippet: matches(d.output_text, query)
+              ? d.output_text
+              : d.input_text,
+            sessionId: d.session_id,
+          });
+        }
+      }
+      return out;
+    },
 
-    listDictationHistory: async (): Promise<DbDictationHistory[]> => [],
+    listDictationHistory: async (): Promise<DbDictationHistory[]> =>
+      state.dictations.map((d) => ({ ...d })),
+
+    updateSegmentText: async (id: string, newText: string) => {
+      for (const segs of state.segments.values()) {
+        const seg = segs.find((s) => s.id === id);
+        if (seg) {
+          if (seg.original_text == null) seg.original_text = seg.text;
+          seg.text = newText;
+          seg.edited_at = new Date().toISOString();
+          return;
+        }
+      }
+    },
   };
 
   return { state, module: moduleStub };

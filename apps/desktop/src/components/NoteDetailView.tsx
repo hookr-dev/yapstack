@@ -80,6 +80,9 @@ export function NoteDetailView() {
   const loadSessionFolders = useAppStore((s) => s.loadSessionFolders);
   const loadSessionTags = useAppStore((s) => s.loadSessionTags);
   const loadTags = useAppStore((s) => s.loadTags);
+  const refreshViewSessionSegments = useAppStore(
+    (s) => s.refreshViewSessionSegments,
+  );
   const handleToolsExecuted = useCallback(
     async (names: string[]) => {
       if (!selectedSessionId) return;
@@ -97,8 +100,19 @@ export function NoteDetailView() {
       if (effects.has("organization")) {
         await Promise.all([loadSessionFolders(), loadSessionTags(), loadTags()]);
       }
+      if (effects.has("transcript")) {
+        await refreshViewSessionSegments();
+      }
     },
-    [selectedSessionId, loadSessions, incrementNoteRefresh, loadSessionFolders, loadSessionTags, loadTags],
+    [
+      selectedSessionId,
+      loadSessions,
+      incrementNoteRefresh,
+      loadSessionFolders,
+      loadSessionTags,
+      loadTags,
+      refreshViewSessionSegments,
+    ],
   );
 
   const handleSeek = useCallback(

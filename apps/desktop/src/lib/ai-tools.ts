@@ -17,6 +17,7 @@ import {
   searchSessionsByTitle,
   searchDictations,
   getSessionsByIds,
+  updateSegmentText,
   listAllSessionFolders,
   getNote,
   getSessionSegments,
@@ -127,7 +128,7 @@ export interface ToolContext {
 
 // --- Modular tool definition ---
 
-export type ToolEffect = "session-meta" | "notes" | "organization";
+export type ToolEffect = "session-meta" | "notes" | "organization" | "transcript";
 
 /**
  * Compile-time discriminator for tool intent.
@@ -1108,6 +1109,149 @@ registerTool({
     };
   },
   undo: async () => {},
+});
+
+// --- Tool: replace_in_transcript ---
+
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+registerTool({
+  kind: "mutate",
+  affects: ["transcript"],
+  schema: {
+    type: "function",
+    function: {
+      name: "replace_in_transcript",
+      description:
+        "Find and replace text within the current session's transcript segments. Use this when the user spots a misheard or misspelled word in the transcript and asks you to fix it (e.g. \"it should be 'kubernetes' not 'kubernet ease' everywhere\"). Matches every occurrence inside each segment's text; case-insensitive by default. Limited to 50 affected segments per call — if more match, the call fails and the model should narrow `find`.",
+      parameters: {
+        type: "object",
+        properties: {
+          find: {
+            type: "string",
+            description:
+              "Substring to search for in segment text. Required and non-empty.",
+          },
+          replace: {
+            type: "string",
+            description:
+              "Replacement text. Pass an empty string to delete every occurrence.",
+          },
+          case_sensitive: {
+            type: ["boolean", "null"],
+            description:
+              "When true, match exact casing. When false or null, match case-insensitively (default).",
+          },
+        },
+        required: ["find", "replace", "case_sensitive"],
+        additionalProperties: false,
+      },
+    },
+  },
+  execute: async (args, ctx) => {
+    const find = String(args.find ?? "");
+    const replace = String(args.replace ?? "");
+    const caseSensitive = args.case_sensitive === true;
+
+    if (!find) {
+      return {
+        name: "replace_in_transcript",
+        label: "Transcript",
+        detail: "Empty find",
+        result: "Error: replace_in_transcript requires a non-empty `find`.",
+      };
+    }
+    if (find === replace) {
+      return {
+        name: "replace_in_transcript",
+        label: "Transcript",
+        detail: "No-op (find equals replace)",
+        result: `No change — \`find\` and \`replace\` are identical ("${find}").`,
+      };
+    }
+    if (!ctx.segments || ctx.segments.length === 0) {
+      return {
+        name: "replace_in_transcript",
+        label: "Transcript",
+        detail: "No segments",
+        result: "Error: this session has no transcript segments to edit.",
+      };
+    }
+
+    const flags = caseSensitive ? "g" : "gi";
+    const pattern = new RegExp(escapeRegExp(find), flags);
+
+    type EditPlan = { segmentId: string; previousText: string; newText: string };
+    const plans: EditPlan[] = [];
+    for (const seg of ctx.segments) {
+      if (seg.deleted_at || seg.hidden) continue;
+      pattern.lastIndex = 0;
+      if (!pattern.test(seg.text)) continue;
+      pattern.lastIndex = 0;
+      const newText = seg.text.replace(pattern, replace);
+      if (newText === seg.text) continue;
+      plans.push({ segmentId: seg.id, previousText: seg.text, newText });
+    }
+
+    const MAX_AFFECTED = 50;
+    if (plans.length > MAX_AFFECTED) {
+      return {
+        name: "replace_in_transcript",
+        label: "Transcript",
+        detail: `Too many matches (${plans.length})`,
+        result: `Error: replace_in_transcript would change ${plans.length} segments, exceeding the cap of ${MAX_AFFECTED}. Narrow \`find\` (use surrounding words for context) and call again.`,
+      };
+    }
+    if (plans.length === 0) {
+      return {
+        name: "replace_in_transcript",
+        label: "Transcript",
+        detail: `No matches for "${find}"`,
+        result: `No segment in this session contains "${find}". Verify the spelling against the transcript before retrying.`,
+      };
+    }
+
+    // Snapshot pre-edit state for undo before any DB writes — `updateSegmentText`
+    // mutates a per-segment original_text snapshot too, but that captures the
+    // very first transcription, not the pre-this-call state.
+    const undoData = await captureUndoSnapshot(() =>
+      plans.map((p) => ({ segmentId: p.segmentId, previousText: p.previousText })),
+    );
+
+    for (const p of plans) {
+      await updateSegmentText(p.segmentId, p.newText);
+    }
+
+    const detail = `Replaced "${find}" with "${replace}" in ${plans.length} segment${plans.length === 1 ? "" : "s"}`;
+    const result =
+      `${detail}.\n` +
+      plans
+        .slice(0, 10)
+        .map((p) => `- seg=${p.segmentId}: "${p.previousText.slice(0, 80)}" → "${p.newText.slice(0, 80)}"`)
+        .join("\n") +
+      (plans.length > 10 ? `\n… (${plans.length - 10} more)` : "");
+
+    return {
+      name: "replace_in_transcript",
+      label: "Transcript",
+      detail,
+      result,
+      undoData,
+      observation: {
+        summary: detail,
+        evidence: result,
+        affectedIds: plans.map((p) => p.segmentId),
+      },
+    };
+  },
+  undo: async (undoData) => {
+    const data = undoData as { segmentId: string; previousText: string }[];
+    for (const { segmentId, previousText } of data) {
+      await updateSegmentText(segmentId, previousText);
+    }
+  },
 });
 
 // --- Tool: search_dictations ---

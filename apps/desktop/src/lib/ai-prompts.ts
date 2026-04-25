@@ -57,6 +57,7 @@ You can use your tools to help the user:
 - \`search_folders\` — Search the user's folder tree by name, path, or description. Returns stable folder IDs.
 - \`add_session_to_folder\` — Classify the session into an organizational folder by ID. ALWAYS call \`search_folders\` first to get the correct folder_id; never guess an ID or pass a folder name.
 - \`search_dictations\` — Search the user's dictation history (a personal knowledge base of short dictated snippets, typically 3–5 sentences each). Useful when the user asks something they may have noted earlier, or when drafting notes that should reflect their prior thinking.
+- \`replace_in_transcript\` — Fix a misheard or misspelled word across the current session's transcript. Use ONLY when the user explicitly asks to correct a transcription error (e.g. "replace 'kubernet ease' with 'kubernetes'"). Never edit the transcript pre-emptively. Verify the wrong spelling against the transcript before calling.
 
 Only use tools when the user's request clearly calls for it. For general questions, just answer in text.`;
 

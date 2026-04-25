@@ -130,6 +130,7 @@ export function createSessionTools(sessionId: string): AIContextTools {
       "search_sessions",
       "get_session_context",
       "search_dictations",
+      "replace_in_transcript",
     ],
     contextType: "session",
     getToolContext: async (): Promise<ToolContext> => {

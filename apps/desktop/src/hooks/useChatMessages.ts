@@ -123,6 +123,7 @@ const TOOL_DISPLAY_LABELS: Record<string, string> = {
   search_sessions: "Searching sessions",
   get_session_context: "Reading sessions",
   search_dictations: "Searching dictations",
+  replace_in_transcript: "Editing transcript",
 };
 
 function cleanToolBadges(content: string): string {
