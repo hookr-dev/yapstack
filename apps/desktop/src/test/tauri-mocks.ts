@@ -156,5 +156,11 @@ export const tauriCommandsMock = () => ({
       data: { phase: "Stopped" },
     }),
     clipboardPaste: vi.fn().mockResolvedValue({ status: "ok", data: null }),
+    requestScreenCapturePermission: vi
+      .fn()
+      .mockResolvedValue({ status: "ok", data: "Granted" }),
+    updateVocabularyHints: vi
+      .fn()
+      .mockResolvedValue({ status: "ok", data: null }),
   },
 });

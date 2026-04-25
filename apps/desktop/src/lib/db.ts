@@ -798,6 +798,12 @@ export async function searchSegments(
       speaker_id: number | null;
     }[]
   >(
+    // `hidden = 0` matches the visibility filter used by
+    // assembleTranscriptContext and get_session_context, so the AI
+    // retrieval loop never surfaces a segment the user has explicitly
+    // hidden from their own transcript view. `IS 0 OR IS NULL` covers
+    // legacy rows where `hidden` may have been NULL before the column
+    // got a default.
     `SELECT seg.session_id AS session_id, seg.text AS text, s.title AS title,
             seg.source AS source, seg.speaker_id AS speaker_id
      FROM segments_fts
@@ -805,6 +811,7 @@ export async function searchSegments(
      JOIN sessions s ON seg.session_id = s.id
      WHERE segments_fts MATCH $1
        AND seg.deleted_at IS NULL
+       AND (seg.hidden = 0 OR seg.hidden IS NULL)
      ORDER BY bm25(segments_fts)
      LIMIT 50`,
     [match],
@@ -1023,6 +1030,80 @@ export async function deleteChatMessages(
     "DELETE FROM chat_messages WHERE context_key = $1",
     [contextKey],
   );
+}
+
+export async function getChatMessageById(
+  id: string,
+): Promise<DbChatMessage | null> {
+  const db = await getDb();
+  const rows = await db.select<DbChatMessage[]>(
+    "SELECT * FROM chat_messages WHERE id = $1 LIMIT 1",
+    [id],
+  );
+  return rows[0] ?? null;
+}
+
+/**
+ * Erase a set of tool calls from a persisted send group. Used by the
+ * Undo flow so a reverted mutation doesn't get replayed to the LLM on
+ * the next turn — the model would otherwise see the original
+ * assistant.tool_calls + tool result rows and assume the action stuck.
+ *
+ * Behaviour:
+ *  - Deletes every `role='tool'` row whose `tool_call_id` is in the set.
+ *  - For every `role='assistant'` row in the same send, parses
+ *    `tool_calls` JSON, drops entries whose `id` is in the set, and
+ *    writes the result back. If the resulting list is empty, the
+ *    column is set to NULL so the assembler skips it cleanly.
+ *  - An assistant row left with neither prose nor any tool_calls is a
+ *    pure no-op for the LLM; the assembler already drops empty rows,
+ *    so we don't need to delete it.
+ */
+export async function removeToolCallsFromSend(
+  contextKey: string,
+  sendId: string,
+  callIds: string[],
+): Promise<void> {
+  if (callIds.length === 0) return;
+  const db = await getDb();
+
+  // 1. Drop the tool result rows.
+  for (const cid of callIds) {
+    await db.execute(
+      `DELETE FROM chat_messages
+       WHERE context_key = $1 AND send_id = $2
+         AND role = 'tool' AND tool_call_id = $3`,
+      [contextKey, sendId, cid],
+    );
+  }
+
+  // 2. Strip matching entries from each assistant row's tool_calls JSON.
+  const rows = await db.select<DbChatMessage[]>(
+    `SELECT * FROM chat_messages
+     WHERE context_key = $1 AND send_id = $2
+       AND role = 'assistant' AND tool_calls IS NOT NULL`,
+    [contextKey, sendId],
+  );
+  const callIdSet = new Set(callIds);
+  for (const row of rows) {
+    if (!row.tool_calls) continue;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(row.tool_calls);
+    } catch {
+      continue;
+    }
+    if (!Array.isArray(parsed)) continue;
+    const filtered = parsed.filter(
+      (p) => !(typeof p === "object" && p && callIdSet.has((p as { id?: string }).id ?? "")),
+    );
+    if (filtered.length === parsed.length) continue;
+    const newJson = filtered.length > 0 ? JSON.stringify(filtered) : null;
+    await db.execute(
+      "UPDATE chat_messages SET tool_calls = $1 WHERE id = $2",
+      [newJson, row.id],
+    );
+  }
 }
 
 // --- Dictation history ---

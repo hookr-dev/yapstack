@@ -16,6 +16,8 @@ import {
   insertChatMessage,
   updateChatMessageContent,
   deleteChatMessages,
+  getChatMessageById,
+  removeToolCallsFromSend,
 } from "@/lib/db";
 import {
   createAIClient,
@@ -204,17 +206,36 @@ export function useChatMessages(
           trackChatToolUndone({ tool_name: t.name });
         }
 
-        setMessages((prev) =>
-          prev.map((m) => {
-            if (m.id !== state.messageId) return m;
-            return { ...m, content: cleanToolBadges(m.content) };
-          }),
-        );
+        // Erase the persisted tool-call records for the reverted calls
+        // so they don't get replayed to the LLM on the next turn.
+        // Without this, the assistant.tool_calls + role='tool' rows live
+        // on, and the model assumes the mutation stuck — the user sees a
+        // silently-stale answer ("I already pinned it") even though the
+        // pin was undone.
+        const callIds = state.executed
+          .map((t) => t.toolCallId)
+          .filter((id): id is string => !!id);
+        const ref = await getChatMessageById(state.messageId);
+        if (ref?.send_id && callIds.length > 0) {
+          await removeToolCallsFromSend(
+            ref.context_key,
+            ref.send_id,
+            callIds,
+          );
+        }
 
+        // Strip the legacy `[tool:NAME] …` text prefix on the assistant
+        // row (no-op for v14 rows, kept for old chats). Then refresh
+        // in-memory state from DB so the UI reflects the cleaned send.
         const msg = messagesRef.current.find((m) => m.id === state.messageId);
         if (msg) {
-          await updateChatMessageContent(state.messageId, cleanToolBadges(msg.content));
+          await updateChatMessageContent(
+            state.messageId,
+            cleanToolBadges(msg.content),
+          );
         }
+        const refreshed = await getChatMessages(contextKey);
+        setMessages(dbRowsToChatMessages(refreshed));
 
         if (onToolsExecuted) {
           await onToolsExecuted(state.executed.map((t) => t.name));
@@ -227,7 +248,7 @@ export function useChatMessages(
       }
       setUndoState(null);
     },
-    [isSessionContext, sessionId, onToolsExecuted],
+    [contextKey, isSessionContext, sessionId, onToolsExecuted],
   );
 
   const handleClearChat = useCallback(async () => {
