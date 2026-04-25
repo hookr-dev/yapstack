@@ -109,6 +109,7 @@ describe("Chat agent eval cases", () => {
             : null,
           isPinned: session?.is_pinned === 1,
           folderIds,
+          allowedSessionIds: step.ctxAllowedSessionIds,
         };
 
         let result;

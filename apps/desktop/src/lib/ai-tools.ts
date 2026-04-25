@@ -99,6 +99,14 @@ export interface ToolContext {
   tags?: string[];
   folderNames?: string[];
   folderIds?: string[];
+  /**
+   * When defined, retrieval Tools (`search_sessions`, `get_session_context`)
+   * must restrict their results to these session IDs. Set by multi-session
+   * Chats (folder/pinned/all) so the model can't reach outside the user's
+   * current scope. Single-session Chats leave this undefined so the user
+   * can still ask cross-session questions from a session view.
+   */
+  allowedSessionIds?: string[];
 }
 
 // --- Modular tool definition ---
@@ -763,7 +771,7 @@ registerTool({
       },
     },
   },
-  execute: async (args) => {
+  execute: async (args, ctx) => {
     const query = String(args.query).trim();
     const filters = (args.filters ?? null) as {
       folder_id: string | null;
@@ -784,6 +792,9 @@ registerTool({
       };
     }
 
+    const scopeIds = ctx.allowedSessionIds;
+    const scopeSet = scopeIds ? new Set(scopeIds) : null;
+
     // Hybrid retrieval: title hits beat note hits beat segment hits, ordered
     // within each tier by FTS5 bm25 (already applied by the search* helpers).
     // We dedupe by session_id keeping the highest-precedence hit.
@@ -802,7 +813,10 @@ registerTool({
       // Within a tier, earlier ranks score higher.
       Math.max(0, 1000 - tier * 100 - rank);
 
+    const inScope = (sessionId: string) => !scopeSet || scopeSet.has(sessionId);
+
     titleHits.forEach((hit, i) => {
+      if (!inScope(hit.sessionId)) return;
       bySessionId.set(hit.sessionId, {
         session_id: hit.sessionId,
         title: hit.sessionTitle,
@@ -814,6 +828,7 @@ registerTool({
       });
     });
     noteHits.forEach((hit, i) => {
+      if (!inScope(hit.sessionId)) return;
       if (bySessionId.has(hit.sessionId)) return;
       bySessionId.set(hit.sessionId, {
         session_id: hit.sessionId,
@@ -826,6 +841,7 @@ registerTool({
       });
     });
     segmentHits.forEach((hit, i) => {
+      if (!inScope(hit.sessionId)) return;
       if (bySessionId.has(hit.sessionId)) return;
       bySessionId.set(hit.sessionId, {
         session_id: hit.sessionId,
@@ -939,7 +955,7 @@ registerTool({
       },
     },
   },
-  execute: async (args) => {
+  execute: async (args, ctx) => {
     const sessionIds = (args.session_ids as string[]) ?? [];
     const scope = String(args.scope) as "segments" | "notes" | "summary" | "all";
     if (sessionIds.length === 0) {
@@ -949,6 +965,19 @@ registerTool({
         detail: "No session_ids provided",
         result: "Error: get_session_context requires at least one session_id.",
       };
+    }
+
+    if (ctx.allowedSessionIds) {
+      const scopeSet = new Set(ctx.allowedSessionIds);
+      const outOfScope = sessionIds.filter((id) => !scopeSet.has(id));
+      if (outOfScope.length > 0) {
+        return {
+          name: "get_session_context",
+          label: "Sessions",
+          detail: `${outOfScope.length} session_id${outOfScope.length === 1 ? "" : "s"} out of scope`,
+          result: `Error: requested session_ids are outside the current chat scope: ${outOfScope.join(", ")}. Only call search_sessions and get_session_context with IDs returned from this chat's search_sessions.`,
+        };
+      }
     }
 
     const wantSegments = scope === "segments" || scope === "all";

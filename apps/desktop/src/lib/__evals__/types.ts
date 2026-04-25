@@ -31,6 +31,13 @@ export interface EvalStep {
   args: Record<string, unknown>;
   /** Override the default sessionId used in ToolContext (defaults to first session). */
   ctxSessionId?: string;
+  /**
+   * Restrict retrieval Tools (`search_sessions`, `get_session_context`) to
+   * these session IDs by setting `ctx.allowedSessionIds`. Mirrors what the
+   * runtime wires up for multi-session Chats. Leave undefined for the
+   * single-session case.
+   */
+  ctxAllowedSessionIds?: string[];
   expect: {
     /** Substring of the observation summary or evidence (whichever is truthy). */
     observationContains?: string;
