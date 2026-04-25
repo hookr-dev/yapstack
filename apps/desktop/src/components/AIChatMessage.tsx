@@ -33,6 +33,7 @@ const TOOL_LABELS: Record<string, string> = {
   search_folders: "Folders searched",
   search_sessions: "Sessions searched",
   get_session_context: "Sessions expanded",
+  search_dictations: "Dictations searched",
 };
 
 function parseToolBadges(content: string): {

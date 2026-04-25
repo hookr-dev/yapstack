@@ -8,6 +8,7 @@ import {
   Type,
   Pin,
   Search,
+  Mic,
 } from "lucide-react";
 import type { ToolExecution } from "@/lib/ai";
 
@@ -16,6 +17,7 @@ const TOOL_ICONS: Record<string, typeof Check> = {
   search_folders: Search,
   search_sessions: Search,
   get_session_context: FileText,
+  search_dictations: Mic,
   tag_session: Tag,
   save_to_notes: FileText,
   update_title: Type,

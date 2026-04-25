@@ -15,6 +15,7 @@ import {
   searchSegments,
   searchNotes,
   searchSessionsByTitle,
+  searchDictations,
   getSessionsByIds,
   listAllSessionFolders,
   getNote,
@@ -1103,6 +1104,84 @@ registerTool({
         evidence: result.slice(0, 500),
         affectedIds: sessionIds,
         provenance,
+      },
+    };
+  },
+  undo: async () => {},
+});
+
+// --- Tool: search_dictations ---
+
+registerTool({
+  kind: "read",
+  affects: [],
+  schema: {
+    type: "function",
+    function: {
+      name: "search_dictations",
+      description:
+        "Search the user's dictation history — short voice-to-text snippets (typically 3–5 sentences each) the user has dictated outside of recording sessions. Useful as a personal knowledge base: facts, ideas, reminders, definitions the user wrote earlier. Each result includes the full dictated text since entries are short, so no separate expansion call is needed. Use when the user asks a question that might be answered by something they previously dictated, or when drafting notes that should incorporate their prior thinking.",
+      parameters: {
+        type: "object",
+        properties: {
+          query: {
+            type: "string",
+            description: "Free-form keywords to search dictation text.",
+          },
+          limit: {
+            type: ["integer", "null"],
+            description: "Max results to return (default 10, max 25).",
+          },
+        },
+        required: ["query", "limit"],
+        additionalProperties: false,
+      },
+    },
+  },
+  execute: async (args) => {
+    const query = String(args.query).trim();
+    const limitArg = args.limit;
+    const limit = Math.min(
+      typeof limitArg === "number" && limitArg > 0 ? limitArg : 10,
+      25,
+    );
+
+    if (!query) {
+      return {
+        name: "search_dictations",
+        label: "Dictations",
+        detail: "Empty query",
+        result: "Error: search_dictations requires a non-empty query.",
+      };
+    }
+
+    const hits = await searchDictations(query);
+    const top = hits.slice(0, limit);
+
+    const detail =
+      top.length === 0
+        ? `No dictations match "${query}"`
+        : `Matched ${top.length} dictation${top.length === 1 ? "" : "s"}`;
+
+    const result =
+      top.length === 0
+        ? `No dictations match "${query}".`
+        : `Matches:\n${top
+            .map(
+              (h) =>
+                `- dictation_id=${h.dictationId} slot="${h.slotName}"${h.sessionId ? ` linked_session=${h.sessionId}` : ""}\n  ${h.snippet.slice(0, 600)}`,
+            )
+            .join("\n")}`;
+
+    return {
+      name: "search_dictations",
+      label: "Dictations",
+      detail,
+      result,
+      observation: {
+        summary: detail,
+        evidence: result,
+        affectedIds: top.map((h) => h.dictationId),
       },
     };
   },
