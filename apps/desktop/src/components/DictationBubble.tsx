@@ -65,6 +65,12 @@ const stateConfig: Record<
     textColor: "text-red-400",
     glow: "shadow-[0_0_12px_rgba(239,68,68,0.5)]",
   },
+  cancelled: {
+    label: "Cancelled",
+    ringColor: "ring-zinc-500",
+    textColor: "text-zinc-400",
+    glow: "shadow-[0_0_12px_rgba(113,113,122,0.4)]",
+  },
 };
 
 export function DictationBubble() {
