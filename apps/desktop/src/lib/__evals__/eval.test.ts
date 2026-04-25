@@ -45,6 +45,7 @@ vi.mock("@/lib/db", () => {
     removeSessionFromFolder: get("removeSessionFromFolder"),
     getNote: get("getNote"),
     saveNote: get("saveNote"),
+    createNoteVersion: get("createNoteVersion"),
     getSessionSegments: get("getSessionSegments"),
     listTags: get("listTags"),
     getTagByName: get("getTagByName"),
