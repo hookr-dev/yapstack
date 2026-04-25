@@ -29,6 +29,7 @@ export function ChatView({
   const activeRef = useRef<HTMLDivElement>(null);
   const scrollAreaRef = useRef<HTMLDivElement>(null);
   const autoScrollingRef = useRef(false);
+  const lastScrollTopRef = useRef(0);
   const [userScrolled, setUserScrolled] = useState(false);
   const [scrollDirection, setScrollDirection] = useState<"up" | "down">("down");
 
@@ -80,50 +81,57 @@ export function ChatView({
     height: number;
   } | null>(null);
 
+  // Stick-to-bottom: follow new segments unless the user has scrolled away.
   useEffect(() => {
+    if (userScrolled) return;
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [segments.length]);
+  }, [segments.length, userScrolled]);
 
-  // On mount, scroll to bottom for active sessions so user sees latest segments
   useEffect(() => {
     if (initialScrollToBottom) {
       requestAnimationFrame(() => {
         bottomRef.current?.scrollIntoView({ behavior: "instant" });
       });
     }
-    // Only run on mount
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Reset userScrolled when playback stops
+  // When playback stops, resume following so the next session sticks again.
   useEffect(() => {
     if (currentPlaybackTime == null) {
       setUserScrolled(false);
     }
   }, [currentPlaybackTime]);
 
-  // Auto-scroll to active segment during playback (unless user scrolled away)
+  // Auto-scroll to the active segment during playback (unless the user is freed).
   useEffect(() => {
     if (currentPlaybackTime != null && activeRef.current && !userScrolled) {
       autoScrollingRef.current = true;
       activeRef.current.scrollIntoView({ behavior: "smooth", block: "nearest" });
-      // Clear flag after scroll settles
       setTimeout(() => {
         autoScrollingRef.current = false;
       }, 150);
     }
   }, [currentPlaybackTime, userScrolled]);
 
-  // Detect user scroll vs programmatic scroll
+  // Disengage stick-to-bottom on user scroll. Programmatic autoscroll only
+  // moves the viewport *down*, so any decrease in scrollTop is unambiguously
+  // the user — robust against rapid segment arrival.
   useEffect(() => {
     const viewport = scrollAreaRef.current?.querySelector(
       "[data-slot='scroll-area-viewport']"
-    );
-    if (!viewport || currentPlaybackTime == null) return;
+    ) as HTMLElement | null;
+    if (!viewport) return;
+
+    lastScrollTopRef.current = viewport.scrollTop;
 
     const handleScroll = () => {
-      if (autoScrollingRef.current) return;
-      if (activeRef.current) {
+      const newScrollTop = viewport.scrollTop;
+      const wentUp = newScrollTop < lastScrollTopRef.current - 1;
+      lastScrollTopRef.current = newScrollTop;
+
+      if (currentPlaybackTime != null && activeRef.current) {
+        if (autoScrollingRef.current) return;
         const rect = activeRef.current.getBoundingClientRect();
         const vpRect = viewport.getBoundingClientRect();
         const visible = rect.top >= vpRect.top && rect.bottom <= vpRect.bottom;
@@ -131,22 +139,37 @@ export function ChatView({
         if (!visible) {
           setScrollDirection(rect.top < vpRect.top ? "up" : "down");
         }
+        return;
+      }
+
+      const distFromBottom =
+        viewport.scrollHeight - newScrollTop - viewport.clientHeight;
+      if (wentUp) {
+        setUserScrolled(true);
+        setScrollDirection("down");
+      } else if (distFromBottom < 4) {
+        setUserScrolled(false);
       }
     };
 
     viewport.addEventListener("scroll", handleScroll, { passive: true });
     return () => viewport.removeEventListener("scroll", handleScroll);
-    // Only attach/detach when playback starts/stops
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [currentPlaybackTime != null]);
 
   const handleJumpToCurrent = useCallback(() => {
     setUserScrolled(false);
-    // Delay scrollIntoView so the autoscroll effect picks it up on next tick
     requestAnimationFrame(() => {
-      activeRef.current?.scrollIntoView({ behavior: "smooth", block: "center" });
+      if (currentPlaybackTime != null && activeRef.current) {
+        activeRef.current.scrollIntoView({
+          behavior: "smooth",
+          block: "center",
+        });
+      } else {
+        bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+      }
     });
-  }, []);
+  }, [currentPlaybackTime]);
 
   const handleTimestampClick = useCallback(
     (time: number) => {
@@ -307,7 +330,7 @@ export function ChatView({
         </div>
       </ScrollArea>
       <BulkActionsBar segments={segments} readOnly={!isEditable} />
-      {userScrolled && currentPlaybackTime != null && (
+      {userScrolled && (
         <button
           onClick={handleJumpToCurrent}
           className="absolute bottom-3 left-1/2 -translate-x-1/2 z-10 flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium bg-primary text-primary-foreground rounded-full shadow-md hover:bg-primary/90 transition-colors"
@@ -317,7 +340,7 @@ export function ChatView({
           ) : (
             <ArrowDown className="h-3 w-3" />
           )}
-          Jump to current
+          {currentPlaybackTime != null ? "Jump to current" : "Jump to latest"}
         </button>
       )}
     </div>
