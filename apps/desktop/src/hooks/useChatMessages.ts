@@ -317,12 +317,18 @@ export function useChatMessages(
         // Multi-turn tool execution: after each LLM turn, if it emits tool_calls,
         // execute them and send results back for a follow-up turn. This lets the
         // LLM use tool results (e.g., folder context from add_session_to_folder)
-        // to inform subsequent output (e.g., writing a summary). Capped to
-        // prevent runaway loops.
+        // to inform subsequent output (e.g., writing a summary).
+        //
+        // The cap allows up to MAX_TOOL_ROUNDS tool-calling rounds; after that,
+        // one final round runs without tools so the model is forced to
+        // synthesize a textual answer over the accumulated observations
+        // instead of leaving the user with a row of tool badges and no prose.
         const MAX_TOOL_ROUNDS = 3;
         let turnMessages = chatMessages;
 
         for (let round = 0; round <= MAX_TOOL_ROUNDS; round++) {
+          const allowToolsThisRound = round < MAX_TOOL_ROUNDS;
+          const turnTools = allowToolsThisRound ? tools : [];
           let turnText = "";
           let turnToolCalls: ToolCallResult[] = [];
 
@@ -330,7 +336,7 @@ export function useChatMessages(
             client,
             activeConfig.model,
             turnMessages,
-            tools,
+            turnTools,
             abort.signal,
           )) {
             if (event.type === "token") {
@@ -343,6 +349,7 @@ export function useChatMessages(
           }
 
           if (turnToolCalls.length === 0 || !ctxTools.getToolContext) break;
+          if (!allowToolsThisRound) break;
           if (abort.signal.aborted) break;
 
           const pendingExecs: ToolExecution[] = turnToolCalls.map((c) => ({
