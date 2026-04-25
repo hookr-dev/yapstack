@@ -108,6 +108,8 @@ export function buildEvalDbStub(fixture: EvalFixture): EvalDbStub {
     saveNote: async (sessionId: string, content: string) => {
       state.notes.set(sessionId, content);
     },
+    // No-op in eval fixtures — version-history isn't asserted by any case.
+    createNoteVersion: async () => {},
 
     getSessionSegments: async (sessionId: string) =>
       (state.segments.get(sessionId) ?? []).map((s) => ({ ...s })),

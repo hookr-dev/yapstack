@@ -2,6 +2,7 @@ import type { ChatCompletionTool } from "openai/resources/chat/completions";
 import {
   updateSessionTitle,
   saveNote,
+  createNoteVersion,
   togglePin,
   getSession,
   getTagByName,
@@ -303,6 +304,61 @@ registerTool({
 
 // --- Tool: save_to_notes ---
 
+/**
+ * Substring replacement inside HTML that walks text nodes only.
+ *
+ * The naive approach — `note.replace(find, replace)` against the raw
+ * HTML — risks matching text inside attributes (URLs, classnames) and
+ * destroys formatting if the replacement contains HTML-significant
+ * characters. By walking with `TreeWalker(SHOW_TEXT)`, we only touch
+ * the text nodes the user actually sees, and the DOM serialiser
+ * escapes the replacement string for us.
+ *
+ * Limitations: matches that span tag boundaries (e.g. `**bold word**`
+ * where "word" is bolded but "bold " is not) won't match — the text
+ * is split across two nodes. For inline word/phrase substitution this
+ * is the right behaviour; for structural rewrites the model should
+ * use `append` or `replace` instead.
+ */
+function replaceTextInHtml(
+  html: string,
+  find: string,
+  replacement: string,
+): { html: string; replacedCount: number } {
+  if (!find) return { html, replacedCount: 0 };
+  if (typeof DOMParser === "undefined") {
+    // Tests / non-browser environments. Fall back to a string replace
+    // bounded to text-looking regions: between `>` and `<`. Still
+    // imperfect but unlikely to mangle attributes for the basic HTML
+    // shapes the markdown converter produces.
+    let count = 0;
+    const out = html.replace(/>([^<]*)</g, (_match, text: string) => {
+      const occurrences = text.split(find).length - 1;
+      if (occurrences === 0) return _match;
+      count += occurrences;
+      return ">" + text.split(find).join(replacement) + "<";
+    });
+    return { html: out, replacedCount: count };
+  }
+  const doc = new DOMParser().parseFromString(html, "text/html");
+  const walker = doc.createTreeWalker(doc.body, NodeFilter.SHOW_TEXT);
+  const updates: Text[] = [];
+  let node: Node | null;
+  while ((node = walker.nextNode())) {
+    if (node.nodeValue && node.nodeValue.includes(find)) {
+      updates.push(node as Text);
+    }
+  }
+  let replacedCount = 0;
+  for (const n of updates) {
+    if (!n.nodeValue) continue;
+    const occurrences = n.nodeValue.split(find).length - 1;
+    n.nodeValue = n.nodeValue.split(find).join(replacement);
+    replacedCount += occurrences;
+  }
+  return { html: doc.body.innerHTML, replacedCount };
+}
+
 registerTool({
   kind: "mutate",
   affects: ["notes"],
@@ -311,47 +367,120 @@ registerTool({
     function: {
       name: "save_to_notes",
       description:
-        "Save content to the session notes. Use 'append' to add alongside existing content, or 'replace' to overwrite (only when notes are empty or you're producing a full rewrite that incorporates existing content). Content should be markdown formatted.",
+        `Edit the session note. Pick the mode that matches the user's intent — wrong choice can destroy hand-written content.
+
+- "find_replace": Surgically replace a specific word, phrase, or sentence. Use whenever the user asks to "change", "fix", "edit", "update", or "rename" something inside their notes. Pass the exact text to find in 'find' and the new text in 'content'. The find string must be an exact substring of the current notes (visible in your prompt). Markdown does NOT render in the replacement — use plain text. Won't match across tag boundaries (e.g. across a heading break).
+- "append": Add new content below the existing notes with a separator. Use when adding a summary, action items, or a follow-up section to existing notes.
+- "prepend": Add new content above the existing notes with a separator. Use for a TL;DR or executive summary at the top.
+- "replace": Overwrite ALL existing notes. Use ONLY when the notes are empty, or the user explicitly asks for a complete rewrite from scratch. NEVER use this to "update" or "change" something — that's find_replace or append.
+
+If you're unsure between append and replace, choose append. The user's manual notes must be preserved.`,
       parameters: {
         type: "object",
         properties: {
-          content: {
-            type: "string",
-            description: "Markdown content to save to notes",
-          },
           mode: {
             type: "string",
-            enum: ["replace", "append"],
+            enum: ["replace", "append", "prepend", "find_replace"],
+          },
+          content: {
+            type: "string",
             description:
-              "append: add content below existing notes with a separator. replace: overwrite all notes (use when notes are empty or when your content is a complete rewrite incorporating existing material).",
+              "For replace/append/prepend: markdown content. For find_replace: plain-text replacement (markdown won't render).",
+          },
+          find: {
+            type: "string",
+            description:
+              "Required for find_replace. Exact substring of the current notes to match.",
           },
         },
-        required: ["content", "mode"],
+        required: ["mode", "content"],
         additionalProperties: false,
       },
     },
   },
   execute: async (args, ctx) => {
+    const mode = String(args.mode) as
+      | "replace"
+      | "append"
+      | "prepend"
+      | "find_replace";
     const content = String(args.content);
-    const mode = args.mode === "append" ? "append" : "replace";
+    const find = args.find != null ? String(args.find) : "";
+
     const previousContent = await captureUndoSnapshot(
       () => ctx.currentNote?.content ?? null,
     );
 
-    let html = markdownToBasicHtml(content);
-    if (ctx.segments?.length) {
-      html = convertCitationsToSegmentRefs(html, ctx.segments);
+    // Snapshot to note_versions before every save, regardless of mode.
+    // The Undo window is short-lived (10s); note_versions is the durable
+    // recovery path. createNoteVersion is a no-op when the user has no
+    // current note (nothing to snapshot).
+    if (ctx.currentNote?.id && previousContent) {
+      await createNoteVersion(ctx.currentNote.id, previousContent);
     }
-    let mergedHtml: string;
 
-    if (
-      mode === "append" &&
-      previousContent &&
-      previousContent !== "<p></p>"
-    ) {
-      mergedHtml = previousContent + "<hr>" + html;
+    let mergedHtml: string;
+    let detail: string;
+    let resultText: string;
+
+    if (mode === "find_replace") {
+      if (!find.trim()) {
+        return {
+          name: "save_to_notes",
+          label: "Notes",
+          detail: "find_replace requires a 'find' argument",
+          result: "Error: find_replace requires a non-empty 'find' argument.",
+        };
+      }
+      if (!previousContent || previousContent === "<p></p>") {
+        return {
+          name: "save_to_notes",
+          label: "Notes",
+          detail: "Notes are empty",
+          result:
+            "Error: notes are empty; nothing to find_replace. Use 'replace' or 'append' instead.",
+        };
+      }
+      const { html: nextHtml, replacedCount } = replaceTextInHtml(
+        previousContent,
+        find,
+        content,
+      );
+      if (replacedCount === 0) {
+        return {
+          name: "save_to_notes",
+          label: "Notes",
+          detail: `Could not find "${truncate(find, 40)}"`,
+          result: `Error: could not find "${find}" in the current notes. Re-read the notes (visible in the system prompt) and try again with an exact match. Note that find_replace cannot match text spanning multiple paragraphs or formatting boundaries.`,
+        };
+      }
+      mergedHtml = nextHtml;
+      detail = `Replaced "${truncate(find, 24)}" → "${truncate(content, 24)}" (${replacedCount}×)`;
+      resultText = `Replaced ${replacedCount} occurrence${replacedCount === 1 ? "" : "s"} of "${find}" with "${content}".`;
     } else {
-      mergedHtml = html;
+      let html = markdownToBasicHtml(content);
+      if (ctx.segments?.length) {
+        html = convertCitationsToSegmentRefs(html, ctx.segments);
+      }
+      const hasExisting =
+        !!previousContent && previousContent !== "<p></p>";
+
+      if (mode === "append" && hasExisting) {
+        mergedHtml = previousContent + "<hr>" + html;
+        detail = "Appended to notes";
+        resultText = "Appended to existing notes.";
+      } else if (mode === "prepend" && hasExisting) {
+        mergedHtml = html + "<hr>" + previousContent;
+        detail = "Prepended to notes";
+        resultText = "Prepended above existing notes.";
+      } else {
+        // replace, OR append/prepend against empty notes (same effect).
+        mergedHtml = html;
+        detail = hasExisting ? "Replaced all notes" : "Notes saved";
+        resultText = hasExisting
+          ? "Replaced all existing notes (previous content snapshotted to note_versions)."
+          : "Notes saved.";
+      }
     }
 
     await saveNote(ctx.sessionId, mergedHtml);
@@ -360,8 +489,8 @@ registerTool({
     return {
       name: "save_to_notes",
       label: "Notes",
-      detail: mode === "append" ? "Appended to notes" : "Notes saved",
-      result: `Notes ${mode === "append" ? "appended" : "saved"} successfully (${wordCount} words).`,
+      detail,
+      result: `${resultText} (${wordCount} words)`,
       undoData: previousContent,
     };
   },
@@ -374,6 +503,10 @@ registerTool({
     }
   },
 });
+
+function truncate(s: string, max: number): string {
+  return s.length <= max ? s : s.slice(0, max - 1) + "…";
+}
 
 // --- Tool: pin_session ---
 

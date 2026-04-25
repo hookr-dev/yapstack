@@ -40,10 +40,13 @@ Every transcript segment carries a speaker label in parentheses after the timest
 When answering questions about who said what, always attribute to the labelled speaker. Never claim the user said something that another speaker said. If a speaker has only the default label (\`Speaker 1\`, \`Speaker 2\`, …), use that label verbatim — don't invent names.`;
 
 const NOTES_GUIDANCE = `
-When saving to notes, choose the mode based on context:
-- Use "append" to add your content alongside existing notes
-- Use "replace" only when notes are empty or when you're producing a complete rewrite that incorporates the existing content
-If existing notes contain useful content (hand-written notes, previously added sections), default to append.`;
+The user's existing notes are visible later in this prompt — read them before saving to notes. Pick the save_to_notes mode that matches their intent:
+- "find_replace" — for changing specific text. Whenever the user asks to change/fix/edit/update/rename a word, phrase, or sentence, this is the right mode. The 'find' string must be an exact substring of the current notes; markdown won't render in the replacement (plain text only).
+- "append" — for adding new content (a summary, action items, follow-up notes) below the existing notes.
+- "prepend" — for a TL;DR or executive summary at the top.
+- "replace" — ONLY when the notes are empty or the user explicitly asks for a full rewrite from scratch. Never use this to make a small change — that's find_replace.
+
+If you're unsure between append and replace, choose append. The user's hand-written notes must be preserved.`;
 
 export const GENERAL_DIRECTIVE = `You are a helpful assistant for a note-taking app. You have access to the user's session content, notes, and session tools.
 
