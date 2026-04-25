@@ -34,7 +34,7 @@ export function ToolExecutionBlock({ executions }: ToolExecutionBlockProps) {
   if (executions.length === 0) return null;
 
   return (
-    <div className="flex flex-col gap-0.5 mb-1.5">
+    <div className="flex flex-col gap-0.5">
       {executions.map((exec, i) => (
         <ToolExecutionRow key={`${exec.name}-${i}`} exec={exec} />
       ))}
