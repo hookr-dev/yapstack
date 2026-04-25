@@ -1044,22 +1044,25 @@ export async function getChatMessageById(
 }
 
 /**
- * Erase a set of tool calls from a persisted send group. Used by the
- * Undo flow so a reverted mutation doesn't get replayed to the LLM on
- * the next turn — the model would otherwise see the original
- * assistant.tool_calls + tool result rows and assume the action stuck.
+ * Mark a set of tool calls as undone in a persisted send group. Used by
+ * the Undo flow.
  *
- * Behaviour:
- *  - Deletes every `role='tool'` row whose `tool_call_id` is in the set.
- *  - For every `role='assistant'` row in the same send, parses
- *    `tool_calls` JSON, drops entries whose `id` is in the set, and
- *    writes the result back. If the resulting list is empty, the
- *    column is set to NULL so the assembler skips it cleanly.
- *  - An assistant row left with neither prose nor any tool_calls is a
- *    pure no-op for the LLM; the assembler already drops empty rows,
- *    so we don't need to delete it.
+ * The records stay in place so the chat keeps a visible receipt — the
+ * UI renders an "undone" chip with strike-through, and the model still
+ * sees the assistant.tool_calls when replaying history. What changes:
+ *  - Each matching `assistant.tool_calls[]` JSON entry gets `undone: true`
+ *    so the renderer can style it grayed out.
+ *  - Each paired `role='tool'` row's `content` is rewritten to
+ *    "(undone by user)" and `status` flipped to `"undone"`. On replay,
+ *    the model sees the result was reverted and won't claim the action
+ *    is still in effect.
+ *
+ * This is a balance: the previous implementation deleted the records
+ * outright, which left assistant prose ("I pinned it") in the chat with
+ * no corresponding tool chip — incoherent both visually and to the
+ * model.
  */
-export async function removeToolCallsFromSend(
+export async function markToolCallsAsUndone(
   contextKey: string,
   sendId: string,
   callIds: string[],
@@ -1067,17 +1070,19 @@ export async function removeToolCallsFromSend(
   if (callIds.length === 0) return;
   const db = await getDb();
 
-  // 1. Drop the tool result rows.
+  // 1. Rewrite tool result rows for the undone calls.
+  const undoneContent = "(undone by user)";
   for (const cid of callIds) {
     await db.execute(
-      `DELETE FROM chat_messages
-       WHERE context_key = $1 AND send_id = $2
-         AND role = 'tool' AND tool_call_id = $3`,
-      [contextKey, sendId, cid],
+      `UPDATE chat_messages
+       SET content = $1, status = 'undone'
+       WHERE context_key = $2 AND send_id = $3
+         AND role = 'tool' AND tool_call_id = $4`,
+      [undoneContent, contextKey, sendId, cid],
     );
   }
 
-  // 2. Strip matching entries from each assistant row's tool_calls JSON.
+  // 2. Stamp each assistant row's tool_calls JSON entry with undone=true.
   const rows = await db.select<DbChatMessage[]>(
     `SELECT * FROM chat_messages
      WHERE context_key = $1 AND send_id = $2
@@ -1094,14 +1099,22 @@ export async function removeToolCallsFromSend(
       continue;
     }
     if (!Array.isArray(parsed)) continue;
-    const filtered = parsed.filter(
-      (p) => !(typeof p === "object" && p && callIdSet.has((p as { id?: string }).id ?? "")),
-    );
-    if (filtered.length === parsed.length) continue;
-    const newJson = filtered.length > 0 ? JSON.stringify(filtered) : null;
+    let mutated = false;
+    const next = parsed.map((p) => {
+      if (
+        typeof p === "object" &&
+        p &&
+        callIdSet.has((p as { id?: string }).id ?? "")
+      ) {
+        mutated = true;
+        return { ...(p as object), undone: true };
+      }
+      return p;
+    });
+    if (!mutated) continue;
     await db.execute(
       "UPDATE chat_messages SET tool_calls = $1 WHERE id = $2",
-      [newJson, row.id],
+      [JSON.stringify(next), row.id],
     );
   }
 }

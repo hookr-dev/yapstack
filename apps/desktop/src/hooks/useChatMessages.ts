@@ -17,7 +17,7 @@ import {
   updateChatMessageContent,
   deleteChatMessages,
   getChatMessageById,
-  removeToolCallsFromSend,
+  markToolCallsAsUndone,
 } from "@/lib/db";
 import {
   createAIClient,
@@ -94,6 +94,7 @@ function dbRowsToChatMessages(rows: DbChatMessage[]): ChatMessage[] {
             label: p.label,
             status: p.status,
             detail: p.detail,
+            undone: p.undone === true,
           });
         }
       } catch (e) {
@@ -206,18 +207,17 @@ export function useChatMessages(
           trackChatToolUndone({ tool_name: t.name });
         }
 
-        // Erase the persisted tool-call records for the reverted calls
-        // so they don't get replayed to the LLM on the next turn.
-        // Without this, the assistant.tool_calls + role='tool' rows live
-        // on, and the model assumes the mutation stuck — the user sees a
-        // silently-stale answer ("I already pinned it") even though the
-        // pin was undone.
+        // Mark the persisted tool-call records as undone — the chip stays
+        // visible (rendered grayed/struck-through) so the user sees a
+        // receipt of what was attempted, and the model sees the tool
+        // result content rewritten to "(undone by user)" on the next
+        // turn so it understands the action no longer stands.
         const callIds = state.executed
           .map((t) => t.toolCallId)
           .filter((id): id is string => !!id);
         const ref = await getChatMessageById(state.messageId);
         if (ref?.send_id && callIds.length > 0) {
-          await removeToolCallsFromSend(
+          await markToolCallsAsUndone(
             ref.context_key,
             ref.send_id,
             callIds,

@@ -74,6 +74,14 @@ export interface PersistedToolCall {
   status: "done" | "error";
   detail?: string;
   observation?: ToolObservation;
+  /**
+   * True after the user reverts this call via the Undo window. The chip
+   * stays visible (rendered with strike-through) and the call is still
+   * replayed to the LLM, but the paired tool row's content is rewritten
+   * to "(undone by user)" so the model understands the action no longer
+   * stands.
+   */
+  undone?: boolean;
 }
 
 /**

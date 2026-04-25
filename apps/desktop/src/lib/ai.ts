@@ -61,6 +61,9 @@ export interface ToolExecution {
   label: string;
   detail?: string;
   status: ToolExecutionStatus;
+  /** True if the user reverted this call via Undo. Renderer applies a
+   * grayed/strike-through style; the call still appears in chat history. */
+  undone?: boolean;
 }
 
 export interface ChatMessage {

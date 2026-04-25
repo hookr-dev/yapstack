@@ -10,6 +10,7 @@ import {
   Search,
   Mic,
   Pencil,
+  Undo2,
 } from "lucide-react";
 import type { ToolExecution } from "@/lib/ai";
 
@@ -44,34 +45,46 @@ export function ToolExecutionBlock({ executions }: ToolExecutionBlockProps) {
 
 function ToolExecutionRow({ exec }: { exec: ToolExecution }) {
   const Icon = TOOL_ICONS[exec.name] ?? FileText;
+  const undone = exec.undone === true;
+
+  // Status icon: undone wins over status — even an erroring call that
+  // ended up undone should read as "reverted, no longer in effect."
+  const statusIcon = undone ? (
+    <Undo2 className="h-3 w-3 text-muted-foreground/60" />
+  ) : exec.status === "running" ? (
+    <Loader2 className="h-3 w-3 text-primary animate-spin" />
+  ) : exec.status === "error" ? (
+    <AlertCircle className="h-3 w-3 text-destructive" />
+  ) : (
+    <Check className="h-3 w-3 text-primary" />
+  );
+
+  const labelClass = undone
+    ? "text-muted-foreground/50 line-through"
+    : exec.status === "running"
+      ? "text-foreground/80"
+      : exec.status === "error"
+        ? "text-destructive/80"
+        : "text-muted-foreground";
+
+  const detailClass = undone
+    ? "text-muted-foreground/40 line-through truncate max-w-[200px]"
+    : "text-muted-foreground/60 truncate max-w-[200px]";
 
   return (
-    <div className="flex items-center gap-1.5 text-[11px] leading-tight">
+    <div
+      className="flex items-center gap-1.5 text-[11px] leading-tight"
+      title={undone ? "Undone by user" : undefined}
+    >
       <span className="flex items-center justify-center w-4 h-4 shrink-0">
-        {exec.status === "running" ? (
-          <Loader2 className="h-3 w-3 text-primary animate-spin" />
-        ) : exec.status === "error" ? (
-          <AlertCircle className="h-3 w-3 text-destructive" />
-        ) : (
-          <Check className="h-3 w-3 text-primary" />
-        )}
+        {statusIcon}
       </span>
-      <Icon className="h-3 w-3 shrink-0 text-muted-foreground" />
-      <span
-        className={
-          exec.status === "running"
-            ? "text-foreground/80"
-            : exec.status === "error"
-              ? "text-destructive/80"
-              : "text-muted-foreground"
-        }
-      >
-        {exec.label}
-      </span>
+      <Icon
+        className={`h-3 w-3 shrink-0 ${undone ? "text-muted-foreground/40" : "text-muted-foreground"}`}
+      />
+      <span className={labelClass}>{exec.label}</span>
       {exec.detail && exec.status !== "running" && (
-        <span className="text-muted-foreground/60 truncate max-w-[200px]">
-          — {exec.detail}
-        </span>
+        <span className={detailClass}>— {exec.detail}</span>
       )}
     </div>
   );
