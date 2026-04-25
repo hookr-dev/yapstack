@@ -319,6 +319,128 @@ pub fn migrations() -> Vec<Migration> {
         "#,
             kind: MigrationKind::Up,
         },
+        Migration {
+            version: 12,
+            description: "add FTS5 search tables for segments, notes, sessions, dictation_history",
+            sql: r#"
+            -- Contentless FTS5 tables that own their searchable text plus the
+            -- source-row TEXT primary key as UNINDEXED columns. Search queries
+            -- return the PK directly; no rowid mapping needed for our UUID PKs.
+
+            CREATE VIRTUAL TABLE segments_fts USING fts5(
+                segment_id UNINDEXED,
+                session_id UNINDEXED,
+                text,
+                tokenize = 'porter unicode61 remove_diacritics 2'
+            );
+
+            CREATE VIRTUAL TABLE notes_fts USING fts5(
+                note_id UNINDEXED,
+                session_id UNINDEXED,
+                content,
+                tokenize = 'porter unicode61 remove_diacritics 2'
+            );
+
+            CREATE VIRTUAL TABLE sessions_fts USING fts5(
+                session_id UNINDEXED,
+                title,
+                tokenize = 'porter unicode61 remove_diacritics 2'
+            );
+
+            CREATE VIRTUAL TABLE dictations_fts USING fts5(
+                dictation_id UNINDEXED,
+                output_text,
+                input_text,
+                tokenize = 'porter unicode61 remove_diacritics 2'
+            );
+
+            -- Backfill from existing rows. segments_fts skips soft-deleted rows.
+            INSERT INTO segments_fts (segment_id, session_id, text)
+                SELECT id, session_id, text FROM segments WHERE deleted_at IS NULL;
+
+            INSERT INTO notes_fts (note_id, session_id, content)
+                SELECT id, session_id, content FROM notes;
+
+            INSERT INTO sessions_fts (session_id, title)
+                SELECT id, title FROM sessions;
+
+            INSERT INTO dictations_fts (dictation_id, output_text, input_text)
+                SELECT id, output_text, input_text FROM dictation_history;
+
+            -- Triggers: keep FTS in sync with source tables.
+
+            CREATE TRIGGER segments_ai AFTER INSERT ON segments
+            WHEN new.deleted_at IS NULL
+            BEGIN
+                INSERT INTO segments_fts (segment_id, session_id, text)
+                    VALUES (new.id, new.session_id, new.text);
+            END;
+
+            CREATE TRIGGER segments_ad AFTER DELETE ON segments BEGIN
+                DELETE FROM segments_fts WHERE segment_id = old.id;
+            END;
+
+            CREATE TRIGGER segments_au AFTER UPDATE ON segments BEGIN
+                DELETE FROM segments_fts WHERE segment_id = old.id;
+                INSERT INTO segments_fts (segment_id, session_id, text)
+                    SELECT new.id, new.session_id, new.text WHERE new.deleted_at IS NULL;
+            END;
+
+            CREATE TRIGGER notes_ai AFTER INSERT ON notes BEGIN
+                INSERT INTO notes_fts (note_id, session_id, content)
+                    VALUES (new.id, new.session_id, new.content);
+            END;
+
+            CREATE TRIGGER notes_ad AFTER DELETE ON notes BEGIN
+                DELETE FROM notes_fts WHERE note_id = old.id;
+            END;
+
+            CREATE TRIGGER notes_au AFTER UPDATE ON notes BEGIN
+                DELETE FROM notes_fts WHERE note_id = old.id;
+                INSERT INTO notes_fts (note_id, session_id, content)
+                    VALUES (new.id, new.session_id, new.content);
+            END;
+
+            CREATE TRIGGER sessions_ai AFTER INSERT ON sessions BEGIN
+                INSERT INTO sessions_fts (session_id, title)
+                    VALUES (new.id, new.title);
+            END;
+
+            CREATE TRIGGER sessions_ad AFTER DELETE ON sessions BEGIN
+                DELETE FROM sessions_fts WHERE session_id = old.id;
+            END;
+
+            CREATE TRIGGER sessions_au AFTER UPDATE OF title ON sessions BEGIN
+                DELETE FROM sessions_fts WHERE session_id = old.id;
+                INSERT INTO sessions_fts (session_id, title)
+                    VALUES (new.id, new.title);
+            END;
+
+            CREATE TRIGGER dictations_ai AFTER INSERT ON dictation_history BEGIN
+                INSERT INTO dictations_fts (dictation_id, output_text, input_text)
+                    VALUES (new.id, new.output_text, new.input_text);
+            END;
+
+            CREATE TRIGGER dictations_ad AFTER DELETE ON dictation_history BEGIN
+                DELETE FROM dictations_fts WHERE dictation_id = old.id;
+            END;
+
+            CREATE TRIGGER dictations_au AFTER UPDATE ON dictation_history BEGIN
+                DELETE FROM dictations_fts WHERE dictation_id = old.id;
+                INSERT INTO dictations_fts (dictation_id, output_text, input_text)
+                    VALUES (new.id, new.output_text, new.input_text);
+            END;
+        "#,
+            kind: MigrationKind::Up,
+        },
+        Migration {
+            version: 13,
+            description: "add tool_calls JSON column to chat_messages",
+            sql: r#"
+            ALTER TABLE chat_messages ADD COLUMN tool_calls TEXT;
+        "#,
+            kind: MigrationKind::Up,
+        },
         // segments.speaker_id is added by `ensure_runtime_schema()` instead —
         // see that function for why.
     ]
@@ -338,7 +460,7 @@ mod tests {
     fn test_migrations_sequential_versions() {
         let m = migrations();
         let actual_versions: Vec<i64> = m.iter().map(|x| x.version).collect();
-        assert_eq!(actual_versions, (1..=11).collect::<Vec<_>>());
+        assert_eq!(actual_versions, (1..=13).collect::<Vec<_>>());
     }
 
     #[test]
@@ -409,8 +531,64 @@ mod tests {
     fn test_migration_count() {
         assert_eq!(
             migrations().len(),
-            11,
-            "v1-v11; segments.speaker_id handled at runtime via ensure_runtime_schema"
+            13,
+            "v1-v13; segments.speaker_id handled at runtime via ensure_runtime_schema"
         );
+    }
+
+    #[test]
+    fn test_migration_v13_adds_tool_calls_column() {
+        let m = migrations();
+        let v13 = &m[12];
+        assert_eq!(v13.version, 13);
+        assert!(v13.sql.contains("ALTER TABLE chat_messages"));
+        assert!(v13.sql.contains("tool_calls"));
+    }
+
+    #[test]
+    fn test_all_migrations_execute_against_sqlite() {
+        // Run the migration SQL against an in-memory rusqlite to catch
+        // syntax errors (e.g. malformed FTS5 declarations) at test time
+        // instead of waiting for a user to launch a fresh DB.
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        for m in migrations() {
+            conn.execute_batch(m.sql).unwrap_or_else(|e| {
+                panic!("migration v{} failed: {}", m.version, e)
+            });
+        }
+        // Sanity-check that the FTS5 tables are queryable post-migration.
+        for fts_table in [
+            "segments_fts",
+            "notes_fts",
+            "sessions_fts",
+            "dictations_fts",
+        ] {
+            let count: i64 = conn
+                .query_row(
+                    &format!("SELECT count(*) FROM {fts_table}"),
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap_or_else(|e| {
+                    panic!("query against {fts_table} failed: {e}")
+                });
+            assert_eq!(count, 0, "{fts_table} should be empty after migration");
+        }
+    }
+
+    #[test]
+    fn test_migration_v12_creates_fts_tables() {
+        let m = migrations();
+        let v12 = &m[11];
+        assert_eq!(v12.version, 12);
+        assert!(v12.sql.contains("CREATE VIRTUAL TABLE segments_fts"));
+        assert!(v12.sql.contains("CREATE VIRTUAL TABLE notes_fts"));
+        assert!(v12.sql.contains("CREATE VIRTUAL TABLE sessions_fts"));
+        assert!(v12.sql.contains("CREATE VIRTUAL TABLE dictations_fts"));
+        assert!(v12.sql.contains("USING fts5"));
+        assert!(v12.sql.contains("INSERT INTO segments_fts"));
+        assert!(v12.sql.contains("CREATE TRIGGER segments_ai"));
+        assert!(v12.sql.contains("CREATE TRIGGER segments_ad"));
+        assert!(v12.sql.contains("CREATE TRIGGER segments_au"));
     }
 }

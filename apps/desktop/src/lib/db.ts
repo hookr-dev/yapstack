@@ -1,4 +1,5 @@
 import Database from "@tauri-apps/plugin-sql";
+import { stripHtml } from "./utils";
 
 // --- Types ---
 
@@ -98,6 +99,8 @@ export interface DbChatMessage {
   content: string;
   action: string | null;
   created_at: string;
+  /** JSON-serialized PersistedToolCall[] from a Chat assistant turn. */
+  tool_calls: string | null;
 }
 
 // --- Singleton ---
@@ -107,14 +110,139 @@ let dbInstance: Database | null = null;
 async function getDb(): Promise<Database> {
   if (!dbInstance) {
     dbInstance = await Database.load("sqlite:yapstack.db");
-    // Idempotent runtime patch: tauri-plugin-sql migrations stop at v10, but
-    // segment inserts reference speaker_id. Duplicate-column error is the
-    // expected no-op on subsequent runs.
-    await dbInstance
-      .execute("ALTER TABLE segments ADD COLUMN speaker_id INTEGER")
-      .catch(() => {});
+    await ensureRuntimeSchema(dbInstance);
   }
   return dbInstance;
+}
+
+/**
+ * Idempotent runtime schema patches. tauri-plugin-sql can skip a migration
+ * on a dev DB whose `_sqlx_migrations` history was written under a prior
+ * version-numbering scheme (see CLAUDE.md). Re-applying these on every load
+ * ensures the columns/tables/triggers exist; CREATE/ALTER variants use
+ * `IF NOT EXISTS` or are wrapped with `.catch()` so the duplicate-column /
+ * duplicate-table error on subsequent runs is a silent no-op.
+ */
+async function ensureRuntimeSchema(db: Database): Promise<void> {
+  // Single-column patches (column-add only).
+  await db
+    .execute("ALTER TABLE segments ADD COLUMN speaker_id INTEGER")
+    .catch(() => {});
+  await db
+    .execute("ALTER TABLE chat_messages ADD COLUMN tool_calls TEXT")
+    .catch(() => {});
+
+  // FTS5 search tables. Created idempotently; backfilled only when the FTS
+  // table is empty (i.e. on its very first run). Triggers keep them in sync
+  // with the source tables thereafter.
+  const tables: { name: string; columns: string; backfill: string }[] = [
+    {
+      name: "segments_fts",
+      columns:
+        "segment_id UNINDEXED, session_id UNINDEXED, text, tokenize = 'porter unicode61 remove_diacritics 2'",
+      backfill:
+        "INSERT INTO segments_fts (segment_id, session_id, text) SELECT id, session_id, text FROM segments WHERE deleted_at IS NULL",
+    },
+    {
+      name: "notes_fts",
+      columns:
+        "note_id UNINDEXED, session_id UNINDEXED, content, tokenize = 'porter unicode61 remove_diacritics 2'",
+      backfill:
+        "INSERT INTO notes_fts (note_id, session_id, content) SELECT id, session_id, content FROM notes",
+    },
+    {
+      name: "sessions_fts",
+      columns:
+        "session_id UNINDEXED, title, tokenize = 'porter unicode61 remove_diacritics 2'",
+      backfill:
+        "INSERT INTO sessions_fts (session_id, title) SELECT id, title FROM sessions",
+    },
+    {
+      name: "dictations_fts",
+      columns:
+        "dictation_id UNINDEXED, output_text, input_text, tokenize = 'porter unicode61 remove_diacritics 2'",
+      backfill:
+        "INSERT INTO dictations_fts (dictation_id, output_text, input_text) SELECT id, output_text, input_text FROM dictation_history",
+    },
+  ];
+  for (const t of tables) {
+    await db
+      .execute(`CREATE VIRTUAL TABLE IF NOT EXISTS ${t.name} USING fts5(${t.columns})`)
+      .catch(() => {});
+    const rows = await db
+      .select<{ c: number }[]>(`SELECT count(*) AS c FROM ${t.name}`)
+      .catch(() => [{ c: 1 }]);
+    if (rows[0]?.c === 0) {
+      await db.execute(t.backfill).catch(() => {});
+    }
+  }
+
+  // Triggers: keep FTS in sync with source tables. CREATE TRIGGER IF NOT
+  // EXISTS is a single statement, so we run them one-by-one.
+  const triggers: string[] = [
+    `CREATE TRIGGER IF NOT EXISTS segments_ai AFTER INSERT ON segments
+       WHEN new.deleted_at IS NULL
+     BEGIN
+       INSERT INTO segments_fts (segment_id, session_id, text)
+         VALUES (new.id, new.session_id, new.text);
+     END`,
+    `CREATE TRIGGER IF NOT EXISTS segments_ad AFTER DELETE ON segments
+     BEGIN
+       DELETE FROM segments_fts WHERE segment_id = old.id;
+     END`,
+    `CREATE TRIGGER IF NOT EXISTS segments_au AFTER UPDATE ON segments
+     BEGIN
+       DELETE FROM segments_fts WHERE segment_id = old.id;
+       INSERT INTO segments_fts (segment_id, session_id, text)
+         SELECT new.id, new.session_id, new.text WHERE new.deleted_at IS NULL;
+     END`,
+    `CREATE TRIGGER IF NOT EXISTS notes_ai AFTER INSERT ON notes
+     BEGIN
+       INSERT INTO notes_fts (note_id, session_id, content)
+         VALUES (new.id, new.session_id, new.content);
+     END`,
+    `CREATE TRIGGER IF NOT EXISTS notes_ad AFTER DELETE ON notes
+     BEGIN
+       DELETE FROM notes_fts WHERE note_id = old.id;
+     END`,
+    `CREATE TRIGGER IF NOT EXISTS notes_au AFTER UPDATE ON notes
+     BEGIN
+       DELETE FROM notes_fts WHERE note_id = old.id;
+       INSERT INTO notes_fts (note_id, session_id, content)
+         VALUES (new.id, new.session_id, new.content);
+     END`,
+    `CREATE TRIGGER IF NOT EXISTS sessions_ai AFTER INSERT ON sessions
+     BEGIN
+       INSERT INTO sessions_fts (session_id, title) VALUES (new.id, new.title);
+     END`,
+    `CREATE TRIGGER IF NOT EXISTS sessions_ad AFTER DELETE ON sessions
+     BEGIN
+       DELETE FROM sessions_fts WHERE session_id = old.id;
+     END`,
+    `CREATE TRIGGER IF NOT EXISTS sessions_au AFTER UPDATE OF title ON sessions
+     BEGIN
+       DELETE FROM sessions_fts WHERE session_id = old.id;
+       INSERT INTO sessions_fts (session_id, title) VALUES (new.id, new.title);
+     END`,
+    `CREATE TRIGGER IF NOT EXISTS dictations_ai AFTER INSERT ON dictation_history
+     BEGIN
+       INSERT INTO dictations_fts (dictation_id, output_text, input_text)
+         VALUES (new.id, new.output_text, new.input_text);
+     END`,
+    `CREATE TRIGGER IF NOT EXISTS dictations_ad AFTER DELETE ON dictation_history
+     BEGIN
+       DELETE FROM dictations_fts WHERE dictation_id = old.id;
+     END`,
+    `CREATE TRIGGER IF NOT EXISTS dictations_au AFTER UPDATE ON dictation_history
+     BEGIN
+       DELETE FROM dictations_fts WHERE dictation_id = old.id;
+       INSERT INTO dictations_fts (dictation_id, output_text, input_text)
+         VALUES (new.id, new.output_text, new.input_text);
+     END`,
+  ];
+  for (const sql of triggers) {
+    await db.execute(sql).catch(() => {});
+  }
 }
 
 // --- Session CRUD ---
@@ -176,6 +304,16 @@ export async function getSession(id: string): Promise<DbSession | null> {
     [id],
   );
   return rows[0] ?? null;
+}
+
+export async function getSessionsByIds(ids: string[]): Promise<DbSession[]> {
+  if (ids.length === 0) return [];
+  const db = await getDb();
+  const placeholders = ids.map((_, i) => `$${i + 1}`).join(",");
+  return await db.select<DbSession[]>(
+    `SELECT * FROM sessions WHERE id IN (${placeholders})`,
+    ids,
+  );
 }
 
 export async function deleteAllSessions(): Promise<void> {
@@ -571,25 +709,40 @@ export interface DictationSearchResult {
   sessionId: string | null;
 }
 
-function stripHtml(html: string): string {
-  return html.replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim();
+/**
+ * Build a safe FTS5 MATCH expression from a free-form user query.
+ * Tokenises on whitespace, drops FTS5 special characters from each token,
+ * appends `*` for prefix matching, and joins tokens with implicit AND.
+ * Returns null if no usable token survives — callers should short-circuit.
+ */
+function toFts5Match(query: string): string | null {
+  const tokens = query
+    .trim()
+    .split(/\s+/)
+    .map((t) => t.replace(/["()*^+\-:,]/g, "").trim())
+    .filter((t) => t.length > 0)
+    .map((t) => `"${t}"*`);
+  return tokens.length > 0 ? tokens.join(" ") : null;
 }
 
 export async function searchSegments(
   query: string,
 ): Promise<SearchResult[]> {
+  const match = toFts5Match(query);
+  if (!match) return [];
   const db = await getDb();
-  const pattern = `%${query}%`;
   const rows = await db.select<
     { session_id: string; text: string; title: string }[]
   >(
-    `SELECT seg.session_id, seg.text, s.title
-     FROM segments seg
+    `SELECT seg.session_id AS session_id, seg.text AS text, s.title AS title
+     FROM segments_fts
+     JOIN segments seg ON seg.id = segments_fts.segment_id
      JOIN sessions s ON seg.session_id = s.id
-     WHERE seg.deleted_at IS NULL AND seg.text LIKE $1
-     ORDER BY seg.audio_offset_seconds ASC
+     WHERE segments_fts MATCH $1
+       AND seg.deleted_at IS NULL
+     ORDER BY bm25(segments_fts)
      LIMIT 50`,
-    [pattern],
+    [match],
   );
   return rows.map((r) => ({
     type: "segment",
@@ -602,18 +755,20 @@ export async function searchSegments(
 export async function searchNotes(
   query: string,
 ): Promise<SearchResult[]> {
+  const match = toFts5Match(query);
+  if (!match) return [];
   const db = await getDb();
-  const pattern = `%${query}%`;
   const rows = await db.select<
     { session_id: string; content: string; title: string }[]
   >(
-    `SELECT n.session_id, n.content, s.title
-     FROM notes n
+    `SELECT n.session_id AS session_id, n.content AS content, s.title AS title
+     FROM notes_fts
+     JOIN notes n ON n.id = notes_fts.note_id
      JOIN sessions s ON n.session_id = s.id
-     WHERE n.content LIKE $1
-     ORDER BY n.updated_at DESC
+     WHERE notes_fts MATCH $1
+     ORDER BY bm25(notes_fts)
      LIMIT 50`,
-    [pattern],
+    [match],
   );
   return rows.map((r) => ({
     type: "note",
@@ -626,14 +781,17 @@ export async function searchNotes(
 export async function searchSessionsByTitle(
   query: string,
 ): Promise<SearchResult[]> {
+  const match = toFts5Match(query);
+  if (!match) return [];
   const db = await getDb();
-  const pattern = `%${query}%`;
   const rows = await db.select<{ id: string; title: string }[]>(
-    `SELECT id, title FROM sessions
-     WHERE title LIKE $1
-     ORDER BY updated_at DESC
+    `SELECT s.id AS id, s.title AS title
+     FROM sessions_fts
+     JOIN sessions s ON s.id = sessions_fts.session_id
+     WHERE sessions_fts MATCH $1
+     ORDER BY bm25(sessions_fts)
      LIMIT 20`,
-    [pattern],
+    [match],
   );
   return rows.map((r) => ({
     type: "session",
@@ -646,6 +804,8 @@ export async function searchSessionsByTitle(
 export async function searchFolders(
   query: string,
 ): Promise<{ id: string; name: string }[]> {
+  // Folder count is small and folder names are short; a substring LIKE is
+  // simpler and good enough. Not worth the FTS5 indexing cost.
   const db = await getDb();
   const pattern = `%${query}%`;
   return await db.select<{ id: string; name: string }[]>(
@@ -657,8 +817,9 @@ export async function searchFolders(
 export async function searchDictations(
   query: string,
 ): Promise<DictationSearchResult[]> {
+  const match = toFts5Match(query);
+  if (!match) return [];
   const db = await getDb();
-  const pattern = `%${query}%`;
   const rows = await db.select<
     {
       id: string;
@@ -668,12 +829,14 @@ export async function searchDictations(
       session_id: string | null;
     }[]
   >(
-    `SELECT id, slot_name, input_text, output_text, session_id
-     FROM dictation_history
-     WHERE output_text LIKE $1 OR input_text LIKE $1
-     ORDER BY created_at DESC
+    `SELECT d.id AS id, d.slot_name AS slot_name, d.input_text AS input_text,
+            d.output_text AS output_text, d.session_id AS session_id
+     FROM dictations_fts
+     JOIN dictation_history d ON d.id = dictations_fts.dictation_id
+     WHERE dictations_fts MATCH $1
+     ORDER BY bm25(dictations_fts)
      LIMIT 50`,
-    [pattern],
+    [match],
   );
   const q = query.toLowerCase();
   return rows.map((r) => {
@@ -737,8 +900,16 @@ export async function createManualSession(
 export async function insertChatMessage(msg: DbChatMessage): Promise<void> {
   const db = await getDb();
   await db.execute(
-    "INSERT INTO chat_messages (id, context_key, session_id, role, content, action) VALUES ($1, $2, $3, $4, $5, $6)",
-    [msg.id, msg.context_key, msg.session_id, msg.role, msg.content, msg.action],
+    "INSERT INTO chat_messages (id, context_key, session_id, role, content, action, tool_calls) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+    [
+      msg.id,
+      msg.context_key,
+      msg.session_id,
+      msg.role,
+      msg.content,
+      msg.action,
+      msg.tool_calls,
+    ],
   );
 }
 
@@ -755,11 +926,12 @@ export async function getChatMessages(
 export async function updateChatMessageContent(
   id: string,
   content: string,
+  toolCalls: string | null = null,
 ): Promise<void> {
   const db = await getDb();
   await db.execute(
-    "UPDATE chat_messages SET content = $1 WHERE id = $2",
-    [content, id],
+    "UPDATE chat_messages SET content = $1, tool_calls = $2 WHERE id = $3",
+    [content, toolCalls, id],
   );
 }
 
@@ -869,27 +1041,3 @@ export async function clearDictationSessionLink(
   );
 }
 
-// --- Multi-session helpers ---
-
-export interface SessionWithNote {
-  sessionId: string;
-  title: string;
-  createdAt: string;
-  noteContent: string | null;
-}
-
-export async function getNotesForSessions(
-  sessionIds: string[],
-): Promise<SessionWithNote[]> {
-  if (sessionIds.length === 0) return [];
-  const db = await getDb();
-  const placeholders = sessionIds.map((_, i) => `$${i + 1}`).join(", ");
-  return await db.select<SessionWithNote[]>(
-    `SELECT s.id as sessionId, s.title, s.created_at as createdAt, n.content as noteContent
-     FROM sessions s
-     LEFT JOIN notes n ON n.session_id = s.id
-     WHERE s.id IN (${placeholders})
-     ORDER BY s.created_at DESC`,
-    sessionIds,
-  );
-}

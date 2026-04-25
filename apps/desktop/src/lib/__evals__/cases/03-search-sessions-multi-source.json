@@ -1,0 +1,113 @@
+{
+  "name": "search_sessions ranks title hits above note and segment hits",
+  "description": "Title match for 'rocket' should outrank note match and transcript match.",
+  "fixture": {
+    "sessions": [
+      {
+        "id": "title-hit",
+        "title": "Rocket launch postmortem",
+        "created_at": "2026-04-10T10:00:00",
+        "updated_at": "2026-04-10T10:00:00",
+        "source": "Mic",
+        "status": "completed",
+        "duration_seconds": 0,
+        "total_segments": 0,
+        "folder_id": null,
+        "is_pinned": 0,
+        "pinned_at": null,
+        "session_type": "recording",
+        "wav_file_path": null,
+        "wav_duration_seconds": null,
+        "sort_order": 0
+      },
+      {
+        "id": "note-hit",
+        "title": "Q4 review",
+        "created_at": "2026-04-09T10:00:00",
+        "updated_at": "2026-04-09T10:00:00",
+        "source": "Mic",
+        "status": "completed",
+        "duration_seconds": 0,
+        "total_segments": 0,
+        "folder_id": null,
+        "is_pinned": 0,
+        "pinned_at": null,
+        "session_type": "recording",
+        "wav_file_path": null,
+        "wav_duration_seconds": null,
+        "sort_order": 0
+      },
+      {
+        "id": "segment-hit",
+        "title": "Sync",
+        "created_at": "2026-04-08T10:00:00",
+        "updated_at": "2026-04-08T10:00:00",
+        "source": "Mic",
+        "status": "completed",
+        "duration_seconds": 0,
+        "total_segments": 1,
+        "folder_id": null,
+        "is_pinned": 0,
+        "pinned_at": null,
+        "session_type": "recording",
+        "wav_file_path": null,
+        "wav_duration_seconds": null,
+        "sort_order": 0
+      },
+      {
+        "id": "no-hit",
+        "title": "Unrelated",
+        "created_at": "2026-04-07T10:00:00",
+        "updated_at": "2026-04-07T10:00:00",
+        "source": "Mic",
+        "status": "completed",
+        "duration_seconds": 0,
+        "total_segments": 0,
+        "folder_id": null,
+        "is_pinned": 0,
+        "pinned_at": null,
+        "session_type": "recording",
+        "wav_file_path": null,
+        "wav_duration_seconds": null,
+        "sort_order": 0
+      }
+    ],
+    "folders": [],
+    "sessionFolders": [],
+    "notes": {
+      "note-hit": "<p>We discussed the rocket project finances.</p>"
+    },
+    "segments": {
+      "segment-hit": [
+        {
+          "id": "seg-1",
+          "session_id": "segment-hit",
+          "source": "Mic",
+          "text": "Yeah, the rocket prototype is ready.",
+          "audio_offset_seconds": 0,
+          "chunk_duration_seconds": 5,
+          "confidence": 0.95,
+          "created_at": "",
+          "chunk_index": 0,
+          "original_text": null,
+          "edited_at": null,
+          "deleted_at": null,
+          "hidden": 0
+        }
+      ]
+    },
+    "tags": [],
+    "sessionTags": []
+  },
+  "steps": [
+    {
+      "tool": "search_sessions",
+      "args": { "query": "rocket", "filters": null, "limit": 10 },
+      "expect": {
+        "affectedIdsIncludes": ["title-hit", "note-hit", "segment-hit"],
+        "affectedIdsExcludes": ["no-hit"],
+        "mutated": false
+      }
+    }
+  ]
+}

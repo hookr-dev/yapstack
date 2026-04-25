@@ -1,0 +1,66 @@
+{
+  "name": "add_session_to_folder removes ancestor folder when adding a descendant",
+  "description": "Branch-conflict resolution: a session in 'Work' is moved into 'Work/Q4' and dropped from 'Work'.",
+  "fixture": {
+    "sessions": [
+      {
+        "id": "s1",
+        "title": "Q4 plan",
+        "created_at": "2026-04-10T10:00:00",
+        "updated_at": "2026-04-10T10:00:00",
+        "source": "Mic",
+        "status": "completed",
+        "duration_seconds": 0,
+        "total_segments": 0,
+        "folder_id": null,
+        "is_pinned": 0,
+        "pinned_at": null,
+        "session_type": "recording",
+        "wav_file_path": null,
+        "wav_duration_seconds": null,
+        "sort_order": 0
+      }
+    ],
+    "folders": [
+      {
+        "id": "f-work",
+        "name": "Work",
+        "parent_id": null,
+        "sort_order": 0,
+        "icon": null,
+        "color": null,
+        "description": null,
+        "created_at": "",
+        "updated_at": ""
+      },
+      {
+        "id": "f-q4",
+        "name": "Q4",
+        "parent_id": "f-work",
+        "sort_order": 0,
+        "icon": null,
+        "color": null,
+        "description": null,
+        "created_at": "",
+        "updated_at": ""
+      }
+    ],
+    "sessionFolders": [
+      { "session_id": "s1", "folder_id": "f-work", "created_at": "" }
+    ],
+    "notes": {},
+    "segments": {},
+    "tags": [],
+    "sessionTags": []
+  },
+  "steps": [
+    {
+      "tool": "add_session_to_folder",
+      "args": { "folder_id": "f-q4" },
+      "expect": {
+        "affectedIdsIncludes": ["f-q4", "f-work"],
+        "mutated": true
+      }
+    }
+  ]
+}
