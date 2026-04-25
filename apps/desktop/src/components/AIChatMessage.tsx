@@ -67,7 +67,12 @@ function formatTimestamp(seconds: number): string {
   return `${mins}:${secs.toString().padStart(2, "0")}`;
 }
 
-const CITE_REGEX = /\[\[seg:([a-zA-Z0-9_-]+)\]\]/g;
+// Stateless pattern used for `.test()` checks. `renderTextWithCitations`
+// builds its own `g`-flagged regex from `.source` for the exec-loop, so
+// keeping this one without `g` is safe and prevents the cross-call
+// `lastIndex` drift that was making citations render as raw text after
+// the first chat message in a session.
+const CITE_REGEX = /\[\[seg:([a-zA-Z0-9_-]+)\]\]/;
 
 function renderTextWithCitations(
   text: string,
