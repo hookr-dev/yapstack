@@ -173,8 +173,14 @@ export const EditableSegment = memo(forwardRef<
                   ? "bg-primary text-primary-foreground rounded-br-md"
                   : "bg-muted text-foreground rounded-bl-md",
                 isLowConfidence && "opacity-60",
-                isActive && "ring-2 ring-ring shadow-md scale-[1.02]",
-                isSelected && "ring-2 ring-primary/60 shadow-sm",
+                isActive && "ring-2 shadow-md scale-[1.02]",
+                isActive && (isMic
+                  ? "ring-primary ring-offset-2 ring-offset-background"
+                  : "ring-ring"),
+                isSelected && "ring-2 shadow-sm",
+                isSelected && (isMic
+                  ? "ring-primary/60 ring-offset-2 ring-offset-background"
+                  : "ring-primary/60"),
                 isEditing
                   ? "outline-none ring-2 ring-ring cursor-text"
                   : readOnly
