@@ -24,12 +24,20 @@ export function getContentScaleGuidance(transcriptText: string): string {
 const CITATION_INSTRUCTION = `
 When referencing specific parts of the conversation, cite the segment using its ID in this format: [[seg:ID]]. For example: "The team discussed increasing marketing spend [[seg:def456]]." Only cite when it adds value — don't cite every statement.`;
 
-/// Added to the system prompt only when the transcript was produced by a
-/// diarized engine (Parakeet + Sortformer). Tells the model that segment
-/// lines carry a `(Speaker N)` or `(Alice)` parenthetical and that the
-/// user expects answers to attribute statements to the right person.
+/// Added to the system prompt whenever transcript text is in scope.
+/// Transcripts always carry a parenthetical speaker label after the
+/// timestamp; this instruction tells the model what each label means and
+/// — critically — that statements from other speakers must NOT be
+/// attributed to the user. Without this guidance, models routinely
+/// summarise things "the user said" when in fact another participant
+/// said them on the call.
 const SPEAKER_INSTRUCTION = `
-This transcript includes speaker labels in parentheses after each segment timestamp — e.g. \`[seg:abc 0:12] (Alice) Yes, exactly.\`. When summarizing or answering questions about who said what, attribute statements to the named speaker. If a speaker has only the default label (\`Speaker 1\`, \`Speaker 2\`, …), use that label verbatim — don't invent names.`;
+Every transcript segment carries a speaker label in parentheses after the timestamp — e.g. \`[seg:abc 0:12] (You) Yes, exactly.\`. The labels mean:
+- \`(You)\` — the human running this app, captured from their microphone. This is the user you are talking to right now. Quotes and statements wrapped with \`(You)\` are theirs.
+- \`(Alice)\`, \`(Bob)\`, \`(Speaker 1)\`, etc. — other people in the recording, captured from system audio (a video call, podcast, etc.). These statements were NOT said by the user.
+- \`(Other)\` — another participant whose identity isn't known. Still not the user.
+
+When answering questions about who said what, always attribute to the labelled speaker. Never claim the user said something that another speaker said. If a speaker has only the default label (\`Speaker 1\`, \`Speaker 2\`, …), use that label verbatim — don't invent names.`;
 
 const NOTES_GUIDANCE = `
 When saving to notes, choose the mode based on context:
@@ -156,7 +164,7 @@ export function getMultiSessionSystemPrompt(
   let prompt = `You are a helpful assistant for a note-taking app. The user is viewing multiple sessions. You can answer questions, compare sessions, find patterns, and synthesize information across them.
 
 Be concise and direct. Use **bold** for labels when organizing information. Do not use # or ## markdown headings.
-
+${SPEAKER_INSTRUCTION}
 ---
 `;
 
