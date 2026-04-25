@@ -80,6 +80,11 @@ export function makeChatMessage(
     action: null,
     created_at: "2024-06-15T10:00:00",
     tool_calls: null,
+    send_id: `send-${id}`,
+    sequence: 0,
+    tool_call_id: null,
+    observation: null,
+    status: null,
     ...overrides,
   };
 }

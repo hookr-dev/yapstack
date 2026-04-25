@@ -441,6 +441,44 @@ pub fn migrations() -> Vec<Migration> {
         "#,
             kind: MigrationKind::Up,
         },
+        Migration {
+            version: 14,
+            description: "per-LLM-response chat_messages rows for tool replay",
+            // New columns:
+            //   send_id      groups all rows derived from one user send
+            //   sequence     ordering within send_id (0=user, 1+ = subsequent)
+            //   tool_call_id required on role='tool', references the parent
+            //                assistant row's tool_calls[].id
+            //   observation  structured ToolObservation JSON, role='tool' only
+            //   status       'done' | 'error', role='tool' only
+            //
+            // SQLite can't relax the implicit role check in-place, but the
+            // CHECK was never declared explicitly — `role` is just TEXT, so
+            // 'tool' is already accepted by the column type. No CHECK changes
+            // needed.
+            //
+            // `content` was NOT NULL in the original CREATE TABLE. SQLite
+            // can't drop NOT NULL via ALTER, so we keep writes valid by
+            // storing an empty string for assistant rows that only emit
+            // tool_calls. The TS layer treats `content === ""` as "no prose".
+            //
+            // Backfill: every existing row is its own send (one-row sends),
+            // so set send_id = id, sequence = 0. Pre-v14 tool memory is left
+            // dormant in the legacy `tool_calls` JSON column for read-side
+            // soft fallback.
+            sql: r#"
+            ALTER TABLE chat_messages ADD COLUMN send_id TEXT;
+            ALTER TABLE chat_messages ADD COLUMN sequence INTEGER;
+            ALTER TABLE chat_messages ADD COLUMN tool_call_id TEXT;
+            ALTER TABLE chat_messages ADD COLUMN observation TEXT;
+            ALTER TABLE chat_messages ADD COLUMN status TEXT;
+            UPDATE chat_messages SET send_id = id WHERE send_id IS NULL;
+            UPDATE chat_messages SET sequence = 0 WHERE sequence IS NULL;
+            CREATE INDEX IF NOT EXISTS idx_chat_messages_send
+                ON chat_messages(context_key, send_id, sequence);
+        "#,
+            kind: MigrationKind::Up,
+        },
         // segments.speaker_id is added by `ensure_runtime_schema()` instead —
         // see that function for why.
     ]
@@ -460,7 +498,7 @@ mod tests {
     fn test_migrations_sequential_versions() {
         let m = migrations();
         let actual_versions: Vec<i64> = m.iter().map(|x| x.version).collect();
-        assert_eq!(actual_versions, (1..=13).collect::<Vec<_>>());
+        assert_eq!(actual_versions, (1..=14).collect::<Vec<_>>());
     }
 
     #[test]
@@ -531,8 +569,8 @@ mod tests {
     fn test_migration_count() {
         assert_eq!(
             migrations().len(),
-            13,
-            "v1-v13; segments.speaker_id handled at runtime via ensure_runtime_schema"
+            14,
+            "v1-v14; segments.speaker_id handled at runtime via ensure_runtime_schema"
         );
     }
 

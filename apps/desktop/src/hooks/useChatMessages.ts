@@ -34,7 +34,14 @@ import {
   trackChatCleared,
 } from "@/lib/analytics";
 
-function dbToChatMessage(row: DbChatMessage): ChatMessage {
+/**
+ * Convert one persisted row into a ChatMessage for the renderer. Tool rows
+ * (`role === "tool"`) aren't user-facing bubbles — they get folded into the
+ * surrounding assistant bubble at the renderer layer. Returns `null` for
+ * those so the caller can `.filter()` them out.
+ */
+function dbToChatMessage(row: DbChatMessage): ChatMessage | null {
+  if (row.role === "tool") return null;
   let toolExecutions: ToolExecution[] | undefined;
   let content = row.content;
   if (row.tool_calls) {
@@ -131,7 +138,7 @@ export function useChatMessages(
       setUndoState(null);
     }
     getChatMessages(contextKey).then((rows) => {
-      setMessages(rows.map(dbToChatMessage));
+      setMessages(rows.map(dbToChatMessage).filter((m): m is ChatMessage => m !== null));
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [contextKey]);
@@ -232,6 +239,7 @@ export function useChatMessages(
         // missing column on a stale dev DB, a locked file, etc.) routes
         // through the catch + finally and clears `isStreaming` instead of
         // surfacing as an unhandled rejection that strands the spinner.
+        const sendId = crypto.randomUUID();
         await insertChatMessage({
           id: userMessage.id,
           context_key: contextKey,
@@ -241,6 +249,11 @@ export function useChatMessages(
           action: userMessage.action ?? null,
           created_at: new Date().toISOString(),
           tool_calls: null,
+          send_id: sendId,
+          sequence: 0,
+          tool_call_id: null,
+          observation: null,
+          status: null,
         });
 
         await insertChatMessage({
@@ -252,6 +265,11 @@ export function useChatMessages(
           action: null,
           created_at: new Date().toISOString(),
           tool_calls: null,
+          send_id: sendId,
+          sequence: 1,
+          tool_call_id: null,
+          observation: null,
+          status: null,
         });
 
         const client = createAIClient(aiSettings);
