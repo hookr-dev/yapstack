@@ -404,6 +404,16 @@ export async function getSessionTagIds(sessionId: string): Promise<string[]> {
   return rows.map((r) => r.tag_id);
 }
 
+export async function getSessionTagRows(
+  sessionId: string,
+): Promise<DbSessionTag[]> {
+  const db = await getDb();
+  return await db.select<DbSessionTag[]>(
+    "SELECT * FROM session_tags WHERE session_id = $1",
+    [sessionId],
+  );
+}
+
 // --- Segment CRUD ---
 
 export async function insertSegment(segment: DbSegment): Promise<void> {

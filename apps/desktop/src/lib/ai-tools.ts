@@ -8,6 +8,7 @@ import {
   createTag,
   addSessionTag,
   removeSessionTag,
+  getSessionTagRows,
   addSessionToFolder as dbAddSessionToFolder,
   removeSessionFromFolder as dbRemoveSessionFromFolder,
   listFolders,
@@ -33,6 +34,13 @@ export interface ExecutedTool {
   toolCallId?: string;
   result?: string;
   undoData?: unknown;
+  /**
+   * True when the tool changed session state (title, notes, pin, tags,
+   * folder membership). Read-only or no-op results set this to false so
+   * the chat UI doesn't render an Undo toast / "Session updated" message
+   * / refresh callback for something that didn't mutate.
+   */
+  mutated?: boolean;
 }
 
 export interface ToolContext {
@@ -171,6 +179,7 @@ registerTool({
       detail: title,
       result: `Title updated from "${previousTitle}" to "${title}".`,
       undoData: previousTitle,
+      mutated: true,
     };
   },
   undo: async (undoData, ctx) => {
@@ -236,6 +245,7 @@ registerTool({
       detail: mode === "append" ? "Appended to notes" : "Notes saved",
       result: `Notes ${mode === "append" ? "appended" : "saved"} successfully (${wordCount} words).`,
       undoData: previousContent,
+      mutated: true,
     };
   },
   undo: async (undoData, ctx) => {
@@ -272,8 +282,9 @@ registerTool({
   execute: async (args, ctx) => {
     const wantPinned = Boolean(args.pinned);
     const wasPinned = ctx.isPinned;
+    const changed = wantPinned !== wasPinned;
 
-    if (wantPinned !== wasPinned) {
+    if (changed) {
       await togglePin(ctx.sessionId);
     }
 
@@ -281,8 +292,13 @@ registerTool({
       name: "pin_session",
       label: "Pinned",
       detail: wantPinned ? "Session pinned" : "Session unpinned",
-      result: wantPinned ? "Session pinned successfully." : "Session unpinned successfully.",
+      result: changed
+        ? wantPinned
+          ? "Session pinned successfully."
+          : "Session unpinned successfully."
+        : `Session was already ${wantPinned ? "pinned" : "unpinned"}.`,
       undoData: wasPinned,
+      mutated: changed,
     };
   },
   undo: async (undoData, ctx) => {
@@ -326,8 +342,20 @@ registerTool({
   execute: async (args, ctx) => {
     const toAdd = (args.add as string[]) ?? [];
     const toRemove = (args.remove as string[]) ?? [];
+
+    // Snapshot existing rows so undo only inverts real deltas. Without this,
+    // INSERT-OR-IGNORE adds and unconditional removes would record phantom
+    // deltas that, on undo, drop pre-existing manual tags or re-add tags
+    // that were never on the session.
+    const beforeRows = await getSessionTagRows(ctx.sessionId);
+    const beforeSourceById = new Map(
+      beforeRows.map((r) => [r.tag_id, r.source]),
+    );
+
     const addedTagIds: string[] = [];
-    const removedTagIds: string[] = [];
+    const removedTags: { tagId: string; source: "manual" | "auto" | "ai" }[] = [];
+    const addedNames: string[] = [];
+    const removedNames: string[] = [];
 
     for (const name of toAdd) {
       const trimmed = name.trim();
@@ -338,41 +366,52 @@ registerTool({
         await createTag(id, trimmed);
         tag = { id, name: trimmed, color: null, created_at: new Date().toISOString() };
       }
+      if (beforeSourceById.has(tag.id)) continue; // already on the session
       await addSessionTag(ctx.sessionId, tag.id, "ai");
       addedTagIds.push(tag.id);
+      addedNames.push(trimmed);
     }
 
     for (const name of toRemove) {
-      const tag = await getTagByName(name.trim());
-      if (tag) {
-        await removeSessionTag(ctx.sessionId, tag.id);
-        removedTagIds.push(tag.id);
-      }
+      const trimmed = name.trim();
+      if (!trimmed) continue;
+      const tag = await getTagByName(trimmed);
+      if (!tag) continue;
+      const previousSource = beforeSourceById.get(tag.id);
+      if (previousSource === undefined) continue; // wasn't on the session
+      await removeSessionTag(ctx.sessionId, tag.id);
+      removedTags.push({ tagId: tag.id, source: previousSource });
+      removedNames.push(trimmed);
     }
 
-    const detail = toAdd.length > 0
-      ? `Added: ${toAdd.join(", ")}`
-      : `Removed: ${toRemove.join(", ")}`;
-
     const parts: string[] = [];
-    if (toAdd.length > 0) parts.push(`Tags added: ${toAdd.join(", ")}`);
-    if (toRemove.length > 0) parts.push(`Tags removed: ${toRemove.join(", ")}`);
+    if (addedNames.length > 0) parts.push(`Tags added: ${addedNames.join(", ")}`);
+    if (removedNames.length > 0)
+      parts.push(`Tags removed: ${removedNames.join(", ")}`);
+    const detail = parts.length > 0 ? parts.join(". ") : "No tag changes";
+    const result =
+      parts.length > 0 ? parts.join(". ") + "." : "Tags already up to date.";
 
+    const mutated = addedTagIds.length > 0 || removedTags.length > 0;
     return {
       name: "tag_session",
       label: "Tags",
       detail,
-      result: parts.join(". ") + ".",
-      undoData: { addedTagIds, removedTagIds },
+      result,
+      undoData: mutated ? { addedTagIds, removedTags } : undefined,
+      mutated,
     };
   },
   undo: async (undoData, ctx) => {
-    const data = undoData as { addedTagIds: string[]; removedTagIds: string[] };
+    const data = undoData as {
+      addedTagIds: string[];
+      removedTags: { tagId: string; source: "manual" | "auto" | "ai" }[];
+    };
     for (const tagId of data.addedTagIds) {
       await removeSessionTag(ctx.sessionId, tagId);
     }
-    for (const tagId of data.removedTagIds) {
-      await addSessionTag(ctx.sessionId, tagId, "ai");
+    for (const { tagId, source } of data.removedTags) {
+      await addSessionTag(ctx.sessionId, tagId, source);
     }
   },
 });
@@ -417,18 +456,37 @@ registerTool({
   execute: async (args, ctx) => {
     const folderName = String(args.folder_name).trim();
     const folders = await listFolders();
-    const target = folders.find(
+    const matches = folders.filter(
       (f) => f.name.toLowerCase() === folderName.toLowerCase(),
     );
-    if (!target) {
+    if (matches.length === 0) {
       return {
         name: "add_to_folder",
         label: "Folder",
         detail: `Folder "${folderName}" not found`,
         result: `Error: No folder named "${folderName}" exists.`,
+        mutated: false,
+      };
+    }
+    if (matches.length > 1) {
+      // Multiple folders share this name under different parents. Refuse to
+      // guess — surface the candidate paths so the LLM (or a follow-up call)
+      // can pick the intended one. Today the schema only takes a name; the
+      // model can resolve by re-calling get_folder_context for the tree, or
+      // by asking the user.
+      const paths = matches
+        .map((m) => formatFolderContextChain(folders, m.id))
+        .filter((p) => p.length > 0);
+      return {
+        name: "add_to_folder",
+        label: "Folder",
+        detail: `Ambiguous: ${matches.length} folders named "${folderName}"`,
+        result: `Error: ${matches.length} folders named "${folderName}" exist. Resolve by parent path before retrying. Candidates:\n${paths.map((p) => `- ${p}`).join("\n")}`,
+        mutated: false,
       };
     }
 
+    const target = matches[0];
     const currentFolderIds = ctx.folderIds ?? [];
     if (currentFolderIds.includes(target.id)) {
       const contextChain = formatFolderContextChain(folders, target.id);
@@ -437,6 +495,7 @@ registerTool({
         label: "Folder",
         detail: `Already in "${target.name}"`,
         result: `Session is already in this folder. Context: ${contextChain}`,
+        mutated: false,
       };
     }
 
@@ -454,6 +513,7 @@ registerTool({
       detail: `Added to "${target.name}"`,
       result: `Session added to "${target.name}". Folder context: ${contextChain}. Use this context to inform your summary.`,
       undoData: { addedFolderId: target.id, removedConflicts: conflicts },
+      mutated: true,
     };
   },
   undo: async (undoData, ctx) => {
@@ -494,29 +554,45 @@ registerTool({
         label: "Folders",
         detail: "No folders exist",
         result: "No folders have been created yet.",
+        mutated: false,
       };
     }
 
     const folderName = args.folder_name ? String(args.folder_name).trim() : null;
 
     if (folderName) {
-      const target = folders.find(
+      const matches = folders.filter(
         (f) => f.name.toLowerCase() === folderName.toLowerCase(),
       );
-      if (!target) {
+      if (matches.length === 0) {
         return {
           name: "get_folder_context",
           label: "Folders",
           detail: `Folder "${folderName}" not found`,
           result: `No folder named "${folderName}". Available folders: ${folders.map((f) => f.name).join(", ")}`,
+          mutated: false,
         };
       }
+      if (matches.length > 1) {
+        const paths = matches
+          .map((m) => formatFolderContextChain(folders, m.id))
+          .filter((p) => p.length > 0);
+        return {
+          name: "get_folder_context",
+          label: "Folders",
+          detail: `Ambiguous: ${matches.length} folders named "${folderName}"`,
+          result: `${matches.length} folders named "${folderName}" exist. Candidates:\n${paths.map((p) => `- ${p}`).join("\n")}`,
+          mutated: false,
+        };
+      }
+      const target = matches[0];
       const contextChain = formatFolderContextChain(folders, target.id);
       return {
         name: "get_folder_context",
         label: "Folders",
         detail: `Context for "${target.name}"`,
         result: `Folder context chain: ${contextChain}`,
+        mutated: false,
       };
     }
 
@@ -527,6 +603,7 @@ registerTool({
       label: "Folders",
       detail: `${folders.length} folders`,
       result: `Folder tree:\n${treeText}`,
+      mutated: false,
     };
   },
   undo: async () => {},
