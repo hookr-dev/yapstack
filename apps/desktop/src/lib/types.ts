@@ -290,6 +290,14 @@ async getLiveTranscriptionStatus() : Promise<Result<LiveTranscriptionStatus, Com
     else return { status: "error", error: e  as any };
 }
 },
+async updateVocabularyHints(hints: string) : Promise<Result<null, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("update_vocabulary_hints", { hints }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async clipboardPaste(text: string, autoPaste: boolean) : Promise<Result<null, CommandError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("clipboard_paste", { text, autoPaste }) };
@@ -495,7 +503,13 @@ mp3_bitrate: number | null;
  * when the active engine is Parakeet *and* the sidecar was spawned with
  * a Sortformer model path. Whisper sessions ignore this flag.
  */
-diarization?: boolean }
+diarization?: boolean; 
+/**
+ * Comma-separated vocabulary hints (folder/tag names) prepended to the
+ * Whisper initial_prompt to improve recognition of proper nouns. Ignored
+ * for Parakeet sessions (the TDT decoder has no text-prompt input).
+ */
+vocabulary_hints: string | null }
 export type LiveTranscriptionPhase = "Running" | "Stopped" | "Error"
 export type LiveTranscriptionStartResult = { effective_start_epoch_ms: number }
 export type LiveTranscriptionStatus = { phase: LiveTranscriptionPhase; chunks_processed: number; total_audio_seconds: number; error_message: string | null; session_id: string | null; effective_start_epoch_ms: number | null }

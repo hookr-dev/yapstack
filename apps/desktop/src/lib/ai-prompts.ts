@@ -24,18 +24,29 @@ export function getContentScaleGuidance(transcriptText: string): string {
 const CITATION_INSTRUCTION = `
 When referencing specific parts of the conversation, cite the segment using its ID in this format: [[seg:ID]]. For example: "The team discussed increasing marketing spend [[seg:def456]]." Only cite when it adds value — don't cite every statement.`;
 
-/// Added to the system prompt only when the transcript was produced by a
-/// diarized engine (Parakeet + Sortformer). Tells the model that segment
-/// lines carry a `(Speaker N)` or `(Alice)` parenthetical and that the
-/// user expects answers to attribute statements to the right person.
+/// Added to the system prompt whenever transcript text is in scope.
+/// Transcripts always carry a parenthetical speaker label after the
+/// timestamp; this instruction tells the model what each label means and
+/// — critically — that statements from other speakers must NOT be
+/// attributed to the user. Without this guidance, models routinely
+/// summarise things "the user said" when in fact another participant
+/// said them on the call.
 const SPEAKER_INSTRUCTION = `
-This transcript includes speaker labels in parentheses after each segment timestamp — e.g. \`[seg:abc 0:12] (Alice) Yes, exactly.\`. When summarizing or answering questions about who said what, attribute statements to the named speaker. If a speaker has only the default label (\`Speaker 1\`, \`Speaker 2\`, …), use that label verbatim — don't invent names.`;
+Every transcript segment carries a speaker label in parentheses after the timestamp — e.g. \`[seg:abc 0:12] (You) Yes, exactly.\`. The labels mean:
+- \`(You)\` — the human running this app, captured from their microphone. This is the user you are talking to right now. Quotes and statements wrapped with \`(You)\` are theirs.
+- \`(Alice)\`, \`(Bob)\`, \`(Speaker 1)\`, etc. — other people in the recording, captured from system audio (a video call, podcast, etc.). These statements were NOT said by the user.
+- \`(Other)\` — another participant whose identity isn't known. Still not the user.
+
+When answering questions about who said what, always attribute to the labelled speaker. Never claim the user said something that another speaker said. If a speaker has only the default label (\`Speaker 1\`, \`Speaker 2\`, …), use that label verbatim — don't invent names.`;
 
 const NOTES_GUIDANCE = `
-When saving to notes, choose the mode based on context:
-- Use "append" to add your content alongside existing notes
-- Use "replace" only when notes are empty or when you're producing a complete rewrite that incorporates the existing content
-If existing notes contain useful content (hand-written notes, previously added sections), default to append.`;
+The user's existing notes are visible later in this prompt — read them before saving to notes. Pick the save_to_notes mode that matches their intent:
+- "find_replace" — for changing specific text. Whenever the user asks to change/fix/edit/update/rename a word, phrase, or sentence, this is the right mode. The 'find' string must be an exact substring of the current notes; markdown won't render in the replacement (plain text only).
+- "append" — for adding new content (a summary, action items, follow-up notes) below the existing notes.
+- "prepend" — for a TL;DR or executive summary at the top.
+- "replace" — ONLY when the notes are empty or the user explicitly asks for a full rewrite from scratch. Never use this to make a small change — that's find_replace.
+
+If you're unsure between append and replace, choose append. The user's hand-written notes must be preserved.`;
 
 export const GENERAL_DIRECTIVE = `You are a helpful assistant for a note-taking app. You have access to the user's session content, notes, and session tools.
 
@@ -45,6 +56,11 @@ You can use your tools to help the user:
 - \`update_title\` — Set a better session title if the user asks
 - \`save_to_notes\` — Save content to notes when the user asks you to write, draft, or create something
 - \`pin_session\` — Pin/unpin the session
+- \`tag_session\` — Add or remove tags from the session
+- \`search_folders\` — Search the user's folder tree by name, path, or description. Returns stable folder IDs.
+- \`add_session_to_folder\` — Classify the session into an organizational folder by ID. ALWAYS call \`search_folders\` first to get the correct folder_id; never guess an ID or pass a folder name.
+- \`search_dictations\` — Search the user's dictation history (a personal knowledge base of short dictated snippets, typically 3–5 sentences each). Useful when the user asks something they may have noted earlier, or when drafting notes that should reflect their prior thinking.
+- \`replace_in_transcript\` — Fix a misheard or misspelled word across the current session's transcript. Use ONLY when the user explicitly asks to correct a transcription error (e.g. "replace 'kubernet ease' with 'kubernetes'"). Never edit the transcript pre-emptively. Verify the wrong spelling against the transcript before calling.
 
 Only use tools when the user's request clearly calls for it. For general questions, just answer in text.`;
 
@@ -95,6 +111,7 @@ export function getSystemPromptWithToolContext(
   noteText: string,
   attachments: { name: string; content: string }[],
   sessionMeta: SessionMeta,
+  folderTreeContext?: string,
   options?: { hasSpeakers?: boolean },
 ): string {
   const base = getSystemPrompt(
@@ -105,10 +122,13 @@ export function getSystemPromptWithToolContext(
     options,
   );
 
-  return (
-    base +
-    `\n---\nSession metadata:\n- Current title: "${sessionMeta.title}"\n- Pinned: ${sessionMeta.isPinned ? "yes" : "no"}\n- Has existing notes: ${sessionMeta.hasNotes ? "yes" : "no"}\n`
-  );
+  let meta = `\n---\nSession metadata:\n- Current title: "${sessionMeta.title}"\n- Pinned: ${sessionMeta.isPinned ? "yes" : "no"}\n- Has existing notes: ${sessionMeta.hasNotes ? "yes" : "no"}\n`;
+
+  if (folderTreeContext) {
+    meta += `\n**Available folders (classify this session before summarizing):**\n${folderTreeContext}\n`;
+  }
+
+  return base + meta;
 }
 
 export interface FolderContextLayer {
@@ -149,7 +169,7 @@ export function getMultiSessionSystemPrompt(
   let prompt = `You are a helpful assistant for a note-taking app. The user is viewing multiple sessions. You can answer questions, compare sessions, find patterns, and synthesize information across them.
 
 Be concise and direct. Use **bold** for labels when organizing information. Do not use # or ## markdown headings.
-
+${SPEAKER_INSTRUCTION}
 ---
 `;
 

@@ -20,6 +20,8 @@ import {
 import { getActionsForSession } from "@/lib/ai-actions";
 import { getToolEffects } from "@/lib/ai-tools";
 import { convertFileSrc } from "@tauri-apps/api/core";
+import { useAutoTag } from "@/hooks/useAutoTag";
+import { AutoTagSuggestions } from "@/components/AutoTagSuggestions";
 
 /** Build a URL for the custom audio-stream:// protocol registered in Rust. */
 function audioStreamUrl(filePath: string): string {
@@ -47,6 +49,11 @@ export function NoteDetailView() {
 
   const isActiveSession = selectedSessionId === activeSessionId;
 
+  const { suggestions, acceptSuggestion, dismissSuggestion } = useAutoTag(
+    selectedSessionId,
+    isActiveSession,
+  );
+
   const session = isActiveSession ? activeSession : viewSession;
 
   const segments = isActiveSession ? activeSessionSegments : viewSessionSegments;
@@ -70,6 +77,12 @@ export function NoteDetailView() {
     () => getActionsForSession(session?.session_type ?? "recording"),
     [session?.session_type],
   );
+  const loadSessionFolders = useAppStore((s) => s.loadSessionFolders);
+  const loadSessionTags = useAppStore((s) => s.loadSessionTags);
+  const loadTags = useAppStore((s) => s.loadTags);
+  const refreshViewSessionSegments = useAppStore(
+    (s) => s.refreshViewSessionSegments,
+  );
   const handleToolsExecuted = useCallback(
     async (names: string[]) => {
       if (!selectedSessionId) return;
@@ -84,8 +97,22 @@ export function NoteDetailView() {
       if (effects.has("notes")) {
         incrementNoteRefresh();
       }
+      if (effects.has("organization")) {
+        await Promise.all([loadSessionFolders(), loadSessionTags(), loadTags()]);
+      }
+      if (effects.has("transcript")) {
+        await refreshViewSessionSegments();
+      }
     },
-    [selectedSessionId, loadSessions, incrementNoteRefresh],
+    [
+      selectedSessionId,
+      loadSessions,
+      incrementNoteRefresh,
+      loadSessionFolders,
+      loadSessionTags,
+      loadTags,
+      refreshViewSessionSegments,
+    ],
   );
 
   const handleSeek = useCallback(
@@ -165,6 +192,11 @@ export function NoteDetailView() {
     return (
       <div className="flex flex-1 flex-col min-h-0 view-enter">
         <SessionHeader session={session} />
+        <AutoTagSuggestions
+          suggestions={suggestions}
+          onAccept={acceptSuggestion}
+          onDismiss={dismissSuggestion}
+        />
         <ResizablePanelGroup orientation="horizontal" className="flex-1">
           <ResizablePanel defaultSize="40%" minSize="20%">
             <div className="flex flex-col h-full min-h-0">

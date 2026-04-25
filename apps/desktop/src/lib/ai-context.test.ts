@@ -20,8 +20,12 @@ vi.mock("@/lib/db", () => ({
   ]),
   getNote: vi.fn().mockResolvedValue(null),
   getSession: vi.fn().mockResolvedValue(null),
-  getNotesForSessions: vi.fn().mockResolvedValue([]),
+  getSessionsByIds: vi.fn().mockResolvedValue([]),
   listDictationHistory: vi.fn().mockResolvedValue([]),
+  getSessionTagIds: vi.fn().mockResolvedValue([]),
+  listAllSessionFolders: vi.fn().mockResolvedValue([]),
+  listTags: vi.fn().mockResolvedValue([]),
+  listFolders: vi.fn().mockResolvedValue([]),
 }));
 vi.mock("@tauri-apps/plugin-sql", () => ({
   default: { load: vi.fn() },
@@ -73,7 +77,7 @@ describe("createSessionSources", () => {
   it("transcript assembler calls DB and returns formatted text", async () => {
     const sources = createSessionSources("session-1", 1, "recording");
     const result = await sources[0].assembler();
-    expect(result).toContain("[seg:s1 0:00] Hello");
+    expect(result).toContain("[seg:s1 0:00] (You) Hello");
   });
 });
 
@@ -88,21 +92,15 @@ describe("createSessionTools", () => {
 });
 
 describe("createMultiSessionSources", () => {
-  it("returns sessions and notes sources", () => {
+  it("returns a single compact candidates source", () => {
     const sources = createMultiSessionSources([], 0);
-    expect(sources.length).toBe(2);
+    expect(sources.length).toBe(1);
     expect(sources[0].type).toBe("sessions");
-    expect(sources[1].type).toBe("notes");
   });
 
   it("sessions source is not toggleable", () => {
     const sources = createMultiSessionSources([], 0);
     expect(sources[0].toggleable).toBe(false);
-  });
-
-  it("notes source is toggleable", () => {
-    const sources = createMultiSessionSources([], 0);
-    expect(sources[1].toggleable).toBe(true);
   });
 
   it("includes summary with session count", () => {
@@ -112,14 +110,24 @@ describe("createMultiSessionSources", () => {
 });
 
 describe("createMultiSessionTools", () => {
-  it("returns empty tool IDs for multi-session context", () => {
-    const tools = createMultiSessionTools();
-    expect(tools.availableToolIds).toEqual([]);
+  it("exposes retrieval-only tools for multi-session context", () => {
+    const tools = createMultiSessionTools(["s1", "s2"]);
+    expect(tools.availableToolIds).toContain("search_sessions");
+    expect(tools.availableToolIds).toContain("get_session_context");
+    expect(tools.availableToolIds).toContain("search_folders");
+    // No mutating tools at this scope — they need a single sessionId.
+    expect(tools.availableToolIds).not.toContain("update_title");
+    expect(tools.availableToolIds).not.toContain("save_to_notes");
+    expect(tools.availableToolIds).not.toContain("pin_session");
+    expect(tools.availableToolIds).not.toContain("tag_session");
+    expect(tools.availableToolIds).not.toContain("add_session_to_folder");
   });
 
-  it("has null getToolContext", () => {
-    const tools = createMultiSessionTools();
-    expect(tools.getToolContext).toBeNull();
+  it("threads allowedSessionIds through getToolContext", async () => {
+    const tools = createMultiSessionTools(["s1", "s2"]);
+    expect(tools.getToolContext).not.toBeNull();
+    const ctx = await tools.getToolContext!();
+    expect(ctx.allowedSessionIds).toEqual(["s1", "s2"]);
   });
 });
 
@@ -172,13 +180,12 @@ const emptyDeps = {
 };
 
 describe("resolveListContext", () => {
-  it('"all" returns global contextKey with sessions and session-notes sources', () => {
+  it('"all" returns global contextKey with a single compact candidates source', () => {
     const sessions = [makeSession({ id: "a" }), makeSession({ id: "b" })];
     const result = resolveListContext({ type: "all" }, { ...emptyDeps, sessions });
     expect(result.contextKey).toBe("global");
-    expect(result.sources).toHaveLength(2);
+    expect(result.sources).toHaveLength(1);
     expect(result.sources[0].id).toBe("sessions");
-    expect(result.sources[1].id).toBe("session-notes");
     expect(result.placeholder).toBe("Ask about 2 sessions...");
   });
 

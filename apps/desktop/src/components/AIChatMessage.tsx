@@ -10,6 +10,7 @@ import { memo, useState, type ReactNode } from "react";
 import type { ChatMessage } from "@/lib/ai";
 import type { DbSegment } from "@/lib/db";
 import { getAction } from "@/lib/ai-actions";
+import { ToolExecutionBlock } from "@/components/ToolExecutionBlock";
 
 interface ToolBadge {
   tool: string;
@@ -27,6 +28,13 @@ const TOOL_LABELS: Record<string, string> = {
   update_title: "Title updated",
   save_to_notes: "Notes saved",
   pin_session: "Pin toggled",
+  tag_session: "Tags updated",
+  add_session_to_folder: "Classified",
+  search_folders: "Folders searched",
+  search_sessions: "Sessions searched",
+  get_session_context: "Sessions expanded",
+  search_dictations: "Dictations searched",
+  replace_in_transcript: "Transcript edited",
 };
 
 function parseToolBadges(content: string): {
@@ -59,7 +67,12 @@ function formatTimestamp(seconds: number): string {
   return `${mins}:${secs.toString().padStart(2, "0")}`;
 }
 
-const CITE_REGEX = /\[\[seg:([a-zA-Z0-9_-]+)\]\]/g;
+// Stateless pattern used for `.test()` checks. `renderTextWithCitations`
+// builds its own `g`-flagged regex from `.source` for the exec-loop, so
+// keeping this one without `g` is safe and prevents the cross-call
+// `lastIndex` drift that was making citations render as raw text after
+// the first chat message in a session.
+const CITE_REGEX = /\[\[seg:([a-zA-Z0-9_-]+)\]\]/;
 
 function renderTextWithCitations(
   text: string,
@@ -169,22 +182,26 @@ export const AIChatMessage = memo(function AIChatMessage({
     );
   }
 
+  const hasLiveExecs = message.toolExecutions && message.toolExecutions.length > 0;
   const { badges, text } = parseToolBadges(message.content);
   const hasCitations = CITE_REGEX.test(text);
 
+  const toolExecsFromBadges = !hasLiveExecs && badges.length > 0
+    ? badges.map((b) => ({
+        name: b.tool,
+        label: TOOL_LABELS[b.tool] ?? b.tool,
+        detail: b.detail || undefined,
+        status: "done" as const,
+      }))
+    : undefined;
+
+  const toolExecs = message.toolExecutions ?? toolExecsFromBadges;
+
   return (
     <div className="flex flex-col gap-1">
-      {badges.length > 0 && (
-        <div className="flex flex-wrap gap-1 mb-0.5">
-          {badges.map((b, i) => (
-            <span
-              key={i}
-              className="inline-flex items-center gap-1 rounded-md bg-primary/10 px-1.5 py-0.5 text-[10px] font-medium text-primary"
-            >
-              <Check className="h-2.5 w-2.5" />
-              {b.detail || TOOL_LABELS[b.tool] || b.tool}
-            </span>
-          ))}
+      {toolExecs && toolExecs.length > 0 && (
+        <div className="max-w-[95%] rounded-xl bg-muted/40 border border-border/30 px-2.5 py-1.5">
+          <ToolExecutionBlock executions={toolExecs} />
         </div>
       )}
       {(text.trim() || message.isStreaming) && (

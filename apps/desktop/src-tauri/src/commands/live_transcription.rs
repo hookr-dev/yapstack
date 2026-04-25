@@ -62,6 +62,10 @@ pub struct LiveTranscriptionConfig {
     /// a Sortformer model path. Whisper sessions ignore this flag.
     #[serde(default)]
     pub diarization: bool,
+    /// Comma-separated vocabulary hints (folder/tag names) prepended to the
+    /// Whisper initial_prompt to improve recognition of proper nouns. Ignored
+    /// for Parakeet sessions (the TDT decoder has no text-prompt input).
+    pub vocabulary_hints: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Type)]
@@ -183,6 +187,8 @@ struct TranscriptionContext {
     config: LiveTranscriptionConfig,
     /// Shared prompt context bridging backfill → live transcription.
     bridged_prompt: Arc<Mutex<String>>,
+    /// Dynamic vocabulary hints updated by frontend during recording.
+    vocabulary_hints: Arc<Mutex<String>>,
 }
 
 /// Result of transcribing a single chunk.
@@ -254,7 +260,7 @@ struct VadBackfillSource {
 
 // --- Controller ---
 
-pub struct LiveTranscriptionController {
+pub(crate) struct LiveTranscriptionController {
     task_handle: tokio::task::JoinHandle<()>,
     stop_tx: Option<oneshot::Sender<()>>,
     session_id: Option<String>,
@@ -267,7 +273,12 @@ impl LiveTranscriptionController {
     }
 }
 
-pub type LiveTranscriptionState = Arc<Mutex<Option<LiveTranscriptionController>>>;
+pub struct LiveTranscriptionRuntime {
+    pub(crate) controller: LiveTranscriptionController,
+    vocabulary_hints: Arc<Mutex<String>>,
+}
+
+pub type LiveTranscriptionState = Arc<Mutex<Option<LiveTranscriptionRuntime>>>;
 
 // --- VAD helpers ---
 
@@ -2692,21 +2703,52 @@ async fn transcribe_chunk(
             }
         };
 
-    // Transcribe using the private (zero-contention) client.
-    // Use per-source accumulated_text as initial_prompt to avoid cross-source
-    // contamination in Mixed mode (e.g. system audio biasing mic transcription).
-    // shared_prompt is still updated for prompt-decay tracking.
-    //
-    // Truncate to prompt_context_chars for the Whisper prompt (default 350).
-    // accumulated_text itself is kept at up to MAX_ACCUMULATED_TEXT_CHARS for the LiveSegmentEvent.
+    // Build effective prompt: [vocabulary_hints]. [rolling_context]
+    // Vocabulary hints (folder names) are prepended to help Whisper recognise proper nouns.
+    // Read fresh each chunk so mid-recording updates take effect. Snapshot the
+    // hints into an owned String inside a short scope so the mutex is dropped
+    // before the long `transcribe_with` await — otherwise the
+    // `update_vocabulary_hints` command can block behind a multi-second
+    // sidecar round trip.
     let max_prompt = ctx.config.prompt_context_chars.unwrap_or(350) as usize;
-    let effective_prompt: Option<&str> = if accumulated_text.is_empty() {
-        None
-    } else if accumulated_text.len() > max_prompt {
-        let boundary = accumulated_text.ceil_char_boundary(accumulated_text.len() - max_prompt);
-        Some(&accumulated_text[boundary..])
+    let vocab_truncated: String = {
+        let vocab_guard = ctx.vocabulary_hints.lock().await;
+        let vocab: &str = vocab_guard.as_str();
+        // Round down to a char boundary — folder/tag names can contain
+        // multibyte codepoints, and a raw byte slice at the 80-byte cap
+        // could land mid-codepoint and panic the live-transcription task.
+        let vocab_budget = vocab.floor_char_boundary(vocab.len().min(80));
+        vocab[..vocab_budget].to_string()
+    };
+    let vocab_budget = vocab_truncated.len();
+    let context_budget = max_prompt.saturating_sub(if vocab_budget > 0 {
+        vocab_budget + 2
     } else {
-        Some(accumulated_text.as_str())
+        0
+    });
+
+    let combined_prompt: String;
+    let effective_prompt: Option<&str> = if accumulated_text.is_empty() && vocab_budget == 0 {
+        None
+    } else {
+        let context_part = if accumulated_text.is_empty() {
+            ""
+        } else if accumulated_text.len() > context_budget {
+            let boundary =
+                accumulated_text.ceil_char_boundary(accumulated_text.len() - context_budget);
+            &accumulated_text[boundary..]
+        } else {
+            accumulated_text.as_str()
+        };
+
+        if vocab_budget > 0 && !context_part.is_empty() {
+            combined_prompt = format!("{}. {}", &vocab_truncated, context_part);
+            Some(&combined_prompt)
+        } else if vocab_budget > 0 {
+            Some(&vocab_truncated)
+        } else {
+            Some(context_part)
+        }
     };
 
     // Briefly lock the outer mutex just to clone the inner Arc<TranscriptionClient>.
@@ -2951,8 +2993,8 @@ pub async fn start_live_transcription(
     let mut guard = live_state.lock().await;
 
     // Check if already running
-    if let Some(ref controller) = *guard {
-        if controller.is_running() {
+    if let Some(ref runtime) = *guard {
+        if runtime.controller.is_running() {
             return Err(CommandError::InvalidInput {
                 message: "live transcription is already running".into(),
             });
@@ -3185,12 +3227,17 @@ pub async fn start_live_transcription(
         })?
     };
 
+    let vocab_hints = Arc::new(Mutex::new(
+        config.vocabulary_hints.clone().unwrap_or_default(),
+    ));
+
     let ctx = TranscriptionContext {
         transcription_client: Arc::new(Mutex::new(Some(extracted_client))),
         shared_transcription_state: transcription_state_clone,
         app_handle,
         config,
         bridged_prompt: Arc::new(Mutex::new(String::new())),
+        vocabulary_hints: vocab_hints.clone(),
     };
 
     let task_handle = tokio::spawn({
@@ -3236,11 +3283,14 @@ pub async fn start_live_transcription(
         }
     });
 
-    *guard = Some(LiveTranscriptionController {
-        task_handle,
-        stop_tx: Some(stop_tx),
-        session_id: controller_session_id,
-        effective_start_epoch_ms,
+    *guard = Some(LiveTranscriptionRuntime {
+        controller: LiveTranscriptionController {
+            task_handle,
+            stop_tx: Some(stop_tx),
+            session_id: controller_session_id,
+            effective_start_epoch_ms,
+        },
+        vocabulary_hints: vocab_hints,
     });
 
     Ok(LiveTranscriptionStartResult {
@@ -3256,11 +3306,10 @@ pub async fn stop_live_transcription(
     let mut guard = live_state.lock().await;
 
     match guard.take() {
-        Some(mut controller) => {
-            if let Some(tx) = controller.stop_tx.take() {
+        Some(mut runtime) => {
+            if let Some(tx) = runtime.controller.stop_tx.take() {
                 let _ = tx.send(());
             }
-            // Don't await the task — it will finish on its own and emit Stopped status
             Ok(())
         }
         None => Err(CommandError::InvalidInput {
@@ -3283,15 +3332,16 @@ pub async fn get_live_transcription_status(
     // command reads. Low priority since the frontend receives accurate per-chunk
     // values via the "live-transcription-status" event stream.
     match &*guard {
-        Some(controller) => {
-            if controller.is_running() {
+        Some(runtime) => {
+            let c = &runtime.controller;
+            if c.is_running() {
                 Ok(LiveTranscriptionStatus {
                     phase: LiveTranscriptionPhase::Running,
                     chunks_processed: 0,
                     total_audio_seconds: 0.0,
                     error_message: None,
-                    session_id: controller.session_id.clone(),
-                    effective_start_epoch_ms: Some(controller.effective_start_epoch_ms),
+                    session_id: c.session_id.clone(),
+                    effective_start_epoch_ms: Some(c.effective_start_epoch_ms),
                 })
             } else {
                 Ok(LiveTranscriptionStatus {
@@ -3299,8 +3349,8 @@ pub async fn get_live_transcription_status(
                     chunks_processed: 0,
                     total_audio_seconds: 0.0,
                     error_message: None,
-                    session_id: controller.session_id.clone(),
-                    effective_start_epoch_ms: Some(controller.effective_start_epoch_ms),
+                    session_id: c.session_id.clone(),
+                    effective_start_epoch_ms: Some(c.effective_start_epoch_ms),
                 })
             }
         }
@@ -3312,6 +3362,23 @@ pub async fn get_live_transcription_status(
             session_id: None,
             effective_start_epoch_ms: None,
         }),
+    }
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn update_vocabulary_hints(
+    live_state: tauri::State<'_, LiveTranscriptionState>,
+    hints: String,
+) -> Result<(), CommandError> {
+    let guard = live_state.lock().await;
+    match &*guard {
+        Some(runtime) => {
+            let mut vocab = runtime.vocabulary_hints.lock().await;
+            *vocab = hints;
+            Ok(())
+        }
+        None => Ok(()),
     }
 }
 
@@ -3741,6 +3808,7 @@ mod tests {
             audio_export_format: None,
             mp3_bitrate: None,
             diarization: false,
+            vocabulary_hints: None,
         }
     }
 

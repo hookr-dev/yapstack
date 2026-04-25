@@ -6,7 +6,8 @@ import { useAppStore } from "@/stores/appStore";
 import { commands } from "@/lib/tauri";
 import { EVENTS, WINDOWS, listenEvent, emitEvent, type BubbleState } from "@/lib/events";
 import { createAIClient, getActiveConfig, isAIConfigured } from "@/lib/ai";
-import { createManualSession as dbCreateManualSession, saveNote, insertDictationHistory } from "@/lib/db";
+import { buildVocabularyHints } from "@/lib/transcription";
+import { createManualSession as dbCreateManualSession, saveNote, insertDictationHistory, listFolders, listTags } from "@/lib/db";
 import { toast } from "sonner";
 import { trackDictationStarted, trackDictationCompleted, trackDictationFailed } from "@/lib/analytics";
 
@@ -226,6 +227,7 @@ export function useDictation() {
         mp3_bitrate: s.settings.audioExportFormat === "mp3" ? s.settings.mp3Bitrate : null,
         diarization:
           s.settings.selectedEngine === "Parakeet" && s.settings.diarizationEnabled,
+        vocabulary_hints: buildVocabularyHints(await listFolders(), await listTags()),
       });
 
       if (result.status === "error") {

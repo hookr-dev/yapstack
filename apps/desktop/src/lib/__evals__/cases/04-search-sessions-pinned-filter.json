@@ -1,0 +1,63 @@
+{
+  "name": "search_sessions filters by pinned",
+  "description": "filters.pinned=true should restrict to pinned sessions only.",
+  "fixture": {
+    "sessions": [
+      {
+        "id": "pinned-1",
+        "title": "Pinned planning",
+        "created_at": "2026-04-10T10:00:00",
+        "updated_at": "2026-04-10T10:00:00",
+        "source": "Mic",
+        "status": "completed",
+        "duration_seconds": 0,
+        "total_segments": 0,
+        "folder_id": null,
+        "is_pinned": 1,
+        "pinned_at": "2026-04-10T10:00:00",
+        "session_type": "recording",
+        "wav_file_path": null,
+        "wav_duration_seconds": null,
+        "sort_order": 0
+      },
+      {
+        "id": "unpinned-1",
+        "title": "Unpinned planning",
+        "created_at": "2026-04-09T10:00:00",
+        "updated_at": "2026-04-09T10:00:00",
+        "source": "Mic",
+        "status": "completed",
+        "duration_seconds": 0,
+        "total_segments": 0,
+        "folder_id": null,
+        "is_pinned": 0,
+        "pinned_at": null,
+        "session_type": "recording",
+        "wav_file_path": null,
+        "wav_duration_seconds": null,
+        "sort_order": 0
+      }
+    ],
+    "folders": [],
+    "sessionFolders": [],
+    "notes": {},
+    "segments": {},
+    "tags": [],
+    "sessionTags": []
+  },
+  "steps": [
+    {
+      "tool": "search_sessions",
+      "args": {
+        "query": "planning",
+        "filters": { "folder_id": null, "pinned": true },
+        "limit": 10
+      },
+      "expect": {
+        "affectedIdsIncludes": ["pinned-1"],
+        "affectedIdsExcludes": ["unpinned-1"],
+        "mutated": false
+      }
+    }
+  ]
+}

@@ -293,26 +293,35 @@ The persisted domain model. All writes flow through `tauri-plugin-sql` via `lib/
 
 ### Overview
 
-The AI chat system uses OpenAI-compatible APIs (OpenAI, OpenRouter, or custom endpoints) with **function/tool calling** to let the AI directly mutate session data. This creates a two-way bridge: the AI reads transcript + notes context, and writes back title changes, note updates, and pin state.
+The AI chat system uses OpenAI-compatible APIs (OpenAI, OpenRouter, or custom endpoints) with **function/tool calling** to let the AI directly mutate session data. This creates a two-way bridge: the AI reads transcript + notes + folder context, and writes back title changes, note updates, pin state, folder classification, and tags.
 
-The system is designed around two self-contained registries — **actions** (prompt directives) and **tools** (mutations with undo) — so that extending the AI requires minimal file changes.
+The system is designed around two self-contained registries — **actions** (prompt directives with phased tool chaining) and **tools** (mutations with undo and structured results) — so that extending the AI requires minimal file changes.
 
 ### Architecture
 
 ```
 User triggers action (quick action button) or freeform message
-    → FloatingChatBar.handleSend(actionDef?: ActionDefinition)
+    → useChatMessages.handleSend(actionDef?: ActionDefinition)
     → Resolve directive: actionDef.directive ?? GENERAL_DIRECTIVE
     → Assemble context from enabled sources (transcript, notes)
+    → If action + session context: inject folder tree via assembleFolderTreeForActions()
     → buildSystemPrompt(directive, contextParts, attachments)
-        → getSystemPromptWithToolContext(directive, transcript, notes, attachments, sessionMeta)
-    → streamChatWithTools(client, model, messages, tools)
-        → OpenAI streaming API with tool schemas
-        → yields: token events (streamed text) + tool_call events (accumulated)
-    → For each tool_call: executeTool(name, args, toolContext)
-        → Mutates DB (title, notes, pin)
-        → Returns ExecutedTool with undoData
-    → Prepend [tool:name] badge lines to message content
+        → getSystemPromptWithToolContext(directive, transcript, notes, attachments, sessionMeta, folderTree?)
+    → Multi-turn tool execution loop (up to MAX_TOOL_ROUNDS=3):
+        → streamChatWithTools(client, model, messages, tools)
+            → OpenAI streaming API with tool schemas
+            → yields: token events (streamed text) + tool_call events (accumulated)
+        → If tool_calls present:
+            → Update ToolExecution[] state (status: "running" → per-tool spinners in UI)
+            → For each tool_call: executeTool(name, args, toolContext)
+                → Mutates DB (title, notes, pin, folders, tags)
+                → Returns ExecutedTool with undoData + result string
+                → Update ToolExecution status → "done" (checkmark) or "error"
+            → Build tool-role messages with result strings
+            → Append assistant + tool messages to conversation
+            → Loop: make new streaming call with full conversation
+        → If no tool_calls: break (LLM finished)
+    → Prepend [tool:name] badge lines to message content (DB persistence format)
     → Persist to chat_messages DB
     → Post-tool refresh via onToolsExecuted → getToolEffects() → refresh by effect category
     → Show toast with 10s undo window
@@ -322,18 +331,23 @@ User triggers action (quick action button) or freeform message
 
 | File | Responsibility |
 |------|---------------|
-| `lib/ai-actions.ts` | Self-contained action definitions — each carries its own `directive` string |
-| `lib/ai-tools.ts` | Self-contained tool registry — schema + executor + undo + `affects` metadata per tool |
+| `lib/ai-actions.ts` | Self-contained action definitions — each carries phased `directive` string with tool chaining instructions |
+| `lib/ai-tools.ts` | Self-contained tool registry — schema + executor + undo + `affects` + `result` per tool. Six tools. |
 | `lib/ai-prompts.ts` | Prompt assembly: `GENERAL_DIRECTIVE`, `getSystemPrompt(directive, ...)`, citation/notes guidance |
-| `lib/ai-context.ts` | Context provider types, factory functions for session/multi-session context assembly |
-| `lib/ai.ts` | OpenAI client, streaming (with and without tools), context assembly, markdown→HTML via `marked` |
+| `lib/ai-context.ts` | Context provider types, factory functions for session/multi-session context assembly, `assembleFolderTreeForActions()` |
+| `lib/ai.ts` | OpenAI client, streaming (with and without tools), context assembly, `ToolExecution` types, markdown→HTML via `marked` |
+| `lib/transcription.ts` | Whisper-facing utilities: `buildVocabularyHints()` for folder/tag name injection |
+| `lib/auto-tag.ts` | `FolderSuggestionTracker` — keyword matching for folder suggestion chips during recording |
 | `components/AIContextProvider.tsx` | React context provider, source toggle state management |
 | `components/FloatingChatBar.tsx` | Chat UI shell, delegates chat logic to `useChatMessages` hook and input to `ChatInputBar` |
 | `components/chat/ChatInputBar.tsx` | Input textarea, file attachments, action buttons, context/model pills |
 | `components/chat/ContextPill.tsx` | Toggleable context source pill (transcript, notes) |
 | `components/chat/ModelPickerPill.tsx` | Popover-based model selector grouped by provider |
-| `hooks/useChatMessages.ts` | Chat message lifecycle: send, stream, tool execution, undo, DB persistence |
-| `components/AIChatMessage.tsx` | Message rendering with tool badges and citation chips |
+| `hooks/useChatMessages.ts` | Chat message lifecycle: send, stream, multi-turn tool execution, undo, DB persistence |
+| `hooks/useAutoTag.ts` | Folder suggestion hook — processes live segments, manages suggestion state, pushes vocab updates |
+| `components/AIChatMessage.tsx` | Message rendering with `ToolExecutionBlock` and citation chips |
+| `components/ToolExecutionBlock.tsx` | Tool execution status rows — per-tool icon, spinner/checkmark, label, detail |
+| `components/AutoTagSuggestions.tsx` | Inline folder suggestion chips below session header during recording |
 
 ### Action Definitions (`ai-actions.ts`)
 
@@ -350,16 +364,18 @@ interface ActionDefinition {
 }
 ```
 
-Built-in actions:
+Built-in actions (all use **two-phase tool chaining**):
 
-| Action | Tool usage | Behavior |
-|--------|-----------|----------|
-| `summarize` | `update_title` + `save_to_notes` | Structured summary with bold section labels. Tries to set title if generic. `requiresTranscript: true`. |
-| `key-points` | `save_to_notes` (append) | 5-15 bullet points, appended to existing notes |
-| `action-items` | `save_to_notes` (append) | Numbered action items, appended |
-| `meeting-minutes` | `update_title` + `save_to_notes` | Professional minutes format. `requiresTranscript: true`. |
+| Action | Phase 1 (classify) | Phase 2 (write) | Behavior |
+|--------|-------------------|-----------------|----------|
+| `summarize` | `add_to_folder` | `update_title` + `tag_session` + `save_to_notes` | Structured summary informed by folder context. `requiresTranscript: true`. |
+| `key-points` | `add_to_folder` | `tag_session` + `save_to_notes` (append) | 5-15 bullet points, appended to existing notes |
+| `action-items` | `add_to_folder` | `tag_session` + `save_to_notes` (append) | Numbered action items, appended |
+| `meeting-minutes` | `add_to_folder` | `update_title` + `tag_session` + `save_to_notes` | Professional minutes format. `requiresTranscript: true`. |
 
-When no action is selected (freeform chat), `GENERAL_DIRECTIVE` from `ai-prompts.ts` is used as the fallback directive.
+Phase 1 directives explicitly say "Do NOT call other tools yet — wait for folder context results." This forces the multi-turn loop to execute, sending the folder description chain back before Phase 2.
+
+When no action is selected (freeform chat), `GENERAL_DIRECTIVE` from `ai-prompts.ts` is used as the fallback directive. Freeform chat does NOT inject the folder tree — it's action-only context.
 
 `getActionsForSession(sessionType)` filters actions — manual sessions hide `requiresTranscript` actions (summarize, meeting-minutes) since there's no transcript to process.
 
@@ -376,13 +392,22 @@ Tools are self-contained `ToolDefinition` objects registered at module load. Eac
 - **`affects`** — Array of `ToolEffect` categories for declarative post-execution refresh
 
 ```typescript
-type ToolEffect = "session-meta" | "notes";
+type ToolEffect = "session-meta" | "notes" | "organization";
 
 interface ToolDefinition {
   schema: ChatCompletionTool;
   execute: (args, ctx: ToolContext) => Promise<ExecutedTool | null>;
   undo: (undoData, ctx: { sessionId: string }) => Promise<void>;
   affects?: ToolEffect[];
+}
+
+interface ExecutedTool {
+  name: string;
+  label: string;
+  detail: string;           // Human-facing badge text
+  toolCallId?: string;      // OpenAI tool_call ID for multi-turn
+  result?: string;          // Sent back to LLM as tool-role message content
+  undoData?: unknown;
 }
 ```
 
@@ -391,24 +416,26 @@ Built-in tools:
 | Tool | Params | Effects | What it does |
 |------|--------|---------|-------------|
 | `update_title` | `{ title: string }` | `session-meta` | Sets session title (max 80 chars). Undo restores previous title. |
-| `save_to_notes` | `{ content: string, mode: "replace" \| "append" }` | `notes` | Converts markdown → HTML via `marked`, saves/appends to notes, creates version snapshot. Undo restores previous note content. |
+| `save_to_notes` | `{ content: string, mode: "replace" \| "append" }` | `notes` | Converts markdown → HTML via `marked`, saves/appends to notes. Undo restores previous note content. |
 | `pin_session` | `{ pinned: boolean }` | `session-meta` | Pins/unpins session (only toggles if state differs). Undo restores previous pin state. |
+| `tag_session` | `{ add: string[], remove?: string[] }` | `organization` | Adds/removes tags. Creates new tags on-the-fly if they don't exist. Source tracked as `"ai"`. |
+| `add_to_folder` | `{ folder_name: string }` | `organization` | Classifies session into a folder by name (case-insensitive). Handles branch conflicts. Returns the folder's hierarchical description chain in `result`. |
+| `get_folder_context` | `{ folder_name?: string }` | (none) | Read-only. Returns the full folder tree with descriptions, or a specific folder's context chain. No undo needed. |
 
 **Post-tool refresh** uses `getToolEffects(toolNames)` to determine what to refresh based on `affects` metadata:
 - `"session-meta"` → refresh sessions list + viewSession
 - `"notes"` → increment note refresh counter
-
-This replaces hardcoded tool name checks in `NoteDetailView.handleToolsExecuted`, so new tools with `affects` tags automatically trigger the right refreshes.
+- `"organization"` → refresh session folders, session tags, and tags list
 
 **Adding a new tool** requires only a `registerTool({...})` call in `ai-tools.ts` with an `affects` tag. No changes needed in `FloatingChatBar.tsx`, `NoteDetailView.tsx`, or `AIChatMessage.tsx`.
 
 ### Tool Context
 
-Before executing tools, `FloatingChatBar` fetches a `ToolContext` via the provider's `getToolContext()`:
+Before executing tools, `useChatMessages` fetches a `ToolContext` via the provider's `getToolContext()`:
 ```typescript
-{ sessionId, currentTitle, currentNote: DbNote | null, isPinned: boolean, segments?: DbSegment[] }
+{ sessionId, currentTitle, currentNote, isPinned, segments?, tags?, folderIds? }
 ```
-This allows tools to capture previous state for undo and make conditional decisions (e.g., `pin_session` only calls `togglePin` if the current state differs from the requested state). `segments` are used by `save_to_notes` to convert `[[seg:ID]]` citations in the saved content to interactive `<span>` elements.
+Re-fetched each turn of the multi-turn loop so mutations from previous turns are reflected. `tags` and `folderIds` are populated via parallel DB queries (`getSessionTagIds`, `listAllSessionFolders`). `segments` are used by `save_to_notes` to convert `[[seg:ID]]` citations to interactive `<span>` elements.
 
 ### Prompt Assembly (`ai-prompts.ts`)
 
@@ -416,7 +443,7 @@ The prompt system is **directive-first** — the caller passes a `directive: str
 
 ```typescript
 getSystemPrompt(directive: string, transcriptText, noteText, attachments) → string
-getSystemPromptWithToolContext(directive: string, ..., sessionMeta) → string
+getSystemPromptWithToolContext(directive: string, ..., sessionMeta, folderTreeContext?) → string
 ```
 
 Assembly layers:
@@ -424,18 +451,40 @@ Assembly layers:
 2. **Citation instruction** — appended only when transcript is present (instructs `[[seg:ID]]` format)
 3. **Notes guidance** — always appended (instructs append vs. replace mode)
 4. **Context sections** — `## Session Transcript`, `## Notes`, `## Attached Files` (only when non-empty)
-5. **Session metadata** — current title, pin state, notes presence (via `getSystemPromptWithToolContext`)
+5. **Session metadata** — current title, pin state, notes presence
+6. **Folder tree** (actions only) — full folder hierarchy with descriptions, injected as a `"folder-tree"` context part by `useChatMessages` when an action is triggered. Built by `assembleFolderTreeForActions()` → `assembleFolderTreeContext()`. Not included in regular freeform chat to keep prompts lean.
 
 For multi-session contexts, `getMultiSessionSystemPrompt(sessionsContext, attachments, folderContext?)` builds a read-only prompt with optional `FolderContextLayer[]` hierarchy (folder name + description pairs from root to leaf).
 
 ### Streaming with Tool Calls
+
+### Multi-Turn Tool Execution
 
 `streamChatWithTools()` is an async generator that yields typed `StreamEvent`s:
 - `{ type: "token", content }` — Text delta from the model (rendered incrementally)
 - `{ type: "tool_calls", calls }` — Accumulated tool calls (emitted after stream ends, before `done`)
 - `{ type: "done" }` — Stream complete
 
-Tool call deltas arrive incrementally during streaming (partial JSON arguments across multiple chunks). The generator accumulates them by index in a Map, then parses the complete JSON arguments after the stream finishes. This is a **single-turn** tool flow — we execute tools locally and don't send results back to the model for a follow-up response.
+The consumer (`useChatMessages`) wraps this in a **multi-turn loop** (up to `MAX_TOOL_ROUNDS=3`):
+
+1. Stream a response — accumulate tokens and tool calls
+2. If tool calls present: execute them, build `tool`-role messages with results, append to conversation
+3. Make a new streaming call with the extended conversation
+4. Repeat until the LLM produces text without tool calls, or max rounds hit
+
+This enables **phased tool chaining**: the LLM calls `add_to_folder` in turn 1, receives the folder context chain as a tool result, then uses that context to write an informed summary in turn 2.
+
+**Tool execution state** is tracked via `ToolExecution[]` on `ChatMessage`:
+```typescript
+type ToolExecutionStatus = "running" | "done" | "error";
+interface ToolExecution { name: string; label: string; detail?: string; status: ToolExecutionStatus; }
+```
+
+Each tool gets a `"running"` entry when the turn starts (showing a spinner in the UI), then transitions to `"done"` (checkmark) or `"error"` as execution completes. Updates are per-tool, not per-turn — the user sees individual tools resolve one by one.
+
+**Null tool results**: When `executeTool` returns null (no-op, e.g., title already matches), a `"No action needed."` result is still sent as the tool-role message. The OpenAI API requires a response for every `tool_call` ID.
+
+**Abort propagation**: The abort signal is checked between turns and between individual tool executions within a turn.
 
 ### Undo System
 
@@ -457,20 +506,22 @@ In saved notes (via `save_to_notes` tool), citations are converted to `<span dat
 
 ### Tool Badge Persistence
 
-When tools execute, badge lines are prepended to the assistant message content:
+When tools execute, badge lines are prepended to the assistant message content for DB persistence:
 ```
-[tool:update_title] Q1 Budget Planning Meeting
+[tool:add_to_folder] Added to "ConsignR"
+[tool:update_title] Q1 Budget Planning
+[tool:tag_session] Added: meeting, planning
 [tool:save_to_notes] Notes saved
 
 Here's a summary of your session...
 ```
-These persist in `chat_messages` DB, so they render as badges on reload. `AIChatMessage.parseToolBadges()` splits them from the text body. If the remaining text is empty (tool-only response), the message bubble is hidden — only badges show.
+These persist in `chat_messages` DB. On load, `AIChatMessage.parseToolBadges()` converts them to `ToolExecution[]` (all `status: "done"`). During live streaming, the structured `toolExecutions` field on `ChatMessage` takes precedence — the component renders `ToolExecutionBlock` with per-tool status (spinning loader → checkmark). Both live and persisted messages render through the same `ToolExecutionBlock` component.
 
 ### Context Provider Pattern
 
 `AIContextProvider` wraps `FloatingChatBar` and provides `AIContextValue` via React context. Factory functions in `ai-context.ts` create sources, tools, actions, and system prompt builders for different contexts:
 
-- **Session context** (`createSessionSources`, `createSessionTools`, `createSessionSystemPromptBuilder`) — Single session with toggleable transcript and notes sources. All three tools available. Actions filtered by `getActionsForSession(sessionType)`.
+- **Session context** (`createSessionSources`, `createSessionTools`, `createSessionSystemPromptBuilder`) — Single session with toggleable transcript and notes sources. All six tools available. Actions filtered by `getActionsForSession(sessionType)`.
 - **Multi-session context** (`createMultiSessionSources`, `createMultiSessionTools`, `createMultiSessionSystemPromptBuilder`) — Folder-level AI chat aggregating sessions. No tools available (read-only analysis). Folder context hierarchy passed as `FolderContextLayer[]`.
 - **Dictation context** (`createDictationSources`, `createDictationSystemPromptBuilder`) — Dictation history AI chat. Read-only analysis of dictation entries. No tools available.
 - **List context** — `resolveListContext(filter, sessions, folders)` returns a `ListChatContext` (contextKey, sources, tools, systemPromptBuilder, placeholder) for any `ListFilter` type. `ListContextBar` renders the `AIContextProvider` + `FloatingChatBar` for non-session views.
@@ -525,7 +576,7 @@ registerTool({
 2. **`AIActionType` is `string`** — Not a closed union. Any action ID passes typecheck. Built-in IDs documented in JSDoc.
 3. **Directive-first prompt assembly** — `getSystemPrompt` takes a `directive: string`, not an action ID. The caller resolves the directive from the action definition. This decouples prompt construction from the action registry.
 4. **Tool effect categories** — `affects: ToolEffect[]` on each `ToolDefinition` declares what side effects a tool has. `getToolEffects()` aggregates effects from executed tools. Post-tool refresh is driven by effects, not hardcoded tool names.
-5. **Single-turn tool calling** — We don't send tool results back to the model. The AI calls tools, we execute them, and prepend badge metadata to the message. This avoids an extra API round-trip and works well because our tools are simple mutations with clear success/failure.
+5. **Multi-turn tool calling** — Tool results are sent back to the model as `tool`-role messages, enabling phased workflows. The LLM classifies a session into a folder (turn 1), receives the folder context chain, then writes an informed summary (turn 2). Capped at `MAX_TOOL_ROUNDS=3` to prevent runaway loops. Each tool returns a `result` string (for the LLM) distinct from `detail` (for the human-facing badge).
 6. **Modular tool registry** — Tools are self-contained objects with schema + executor + undo + affects. Adding a tool touches one file. The registry pattern avoids a switch statement in the execution path.
 7. **Undo via captured state** — Each tool captures the previous value (not a diff). This makes undo reliable even if other mutations happen between execute and undo.
 8. **Badge lines in message content** — Tool metadata is stored as `[tool:name] detail` prefix lines in the DB message content. This is a simple, persistent format that survives reload without a separate DB column or join table.

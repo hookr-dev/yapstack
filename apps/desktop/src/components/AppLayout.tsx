@@ -49,6 +49,8 @@ export function AppLayout() {
   const sidebarCollapsed = useAppStore((s) => s.settings.sidebarCollapsed);
   const dictationEnabled = useAppStore((s) => s.settings.dictation.enabled);
   const loadDictationHistory = useAppStore((s) => s.loadDictationHistory);
+  const loadTags = useAppStore((s) => s.loadTags);
+  const loadSessionTags = useAppStore((s) => s.loadSessionTags);
 
   const pointerSensor = useSensor(PointerSensor, {
     activationConstraint: { distance: 5 },
@@ -73,7 +75,9 @@ export function AppLayout() {
     loadSessions();
     loadFolders();
     loadSessionFolders();
-  }, [loadSessions, loadFolders, loadSessionFolders]);
+    loadTags();
+    loadSessionTags();
+  }, [loadSessions, loadFolders, loadSessionFolders, loadTags, loadSessionTags]);
 
   // Load dictation history unconditionally when dictation is enabled (feeds sidebar tray)
   useEffect(() => {

@@ -5,22 +5,24 @@ import {
   getSessionSegments,
   getNote,
   getSession,
-  getNotesForSessions,
+  getSessionsByIds,
   listDictationHistory,
+  getSessionTagIds,
+  listAllSessionFolders,
+  listTags,
+  listFolders,
 } from "./db";
 import {
   assembleTranscriptContext,
   assembleNoteContext,
-  assembleMultiSessionContext,
+  assembleSessionCandidates,
   assembleDictationContext,
+  assembleFolderTreeContext,
   chatContextKey,
   transcriptHasSpeakers,
 } from "./ai";
 import type { ChatContext, FileAttachment } from "./ai";
 import { useAppStore } from "@/stores/appStore";
-
-export type ListChatContext = Exclude<ChatContext, { type: "session" }>;
-
 import {
   getSystemPromptWithToolContext,
   getMultiSessionSystemPrompt,
@@ -29,7 +31,9 @@ import {
 import type { FolderContextLayer } from "./ai-prompts";
 import type { ToolContext } from "./ai-tools";
 import type { ActionDefinition } from "./ai-actions";
-import { getFolderPath } from "./folder-tree";
+import { getFolderPath, buildFolderTree } from "./folder-tree";
+
+export type ListChatContext = Exclude<ChatContext, { type: "session" }>;
 
 // --- Core types ---
 
@@ -116,18 +120,42 @@ export function createSessionSources(
 
 export function createSessionTools(sessionId: string): AIContextTools {
   return {
-    availableToolIds: ["update_title", "save_to_notes", "pin_session"],
+    availableToolIds: [
+      "update_title",
+      "save_to_notes",
+      "pin_session",
+      "tag_session",
+      "search_folders",
+      "add_session_to_folder",
+      "search_sessions",
+      "get_session_context",
+      "search_dictations",
+      "replace_in_transcript",
+    ],
     contextType: "session",
     getToolContext: async (): Promise<ToolContext> => {
-      const session = await getSession(sessionId);
-      const note = await getNote(sessionId);
-      const segments = await getSessionSegments(sessionId);
+      const [session, note, segments, tagIds, allSessionFolders, allTags] = await Promise.all([
+        getSession(sessionId),
+        getNote(sessionId),
+        getSessionSegments(sessionId),
+        getSessionTagIds(sessionId),
+        listAllSessionFolders(),
+        listTags(),
+      ]);
+      const folderIds = allSessionFolders
+        .filter((sf) => sf.session_id === sessionId)
+        .map((sf) => sf.folder_id);
+      const tagNames = tagIds
+        .map((tid) => allTags.find((t) => t.id === tid)?.name)
+        .filter((n): n is string => !!n);
       return {
         sessionId,
         currentTitle: session?.title ?? "Untitled",
         currentNote: note,
         isPinned: session?.is_pinned === 1,
         segments,
+        tags: tagNames,
+        folderIds,
       };
     },
   };
@@ -139,6 +167,7 @@ export function createSessionSystemPromptBuilder(
   return async (directive, contextParts, attachments) => {
     const transcript = contextParts["transcript"] ?? "";
     const notes = contextParts["notes"] ?? "";
+    const folderTreeCtx = contextParts["folder-tree"] ?? undefined;
     const session = await getSession(sessionId);
     const note = await getNote(sessionId);
     const sessionMeta = {
@@ -156,9 +185,17 @@ export function createSessionSystemPromptBuilder(
       notes,
       attachments,
       sessionMeta,
+      folderTreeCtx,
       { hasSpeakers },
     );
   };
+}
+
+export async function assembleFolderTreeForActions(): Promise<string> {
+  const folders = await listFolders();
+  if (folders.length === 0) return "";
+  const tree = buildFolderTree(folders);
+  return assembleFolderTreeContext(tree);
 }
 
 export function createMultiSessionSources(
@@ -175,32 +212,62 @@ export function createMultiSessionSources(
       toggleable: false,
       summary: `${count} sessions`,
       assembler: async () => {
-        // Session list without notes — notes handled by separate source
-        const sessionNotes = await getNotesForSessions(sessionIds);
-        return assembleMultiSessionContext(sessionNotes, false);
-      },
-    },
-    {
-      id: "session-notes",
-      type: "notes",
-      label: "Notes",
-      icon: StickyNote,
-      enabled: true,
-      toggleable: true,
-      assembler: async () => {
-        // Full context with notes included
-        const sessionNotes = await getNotesForSessions(sessionIds);
-        return assembleMultiSessionContext(sessionNotes, true);
+        // Compact candidate list only — title, date, folder path. The LLM
+        // pulls richer context (notes, transcript) on demand via the
+        // `get_session_context` tool. This stops the prompt from ballooning
+        // when the list filter covers many sessions.
+        const [sessions, folders, sessionFolders] = await Promise.all([
+          getSessionsByIds(sessionIds),
+          listFolders(),
+          listAllSessionFolders(),
+        ]);
+        const candidates = sessions.map((s) => {
+          const fid = sessionFolders.find((sf) => sf.session_id === s.id)
+            ?.folder_id;
+          const folderPath = fid
+            ? getFolderPath(folders, fid)
+                .map((f) => f.name)
+                .join(" > ")
+            : null;
+          return {
+            id: s.id,
+            title: s.title,
+            date: s.created_at,
+            folderPath,
+          };
+        });
+        return assembleSessionCandidates(candidates);
       },
     },
   ];
 }
 
-export function createMultiSessionTools(): AIContextTools {
+export function createMultiSessionTools(
+  allowedSessionIds: string[],
+): AIContextTools {
   return {
-    availableToolIds: [],
+    // Multi-session Chats expose retrieval-only tools so the LLM can search
+    // and expand sessions on demand instead of having all candidates dumped
+    // into the prompt. No mutating tools here — those need a single
+    // sessionId and would need a different ToolContext.
+    availableToolIds: [
+      "search_sessions",
+      "get_session_context",
+      "search_folders",
+      "search_dictations",
+    ],
     contextType: "multi-session",
-    getToolContext: null,
+    // Retrieval tools don't read from session-scoped ToolContext; they hit
+    // the DB directly. The session-meta fields go unused; allowedSessionIds
+    // is the load-bearing field — it pins retrieval to the Chat's filter
+    // (folder/pinned/all) so the model can't reach outside the user's view.
+    getToolContext: async () => ({
+      sessionId: "",
+      currentTitle: "",
+      currentNote: null,
+      isPinned: false,
+      allowedSessionIds,
+    }),
   };
 }
 
@@ -208,8 +275,7 @@ export function createMultiSessionSystemPromptBuilder(
   folderContext?: FolderContextLayer[],
 ): SystemPromptBuilder {
   return async (_directive, contextParts, attachments) => {
-    // Use notes-inclusive context if notes source is enabled, otherwise sessions-only
-    const sessionsContext = contextParts["session-notes"] ?? contextParts["sessions"] ?? "";
+    const sessionsContext = contextParts["sessions"] ?? "";
     return getMultiSessionSystemPrompt(sessionsContext, attachments, folderContext);
   };
 }
@@ -266,7 +332,9 @@ export function resolveListContext(
       return {
         contextKey: key,
         sources: createDictationSources(count),
-        tools: createMultiSessionTools(),
+        // Dictation chats don't expose session retrieval, but pass an empty
+        // scope to be explicit that no sessions are reachable from here.
+        tools: createMultiSessionTools([]),
         buildSystemPrompt: createDictationSystemPromptBuilder(),
         placeholder: `Ask about ${count} dictation${count !== 1 ? "s" : ""}...`,
       };
@@ -282,7 +350,7 @@ export function resolveListContext(
       return {
         contextKey: key,
         sources: createMultiSessionSources(ids, ids.length),
-        tools: createMultiSessionTools(),
+        tools: createMultiSessionTools(ids),
         buildSystemPrompt: createMultiSessionSystemPromptBuilder(layers.length > 0 ? layers : undefined),
         placeholder: `Ask about ${ids.length} session${ids.length !== 1 ? "s" : ""}...`,
       };
@@ -292,7 +360,7 @@ export function resolveListContext(
       return {
         contextKey: key,
         sources: createMultiSessionSources(ids, ids.length),
-        tools: createMultiSessionTools(),
+        tools: createMultiSessionTools(ids),
         buildSystemPrompt: createMultiSessionSystemPromptBuilder(),
         placeholder: `Ask about ${ids.length} pinned session${ids.length !== 1 ? "s" : ""}...`,
       };
@@ -302,7 +370,7 @@ export function resolveListContext(
       return {
         contextKey: key,
         sources: createMultiSessionSources(ids, ids.length),
-        tools: createMultiSessionTools(),
+        tools: createMultiSessionTools(ids),
         buildSystemPrompt: createMultiSessionSystemPromptBuilder(),
         placeholder: `Ask about ${ids.length} session${ids.length !== 1 ? "s" : ""}...`,
       };

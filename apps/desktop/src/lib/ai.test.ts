@@ -19,6 +19,7 @@ import {
   getModelsForProvider,
   assembleTranscriptContext,
   assembleNoteContext,
+  formatSegmentSpeaker,
   markdownToBasicHtml,
   fetchCustomModels,
   isAIConfigured,
@@ -26,6 +27,7 @@ import {
   type ChatContext,
   type AISettings,
 } from "./ai";
+import type { DbSegment } from "./db";
 
 describe("chatContextKey", () => {
   it("returns sessionId for session context", () => {
@@ -68,6 +70,56 @@ describe("getModelsForProvider", () => {
   });
 });
 
+describe("formatSegmentSpeaker", () => {
+  function seg(overrides: Partial<DbSegment>): DbSegment {
+    return {
+      id: "s1",
+      session_id: "sess",
+      source: "Mic",
+      text: "",
+      audio_offset_seconds: 0,
+      chunk_duration_seconds: 1,
+      confidence: 0.9,
+      created_at: "",
+      chunk_index: 0,
+      original_text: null,
+      edited_at: null,
+      deleted_at: null,
+      hidden: 0,
+      speaker_id: null,
+      ...overrides,
+    };
+  }
+
+  it("returns 'You' for Mic source regardless of speaker_id", () => {
+    expect(formatSegmentSpeaker(seg({ source: "Mic" }))).toBe("You");
+    expect(formatSegmentSpeaker(seg({ source: "Mic", speaker_id: 0 }))).toBe(
+      "You",
+    );
+  });
+
+  it("returns 'Other' for System source without speaker_id", () => {
+    expect(formatSegmentSpeaker(seg({ source: "System" }))).toBe("Other");
+  });
+
+  it("returns 'Speaker N' (1-indexed) for diarised System segments", () => {
+    expect(
+      formatSegmentSpeaker(seg({ source: "System", speaker_id: 0 })),
+    ).toBe("Speaker 1");
+    expect(
+      formatSegmentSpeaker(seg({ source: "System", speaker_id: 2 })),
+    ).toBe("Speaker 3");
+  });
+
+  it("uses speakerNames overrides when provided", () => {
+    expect(
+      formatSegmentSpeaker(seg({ source: "System", speaker_id: 0 }), {
+        0: "Alice",
+      }),
+    ).toBe("Alice");
+  });
+});
+
 describe("assembleTranscriptContext", () => {
   it("returns empty string for no segments", () => {
     expect(assembleTranscriptContext([])).toBe("");
@@ -91,7 +143,9 @@ describe("assembleTranscriptContext", () => {
         hidden: 0,
       },
     ];
-    expect(assembleTranscriptContext(segments)).toBe("[seg:seg1 1:05] Hello world");
+    expect(assembleTranscriptContext(segments)).toBe(
+      "[seg:seg1 1:05] (You) Hello world",
+    );
   });
 
   it("filters hidden segments", () => {
@@ -127,7 +181,9 @@ describe("assembleTranscriptContext", () => {
         hidden: 1,
       },
     ];
-    expect(assembleTranscriptContext(segments)).toBe("[seg:seg1 0:00] Visible");
+    expect(assembleTranscriptContext(segments)).toBe(
+      "[seg:seg1 0:00] (You) Visible",
+    );
   });
 
   it("filters deleted segments", () => {
