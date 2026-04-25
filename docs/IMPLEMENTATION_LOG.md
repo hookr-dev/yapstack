@@ -1146,6 +1146,41 @@ Replaced raw `*Executing: add_to_folder, tag_session...*` text with structured `
 
 ---
 
+## Phase 28 — Escape-to-Cancel for Dictation
+
+### What was built
+
+Pressing **Escape** while a Dictation is in any non-idle phase (`recording`, `transcribing`, `processing`, or post-failure `done`) fully aborts that Dictation: live transcription stops, in-flight AI is aborted, the Output action does not fire, no `dictation_history` row is written, and the streamed Session WAV is deleted. The Dictation Bubble shows a brief "Cancelled" (~450 ms) before hiding.
+
+PRD: `docs/plans/dictation-escape-cancel.md`.
+
+### Key decisions
+
+- **Frontend-only feature.** No backend or IPC changes. The cancel reducer reuses existing `commands.stopLiveTranscription()` and `commands.deleteSessionWav()`. The Sidecar's currently-in-flight Chunk transcribe is allowed to finish and its result is discarded by the Lifecycle Hook on the way past — explicitly out-of-scope for V1.
+- **Escape as a Global hotkey, scoped to a non-idle Dictation.** Registered in `useDictation`'s `handleStart` (after the start is accepted) via `@tauri-apps/plugin-global-shortcut`'s per-binding `register`/`unregister`, and unregistered in `setIdle`. Outside an active Dictation, Escape behaves normally for the OS / focused app. The Global registration is what makes cancel work while focus is in another app, which is the realistic dictation case for `paste` and `clipboard` Output actions.
+- **Cooperative cancellation, not preemption.** The cancel reducer (`handleCancel`) takes ownership by setting `phase = "cancelling"` synchronously. Every `await` in the existing `handleStop` body and the ghost-transcription guard in `handleStart` are followed by an explicit `if (phase() === "cancelling") return;` bail-point, so the cancel path does its own teardown without double-running with the happy path.
+- **Suppress, don't preempt, the Output action.** The reducer never reaches the paste/copy/note branches — there is nothing to undo, no race with the OS clipboard. AI is the one in-flight thing we *can* cancel, so the AI `AbortController` is aborted explicitly.
+- **TS narrowing workaround**: a `phase = (): DictationState => stateRef.current` helper inside the effect defeats TypeScript's control-flow narrowing of `stateRef.current` after intermediate assignments (e.g. `= "transcribing"`), without which the cancel bail-points read as "no overlap with literal type" comparisons.
+- **Session safety**: a regular Session and a Dictation cannot run concurrently (`LiveTranscriptionState` is single-occupancy on the Rust side), so cancel cannot affect a Session's stream. Pressing Escape during a Session is a no-op — the hotkey isn't registered.
+
+### Trade-offs accepted
+
+- **Settings change mid-Dictation** can cause `useGlobalShortcuts.unregisterAll()` to clobber the Dictation Escape registration. Rare and not handled — the Dictation continues normally and finishes via its hotkey or programmatic stop.
+- **In-flight Sidecar Chunk** runs to completion. Bounded by VAD config (≤10 s chunks) and CPU/GPU cost is acceptable. Adding a per-request abort verb would require backend protocol churn; deferred until measurement shows it's worth it.
+- **Escape consumed system-wide** while a Dictation is open. Other apps' Escape handlers don't see the keypress for the duration. Acceptable because dictation is brief and Escape pressed during a Dictation almost certainly means "cancel this Dictation."
+
+### Files Changed
+
+| File | Change |
+|------|--------|
+| `apps/desktop/src/lib/events.ts` | Added `cancelled` to the `BubbleState` union |
+| `apps/desktop/src/components/DictationBubble.tsx` | Added `cancelled` state config (neutral grey ring, "Cancelled" label, no pulse) |
+| `apps/desktop/src/lib/analytics.ts` | New `trackDictationCancelled({ slot_id, phase, duration_ms })` |
+| `apps/desktop/src/hooks/useDictation.ts` | `cancelling` phase + `handleCancel` reducer + `registerCancelHotkey` / `unregisterCancelHotkey` lifecycle + per-await bail-points in `handleStop` and the ghost-transcription guard |
+| `docs/plans/dictation-escape-cancel.md` | PRD |
+
+---
+
 ## What's Not Yet Built
 
 - **End-to-end integration tests** — capture audio, transcribe, verify text (unit + component tests now exist; integration tests still needed)

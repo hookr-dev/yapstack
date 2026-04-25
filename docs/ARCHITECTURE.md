@@ -627,6 +627,7 @@ Decoupled side effects via custom DOM events:
 - `yapstack:confirm-delete-session` — Triggers delete confirmation dialog
 - `yapstack:dictation-start` — Starts dictation recording (with `{ slotId }` detail)
 - `yapstack:dictation-stop` — Stops dictation recording
+- `yapstack:dictation-cancel` — Aborts the active Dictation regardless of phase (dispatched by the Escape Global hotkey while a Dictation is non-idle; see "Cancellation" below)
 - `yapstack:dictation-idle` — Signals dictation has returned to idle (used for toggle mode cleanup)
 
 ## Dictation
@@ -671,8 +672,10 @@ Slots are stored in `dictation.slots` in persisted settings. Keybinds are stored
 
 ```
 idle → recording → transcribing → processing → done → idle
-         ↑                                        ↓
-     (key press)                              (500ms delay)
+  │      │              │               │
+  │      └──────────────┴───────────────┴────► cancelling → idle  (Escape)
+  ↑                                                ↓
+(key press)                                  (450ms display)
 ```
 
 1. **recording**: Key pressed → validate (dictation enabled, engine ready, not in active recording) → show bubble, start timing
@@ -682,13 +685,25 @@ idle → recording → transcribing → processing → done → idle
    - `"paste"`: `clipboard_paste(text, true)` — copies to clipboard + auto-pastes via osascript
    - `"clipboard"`: `clipboard_paste(text, false)` — copies to clipboard only
    - `"new-note"`: Creates a manual session, saves transcription as notes, opens in main window
+5. **cancelling**: User pressed Escape → see "Cancellation" below. Suppresses the Output action and the Dictation history write before returning to `idle`.
+
+### Cancellation
+
+Pressing **Escape** while a Dictation is in any non-idle phase (`recording`, `transcribing`, `processing`, or post-failure `done`) fully aborts the Dictation. Implemented entirely in the frontend — no backend changes.
+
+- **Hotkey scope**: `useDictation` registers Escape as a Global hotkey via `@tauri-apps/plugin-global-shortcut` only while a Dictation is non-idle, and unregisters it in `setIdle`. While idle, Escape behaves as the OS / focused app would normally handle it. This is what makes cancel work while the user is focused in another app (the realistic dictation case for `paste` and `clipboard` Output actions).
+- **Cancel reducer** (`handleCancel`): takes ownership by setting `phase = "cancelling"` synchronously, then runs a single linear teardown: abort the AI `AbortController`, resolve the stop-deferred so any waiting `handleStop` unblocks, emit the `cancelled` Bubble state, call `commands.stopLiveTranscription()`, wait up to 1.5 s for the streamed Session WAV to finalize, delete it via `commands.deleteSessionWav`, hold the Bubble for 450 ms, hide, idle.
+- **Cooperative bail-points**: every `await` in `handleStop` and the ghost-transcription guard in `handleStart` are followed by `if (phase() === "cancelling") return;`, so a cancel that arrives mid-stop bails cleanly without double-running teardown.
+- **What is suppressed**: the Output action (`paste` / `clipboard` / `new-note`) does not fire, no `dictation_history` row is written, the streamed Session WAV is deleted, and toggle-mode state is cleared via the existing `dictation-idle` event.
+- **What still happens**: the Sidecar's currently-in-flight Chunk transcribe is allowed to finish; its result is discarded by the cancel reducer (no per-request abort IPC). Capture itself is app-wide and stays running, so the next Dictation can start immediately.
+- **Scope**: a regular Session and a Dictation cannot run concurrently (`LiveTranscriptionState` is single-occupancy on the Rust side), so cancel cannot affect a Session's stream. Pressing Escape during a Session does nothing dictation-related — the hotkey isn't registered.
 
 ### Dictation Bubble Window
 
 Separate Tauri window (`?window=dictation`) configured as:
 - 220×64px, transparent, no decorations, no shadow, always-on-top, skip taskbar, no focus steal
 - Positioned at bottom-center of screen during dictation
-- `DictationBubble` component shows state-dependent visuals: red ring (recording), blue (transcribing), purple (processing), green (done), yellow pulsing (no-input)
+- `DictationBubble` component shows state-dependent visuals: red ring (recording), blue (transcribing), purple (processing), green (done), yellow pulsing (no-input), grey (cancelled)
 - `showBubble()` uses `commands.showOverlayPanel("dictation")`, `hideBubble()` uses `commands.hideOverlayPanel("dictation")` — platform-agnostic (macOS: NSPanel, others: WebviewWindow)
 - `App.tsx` routes to `DictationBubble` when `?window=dictation` is detected, avoiding hook violations
 
@@ -709,13 +724,13 @@ Privacy-first usage analytics via [Aptabase](https://aptabase.com) — no user I
 - **ACL**: `aptabase:allow-track-event` in `capabilities/default.json`.
 - **Build**: `APTABASE_KEY` sourced from `.env` (local) or GitHub Secrets (CI). Optional for dev — analytics silently disabled when unset.
 
-### Event Taxonomy (~34 events)
+### Event Taxonomy (~35 events)
 
 | Category | Events | Key Props |
 |----------|--------|-----------|
 | App lifecycle | `app_launched`, `app_exited` | capture_source, model_size, theme, ai_provider, dictation_slot_count |
 | Sessions | `session_created`, `session_stopped`, `session_deleted`, `sessions_cleared`, `manual_note_created` | source, trigger (sidebar/tray/shortcut), duration_seconds, segment_count |
-| Dictation | `dictation_started`, `dictation_completed`, `dictation_failed`, `dictation_slot_created/deleted/configured`, `dictation_history_cleared`, `dictation_history_entry_deleted`, `dictation_moved_to_note` | slot_id, duration_ms, ai_processed, output_action, error_reason |
+| Dictation | `dictation_started`, `dictation_completed`, `dictation_failed`, `dictation_cancelled`, `dictation_slot_created/deleted/configured`, `dictation_history_cleared`, `dictation_history_entry_deleted`, `dictation_moved_to_note` | slot_id, duration_ms, ai_processed, output_action, error_reason, phase (cancelled-from) |
 | AI chat | `chat_message_sent`, `chat_tool_executed`, `chat_tool_undone`, `chat_cleared` | context, action_id, tool_name |
 | Navigation | `search_used`, `folder_created`, `session_pinned/unpinned`, `session_moved_to_folder` | — |
 | Shortcuts | `shortcut_used` | shortcut_id |
