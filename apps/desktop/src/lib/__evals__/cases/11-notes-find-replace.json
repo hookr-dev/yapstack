@@ -1,0 +1,44 @@
+{
+  "name": "save_to_notes find_replace edits in place without nuking manual content",
+  "description": "Surgical edit preserves the user's hand-written paragraph while swapping a single word.",
+  "fixture": {
+    "sessions": [
+      {
+        "id": "s1",
+        "title": "Q3 planning",
+        "created_at": "2026-04-25T10:00:00",
+        "updated_at": "2026-04-25T10:00:00",
+        "source": "Mic",
+        "status": "completed",
+        "duration_seconds": 0,
+        "total_segments": 0,
+        "folder_id": null,
+        "is_pinned": 0,
+        "pinned_at": null,
+        "session_type": "recording",
+        "wav_file_path": null,
+        "wav_duration_seconds": null,
+        "sort_order": 0
+      }
+    ],
+    "folders": [],
+    "sessionFolders": [],
+    "notes": {
+      "s1": "<p>My notes about Q3 priorities.</p><p>Talked to Alice about Q3 budget.</p>"
+    },
+    "segments": {},
+    "tags": [],
+    "sessionTags": []
+  },
+  "steps": [
+    {
+      "tool": "save_to_notes",
+      "args": { "mode": "find_replace", "find": "Q3", "content": "Q4" },
+      "ctxSessionId": "s1",
+      "expect": {
+        "observationContains": "Replaced",
+        "mutated": true
+      }
+    }
+  ]
+}

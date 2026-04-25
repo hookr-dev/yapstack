@@ -7,9 +7,9 @@ import type {
 import { marked } from "marked";
 import DOMPurify from "dompurify";
 import type { DbSegment } from "./db";
-import type { SessionWithNote } from "./db";
 import type { DbDictationHistory } from "./db";
 import type { ToolCallResult } from "./ai-tools";
+import type { FolderTreeNode } from "./folder-tree";
 
 // ----- ChatContext -----
 
@@ -54,12 +54,25 @@ export interface AISettings {
   providers: Record<AIProvider, AIProviderConfig>;
 }
 
+export type ToolExecutionStatus = "running" | "done" | "error";
+
+export interface ToolExecution {
+  name: string;
+  label: string;
+  detail?: string;
+  status: ToolExecutionStatus;
+  /** True if the user reverted this call via Undo. Renderer applies a
+   * grayed/strike-through style; the call still appears in chat history. */
+  undone?: boolean;
+}
+
 export interface ChatMessage {
   id: string;
   role: "user" | "assistant";
   content: string;
   action?: AIActionType;
   isStreaming?: boolean;
+  toolExecutions?: ToolExecution[];
 }
 
 export interface FileAttachment {
@@ -242,6 +255,37 @@ export function isAIConfigured(settings: AISettings): boolean {
 
 // ----- Context Assembly -----
 
+/**
+ * Speaker label for a segment in transcript text rendered for the LLM.
+ *
+ * The convention is the same everywhere a segment is shown to the model
+ * (single-session transcript context, `get_session_context` tool output,
+ * `search_sessions` snippets). The model relies on this label — without
+ * it, statements from other speakers look indistinguishable from things
+ * the user said.
+ *
+ *  - `Mic`  → "You" (the human running the app, captured via microphone).
+ *  - `System` with `speaker_id` set → custom name from `speakerNames` if
+ *    present, else `Speaker N` (1-indexed for human-friendly numbering).
+ *    System audio is everyone else: people on a video call, podcast
+ *    audio, etc.
+ *  - `System` without diarization → "Other" (we know it isn't the user
+ *    but we have no further identification).
+ *
+ * Returning a flat string (not optional) means callers can always wrap
+ * it in `(...)` without conditional formatting.
+ */
+export function formatSegmentSpeaker(
+  seg: DbSegment,
+  speakerNames?: Record<number, string>,
+): string {
+  if (seg.source === "Mic") return "You";
+  if (seg.speaker_id != null) {
+    return speakerNames?.[seg.speaker_id] ?? `Speaker ${seg.speaker_id + 1}`;
+  }
+  return "Other";
+}
+
 export function assembleTranscriptContext(
   segments: DbSegment[],
   speakerNames?: Record<number, string>,
@@ -252,20 +296,22 @@ export function assembleTranscriptContext(
       const mins = Math.floor(s.audio_offset_seconds / 60);
       const secs = Math.floor(s.audio_offset_seconds % 60);
       const ts = `${mins}:${secs.toString().padStart(2, "0")}`;
-      const speakerPrefix =
-        s.speaker_id != null
-          ? ` (${speakerNames?.[s.speaker_id] ?? `Speaker ${s.speaker_id + 1}`})`
-          : "";
-      return `[seg:${s.id} ${ts}]${speakerPrefix} ${s.text}`;
+      const label = formatSegmentSpeaker(s, speakerNames);
+      return `[seg:${s.id} ${ts}] (${label}) ${s.text}`;
     })
     .join("\n");
 }
 
-/// True when any segment carries a non-null `speaker_id` — i.e. the
-/// transcript came from a diarized session. Used by the system-prompt
-/// builder to decide whether to include speaker guidance.
+/**
+ * True for any transcript with at least one segment — speaker labels are
+ * now applied universally (see `formatSegmentSpeaker`), so the
+ * SPEAKER_INSTRUCTION prompt always applies when a transcript is in
+ * scope. Kept as a function (not inlined) so callers stay readable and
+ * we have one place to flip if the convention ever needs to be gated
+ * again (e.g. for an engine that produces no source-tagged segments).
+ */
 export function transcriptHasSpeakers(segments: DbSegment[]): boolean {
-  return segments.some((s) => s.speaker_id != null);
+  return segments.length > 0;
 }
 
 export function assembleNoteContext(noteHtml: string): string {
@@ -285,27 +331,42 @@ export function assembleNoteContext(noteHtml: string): string {
     .trim();
 }
 
-// ----- Message Building -----
+// ----- Folder Tree Context -----
+
+export function assembleFolderTreeContext(tree: FolderTreeNode[]): string {
+  function renderNode(node: FolderTreeNode, depth: number): string {
+    const indent = "  ".repeat(depth);
+    const desc = node.folder.description
+      ? ` — "${node.folder.description}"`
+      : "";
+    let line = `${indent}- ${node.folder.name}${desc}`;
+    for (const child of node.children) {
+      line += "\n" + renderNode(child, depth + 1);
+    }
+    return line;
+  }
+  return tree.map((root) => renderNode(root, 0)).join("\n");
+}
 
 // ----- Multi-session context -----
 
-export function assembleMultiSessionContext(
-  sessions: SessionWithNote[],
-  includeNotes: boolean,
+/**
+ * Compact, retrieval-friendly listing of session candidates. Used by
+ * multi-session Chats so the LLM sees a candidate list (id + title + date
+ * + folder path) and decides which sessions to expand via the
+ * `get_session_context` tool, instead of being handed every session's
+ * notes/transcript up front.
+ */
+export function assembleSessionCandidates(
+  candidates: { id: string; title: string; date: string; folderPath: string | null }[],
 ): string {
-  return sessions
-    .map((s) => {
-      const date = new Date(s.createdAt).toLocaleDateString();
-      let block = `- **${s.title || "Untitled"}** (${date})`;
-      if (includeNotes && s.noteContent) {
-        const plain = assembleNoteContext(s.noteContent);
-        if (plain) {
-          block += "\n  Notes:\n" + plain.split("\n").map((l) => `    ${l}`).join("\n");
-        }
-      }
-      return block;
-    })
-    .join("\n\n");
+  if (candidates.length === 0) return "";
+  const lines = candidates.map((c) => {
+    const date = c.date ? new Date(c.date).toLocaleDateString() : "";
+    const folder = c.folderPath ? ` folder="${c.folderPath}"` : "";
+    return `- session_id=${c.id} title="${c.title || "Untitled"}" date=${date}${folder}`;
+  });
+  return lines.join("\n");
 }
 
 // ----- Dictation Context Assembly -----
@@ -409,12 +470,10 @@ export async function* streamChatWithTools(
 
     const delta = choice.delta;
 
-    // Text content
     if (delta?.content) {
       yield { type: "token", content: delta.content };
     }
 
-    // Tool call deltas
     if (delta?.tool_calls) {
       for (const tc of delta.tool_calls) {
         const existing = toolCallMap.get(tc.index);
@@ -433,15 +492,27 @@ export async function* streamChatWithTools(
     }
   }
 
-  // Emit accumulated tool calls
+  // Emit accumulated tool calls. If a parse fails we still emit the call so
+  // the orchestrator can produce a tool-error result back to the model
+  // (every tool_call must have a matching tool_result, otherwise
+  // the next turn errors out).
   if (toolCallMap.size > 0) {
     const calls: ToolCallResult[] = [];
     for (const [, tc] of toolCallMap) {
       try {
         const parsed = JSON.parse(tc.arguments) as Record<string, unknown>;
         calls.push({ id: tc.id, name: tc.name, arguments: parsed });
-      } catch {
-        // Skip malformed tool call arguments
+      } catch (e) {
+        console.warn(
+          `[ai] tool ${tc.name} returned malformed JSON arguments: ${
+            e instanceof Error ? e.message : String(e)
+          }`,
+        );
+        calls.push({
+          id: tc.id,
+          name: tc.name,
+          arguments: { __parseError: tc.arguments },
+        });
       }
     }
     if (calls.length > 0) {

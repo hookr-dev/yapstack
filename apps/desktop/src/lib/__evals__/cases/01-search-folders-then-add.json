@@ -1,0 +1,82 @@
+{
+  "name": "search_folders → add_session_to_folder round trip",
+  "description": "Model uses the read tool first to discover folder IDs, then mutates with the chosen ID.",
+  "fixture": {
+    "sessions": [
+      {
+        "id": "s1",
+        "title": "Q4 planning",
+        "created_at": "2026-04-01T10:00:00",
+        "updated_at": "2026-04-01T10:00:00",
+        "source": "Mic",
+        "status": "completed",
+        "duration_seconds": 1200,
+        "total_segments": 5,
+        "folder_id": null,
+        "is_pinned": 0,
+        "pinned_at": null,
+        "session_type": "recording",
+        "wav_file_path": null,
+        "wav_duration_seconds": null,
+        "sort_order": 0
+      }
+    ],
+    "folders": [
+      {
+        "id": "f-work",
+        "name": "Work",
+        "parent_id": null,
+        "sort_order": 0,
+        "icon": null,
+        "color": null,
+        "description": "Work and projects",
+        "created_at": "",
+        "updated_at": ""
+      },
+      {
+        "id": "f-personal",
+        "name": "Personal",
+        "parent_id": null,
+        "sort_order": 1,
+        "icon": null,
+        "color": null,
+        "description": "Personal stuff",
+        "created_at": "",
+        "updated_at": ""
+      }
+    ],
+    "sessionFolders": [],
+    "notes": {},
+    "segments": {},
+    "tags": [],
+    "sessionTags": []
+  },
+  "steps": [
+    {
+      "tool": "search_folders",
+      "args": { "query": "work" },
+      "expect": {
+        "affectedIdsIncludes": ["f-work"],
+        "affectedIdsExcludes": ["f-personal"],
+        "mutated": false
+      }
+    },
+    {
+      "tool": "add_session_to_folder",
+      "args": { "folder_id": "f-work" },
+      "expect": {
+        "observationContains": "Work",
+        "affectedIdsIncludes": ["f-work"],
+        "mutated": true
+      }
+    },
+    {
+      "tool": "add_session_to_folder",
+      "args": { "folder_id": "f-work" },
+      "expect": {
+        "observationContains": "Already in",
+        "mutated": false
+      }
+    }
+  ]
+}

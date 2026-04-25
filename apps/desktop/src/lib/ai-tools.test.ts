@@ -8,12 +8,33 @@ vi.mock("@/lib/db", () => ({
   createNoteVersion: vi.fn(),
   togglePin: vi.fn(),
   getSession: vi.fn(),
+  getTagByName: vi.fn(),
+  createTag: vi.fn(),
+  addSessionTag: vi.fn(),
+  removeSessionTag: vi.fn(),
+  addSessionToFolder: vi.fn(),
+  removeSessionFromFolder: vi.fn(),
+  listFolders: vi.fn().mockResolvedValue([]),
 }));
+
+vi.mock("@/lib/folder-tree", () => ({
+  findBranchConflicts: vi.fn().mockReturnValue([]),
+  getFolderPath: vi.fn().mockReturnValue([]),
+  buildFolderTree: vi.fn().mockReturnValue([]),
+}));
+
+vi.mock("@/lib/ai", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./ai")>();
+  return {
+    ...actual,
+    markdownToBasicHtml: vi.fn((s: string) => `<p>${s}</p>`),
+    assembleFolderTreeContext: vi.fn().mockReturnValue(""),
+  };
+});
 
 import {
   convertCitationsToSegmentRefs,
   getRegisteredTools,
-  getToolsForContext,
 } from "./ai-tools";
 import type { DbSegment } from "./db";
 
@@ -84,26 +105,19 @@ describe("convertCitationsToSegmentRefs", () => {
 });
 
 describe("getRegisteredTools", () => {
-  it("returns 3 registered tools", () => {
+  it("returns the registered tools", () => {
     const tools = getRegisteredTools();
-    expect(tools).toHaveLength(3);
     const names = tools.map((t) =>
       t.type === "function" ? t.function.name : "",
     );
     expect(names).toContain("update_title");
     expect(names).toContain("save_to_notes");
     expect(names).toContain("pin_session");
+    expect(names).toContain("tag_session");
+    expect(names).toContain("search_folders");
+    expect(names).toContain("add_session_to_folder");
+    expect(names).not.toContain("add_to_folder");
+    expect(names).not.toContain("get_folder_context");
   });
 });
 
-describe("getToolsForContext", () => {
-  it("returns tools for session context", () => {
-    const tools = getToolsForContext(true);
-    expect(tools).toHaveLength(3);
-  });
-
-  it("returns empty for non-session context", () => {
-    const tools = getToolsForContext(false);
-    expect(tools).toHaveLength(0);
-  });
-});

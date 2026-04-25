@@ -1,0 +1,78 @@
+{
+  "name": "retrieval tools respect allowedSessionIds",
+  "description": "search_sessions filters out sessions outside the chat scope; get_session_context errors when asked for an out-of-scope id.",
+  "fixture": {
+    "sessions": [
+      {
+        "id": "in-scope",
+        "title": "Quarterly review",
+        "created_at": "2026-04-10T10:00:00",
+        "updated_at": "2026-04-10T10:00:00",
+        "source": "Mic",
+        "status": "completed",
+        "duration_seconds": 0,
+        "total_segments": 0,
+        "folder_id": null,
+        "is_pinned": 0,
+        "pinned_at": null,
+        "session_type": "recording",
+        "wav_file_path": null,
+        "wav_duration_seconds": null,
+        "sort_order": 0
+      },
+      {
+        "id": "out-of-scope",
+        "title": "Quarterly retrospective",
+        "created_at": "2026-04-09T10:00:00",
+        "updated_at": "2026-04-09T10:00:00",
+        "source": "Mic",
+        "status": "completed",
+        "duration_seconds": 0,
+        "total_segments": 0,
+        "folder_id": null,
+        "is_pinned": 0,
+        "pinned_at": null,
+        "session_type": "recording",
+        "wav_file_path": null,
+        "wav_duration_seconds": null,
+        "sort_order": 0
+      }
+    ],
+    "folders": [],
+    "sessionFolders": [],
+    "notes": {},
+    "segments": {},
+    "tags": [],
+    "sessionTags": []
+  },
+  "steps": [
+    {
+      "tool": "search_sessions",
+      "args": { "query": "quarterly", "filters": null, "limit": 10 },
+      "ctxAllowedSessionIds": ["in-scope"],
+      "expect": {
+        "affectedIdsIncludes": ["in-scope"],
+        "affectedIdsExcludes": ["out-of-scope"],
+        "mutated": false
+      }
+    },
+    {
+      "tool": "get_session_context",
+      "args": { "session_ids": ["out-of-scope"], "scope": "notes" },
+      "ctxAllowedSessionIds": ["in-scope"],
+      "expect": {
+        "observationContains": "out of scope",
+        "mutated": false
+      }
+    },
+    {
+      "tool": "get_session_context",
+      "args": { "session_ids": ["in-scope"], "scope": "notes" },
+      "ctxAllowedSessionIds": ["in-scope"],
+      "expect": {
+        "observationContains": "Expanded 1 session",
+        "mutated": false
+      }
+    }
+  ]
+}

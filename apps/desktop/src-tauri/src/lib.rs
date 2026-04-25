@@ -238,6 +238,7 @@ pub fn run() {
             commands::live_transcription::start_live_transcription,
             commands::live_transcription::stop_live_transcription,
             commands::live_transcription::get_live_transcription_status,
+            commands::live_transcription::update_vocabulary_hints,
             commands::dictation::clipboard_paste,
             commands::permissions::check_screen_capture_permission,
             commands::permissions::request_screen_capture_permission,
@@ -599,7 +600,7 @@ pub fn run() {
                         matches!(status.state, commands::audio::CaptureStateDto::Capturing);
                     let is_recording = {
                         let guard = live_state.lock().await;
-                        guard.as_ref().is_some_and(|c| c.is_running())
+                        guard.as_ref().is_some_and(|r| r.controller.is_running())
                     };
 
                     if prev_status.as_ref() != Some(&status) {
