@@ -35,38 +35,79 @@ import {
 } from "@/lib/analytics";
 
 /**
- * Convert one persisted row into a ChatMessage for the renderer. Tool rows
- * (`role === "tool"`) aren't user-facing bubbles — they get folded into the
- * surrounding assistant bubble at the renderer layer. Returns `null` for
- * those so the caller can `.filter()` them out.
+ * Fold persisted rows into renderer-facing ChatMessages.
+ *
+ * One DB row per LLM response (v14 shape) means a multi-round send is N
+ * assistant rows + M tool rows. The renderer collapses each `send_id` group
+ * back into one assistant bubble: the final prose comes from the last
+ * assistant row, the tool-execution chips are aggregated from every
+ * assistant row's `tool_calls` JSON across the send, and tool rows are
+ * dropped (their content is replayed to the LLM via `tool_call_id` matching;
+ * the UI doesn't render them as standalone bubbles).
+ *
+ * Pre-v14 rows have `send_id` null; the helper falls back to per-row
+ * grouping so legacy chats still render correctly.
  */
-function dbToChatMessage(row: DbChatMessage): ChatMessage | null {
-  if (row.role === "tool") return null;
-  let toolExecutions: ToolExecution[] | undefined;
-  let content = row.content;
-  if (row.tool_calls) {
-    try {
-      const parsed = JSON.parse(row.tool_calls) as PersistedToolCall[];
-      toolExecutions = parsed.map((p) => ({
-        name: p.name,
-        label: p.label,
-        status: p.status,
-        detail: p.detail,
-      }));
-      // Structured calls supersede the legacy `[tool:NAME] …` badge prefix.
-      // Strip it so the same message doesn't render the badges twice.
-      content = cleanToolBadges(content);
-    } catch (e) {
-      console.warn(`[chat] failed to parse tool_calls JSON for ${row.id}: ${e}`);
+function dbRowsToChatMessages(rows: DbChatMessage[]): ChatMessage[] {
+  const bySendId = new Map<string, DbChatMessage[]>();
+  const order: string[] = [];
+  for (const row of rows) {
+    const key = row.send_id ?? row.id;
+    let group = bySendId.get(key);
+    if (!group) {
+      group = [];
+      bySendId.set(key, group);
+      order.push(key);
     }
+    group.push(row);
   }
-  return {
-    id: row.id,
-    role: row.role,
-    content,
-    action: row.action ?? undefined,
-    toolExecutions,
-  };
+
+  const out: ChatMessage[] = [];
+  for (const key of order) {
+    const group = bySendId.get(key)!;
+    const userRow = group.find((r) => r.role === "user");
+    if (userRow) {
+      out.push({
+        id: userRow.id,
+        role: "user",
+        content: userRow.content,
+        action: userRow.action ?? undefined,
+      });
+    }
+
+    const assistantRows = group.filter((r) => r.role === "assistant");
+    if (assistantRows.length === 0) continue;
+
+    const finalAssistant = assistantRows[assistantRows.length - 1];
+    const toolExecutions: ToolExecution[] = [];
+    for (const ar of assistantRows) {
+      if (!ar.tool_calls) continue;
+      try {
+        const parsed = JSON.parse(ar.tool_calls) as PersistedToolCall[];
+        if (!Array.isArray(parsed)) continue;
+        for (const p of parsed) {
+          toolExecutions.push({
+            name: p.name,
+            label: p.label,
+            status: p.status,
+            detail: p.detail,
+          });
+        }
+      } catch (e) {
+        console.warn(`[chat] failed to parse tool_calls JSON for ${ar.id}: ${e}`);
+      }
+    }
+
+    out.push({
+      id: finalAssistant.id,
+      role: "assistant",
+      content: cleanToolBadges(finalAssistant.content),
+      action: finalAssistant.action ?? undefined,
+      toolExecutions: toolExecutions.length > 0 ? toolExecutions : undefined,
+    });
+  }
+
+  return out;
 }
 
 const UNDO_TIMEOUT_MS = 10_000;
@@ -138,7 +179,7 @@ export function useChatMessages(
       setUndoState(null);
     }
     getChatMessages(contextKey).then((rows) => {
-      setMessages(rows.map(dbToChatMessage).filter((m): m is ChatMessage => m !== null));
+      setMessages(dbRowsToChatMessages(rows));
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [contextKey]);
@@ -234,12 +275,34 @@ export function useChatMessages(
 
       let flushTimer: ReturnType<typeof setInterval> | null = null;
 
+      // Captures one LLM response and the tool executions that followed it.
+      // After the loop completes (or errors), the orchestrator walks this
+      // list and writes one assistant row per round plus one tool row per
+      // call, matching the OpenAI message-array shape on disk so a future
+      // turn can replay the full conversation including tool memory.
+      type RoundRecord = {
+        assistantRowId: string;
+        content: string;
+        toolCalls: PersistedToolCall[];
+        toolResults: {
+          rowId: string;
+          callId: string;
+          content: string;
+          observation: ToolObservation | undefined;
+          status: "done" | "error";
+        }[];
+      };
+
+      const sendId = crypto.randomUUID();
+      const persistedRounds: RoundRecord[] = [];
+
       try {
-        // Persist the placeholder rows inside the try so any DB error (a
-        // missing column on a stale dev DB, a locked file, etc.) routes
-        // through the catch + finally and clears `isStreaming` instead of
-        // surfacing as an unhandled rejection that strands the spinner.
-        const sendId = crypto.randomUUID();
+        // Persist the user row inside the try so any DB error (a missing
+        // column on a stale dev DB, a locked file, etc.) routes through the
+        // catch + finally and clears `isStreaming` instead of surfacing as
+        // an unhandled rejection that strands the spinner. The assistant
+        // and tool rows are written after the loop completes — local React
+        // state (`messages`) drives the streaming UI in the meantime.
         await insertChatMessage({
           id: userMessage.id,
           context_key: contextKey,
@@ -251,22 +314,6 @@ export function useChatMessages(
           tool_calls: null,
           send_id: sendId,
           sequence: 0,
-          tool_call_id: null,
-          observation: null,
-          status: null,
-        });
-
-        await insertChatMessage({
-          id: assistantMessage.id,
-          context_key: contextKey,
-          session_id: sessionId,
-          role: "assistant",
-          content: "",
-          action: null,
-          created_at: new Date().toISOString(),
-          tool_calls: null,
-          send_id: sendId,
-          sequence: 1,
           tool_call_id: null,
           observation: null,
           status: null,
@@ -366,6 +413,17 @@ export function useChatMessages(
             }
           }
 
+          // Open a record for this round. Even rounds with no tool calls
+          // (the final synthesis turn) become an assistant row so the prose
+          // is persisted; rounds with tool calls also persist tool rows.
+          const roundRecord: RoundRecord = {
+            assistantRowId: crypto.randomUUID(),
+            content: turnText,
+            toolCalls: [],
+            toolResults: [],
+          };
+          persistedRounds.push(roundRecord);
+
           if (turnToolCalls.length === 0 || !ctxTools.getToolContext) break;
           if (!allowToolsThisRound) break;
           if (abort.signal.aborted) break;
@@ -399,6 +457,17 @@ export function useChatMessages(
             function: { name: call.name, arguments: JSON.stringify(call.arguments) },
           }));
 
+          // Stub the persisted tool_calls list now so the assistant row
+          // carries one entry per call. The execution loop below fills in
+          // status/detail/observation as each call resolves.
+          roundRecord.toolCalls = turnToolCalls.map((call) => ({
+            id: call.id,
+            name: call.name,
+            arguments: JSON.stringify(call.arguments),
+            label: TOOL_DISPLAY_LABELS[call.name] ?? call.name,
+            status: "done",
+          }));
+
           turnMessages = [
             ...turnMessages,
             {
@@ -422,10 +491,22 @@ export function useChatMessages(
                 status: "error",
                 detail: errMsg,
               };
+              const ptcEntry = roundRecord.toolCalls.find((p) => p.id === call.id);
+              if (ptcEntry) {
+                ptcEntry.status = "error";
+                ptcEntry.detail = errMsg;
+              }
               toolResultMessages.push({
                 role: "tool" as const,
                 tool_call_id: call.id,
                 content: `Error: ${errMsg}`,
+              });
+              roundRecord.toolResults.push({
+                rowId: crypto.randomUUID(),
+                callId: call.id,
+                content: `Error: ${errMsg}`,
+                observation: undefined,
+                status: "error",
               });
               continue;
             }
@@ -454,6 +535,12 @@ export function useChatMessages(
                 if (result.observation) {
                   observationsByCallId.set(call.id, result.observation);
                 }
+                const ptcEntry = roundRecord.toolCalls.find((p) => p.id === call.id);
+                if (ptcEntry) {
+                  ptcEntry.status = "done";
+                  ptcEntry.detail = result.detail;
+                  if (result.observation) ptcEntry.observation = result.observation;
+                }
                 // Read-only tools never enter the Undo window. Mutating
                 // tools that returned without populating undoData (no-op
                 // paths like pin_session-already-pinned, add_session_to_folder-
@@ -467,10 +554,18 @@ export function useChatMessages(
                 ) {
                   executedTools.push(result);
                 }
+                const toolMsgContent = result.result ?? result.detail;
                 toolResultMessages.push({
                   role: "tool" as const,
                   tool_call_id: call.id,
-                  content: result.result ?? result.detail,
+                  content: toolMsgContent,
+                });
+                roundRecord.toolResults.push({
+                  rowId: crypto.randomUUID(),
+                  callId: call.id,
+                  content: toolMsgContent,
+                  observation: result.observation,
+                  status: "done",
                 });
               } else {
                 allToolExecs[execIdx] = { ...allToolExecs[execIdx], status: "done" };
@@ -479,21 +574,39 @@ export function useChatMessages(
                   tool_call_id: call.id,
                   content: "No action needed.",
                 });
+                roundRecord.toolResults.push({
+                  rowId: crypto.randomUUID(),
+                  callId: call.id,
+                  content: "No action needed.",
+                  observation: undefined,
+                  status: "done",
+                });
               }
             } catch (e) {
               console.error(`Tool ${call.name} failed:`, e);
+              const errMsg = e instanceof Error ? e.message : String(e);
               allToolExecs[execIdx] = {
                 ...allToolExecs[execIdx],
                 status: "error",
-                detail: e instanceof Error ? e.message : String(e),
+                detail: errMsg,
               };
-              toast.error(
-                `Tool failed: ${e instanceof Error ? e.message : String(e)}`,
-              );
+              const ptcEntry = roundRecord.toolCalls.find((p) => p.id === call.id);
+              if (ptcEntry) {
+                ptcEntry.status = "error";
+                ptcEntry.detail = errMsg;
+              }
+              toast.error(`Tool failed: ${errMsg}`);
               toolResultMessages.push({
                 role: "tool" as const,
                 tool_call_id: call.id,
-                content: `Error: ${e instanceof Error ? e.message : String(e)}`,
+                content: `Error: ${errMsg}`,
+              });
+              roundRecord.toolResults.push({
+                rowId: crypto.randomUUID(),
+                callId: call.id,
+                content: `Error: ${errMsg}`,
+                observation: undefined,
+                status: "error",
               });
             }
 
@@ -521,26 +634,67 @@ export function useChatMessages(
           ),
         );
 
-        const persistedToolCalls: PersistedToolCall[] | null =
-          allToolExecs.length > 0
-            ? allToolExecs.map((exec, i) => {
-                const observation = observationsByCallId.get(allCallIds[i]);
-                const status: PersistedToolCall["status"] =
-                  exec.status === "error" ? "error" : "done";
-                return {
-                  name: exec.name,
-                  label: exec.label,
-                  status,
-                  detail: exec.detail,
-                  observation,
-                };
-              })
-            : null;
-        await updateChatMessageContent(
-          assistantMessage.id,
-          accumulated,
-          persistedToolCalls ? JSON.stringify(persistedToolCalls) : null,
-        );
+        // Persist per-LLM-response rows in (send_id, sequence) order. Each
+        // round's assistant row carries that round's emitted tool_calls
+        // (`PersistedToolCall[]` JSON, including stable OpenAI call IDs and
+        // the raw arguments string), and each tool result becomes its own
+        // `role='tool'` row whose `tool_call_id` matches an entry on the
+        // preceding assistant row. Reload + replay reconstructs the
+        // OpenAI message array verbatim from these rows.
+        let nextSeq = 1;
+        const writes: Promise<void>[] = [];
+        const nowIso = new Date().toISOString();
+        for (let r = 0; r < persistedRounds.length; r++) {
+          const round = persistedRounds[r];
+          const isLastRound = r === persistedRounds.length - 1;
+          // Use the local React assistantMessage.id for the final round so
+          // the in-memory bubble's id matches the persisted row that the
+          // renderer fold will surface as the assistant ChatMessage. Other
+          // rounds get fresh UUIDs.
+          const assistantId = isLastRound ? assistantMessage.id : round.assistantRowId;
+          writes.push(
+            insertChatMessage({
+              id: assistantId,
+              context_key: contextKey,
+              session_id: sessionId,
+              role: "assistant",
+              content: round.content,
+              action: null,
+              created_at: nowIso,
+              tool_calls:
+                round.toolCalls.length > 0
+                  ? JSON.stringify(round.toolCalls)
+                  : null,
+              send_id: sendId,
+              sequence: nextSeq++,
+              tool_call_id: null,
+              observation: null,
+              status: null,
+            }),
+          );
+          for (const tr of round.toolResults) {
+            writes.push(
+              insertChatMessage({
+                id: tr.rowId,
+                context_key: contextKey,
+                session_id: sessionId,
+                role: "tool",
+                content: tr.content,
+                action: null,
+                created_at: nowIso,
+                tool_calls: null,
+                send_id: sendId,
+                sequence: nextSeq++,
+                tool_call_id: tr.callId,
+                observation: tr.observation
+                  ? JSON.stringify(tr.observation)
+                  : null,
+                status: tr.status,
+              }),
+            );
+          }
+        }
+        await Promise.all(writes);
 
         if (executedTools.length > 0) {
           const toolNames = executedTools.map((t) => t.label).join(", ");
@@ -579,10 +733,26 @@ export function useChatMessages(
               : m,
           ),
         );
-        await updateChatMessageContent(
-          assistantMessage.id,
-          `Error: ${errorText}`,
-        );
+        // No placeholder assistant row to update — insert a fresh one so
+        // the error survives reload. `sequence: 1` slots it right after the
+        // user row in the same send group.
+        await insertChatMessage({
+          id: assistantMessage.id,
+          context_key: contextKey,
+          session_id: sessionId,
+          role: "assistant",
+          content: `Error: ${errorText}`,
+          action: null,
+          created_at: new Date().toISOString(),
+          tool_calls: null,
+          send_id: sendId,
+          sequence: 1,
+          tool_call_id: null,
+          observation: null,
+          status: null,
+        }).catch((insertErr) => {
+          console.error(`[chat] failed to persist error row: ${insertErr}`);
+        });
       } finally {
         if (flushTimer) clearInterval(flushTimer);
         setIsStreaming(false);
