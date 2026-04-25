@@ -240,7 +240,9 @@ export function createMultiSessionSources(
   ];
 }
 
-export function createMultiSessionTools(): AIContextTools {
+export function createMultiSessionTools(
+  allowedSessionIds: string[],
+): AIContextTools {
   return {
     // Multi-session Chats expose retrieval-only tools so the LLM can search
     // and expand sessions on demand instead of having all candidates dumped
@@ -249,14 +251,15 @@ export function createMultiSessionTools(): AIContextTools {
     availableToolIds: ["search_sessions", "get_session_context", "search_folders"],
     contextType: "multi-session",
     // Retrieval tools don't read from session-scoped ToolContext; they hit
-    // the DB directly. Provide an empty context so the orchestrator runs
-    // the multi-turn loop. The session-meta fields go unused by the
-    // retrieval tools.
+    // the DB directly. The session-meta fields go unused; allowedSessionIds
+    // is the load-bearing field — it pins retrieval to the Chat's filter
+    // (folder/pinned/all) so the model can't reach outside the user's view.
     getToolContext: async () => ({
       sessionId: "",
       currentTitle: "",
       currentNote: null,
       isPinned: false,
+      allowedSessionIds,
     }),
   };
 }
@@ -322,7 +325,9 @@ export function resolveListContext(
       return {
         contextKey: key,
         sources: createDictationSources(count),
-        tools: createMultiSessionTools(),
+        // Dictation chats don't expose session retrieval, but pass an empty
+        // scope to be explicit that no sessions are reachable from here.
+        tools: createMultiSessionTools([]),
         buildSystemPrompt: createDictationSystemPromptBuilder(),
         placeholder: `Ask about ${count} dictation${count !== 1 ? "s" : ""}...`,
       };
@@ -338,7 +343,7 @@ export function resolveListContext(
       return {
         contextKey: key,
         sources: createMultiSessionSources(ids, ids.length),
-        tools: createMultiSessionTools(),
+        tools: createMultiSessionTools(ids),
         buildSystemPrompt: createMultiSessionSystemPromptBuilder(layers.length > 0 ? layers : undefined),
         placeholder: `Ask about ${ids.length} session${ids.length !== 1 ? "s" : ""}...`,
       };
@@ -348,7 +353,7 @@ export function resolveListContext(
       return {
         contextKey: key,
         sources: createMultiSessionSources(ids, ids.length),
-        tools: createMultiSessionTools(),
+        tools: createMultiSessionTools(ids),
         buildSystemPrompt: createMultiSessionSystemPromptBuilder(),
         placeholder: `Ask about ${ids.length} pinned session${ids.length !== 1 ? "s" : ""}...`,
       };
@@ -358,7 +363,7 @@ export function resolveListContext(
       return {
         contextKey: key,
         sources: createMultiSessionSources(ids, ids.length),
-        tools: createMultiSessionTools(),
+        tools: createMultiSessionTools(ids),
         buildSystemPrompt: createMultiSessionSystemPromptBuilder(),
         placeholder: `Ask about ${ids.length} session${ids.length !== 1 ? "s" : ""}...`,
       };

@@ -111,7 +111,7 @@ describe("createMultiSessionSources", () => {
 
 describe("createMultiSessionTools", () => {
   it("exposes retrieval-only tools for multi-session context", () => {
-    const tools = createMultiSessionTools();
+    const tools = createMultiSessionTools(["s1", "s2"]);
     expect(tools.availableToolIds).toContain("search_sessions");
     expect(tools.availableToolIds).toContain("get_session_context");
     expect(tools.availableToolIds).toContain("search_folders");
@@ -123,9 +123,11 @@ describe("createMultiSessionTools", () => {
     expect(tools.availableToolIds).not.toContain("add_session_to_folder");
   });
 
-  it("provides a getToolContext so the orchestrator runs the multi-turn loop", () => {
-    const tools = createMultiSessionTools();
+  it("threads allowedSessionIds through getToolContext", async () => {
+    const tools = createMultiSessionTools(["s1", "s2"]);
     expect(tools.getToolContext).not.toBeNull();
+    const ctx = await tools.getToolContext!();
+    expect(ctx.allowedSessionIds).toEqual(["s1", "s2"]);
   });
 });
 
