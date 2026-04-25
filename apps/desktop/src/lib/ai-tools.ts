@@ -934,7 +934,7 @@ registerTool({
     function: {
       name: "get_session_context",
       description:
-        "Expand a list of session_ids returned by search_sessions into structured context. Choose `scope` to control what is returned: 'segments' (transcript chunks with [seg:ID] for citation), 'notes' (the user's note content per session), 'summary' (currently null pending a future summarization step), or 'all' (segments + notes). Keep session_ids small (≤ 5) — this can return a lot of text.",
+        "Expand a list of session_ids returned by search_sessions into structured context. Choose `scope` to control what is returned: 'segments' (transcript chunks with [seg:ID] for citation), 'notes' (the user's note content per session), 'summary' (currently null pending a future summarization step), or 'all' (segments + notes). At most 5 session_ids per call — anything more is rejected; pick the most relevant candidates and call again if you need more.",
       parameters: {
         type: "object",
         properties: {
@@ -964,6 +964,18 @@ registerTool({
         label: "Sessions",
         detail: "No session_ids provided",
         result: "Error: get_session_context requires at least one session_id.",
+      };
+    }
+
+    // Hard cap to keep a confused model from blowing up the next prompt.
+    // The schema description nudges the model to stay ≤ 5; this enforces it.
+    const MAX_SESSION_IDS = 5;
+    if (sessionIds.length > MAX_SESSION_IDS) {
+      return {
+        name: "get_session_context",
+        label: "Sessions",
+        detail: `Too many session_ids (${sessionIds.length})`,
+        result: `Error: get_session_context accepts at most ${MAX_SESSION_IDS} session_ids per call (got ${sessionIds.length}). Pick the most relevant candidates from search_sessions and call again.`,
       };
     }
 
