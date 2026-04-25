@@ -47,12 +47,26 @@ export interface SessionRef {
 }
 
 /**
- * Persisted shape of a Tool call on a Chat assistant message. Stored as
- * JSON in `chat_messages.tool_calls`. `running` is intentionally not part
- * of the status union — only finalized calls are persisted.
+ * Persisted shape of a Tool call on a Chat assistant row, v14+.
+ *
+ * Stored as JSON in `chat_messages.tool_calls`. `id` and `arguments` are
+ * the load-bearing fields for replay — they reconstruct the OpenAI
+ * `assistant.tool_calls[].function.arguments` and `tool_call_id` exactly
+ * as the model emitted them. The remaining fields are convenience for
+ * the renderer so it doesn't need to traverse multiple rows.
+ *
+ * `running` is intentionally not part of the status union — only
+ * finalized calls are persisted.
+ *
+ * Pre-v14 rows may carry an older flat shape that lacks `id`/`arguments`;
+ * the assembler treats those as legacy and skips tool replay.
  */
 export interface PersistedToolCall {
+  /** OpenAI `tool_call_id`. Matches the `tool_call_id` of the paired tool row. */
+  id: string;
   name: string;
+  /** JSON-stringified arguments as the model emitted them. */
+  arguments: string;
   label: string;
   status: "done" | "error";
   detail?: string;
