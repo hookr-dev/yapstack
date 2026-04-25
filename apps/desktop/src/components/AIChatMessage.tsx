@@ -29,8 +29,10 @@ const TOOL_LABELS: Record<string, string> = {
   save_to_notes: "Notes saved",
   pin_session: "Pin toggled",
   tag_session: "Tags updated",
-  add_to_folder: "Classified",
-  get_folder_context: "Folders loaded",
+  add_session_to_folder: "Classified",
+  search_folders: "Folders searched",
+  search_sessions: "Sessions searched",
+  get_session_context: "Sessions expanded",
 };
 
 function parseToolBadges(content: string): {

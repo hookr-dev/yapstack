@@ -1,0 +1,49 @@
+{
+  "name": "pin_session no-op when already pinned",
+  "description": "Mutating tools with no real state change must report mutated=false and no undoData.",
+  "fixture": {
+    "sessions": [
+      {
+        "id": "s1",
+        "title": "Already pinned",
+        "created_at": "2026-04-10T10:00:00",
+        "updated_at": "2026-04-10T10:00:00",
+        "source": "Mic",
+        "status": "completed",
+        "duration_seconds": 0,
+        "total_segments": 0,
+        "folder_id": null,
+        "is_pinned": 1,
+        "pinned_at": "2026-04-10T10:00:00",
+        "session_type": "recording",
+        "wav_file_path": null,
+        "wav_duration_seconds": null,
+        "sort_order": 0
+      }
+    ],
+    "folders": [],
+    "sessionFolders": [],
+    "notes": {},
+    "segments": {},
+    "tags": [],
+    "sessionTags": []
+  },
+  "steps": [
+    {
+      "tool": "pin_session",
+      "args": { "pinned": true },
+      "expect": {
+        "observationContains": "already pinned",
+        "mutated": false
+      }
+    },
+    {
+      "tool": "pin_session",
+      "args": { "pinned": false },
+      "expect": {
+        "observationContains": "unpinned successfully",
+        "mutated": true
+      }
+    }
+  ]
+}

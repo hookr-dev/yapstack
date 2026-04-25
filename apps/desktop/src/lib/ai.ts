@@ -7,7 +7,6 @@ import type {
 import { marked } from "marked";
 import DOMPurify from "dompurify";
 import type { DbSegment } from "./db";
-import type { SessionWithNote } from "./db";
 import type { DbDictationHistory } from "./db";
 import type { ToolCallResult } from "./ai-tools";
 import type { FolderTreeNode } from "./folder-tree";
@@ -313,27 +312,25 @@ export function assembleFolderTreeContext(tree: FolderTreeNode[]): string {
   return tree.map((root) => renderNode(root, 0)).join("\n");
 }
 
-// ----- Message Building -----
-
 // ----- Multi-session context -----
 
-export function assembleMultiSessionContext(
-  sessions: SessionWithNote[],
-  includeNotes: boolean,
+/**
+ * Compact, retrieval-friendly listing of session candidates. Used by
+ * multi-session Chats so the LLM sees a candidate list (id + title + date
+ * + folder path) and decides which sessions to expand via the
+ * `get_session_context` tool, instead of being handed every session's
+ * notes/transcript up front.
+ */
+export function assembleSessionCandidates(
+  candidates: { id: string; title: string; date: string; folderPath: string | null }[],
 ): string {
-  return sessions
-    .map((s) => {
-      const date = new Date(s.createdAt).toLocaleDateString();
-      let block = `- **${s.title || "Untitled"}** (${date})`;
-      if (includeNotes && s.noteContent) {
-        const plain = assembleNoteContext(s.noteContent);
-        if (plain) {
-          block += "\n  Notes:\n" + plain.split("\n").map((l) => `    ${l}`).join("\n");
-        }
-      }
-      return block;
-    })
-    .join("\n\n");
+  if (candidates.length === 0) return "";
+  const lines = candidates.map((c) => {
+    const date = c.date ? new Date(c.date).toLocaleDateString() : "";
+    const folder = c.folderPath ? ` folder="${c.folderPath}"` : "";
+    return `- session_id=${c.id} title="${c.title || "Untitled"}" date=${date}${folder}`;
+  });
+  return lines.join("\n");
 }
 
 // ----- Dictation Context Assembly -----
@@ -437,12 +434,10 @@ export async function* streamChatWithTools(
 
     const delta = choice.delta;
 
-    // Text content
     if (delta?.content) {
       yield { type: "token", content: delta.content };
     }
 
-    // Tool call deltas
     if (delta?.tool_calls) {
       for (const tc of delta.tool_calls) {
         const existing = toolCallMap.get(tc.index);
@@ -461,15 +456,27 @@ export async function* streamChatWithTools(
     }
   }
 
-  // Emit accumulated tool calls
+  // Emit accumulated tool calls. If a parse fails we still emit the call so
+  // the orchestrator can produce a tool-error result back to the model
+  // (every tool_call must have a matching tool_result, otherwise
+  // the next turn errors out).
   if (toolCallMap.size > 0) {
     const calls: ToolCallResult[] = [];
     for (const [, tc] of toolCallMap) {
       try {
         const parsed = JSON.parse(tc.arguments) as Record<string, unknown>;
         calls.push({ id: tc.id, name: tc.name, arguments: parsed });
-      } catch {
-        // Skip malformed tool call arguments
+      } catch (e) {
+        console.warn(
+          `[ai] tool ${tc.name} returned malformed JSON arguments: ${
+            e instanceof Error ? e.message : String(e)
+          }`,
+        );
+        calls.push({
+          id: tc.id,
+          name: tc.name,
+          arguments: { __parseError: tc.arguments },
+        });
       }
     }
     if (calls.length > 0) {

@@ -3,7 +3,12 @@ import type { AIContextValue } from "@/lib/ai-context";
 import { assembleFolderTreeForActions } from "@/lib/ai-context";
 import type { ChatMessage, FileAttachment, ToolExecution } from "@/lib/ai";
 import type { ActionDefinition } from "@/lib/ai-actions";
-import type { ExecutedTool } from "@/lib/ai-tools";
+import type {
+  ExecutedTool,
+  PersistedToolCall,
+  ToolCallResult,
+  ToolObservation,
+} from "@/lib/ai-tools";
 import type { ChatCompletionMessageParam } from "openai/resources/chat/completions";
 import type { DbChatMessage } from "@/lib/db";
 import {
@@ -19,7 +24,7 @@ import {
   DEFAULT_AI_SETTINGS,
 } from "@/lib/ai";
 import { GENERAL_DIRECTIVE } from "@/lib/ai-prompts";
-import { getToolsById, executeTool, undoToolCalls } from "@/lib/ai-tools";
+import { getToolsById, executeTool, undoToolCalls, getToolKind } from "@/lib/ai-tools";
 import { useAppStore } from "@/stores/appStore";
 import { toast } from "sonner";
 import {
@@ -30,11 +35,30 @@ import {
 } from "@/lib/analytics";
 
 function dbToChatMessage(row: DbChatMessage): ChatMessage {
+  let toolExecutions: ToolExecution[] | undefined;
+  let content = row.content;
+  if (row.tool_calls) {
+    try {
+      const parsed = JSON.parse(row.tool_calls) as PersistedToolCall[];
+      toolExecutions = parsed.map((p) => ({
+        name: p.name,
+        label: p.label,
+        status: p.status,
+        detail: p.detail,
+      }));
+      // Structured calls supersede the legacy `[tool:NAME] …` badge prefix.
+      // Strip it so the same message doesn't render the badges twice.
+      content = cleanToolBadges(content);
+    } catch (e) {
+      console.warn(`[chat] failed to parse tool_calls JSON for ${row.id}: ${e}`);
+    }
+  }
   return {
     id: row.id,
     role: row.role,
-    content: row.content,
+    content,
     action: row.action ?? undefined,
+    toolExecutions,
   };
 }
 
@@ -45,8 +69,10 @@ const TOOL_DISPLAY_LABELS: Record<string, string> = {
   save_to_notes: "Saving notes",
   pin_session: "Pinning session",
   tag_session: "Adding tags",
-  add_to_folder: "Classifying session",
-  get_folder_context: "Reading folders",
+  search_folders: "Searching folders",
+  add_session_to_folder: "Classifying session",
+  search_sessions: "Searching sessions",
+  get_session_context: "Reading sessions",
 };
 
 function cleanToolBadges(content: string): string {
@@ -199,29 +225,35 @@ export function useChatMessages(
         action_id: actionId,
       });
 
-      await insertChatMessage({
-        id: userMessage.id,
-        context_key: contextKey,
-        session_id: sessionId,
-        role: "user",
-        content: userMessage.content,
-        action: userMessage.action ?? null,
-        created_at: new Date().toISOString(),
-      });
-
-      await insertChatMessage({
-        id: assistantMessage.id,
-        context_key: contextKey,
-        session_id: sessionId,
-        role: "assistant",
-        content: "",
-        action: null,
-        created_at: new Date().toISOString(),
-      });
-
       let flushTimer: ReturnType<typeof setInterval> | null = null;
 
       try {
+        // Persist the placeholder rows inside the try so any DB error (a
+        // missing column on a stale dev DB, a locked file, etc.) routes
+        // through the catch + finally and clears `isStreaming` instead of
+        // surfacing as an unhandled rejection that strands the spinner.
+        await insertChatMessage({
+          id: userMessage.id,
+          context_key: contextKey,
+          session_id: sessionId,
+          role: "user",
+          content: userMessage.content,
+          action: userMessage.action ?? null,
+          created_at: new Date().toISOString(),
+          tool_calls: null,
+        });
+
+        await insertChatMessage({
+          id: assistantMessage.id,
+          context_key: contextKey,
+          session_id: sessionId,
+          role: "assistant",
+          content: "",
+          action: null,
+          created_at: new Date().toISOString(),
+          tool_calls: null,
+        });
+
         const client = createAIClient(aiSettings);
         const abort = new AbortController();
         abortRef.current = abort;
@@ -229,6 +261,8 @@ export function useChatMessages(
         let accumulated = "";
         const executedTools: ExecutedTool[] = [];
         const allToolExecs: ToolExecution[] = [];
+        const allCallIds: string[] = [];
+        const observationsByCallId = new Map<string, ToolObservation>();
         const history = messagesRef.current.filter((m) => m.content);
 
         const contextParts: Record<string, string> = {};
@@ -282,14 +316,15 @@ export function useChatMessages(
 
         // Multi-turn tool execution: after each LLM turn, if it emits tool_calls,
         // execute them and send results back for a follow-up turn. This lets the
-        // LLM use tool results (e.g., folder context from add_to_folder) to inform
-        // subsequent output (e.g., writing a summary). Capped to prevent runaway loops.
+        // LLM use tool results (e.g., folder context from add_session_to_folder)
+        // to inform subsequent output (e.g., writing a summary). Capped to
+        // prevent runaway loops.
         const MAX_TOOL_ROUNDS = 3;
         let turnMessages = chatMessages;
 
         for (let round = 0; round <= MAX_TOOL_ROUNDS; round++) {
           let turnText = "";
-          let turnToolCalls: import("@/lib/ai-tools").ToolCallResult[] = [];
+          let turnToolCalls: ToolCallResult[] = [];
 
           for await (const event of streamChatWithTools(
             client,
@@ -316,6 +351,7 @@ export function useChatMessages(
             status: "running" as const,
           }));
           allToolExecs.push(...pendingExecs);
+          allCallIds.push(...turnToolCalls.map((c) => c.id));
 
           setMessages((prev) =>
             prev.map((m) =>
@@ -347,6 +383,23 @@ export function useChatMessages(
             const call = turnToolCalls[ci];
             if (abort.signal.aborted) break;
             const execIdx = allToolExecs.length - turnToolCalls.length + ci;
+            // streamChatWithTools surfaces malformed JSON arguments by
+            // attaching `__parseError`. Skip execution and tell the model
+            // so it can retry instead of running a tool with garbage args.
+            if (call.arguments.__parseError !== undefined) {
+              const errMsg = `Invalid JSON for ${call.name}: ${String(call.arguments.__parseError)}`;
+              allToolExecs[execIdx] = {
+                ...allToolExecs[execIdx],
+                status: "error",
+                detail: errMsg,
+              };
+              toolResultMessages.push({
+                role: "tool" as const,
+                tool_call_id: call.id,
+                content: `Error: ${errMsg}`,
+              });
+              continue;
+            }
             try {
               const result = await executeTool(
                 call.name,
@@ -357,14 +410,20 @@ export function useChatMessages(
                 result.toolCallId = call.id;
                 trackChatToolExecuted({ tool_name: call.name });
                 allToolExecs[execIdx] = { ...allToolExecs[execIdx], status: "done", detail: result.detail };
-                // Only mutating tool calls drive undo, the "Session updated"
-                // toast, the persisted [tool:NAME] badge, and the
-                // onToolsExecuted refresh callback. Read-only tools
-                // (get_folder_context) and no-op / error paths
-                // (add_to_folder when already in folder, tag_session with
-                // no real deltas) still send their result back to the LLM
-                // via toolResultMessages but skip the side-effecting UI.
-                if (result.mutated) {
+                if (result.observation) {
+                  observationsByCallId.set(call.id, result.observation);
+                }
+                // Read-only tools never enter the Undo window. Mutating
+                // tools that returned without populating undoData (no-op
+                // paths like pin_session-already-pinned, add_session_to_folder-
+                // already-in-folder, tag_session-no-real-deltas) also skip
+                // the undo state — the LLM still sees the result via
+                // toolResultMessages, but the UI doesn't surface a
+                // "Session updated" toast for a no-op.
+                if (
+                  getToolKind(call.name) === "mutate" &&
+                  result.undoData !== undefined
+                ) {
                   executedTools.push(result);
                 }
                 toolResultMessages.push({
@@ -412,13 +471,6 @@ export function useChatMessages(
         clearInterval(flushTimer);
         flush();
 
-        if (executedTools.length > 0) {
-          const badgeLines = executedTools
-            .map((t) => `[tool:${t.name}] ${t.detail}`)
-            .join("\n");
-          accumulated = badgeLines + "\n" + accumulated;
-        }
-
         const finalToolExecs = allToolExecs.length > 0 ? [...allToolExecs] : undefined;
         setMessages((prev) =>
           prev.map((m) =>
@@ -428,7 +480,26 @@ export function useChatMessages(
           ),
         );
 
-        await updateChatMessageContent(assistantMessage.id, accumulated);
+        const persistedToolCalls: PersistedToolCall[] | null =
+          allToolExecs.length > 0
+            ? allToolExecs.map((exec, i) => {
+                const observation = observationsByCallId.get(allCallIds[i]);
+                const status: PersistedToolCall["status"] =
+                  exec.status === "error" ? "error" : "done";
+                return {
+                  name: exec.name,
+                  label: exec.label,
+                  status,
+                  detail: exec.detail,
+                  observation,
+                };
+              })
+            : null;
+        await updateChatMessageContent(
+          assistantMessage.id,
+          accumulated,
+          persistedToolCalls ? JSON.stringify(persistedToolCalls) : null,
+        );
 
         if (executedTools.length > 0) {
           const toolNames = executedTools.map((t) => t.label).join(", ");

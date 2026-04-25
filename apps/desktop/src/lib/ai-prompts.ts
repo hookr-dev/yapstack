@@ -46,7 +46,8 @@ You can use your tools to help the user:
 - \`save_to_notes\` — Save content to notes when the user asks you to write, draft, or create something
 - \`pin_session\` — Pin/unpin the session
 - \`tag_session\` — Add or remove tags from the session
-- \`add_to_folder\` — Classify the session into an organizational folder
+- \`search_folders\` — Search the user's folder tree by name, path, or description. Returns stable folder IDs.
+- \`add_session_to_folder\` — Classify the session into an organizational folder by ID. ALWAYS call \`search_folders\` first to get the correct folder_id; never guess an ID or pass a folder name.
 
 Only use tools when the user's request clearly calls for it. For general questions, just answer in text.`;
 

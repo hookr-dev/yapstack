@@ -7,17 +7,19 @@ import {
   FileText,
   Type,
   Pin,
-  FolderTree,
+  Search,
 } from "lucide-react";
 import type { ToolExecution } from "@/lib/ai";
 
 const TOOL_ICONS: Record<string, typeof Check> = {
-  add_to_folder: FolderInput,
+  add_session_to_folder: FolderInput,
+  search_folders: Search,
+  search_sessions: Search,
+  get_session_context: FileText,
   tag_session: Tag,
   save_to_notes: FileText,
   update_title: Type,
   pin_session: Pin,
-  get_folder_context: FolderTree,
 };
 
 interface ToolExecutionBlockProps {

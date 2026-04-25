@@ -22,8 +22,8 @@ export const ACTIONS: ActionDefinition[] = [
 You MUST use your tools. Work in two phases:
 
 **Phase 1 — CLASSIFY FIRST:**
-If a folder tree is provided below, call \`add_to_folder\` to classify this session into the most appropriate folder. Consider the folder descriptions to find the best semantic match. If the session is already in the right folder, or no folders match, skip this.
-IMPORTANT: Do NOT call \`update_title\`, \`tag_session\`, or \`save_to_notes\` yet. Call only \`add_to_folder\` and then stop. Wait for the folder context results before proceeding.
+If a folder tree is provided below, call \`search_folders\` to find the best semantic match (consider the folder descriptions), then call \`add_session_to_folder\` with the chosen folder_id. If the session is already in the right folder, or no folders match, skip this.
+IMPORTANT: Do NOT call \`update_title\`, \`tag_session\`, or \`save_to_notes\` yet. Only call \`search_folders\` then \`add_session_to_folder\`, then stop. Wait for the folder context results before proceeding.
 
 **Phase 2 — After receiving folder context, proceed:**
 1. If the current title is generic or vague (e.g. "New Session", a timestamp, or "Untitled"), call \`update_title\` with a concise, descriptive title (max 60 chars). Skip if the title already describes the session content.
@@ -56,7 +56,7 @@ Formatting rules:
     directive: `You are a key-points extractor. Work in two phases:
 
 **Phase 1 — CLASSIFY FIRST:**
-If a folder tree is provided below, call \`add_to_folder\` to classify this session into the most appropriate folder. Do NOT call any other tools yet — stop and wait for the folder context results.
+If a folder tree is provided below, call \`search_folders\` and then \`add_session_to_folder\` with the chosen folder_id to classify this session into the most appropriate folder. Do NOT call any other tools yet — stop and wait for the folder context results.
 
 **Phase 2 — After receiving folder context, proceed:**
 1. Call \`tag_session\` to add relevant tags.
@@ -71,7 +71,7 @@ If a folder tree is provided below, call \`add_to_folder\` to classify this sess
     directive: `You are an action-item extractor. Work in two phases:
 
 **Phase 1 — CLASSIFY FIRST:**
-If a folder tree is provided below, call \`add_to_folder\` to classify this session into the most appropriate folder. Do NOT call any other tools yet — stop and wait for the folder context results.
+If a folder tree is provided below, call \`search_folders\` and then \`add_session_to_folder\` with the chosen folder_id to classify this session into the most appropriate folder. Do NOT call any other tools yet — stop and wait for the folder context results.
 
 **Phase 2 — After receiving folder context, proceed:**
 1. Call \`tag_session\` to add relevant tags.
@@ -87,7 +87,7 @@ If a folder tree is provided below, call \`add_to_folder\` to classify this sess
     directive: `You are a meeting minutes writer with session management tools. Work in two phases:
 
 **Phase 1 — CLASSIFY FIRST:**
-If a folder tree is provided below, call \`add_to_folder\` to classify this session into the most appropriate folder. Do NOT call any other tools yet — stop and wait for the folder context results.
+If a folder tree is provided below, call \`search_folders\` and then \`add_session_to_folder\` with the chosen folder_id to classify this session into the most appropriate folder. Do NOT call any other tools yet — stop and wait for the folder context results.
 
 **Phase 2 — After receiving folder context, proceed:**
 1. Call \`update_title\` with a concise title for the meeting (max 60 chars). Skip if the title is already descriptive.
