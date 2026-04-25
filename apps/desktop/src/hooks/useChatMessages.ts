@@ -355,9 +355,18 @@ export function useChatMessages(
               );
               if (result) {
                 result.toolCallId = call.id;
-                executedTools.push(result);
                 trackChatToolExecuted({ tool_name: call.name });
                 allToolExecs[execIdx] = { ...allToolExecs[execIdx], status: "done", detail: result.detail };
+                // Only mutating tool calls drive undo, the "Session updated"
+                // toast, the persisted [tool:NAME] badge, and the
+                // onToolsExecuted refresh callback. Read-only tools
+                // (get_folder_context) and no-op / error paths
+                // (add_to_folder when already in folder, tag_session with
+                // no real deltas) still send their result back to the LLM
+                // via toolResultMessages but skip the side-effecting UI.
+                if (result.mutated) {
+                  executedTools.push(result);
+                }
                 toolResultMessages.push({
                   role: "tool" as const,
                   tool_call_id: call.id,

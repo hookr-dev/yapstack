@@ -2709,7 +2709,10 @@ async fn transcribe_chunk(
     let max_prompt = ctx.config.prompt_context_chars.unwrap_or(350) as usize;
     let vocab_guard = ctx.vocabulary_hints.lock().await;
     let vocab: &str = vocab_guard.as_str();
-    let vocab_budget = vocab.len().min(80);
+    // Round down to a char boundary — folder/tag names can contain multibyte
+    // codepoints, and a raw byte slice at the 80-byte cap could land
+    // mid-codepoint and panic the live-transcription task.
+    let vocab_budget = vocab.floor_char_boundary(vocab.len().min(80));
     let context_budget = max_prompt.saturating_sub(if vocab_budget > 0 {
         vocab_budget + 2
     } else {

@@ -22,6 +22,10 @@ vi.mock("@/lib/db", () => ({
   getSession: vi.fn().mockResolvedValue(null),
   getNotesForSessions: vi.fn().mockResolvedValue([]),
   listDictationHistory: vi.fn().mockResolvedValue([]),
+  getSessionTagIds: vi.fn().mockResolvedValue([]),
+  listAllSessionFolders: vi.fn().mockResolvedValue([]),
+  listTags: vi.fn().mockResolvedValue([]),
+  listFolders: vi.fn().mockResolvedValue([]),
 }));
 vi.mock("@tauri-apps/plugin-sql", () => ({
   default: { load: vi.fn() },
