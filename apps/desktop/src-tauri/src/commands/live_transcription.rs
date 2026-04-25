@@ -2705,14 +2705,22 @@ async fn transcribe_chunk(
 
     // Build effective prompt: [vocabulary_hints]. [rolling_context]
     // Vocabulary hints (folder names) are prepended to help Whisper recognise proper nouns.
-    // Read fresh each chunk so mid-recording updates take effect.
+    // Read fresh each chunk so mid-recording updates take effect. Snapshot the
+    // hints into an owned String inside a short scope so the mutex is dropped
+    // before the long `transcribe_with` await — otherwise the
+    // `update_vocabulary_hints` command can block behind a multi-second
+    // sidecar round trip.
     let max_prompt = ctx.config.prompt_context_chars.unwrap_or(350) as usize;
-    let vocab_guard = ctx.vocabulary_hints.lock().await;
-    let vocab: &str = vocab_guard.as_str();
-    // Round down to a char boundary — folder/tag names can contain multibyte
-    // codepoints, and a raw byte slice at the 80-byte cap could land
-    // mid-codepoint and panic the live-transcription task.
-    let vocab_budget = vocab.floor_char_boundary(vocab.len().min(80));
+    let vocab_truncated: String = {
+        let vocab_guard = ctx.vocabulary_hints.lock().await;
+        let vocab: &str = vocab_guard.as_str();
+        // Round down to a char boundary — folder/tag names can contain
+        // multibyte codepoints, and a raw byte slice at the 80-byte cap
+        // could land mid-codepoint and panic the live-transcription task.
+        let vocab_budget = vocab.floor_char_boundary(vocab.len().min(80));
+        vocab[..vocab_budget].to_string()
+    };
+    let vocab_budget = vocab_truncated.len();
     let context_budget = max_prompt.saturating_sub(if vocab_budget > 0 {
         vocab_budget + 2
     } else {
@@ -2734,11 +2742,10 @@ async fn transcribe_chunk(
         };
 
         if vocab_budget > 0 && !context_part.is_empty() {
-            combined_prompt = format!("{}. {}", &vocab[..vocab_budget], context_part);
+            combined_prompt = format!("{}. {}", &vocab_truncated, context_part);
             Some(&combined_prompt)
         } else if vocab_budget > 0 {
-            combined_prompt = vocab[..vocab_budget].to_string();
-            Some(&combined_prompt)
+            Some(&vocab_truncated)
         } else {
             Some(context_part)
         }
