@@ -273,10 +273,21 @@ export function useChatMessages(
 
       if (!actionDef && !userText) return;
 
+      // For action invocations with no typed text, send the action's
+      // verbose userPrompt as the model-visible content (falls back to
+      // the label). The chat UI still renders the action chip via
+      // `message.action`, so the user only sees "Summarize" while the
+      // model sees an unambiguous instruction. Without this, a clicked
+      // action mid-conversation reads to the model as a one-word
+      // follow-up and triggers clarification questions.
+      const actionUserContent =
+        actionDef && !userText
+          ? (actionDef.userPrompt ?? actionDef.label)
+          : userText;
       const userMessage: ChatMessage = {
         id: crypto.randomUUID(),
         role: "user",
-        content: actionDef && !userText ? actionDef.label : userText,
+        content: actionUserContent,
         action: actionId,
       };
 

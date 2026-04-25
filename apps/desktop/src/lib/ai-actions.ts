@@ -8,15 +8,38 @@ export interface ActionDefinition {
   icon: LucideIcon;
   requiresTranscript?: boolean;
   directive: string;
+  /**
+   * Verbose user-message content sent to the LLM when this action is
+   * invoked from a button click. Defaults to `label` when omitted, but
+   * a sentence-shaped prompt avoids ambiguity in a chat history
+   * (clicking "Summarize" mid-conversation otherwise reads to the
+   * model as a follow-up clarification rather than an action). The UI
+   * still renders the action chip — the verbose text is hidden behind
+   * `message.action`.
+   */
+  userPrompt?: string;
 }
 
-export const ACTIONS: ActionDefinition[] = [
+/**
+ * Prepended to every action directive. Forbids clarification questions
+ * and pins the source/destination so the model never asks "did you
+ * mean the conversation or the notes?" when both are in context.
+ */
+const ACTION_PREAMBLE = `This is an action invocation, not a conversational request. Execute the action immediately using your tools. Do not ask the user for clarification — the directive below fully specifies what to do. Do not echo what the user might have meant; just do the work.
+
+Source of truth: the session transcript (the recording transcribed under "## Session Transcript" later in this prompt). Existing notes (under "## Notes") are the destination for save_to_notes — they are NEVER the source you summarize or extract from. Ignore any prior chat conversation when interpreting this action; the directive is authoritative.
+
+`;
+
+const RAW_ACTIONS: ActionDefinition[] = [
   {
     id: "summarize",
     label: "Summarize",
     description: "Comprehensive summary with key topics and action items",
     icon: Sparkles,
     requiresTranscript: true,
+    userPrompt:
+      "Summarize the session transcript and save the summary to the session notes. Use the existing notes as the destination, not the source.",
     directive: `You are a note-taker for this session. Write notes as if you were present and capturing what matters — the topics discussed, key details, decisions, and any follow-ups.
 
 You MUST use your tools. Work in two phases:
@@ -53,6 +76,8 @@ Formatting rules:
     label: "Key Points",
     description: "Extract the most important points, ranked by significance",
     icon: List,
+    userPrompt:
+      "Extract the key points from the session transcript and save them to the session notes.",
     directive: `You are a key-points extractor. Work in two phases:
 
 **Phase 1 — CLASSIFY FIRST:**
@@ -68,6 +93,8 @@ If a folder tree is provided below, call \`search_folders\` and then \`add_sessi
     label: "Action Items",
     description: "Pull out concrete tasks with owners and deadlines",
     icon: ListChecks,
+    userPrompt:
+      "Extract action items from the session transcript and save them to the session notes.",
     directive: `You are an action-item extractor. Work in two phases:
 
 **Phase 1 — CLASSIFY FIRST:**
@@ -84,6 +111,8 @@ If a folder tree is provided below, call \`search_folders\` and then \`add_sessi
     description: "Professional meeting minutes with topics and next steps",
     icon: ClipboardList,
     requiresTranscript: true,
+    userPrompt:
+      "Write meeting minutes for the session transcript and save them to the session notes.",
     directive: `You are a meeting minutes writer with session management tools. Work in two phases:
 
 **Phase 1 — CLASSIFY FIRST:**
@@ -113,6 +142,11 @@ Cover every topic that was discussed, including minor ones. Minutes should be th
 IMPORTANT: Use **bold text** for section labels, NEVER use # or ## markdown headings. Be concise and professional.`,
   },
 ];
+
+export const ACTIONS: ActionDefinition[] = RAW_ACTIONS.map((a) => ({
+  ...a,
+  directive: ACTION_PREAMBLE + a.directive,
+}));
 
 export function getAction(id: string): ActionDefinition | undefined {
   return ACTIONS.find((a) => a.id === id);
