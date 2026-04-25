@@ -77,7 +77,7 @@ describe("createSessionSources", () => {
   it("transcript assembler calls DB and returns formatted text", async () => {
     const sources = createSessionSources("session-1", 1, "recording");
     const result = await sources[0].assembler();
-    expect(result).toContain("[seg:s1 0:00] Hello");
+    expect(result).toContain("[seg:s1 0:00] (You) Hello");
   });
 });
 

@@ -21,9 +21,10 @@ import {
   getSessionSegments,
 } from "./db";
 import type { DbNote, DbSegment, DbFolder } from "./db";
-import { markdownToBasicHtml } from "./ai";
+import { markdownToBasicHtml, formatSegmentSpeaker } from "./ai";
 import { formatTime, stripHtml } from "./utils";
 import { findBranchConflicts, getFolderPath } from "./folder-tree";
+import { useAppStore } from "@/stores/appStore";
 
 // --- Core types ---
 
@@ -857,12 +858,25 @@ registerTool({
     segmentHits.forEach((hit, i) => {
       if (!inScope(hit.sessionId)) return;
       if (bySessionId.has(hit.sessionId)) return;
+      // Prepend the speaker label so the model can tell who said this
+      // before deciding whether to expand the session. The label uses the
+      // same convention as `formatSegmentSpeaker`: Mic -> "You", System
+      // with diarisation -> speaker name, System without -> "Other".
+      // Per-session speaker overrides (`speakerNames`) are applied so a
+      // renamed "Speaker 1 -> Alice" mapping shows through here too.
+      const speakerNames =
+        useAppStore.getState().settings.speakerNames[hit.sessionId];
+      let label: string;
+      if (hit.source === "Mic") label = "You";
+      else if (hit.speakerId != null)
+        label = speakerNames?.[hit.speakerId] ?? `Speaker ${hit.speakerId + 1}`;
+      else label = "Other";
       bySessionId.set(hit.sessionId, {
         session_id: hit.sessionId,
         title: hit.sessionTitle,
         date: "",
         folder_path: null,
-        snippet: hit.snippet.slice(0, 240),
+        snippet: `(${label}) ${hit.snippet.slice(0, 240)}`,
         source_type: "segment",
         score: score(i, 2),
       });
@@ -1042,10 +1056,17 @@ registerTool({
         if (live.length === 0) {
           lines.push("**Transcript:** (no segments)");
         } else {
+          // Per-session speaker name overrides — keyed by speaker_id within
+          // that session. Pulled fresh per session because IDs are
+          // session-local (the same speaker_id in two sessions is two
+          // different people).
+          const speakerNames =
+            useAppStore.getState().settings.speakerNames[sid];
           lines.push("**Transcript:**");
           for (const seg of live.slice(0, 200)) {
             const ts = formatTime(Math.max(0, seg.audio_offset_seconds));
-            lines.push(`[seg:${seg.id} ${ts}] ${seg.text}`);
+            const label = formatSegmentSpeaker(seg, speakerNames);
+            lines.push(`[seg:${seg.id} ${ts}] (${label}) ${seg.text}`);
             provenance.push({
               type: "segment",
               segmentId: seg.id,

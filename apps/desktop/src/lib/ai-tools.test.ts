@@ -23,10 +23,14 @@ vi.mock("@/lib/folder-tree", () => ({
   buildFolderTree: vi.fn().mockReturnValue([]),
 }));
 
-vi.mock("@/lib/ai", () => ({
-  markdownToBasicHtml: vi.fn((s: string) => `<p>${s}</p>`),
-  assembleFolderTreeContext: vi.fn().mockReturnValue(""),
-}));
+vi.mock("@/lib/ai", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./ai")>();
+  return {
+    ...actual,
+    markdownToBasicHtml: vi.fn((s: string) => `<p>${s}</p>`),
+    assembleFolderTreeContext: vi.fn().mockReturnValue(""),
+  };
+});
 
 import {
   convertCitationsToSegmentRefs,

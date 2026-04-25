@@ -168,6 +168,8 @@ export function buildEvalDbStub(fixture: EvalFixture): EvalDbStub {
               sessionId: sid,
               sessionTitle: session?.title ?? "Untitled",
               snippet: seg.text,
+              source: seg.source as "Mic" | "System",
+              speakerId: seg.speaker_id ?? null,
             });
           }
         }

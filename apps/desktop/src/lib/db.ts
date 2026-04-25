@@ -750,6 +750,14 @@ export interface SearchResult {
   sessionId: string;
   sessionTitle: string;
   snippet: string;
+  /**
+   * Audio source for `type === "segment"` hits. `Mic` = the user, anything
+   * else came from system audio. Lets the caller render speaker
+   * attribution in the snippet so the model doesn't have to assume.
+   */
+  source?: "Mic" | "System";
+  /** Diarised speaker id for `type === "segment"` hits when present. */
+  speakerId?: number | null;
 }
 
 export interface DictationSearchResult {
@@ -782,9 +790,16 @@ export async function searchSegments(
   if (!match) return [];
   const db = await getDb();
   const rows = await db.select<
-    { session_id: string; text: string; title: string }[]
+    {
+      session_id: string;
+      text: string;
+      title: string;
+      source: "Mic" | "System";
+      speaker_id: number | null;
+    }[]
   >(
-    `SELECT seg.session_id AS session_id, seg.text AS text, s.title AS title
+    `SELECT seg.session_id AS session_id, seg.text AS text, s.title AS title,
+            seg.source AS source, seg.speaker_id AS speaker_id
      FROM segments_fts
      JOIN segments seg ON seg.id = segments_fts.segment_id
      JOIN sessions s ON seg.session_id = s.id
@@ -799,6 +814,8 @@ export async function searchSegments(
     sessionId: r.session_id,
     sessionTitle: r.title || "Untitled",
     snippet: r.text,
+    source: r.source,
+    speakerId: r.speaker_id,
   }));
 }
 
