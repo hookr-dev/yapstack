@@ -25,6 +25,7 @@ import {
 } from "@/lib/ai";
 import { GENERAL_DIRECTIVE } from "@/lib/ai-prompts";
 import { getToolsById, executeTool, undoToolCalls, getToolKind } from "@/lib/ai-tools";
+import { assembleHistoryForRequest } from "@/lib/chat-history";
 import { useAppStore } from "@/stores/appStore";
 import { toast } from "sonner";
 import {
@@ -328,7 +329,16 @@ export function useChatMessages(
         const allToolExecs: ToolExecution[] = [];
         const allCallIds: string[] = [];
         const observationsByCallId = new Map<string, ToolObservation>();
-        const history = messagesRef.current.filter((m) => m.content);
+        // Read persisted rows for the chat and rebuild the OpenAI-shaped
+        // message array including prior `assistant.tool_calls` and
+        // `tool` rows. This is what makes follow-ups like "use the
+        // sessions you just found" work — the model sees the previous
+        // round's tool memory instead of just the assistant prose.
+        // The user row for THIS send was just persisted above, so the
+        // assembler picks it up naturally; we don't need to push it
+        // separately.
+        const persistedRows = await getChatMessages(contextKey);
+        const priorHistory = assembleHistoryForRequest(persistedRows);
 
         const contextParts: Record<string, string> = {};
         for (const source of sources) {
@@ -352,15 +362,8 @@ export function useChatMessages(
 
         const chatMessages: ChatCompletionMessageParam[] = [
           { role: "system", content: systemPrompt },
+          ...priorHistory,
         ];
-        for (const msg of history) {
-          chatMessages.push({ role: msg.role, content: msg.content });
-        }
-        const userContent =
-          actionDef && !userText ? actionDef.label : userText;
-        if (userContent) {
-          chatMessages.push({ role: "user", content: userContent });
-        }
 
         const tools = getToolsById(ctxTools.availableToolIds);
 
