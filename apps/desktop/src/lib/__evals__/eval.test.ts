@@ -59,6 +59,7 @@ vi.mock("@/lib/db", () => {
     searchFolders: get("searchFolders"),
     searchDictations: get("searchDictations"),
     listDictationHistory: get("listDictationHistory"),
+    updateSegmentText: get("updateSegmentText"),
   };
 });
 
@@ -110,6 +111,9 @@ describe("Chat agent eval cases", () => {
           isPinned: session?.is_pinned === 1,
           folderIds,
           allowedSessionIds: step.ctxAllowedSessionIds,
+          // `replace_in_transcript` reads ctx.segments; expose the live
+          // mutable copy so a second tool call after it sees the edits.
+          segments: stub.state.segments.get(sessionId) ?? [],
         };
 
         let result;

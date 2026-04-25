@@ -1,0 +1,107 @@
+{
+  "name": "replace_in_transcript edits matching segments and is undoable",
+  "description": "Case-insensitive substring replace across the session's segments; undo data captures pre-edit text per segment.",
+  "fixture": {
+    "sessions": [
+      {
+        "id": "s1",
+        "title": "Tech chat",
+        "created_at": "2026-04-25T10:00:00",
+        "updated_at": "2026-04-25T10:00:00",
+        "source": "Mic",
+        "status": "completed",
+        "duration_seconds": 30,
+        "total_segments": 3,
+        "folder_id": null,
+        "is_pinned": 0,
+        "pinned_at": null,
+        "session_type": "recording",
+        "wav_file_path": null,
+        "wav_duration_seconds": null,
+        "sort_order": 0
+      }
+    ],
+    "folders": [],
+    "sessionFolders": [],
+    "notes": {},
+    "segments": {
+      "s1": [
+        {
+          "id": "seg1",
+          "session_id": "s1",
+          "source": "Mic",
+          "text": "kubernet ease is hard to learn",
+          "audio_offset_seconds": 0,
+          "chunk_duration_seconds": 5,
+          "confidence": 0.9,
+          "created_at": "",
+          "chunk_index": 0,
+          "original_text": null,
+          "edited_at": null,
+          "deleted_at": null,
+          "hidden": 0
+        },
+        {
+          "id": "seg2",
+          "session_id": "s1",
+          "source": "Mic",
+          "text": "but Kubernet ease has good tooling",
+          "audio_offset_seconds": 6,
+          "chunk_duration_seconds": 5,
+          "confidence": 0.9,
+          "created_at": "",
+          "chunk_index": 1,
+          "original_text": null,
+          "edited_at": null,
+          "deleted_at": null,
+          "hidden": 0
+        },
+        {
+          "id": "seg3",
+          "session_id": "s1",
+          "source": "Mic",
+          "text": "this segment has nothing to fix",
+          "audio_offset_seconds": 12,
+          "chunk_duration_seconds": 5,
+          "confidence": 0.9,
+          "created_at": "",
+          "chunk_index": 2,
+          "original_text": null,
+          "edited_at": null,
+          "deleted_at": null,
+          "hidden": 0
+        }
+      ]
+    },
+    "tags": [],
+    "sessionTags": []
+  },
+  "steps": [
+    {
+      "tool": "replace_in_transcript",
+      "args": {
+        "find": "kubernet ease",
+        "replace": "kubernetes",
+        "case_sensitive": null
+      },
+      "expect": {
+        "affectedIdsIncludes": ["seg1", "seg2"],
+        "affectedIdsExcludes": ["seg3"],
+        "mutated": true,
+        "observationContains": "Replaced"
+      }
+    },
+    {
+      "tool": "replace_in_transcript",
+      "args": {
+        "find": "kubernet ease",
+        "replace": "kubernetes",
+        "case_sensitive": null
+      },
+      "expect": {
+        "observationContains": "No segment in this session contains",
+        "mutated": false
+      }
+    }
+  ]
+}

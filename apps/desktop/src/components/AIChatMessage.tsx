@@ -34,6 +34,7 @@ const TOOL_LABELS: Record<string, string> = {
   search_sessions: "Sessions searched",
   get_session_context: "Sessions expanded",
   search_dictations: "Dictations searched",
+  replace_in_transcript: "Transcript edited",
 };
 
 function parseToolBadges(content: string): {

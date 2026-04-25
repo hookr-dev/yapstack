@@ -12,6 +12,7 @@ import type {
   DbSegment,
   DbTag,
   DbSessionTag,
+  DbDictationHistory,
 } from "@/lib/db";
 
 export interface EvalFixture {
@@ -24,6 +25,8 @@ export interface EvalFixture {
   segments: Record<string, DbSegment[]>;
   tags: DbTag[];
   sessionTags: DbSessionTag[];
+  /** Optional dictation history entries — used by `search_dictations`. */
+  dictations?: DbDictationHistory[];
 }
 
 export interface EvalStep {
