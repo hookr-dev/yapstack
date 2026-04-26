@@ -2521,111 +2521,8 @@ async fn live_transcription_loop(
         }
     }
 
-    // Final WAV flush: extract any remaining audio and finalize
-    if let Some(mut ws) = session_wav_state {
-        // Extract remaining audio since last flush
-        let final_flush = {
-            let manager = audio_state.lock().await;
-            manager.extract_since(&ws.flush_positions, ws.source, ws.mix_config.as_ref())
-        };
-        if let Some((samples, sr, _new_pos)) = final_flush {
-            let to_write: std::borrow::Cow<[f32]> = if sr == ws.wav_sample_rate {
-                std::borrow::Cow::Borrowed(&samples)
-            } else {
-                match yapstack_common::audio::resample(&samples, sr, ws.wav_sample_rate) {
-                    Ok(cow) => std::borrow::Cow::Owned(cow.into_owned()),
-                    Err(e) => {
-                        error!(
-                            "session WAV final flush resample {}Hz → {}Hz failed, dropping {} samples: {}",
-                            sr, ws.wav_sample_rate, samples.len(), e
-                        );
-                        std::borrow::Cow::Owned(Vec::new())
-                    }
-                }
-            };
-            if !to_write.is_empty() {
-                if let Err(e) = ws.writer.write_samples(&to_write) {
-                    error!("session WAV final flush write failed: {}", e);
-                }
-            }
-        }
-
-        if ws.writer.samples_written() == 0 {
-            // No audio was ever written — delete the empty WAV file
-            warn!(
-                "session WAV had 0 samples written — deleting empty file for session {}",
-                ws.session_id
-            );
-            let wav_path = ws.writer.path().to_path_buf();
-            // Finalize WAV only (no MP3 conversion) to release file handle, then delete
-            let _ = ws.writer.finalize_wav_only();
-            let _ = std::fs::remove_file(&wav_path);
-            let _ = ctx.app_handle.emit(
-                "session-wav-error",
-                SessionWavErrorEvent {
-                    session_id: ws.session_id,
-                    message: "No audio was recorded — WAV file not saved".to_string(),
-                },
-            );
-        } else {
-            let use_mp3 = ctx.config.audio_export_format.as_deref().unwrap_or("mp3") != "wav";
-            let result = if use_mp3 {
-                ws.writer
-                    .finalize_as_mp3(ctx.config.mp3_bitrate.unwrap_or(64))
-            } else {
-                ws.writer.finalize_wav_only()
-            };
-            match result {
-                Ok((path, duration)) => {
-                    info!(
-                        "session part {} finalized: {} ({:.1}s)",
-                        ws.part_index,
-                        path.display(),
-                        duration
-                    );
-                    let format = if use_mp3 { "mp3" } else { "wav" };
-                    let file_path_str = path.to_string_lossy().to_string();
-
-                    // Insert the parts row from Rust *before* emitting so the
-                    // DB is the durable source of truth even if the FE event
-                    // listener is unavailable (crash, force-quit, window
-                    // closed). The FE handler now just refreshes from DB.
-                    if let Some(db_path_state) = ctx.app_handle.try_state::<crate::DbPath>() {
-                        let row = crate::db::AudioPartRow {
-                            session_id: ws.session_id.clone(),
-                            part_index: ws.part_index,
-                            file_path: file_path_str.clone(),
-                            format,
-                            duration_seconds: duration,
-                            sample_rate: ws.wav_sample_rate,
-                        };
-                        if let Err(e) =
-                            crate::db::insert_audio_part_row(db_path_state.as_path(), &row)
-                        {
-                            error!("insert_audio_part_row failed (will rely on FE refresh): {e}");
-                        }
-                        if let Some(parent) = path.parent() {
-                            crate::register_trusted_audio_dir(&ctx.app_handle, parent);
-                        }
-                    }
-
-                    let _ = ctx.app_handle.emit(
-                        "session-part-ready",
-                        SessionPartReadyEvent {
-                            session_id: ws.session_id.clone(),
-                            part_index: ws.part_index,
-                            file_path: file_path_str,
-                            format: format.to_string(),
-                            duration_seconds: duration,
-                            sample_rate: ws.wav_sample_rate,
-                        },
-                    );
-                }
-                Err(e) => {
-                    error!("session WAV finalize failed: {}", e);
-                }
-            }
-        }
+    if let Some(ws) = session_wav_state {
+        finalize_session_wav(ws, &audio_state, &ctx).await;
     }
 
     // Wait for concurrent backfill to finish before emitting Stopped.
@@ -2662,6 +2559,119 @@ async fn live_transcription_loop(
     info!(
         "live transcription stopped: {} chunks, {:.1}s total audio",
         final_chunks, final_audio_seconds
+    );
+}
+
+/// Drain the final tail of session audio, finalize the session-WAV writer in
+/// the user's chosen export format, and persist the resulting part row to the
+/// DB before emitting `session-part-ready`. Called once at end-of-loop after
+/// in-flight chunks have drained. Empty recordings get the file deleted and a
+/// `session-wav-error` event instead.
+async fn finalize_session_wav(
+    mut ws: SessionWavState,
+    audio_state: &AudioManagerState,
+    ctx: &TranscriptionContext,
+) {
+    let final_flush = {
+        let manager = audio_state.lock().await;
+        manager.extract_since(&ws.flush_positions, ws.source, ws.mix_config.as_ref())
+    };
+    if let Some((samples, sr, _new_pos)) = final_flush {
+        let to_write: std::borrow::Cow<[f32]> = if sr == ws.wav_sample_rate {
+            std::borrow::Cow::Borrowed(&samples)
+        } else {
+            match yapstack_common::audio::resample(&samples, sr, ws.wav_sample_rate) {
+                Ok(cow) => std::borrow::Cow::Owned(cow.into_owned()),
+                Err(e) => {
+                    error!(
+                        "session WAV final flush resample {}Hz → {}Hz failed, dropping {} samples: {}",
+                        sr, ws.wav_sample_rate, samples.len(), e
+                    );
+                    std::borrow::Cow::Owned(Vec::new())
+                }
+            }
+        };
+        if !to_write.is_empty() {
+            if let Err(e) = ws.writer.write_samples(&to_write) {
+                error!("session WAV final flush write failed: {}", e);
+            }
+        }
+    }
+
+    if ws.writer.samples_written() == 0 {
+        warn!(
+            "session WAV had 0 samples written — deleting empty file for session {}",
+            ws.session_id
+        );
+        let wav_path = ws.writer.path().to_path_buf();
+        // Finalize WAV only (no MP3 conversion) to release the file handle, then delete.
+        let _ = ws.writer.finalize_wav_only();
+        let _ = std::fs::remove_file(&wav_path);
+        let _ = ctx.app_handle.emit(
+            "session-wav-error",
+            SessionWavErrorEvent {
+                session_id: ws.session_id,
+                message: "No audio was recorded — WAV file not saved".to_string(),
+            },
+        );
+        return;
+    }
+
+    let use_mp3 = ctx.config.audio_export_format.as_deref().unwrap_or("mp3") != "wav";
+    let result = if use_mp3 {
+        ws.writer
+            .finalize_as_mp3(ctx.config.mp3_bitrate.unwrap_or(64))
+    } else {
+        ws.writer.finalize_wav_only()
+    };
+    let (path, duration) = match result {
+        Ok(out) => out,
+        Err(e) => {
+            error!("session WAV finalize failed: {}", e);
+            return;
+        }
+    };
+
+    info!(
+        "session part {} finalized: {} ({:.1}s)",
+        ws.part_index,
+        path.display(),
+        duration
+    );
+    let format = if use_mp3 { "mp3" } else { "wav" };
+    let file_path_str = path.to_string_lossy().to_string();
+
+    // Insert the parts row from Rust *before* emitting so the DB is the
+    // durable source of truth even if the FE event listener is unavailable
+    // (crash, force-quit, window closed). The FE handler now just refreshes
+    // from DB.
+    if let Some(db_path_state) = ctx.app_handle.try_state::<crate::DbPath>() {
+        let row = crate::db::AudioPartRow {
+            session_id: ws.session_id.clone(),
+            part_index: ws.part_index,
+            file_path: file_path_str.clone(),
+            format,
+            duration_seconds: duration,
+            sample_rate: ws.wav_sample_rate,
+        };
+        if let Err(e) = crate::db::insert_audio_part_row(db_path_state.as_path(), &row) {
+            error!("insert_audio_part_row failed (will rely on FE refresh): {e}");
+        }
+        if let Some(parent) = path.parent() {
+            crate::register_trusted_audio_dir(&ctx.app_handle, parent);
+        }
+    }
+
+    let _ = ctx.app_handle.emit(
+        "session-part-ready",
+        SessionPartReadyEvent {
+            session_id: ws.session_id,
+            part_index: ws.part_index,
+            file_path: file_path_str,
+            format: format.to_string(),
+            duration_seconds: duration,
+            sample_rate: ws.wav_sample_rate,
+        },
     );
 }
 
