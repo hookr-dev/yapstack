@@ -2166,30 +2166,10 @@ async fn live_transcription_loop(
         )
         .await;
 
-        // Seed live prompt from backfill context once available.
-        // Must seed both shared_prompt AND each source's accumulated_text,
-        // since transcribe_chunk() uses accumulated_text as the Whisper prompt.
-        if !prompt_seeded_from_backfill {
-            let bridged = ctx.bridged_prompt.lock().await;
-            if !bridged.is_empty() {
-                {
-                    let mut s = session.lock().expect("session mutex poisoned");
-                    if s.shared_prompt.is_empty() {
-                        s.shared_prompt = bridged.clone();
-                    }
-                    s.last_transcription_at = Some(Instant::now());
-                }
-                for source in &mut sources {
-                    if source.accumulated_text.is_empty() {
-                        source.accumulated_text = bridged.clone();
-                    }
-                }
-                prompt_seeded_from_backfill = true;
-                debug!(
-                    "live loop: seeded prompt from backfill ({} chars)",
-                    bridged.len()
-                );
-            }
+        if !prompt_seeded_from_backfill
+            && seed_prompt_from_backfill(&ctx, &session, &mut sources).await
+        {
+            prompt_seeded_from_backfill = true;
         }
 
         // First: drain any completed chunk tasks (both the ones collected
@@ -2560,6 +2540,39 @@ async fn live_transcription_loop(
         "live transcription stopped: {} chunks, {:.1}s total audio",
         final_chunks, final_audio_seconds
     );
+}
+
+/// Seed the live shared prompt and per-source `accumulated_text` from the
+/// backfill task's bridged prompt the first time it's non-empty. Whisper uses
+/// `accumulated_text` as its initial prompt, so seeding both keeps the live
+/// loop's first chunk aware of what backfill already transcribed. Returns
+/// `true` once the seed lands so the caller can flip the one-shot guard.
+async fn seed_prompt_from_backfill(
+    ctx: &TranscriptionContext,
+    session: &Arc<StdMutex<SessionAccumulators>>,
+    sources: &mut [SourceVadState],
+) -> bool {
+    let bridged = ctx.bridged_prompt.lock().await;
+    if bridged.is_empty() {
+        return false;
+    }
+    {
+        let mut s = session.lock().expect("session mutex poisoned");
+        if s.shared_prompt.is_empty() {
+            s.shared_prompt = bridged.clone();
+        }
+        s.last_transcription_at = Some(Instant::now());
+    }
+    for source in sources.iter_mut() {
+        if source.accumulated_text.is_empty() {
+            source.accumulated_text = bridged.clone();
+        }
+    }
+    debug!(
+        "live loop: seeded prompt from backfill ({} chars)",
+        bridged.len()
+    );
+    true
 }
 
 /// Drain the final tail of session audio, finalize the session-WAV writer in
