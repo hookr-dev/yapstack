@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
+import { convertFileSrc } from "@tauri-apps/api/core";
 import { useAppStore } from "@/stores/appStore";
 import {
   createManualSession as dbCreateManualSession,
@@ -51,8 +52,11 @@ export function useDictationEntry(entry: DbDictationHistory) {
       setPlaying(false);
       return;
     }
-    const ext = entry.wav_file_path?.endsWith(".mp3") ? "mp3" : "wav";
-    const audio = new Audio(`audio-stream://localhost/${entry.id}.${ext}`);
+    // Use the durable wav_file_path on the dictation_history row so we hit
+    // the actual {dictation_id}.{part_index}.{wav|mp3} file under the
+    // session's tracked audio dir — synthesizing `{entry.id}.{ext}` would
+    // miss the part index and any custom audio_save_location.
+    const audio = new Audio(convertFileSrc(entry.wav_file_path, "audio-stream"));
     audio.onended = () => {
       setPlaying(false);
       audioRef.current = null;

@@ -912,7 +912,6 @@ function createAppStore() {
         const vocabHints = buildVocabularyHints(freshFolders, freshTags);
 
         const config: LiveTranscriptionConfig = {
-          silence_threshold: 0.01,
           silence_duration_ms: settings.silenceDurationMs,
           max_chunk_seconds: settings.maxChunkSeconds,
           backfill_seconds: backfillSeconds ?? 0,
@@ -1021,7 +1020,6 @@ function createAppStore() {
         const vocabHints = buildVocabularyHints(freshFolders, freshTags);
 
         const config: LiveTranscriptionConfig = {
-          silence_threshold: 0.01,
           silence_duration_ms: settings.silenceDurationMs,
           max_chunk_seconds: settings.maxChunkSeconds,
           backfill_seconds: 0,

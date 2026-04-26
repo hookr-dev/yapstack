@@ -157,7 +157,7 @@ The DTO pattern keeps `specta::Type` out of library crates:
 ## Frontend Dependencies
 
 Key frontend dependencies beyond React 19 + Vite:
-- **Zustand** — State management with `persist` middleware for settings (version 16, with migrations)
+- **Zustand** — State management with `persist` middleware for settings (version 23, with migrations — see `docs/API_REFERENCE.md` for the full v0→v23 history)
 - **tauri-plugin-sql** — SQLite via Tauri plugin. Session, segment, note, folder persistence in `src/lib/db.ts`
 - **sonner** — Toast notifications for user feedback
 - **shadcn/ui** — Component library (button, card, tabs, select, popover, alert-dialog, dialog, dropdown-menu, context-menu, tooltip, slider, input, textarea, command, sheet, etc.)
@@ -196,19 +196,20 @@ App (routes by ?window= param: main → MainApp, dictation → DictationBubble, 
 │               │   ├── NoteCardList (grid of session/note cards)
 │               │   │   ├── NoteCard (draggable, with pin/folder badges)
 │               │   │   └── DictationHistoryList (when filter = dictation)
-│               │   │       └── DictationHistoryCard
+│               │   │       └── DictationFeedEntry (per-row, uses useDictationEntry hook)
+│               │   ├── DictationTrayItem (sidebar tray; also uses useDictationEntry)
 │               │   ├── NoteDetailView (session detail)
 │               │   │   ├── SessionHeader (title, badges, actions dropdown)
-│               │   │   ├── AudioPlayer (play/pause, seek, speed control)
+│               │   │   ├── AudioPlayer (play/pause, seek, speed control — parts-aware seeking)
+│               │   │   ├── AutoTagSuggestions (folder suggestion chips during recording)
 │               │   │   ├── ResizablePanelGroup (split pane)
-│               │   │   │   ├── ChatView (transcript bubbles)
+│               │   │   │   ├── ChatView (transcript bubbles, supports diarized speaker grouping)
 │               │   │   │   │   └── EditableSegment (context menu: edit, copy, hide, delete; also used as read-only bubble)
 │               │   │   │   └── NoteEditor (Tiptap rich text with toolbar)
 │               │   │   │       └── NoteHistoryPanel (version snapshots)
-│               │   │   ├── AIContextProvider (context-dependent AI setup)
-│               │   │   │   └── FloatingChatBar (AI chat overlay in notes pane)
-│               │   │   │       └── AIChatMessage (tool badges, citations, markdown)
-│               │   │   └── RecordingControls (during active session)
+│               │   │   └── AIContextProvider (context-dependent AI setup)
+│               │   │       └── FloatingChatBar (AI chat overlay in notes pane)
+│               │   │           └── AIChatMessage (tool badges, citations, markdown)
 │               │   └── SettingsPanel (tabbed settings)
 │               │       ├── AudioTab
 │               │       ├── TranscriptionTab
@@ -251,11 +252,11 @@ Settings are stored via Zustand's `persist` middleware with `localStorage`. Sche
 
 **Rust tests**: Unit tests in `#[cfg(test)] mod tests` within each source file. Hardware-dependent tests (device enumeration, mic capture) are `#[ignore]`d. Tests use `tempfile` for temporary directories/files.
 
-**Frontend tests** (294 tests across ~23 files): vitest + `@testing-library/react` + `@testing-library/user-event` + jsdom.
+**Frontend tests** (338 tests across 23 files): vitest + `@testing-library/react` + `@testing-library/user-event` + jsdom.
 
 Test infrastructure files:
 - `src/test/setup.ts` — Global setup: `@testing-library/jest-dom` matchers + `ResizeObserver` polyfill (needed by `react-resizable-panels` in jsdom)
-- `src/test/tauri-mocks.ts` — Factory functions for Tauri API mocks (`tauriCoreMock`, `tauriEventMock`, `tauriWindowMock`, `tauriDpiMock`, `tauriWebviewWindowMock`, `tauriSqlMock`, `tauriCommandsMock`). Factories return fresh mock objects — `vi.mock()` calls must be in the test file itself (vitest hoisting requirement).
+- `src/test/tauri-mocks.ts` — Factory functions for Tauri API mocks. The full set: `tauriCoreMock`, `tauriEventMock`, `tauriWindowMock`, `tauriDpiMock`, `tauriWebviewWindowMock`, `tauriSqlMock`, `tauriDialogMock`, `tauriFsMock`, `tauriOpenerMock`, `tauriGlobalShortcutMock`, `tauriPathMock`, `tauriCommandsMock`. Factories return fresh mock objects — `vi.mock()` calls must be in the test file itself (vitest hoisting requirement).
 - `src/test/match-media.ts` — `setupMatchMedia()` polyfill for `window.matchMedia` (jsdom doesn't implement it)
 - `vitest.config.ts` — jsdom environment, `@/` path alias, setup file
 
@@ -263,8 +264,6 @@ Testing patterns:
 - **Store injection**: Component tests use `useAppStore.setState()` to set store state before rendering
 - **Module-level mocks**: AI library tests (`ai.test.ts`, `ai-tools.test.ts`) use `vi.mock()` at module level for OpenAI SDK and store imports
 - **Factory mocks**: Tauri mocks use factory functions (not side-effect imports) because `vi.mock()` is hoisted above imports — factories ensure each test file gets fresh mocks
-
-Test coverage: 10 lib files (`utils`, `shortcuts`, `folder-tree`, `ai`, `ai-prompts`, `ai-actions`, `ai-tools`, `ai-context`, `analytics`, `DictationTab`, `ShortcutsTab`), 9 component files (`AudioPlayer`, `EditableSegment`, `AIChatMessage`, `NoteCard`, `FolderDialog`, `RecordingBeacon`, `RecordingControls`, `SetupBanner`, `TrialExpiredOverlay`), 1 hook file (`useClickOutside`), 1 app-level file (`App.test.tsx`). Shared test factories in `test/helpers.ts`.
 
 ### File Organization
 - One module per file (no nested modules except `system/`)

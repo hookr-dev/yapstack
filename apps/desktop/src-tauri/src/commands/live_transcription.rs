@@ -29,8 +29,6 @@ pub enum AudioSourceLabel {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct LiveTranscriptionConfig {
-    /// RMS energy threshold below which audio is considered silence. Default: 0.01.
-    pub silence_threshold: f32,
     /// Milliseconds of continuous silence before triggering a chunk. Default: 800.
     pub silence_duration_ms: u32,
     /// Force a chunk after this many seconds of continuous speech. Default: 30.
@@ -1277,16 +1275,24 @@ fn backfill_chunks_from_probabilities(
     chunks
 }
 
-/// Process backfill audio concurrently with the live VAD loop.
-/// Chunks audio by max_chunk_seconds with soft boundaries at silence gaps,
-/// trims leading silence, interleaves across sources.
-/// Emits segments with offsets 0..backfill_seconds, then emits a `backfill-complete` event.
+/// Process backfill audio concurrently with the live VAD loop. Each source's
+/// chunk boundaries come from `vad_chunk_historical_audio`, which runs the
+/// same Silero-driven state machine the live loop uses; backfill and live
+/// segmentation share boundary choices (no quality gap between a session's
+/// first N seconds and the rest). Emits segments with offsets in the backfill
+/// window, then sets `backfill_done`.
+///
+/// The `session` parameter is the **same** `Arc<StdMutex<SessionAccumulators>>`
+/// the live loop holds — backfill chunks update the same counters the live
+/// loop and `get_live_transcription_status` read, so the status surface
+/// reflects backfill + live work together.
 async fn process_backfill(
     ctx: TranscriptionContext,
     backfill_audio: Vec<(Vec<f32>, u32, AudioSourceLabel)>,
     backfill_done: Arc<AtomicBool>,
     cancel: Arc<AtomicBool>,
     tuning: VadTuning,
+    session: Arc<StdMutex<SessionAccumulators>>,
 ) {
     info!("backfill: starting concurrent processing");
 
@@ -1316,12 +1322,6 @@ async fn process_backfill(
     // Per-source state
     let mut chunk_indices: Vec<u32> = vec![0; source_entries.len()];
     let mut accumulated_texts: Vec<String> = vec![String::new(); source_entries.len()];
-    let session = Arc::new(StdMutex::new(SessionAccumulators {
-        shared_prompt: String::new(),
-        total_chunks: 0,
-        total_audio_seconds: 0.0,
-        last_transcription_at: None,
-    }));
 
     // Interleave: process chunk 0 for all sources, then chunk 1, etc. Keeps
     // cross-source timestamps roughly interleaved instead of emitting all
@@ -1793,12 +1793,14 @@ async fn live_transcription_loop(
         let backfill_ctx = ctx.clone();
         let backfill_done_clone = backfill_done.clone();
         let backfill_cancel_clone = backfill_cancel.clone();
+        let backfill_session = session.clone();
         let handle = tokio::spawn(process_backfill(
             backfill_ctx,
             backfill_audio,
             backfill_done_clone,
             backfill_cancel_clone,
             tuning,
+            backfill_session,
         ));
         let abort_handle = handle.abort_handle();
         Some((handle, abort_handle))
@@ -3082,11 +3084,6 @@ pub async fn start_live_transcription(
     // Validate config values. Use `is_finite` alongside the sign checks
     // because NaN comparisons all return false — raw `<= 0.0` silently
     // admits NaN payloads which would later panic in sample-count math.
-    if !config.silence_threshold.is_finite() || config.silence_threshold <= 0.0 {
-        return Err(CommandError::InvalidInput {
-            message: "silence_threshold must be finite and > 0".into(),
-        });
-    }
     if config.silence_duration_ms == 0 {
         return Err(CommandError::InvalidInput {
             message: "silence_duration_ms must be > 0".into(),
@@ -3771,7 +3768,6 @@ mod tests {
 
     fn dummy_config() -> LiveTranscriptionConfig {
         LiveTranscriptionConfig {
-            silence_threshold: 0.01,
             silence_duration_ms: 800,
             max_chunk_seconds: 30.0,
             backfill_seconds: 0.0,
