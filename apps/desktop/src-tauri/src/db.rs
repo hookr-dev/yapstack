@@ -881,8 +881,10 @@ pub fn migrations() -> Vec<Migration> {
         "#,
             kind: MigrationKind::Up,
         },
-        // segments.speaker_id is added by `ensure_runtime_schema()` instead —
-        // see that function for why.
+        // segments.speaker_id is added by the frontend's `getDb()` after
+        // migrations run — kept out of the migration list because some
+        // local dev DBs picked up a "ghost" v11 entry from another branch
+        // that makes sqlx silently refuse later migrations.
     ]
 }
 
@@ -972,7 +974,7 @@ mod tests {
         assert_eq!(
             migrations().len(),
             15,
-            "v1-v15; segments.speaker_id handled at runtime via ensure_runtime_schema"
+            "v1-v15; segments.speaker_id is patched at runtime by the frontend's getDb()"
         );
     }
 

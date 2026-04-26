@@ -48,12 +48,23 @@ pub struct LiveTranscriptionConfig {
     /// Seconds of all-source silence before clearing prompt context to prevent
     /// hallucination from stale context. Default: 5.0. Set to 0 to disable.
     pub prompt_decay_silence_seconds: Option<f32>,
-    /// Session ID for streaming WAV recording. If set, audio is incrementally
-    /// written to `$APP_DATA_DIR/audio/{session_id}.wav` during the session.
+    /// Session ID for streaming session-audio recording. If set, the loop
+    /// streams a new **session audio part** to disk during the session and
+    /// inserts a `session_audio_parts` row at finalize time before emitting
+    /// `session-part-ready`. The on-disk file is
+    /// `{audio_save_location || $APP_DATA_DIR/audio/}/{session_id}.{part_index}.{wav|mp3}`,
+    /// where `part_index` is 0 for a fresh session and `N` when resuming a
+    /// session that already has parts.
     pub session_id: Option<String>,
-    /// Custom directory for saving WAV files. If None, uses `$APP_DATA_DIR/audio/`.
+    /// Custom directory for saving session audio parts. If None, uses
+    /// `$APP_DATA_DIR/audio/`. The directory is registered with
+    /// `audio_save_locations` at recording start so reconciliation can
+    /// recover orphan parts on the next startup.
     pub audio_save_location: Option<String>,
-    /// Audio export format: "wav" or "mp3". Default: "mp3".
+    /// Audio export format applied at part finalization: "wav" or "mp3".
+    /// Default: "mp3". Choosing "mp3" re-encodes the streamed WAV at
+    /// `mp3_bitrate` and deletes the source WAV; "wav" keeps the streamed
+    /// file as-is.
     pub audio_export_format: Option<String>,
     /// MP3 bitrate in kbps (e.g. 64, 128, 192). Only used when format is "mp3".
     pub mp3_bitrate: Option<u16>,
@@ -283,11 +294,21 @@ pub(crate) struct LiveTranscriptionController {
     stop_tx: Option<oneshot::Sender<()>>,
     session_id: Option<String>,
     effective_start_epoch_ms: f64,
+    /// Live counters shared with the running loop. The loop mutates these
+    /// in-place when a chunk lands; `get_live_transcription_status` reads
+    /// them via a brief lock to surface real values to the UI.
+    session: Arc<StdMutex<SessionAccumulators>>,
 }
 
 impl LiveTranscriptionController {
     pub fn is_running(&self) -> bool {
         !self.task_handle.is_finished()
+    }
+
+    /// Snapshot the live counters under a short lock.
+    fn counters(&self) -> (u32, f32) {
+        let s = self.session.lock().expect("session mutex poisoned");
+        (s.total_chunks, s.total_audio_seconds)
     }
 }
 
@@ -570,21 +591,6 @@ fn emit_status(
             effective_start_epoch_ms: None,
         },
     );
-}
-
-/// Reconstruct `BufferPositions` from the source vec. Retained as a
-/// general helper and exercised by tests; the live loop no longer needs
-/// it now that Silero VAD extracts samples per-source via `extract_source_audio`.
-#[allow(dead_code)]
-fn build_cursor(sources: &[SourceVadState]) -> BufferPositions {
-    let mut pos = BufferPositions::default();
-    for s in sources {
-        match s.label {
-            AudioSourceLabel::Mic => pos.mic_pos = s.cursor,
-            AudioSourceLabel::System => pos.system_pos = s.cursor,
-        }
-    }
-    pos
 }
 
 /// Get the current write position for a source from the manager.
@@ -873,40 +879,6 @@ async fn advance_idle_cursor(vad: &mut SourceVadState, audio_state: &AudioManage
     };
     vad.cursor = new_pos;
     vad.speech_start_pos = new_pos;
-}
-
-/// Trim leading silence from mono audio. Returns (trimmed_slice, offset_seconds).
-/// Scans in small windows; keeps a pad before first detected energy to avoid
-/// clipping speech onset. Returns an empty slice if the chunk is entirely silent.
-#[allow(dead_code)] // kept for tests + potential fallback path
-fn trim_leading_silence(
-    samples: &[f32],
-    sample_rate: u32,
-    silence_threshold: f32,
-    pad_seconds: f32,
-) -> (&[f32], f32) {
-    let window_samples = (sample_rate as f32 * 0.05) as usize; // 50 ms windows
-    if window_samples == 0 || samples.is_empty() {
-        return (samples, 0.0);
-    }
-
-    let mut first_loud = None;
-    for (i, window) in samples.chunks(window_samples).enumerate() {
-        let rms = (window.iter().map(|s| s * s).sum::<f32>() / window.len() as f32).sqrt();
-        if rms > silence_threshold {
-            first_loud = Some(i * window_samples);
-            break;
-        }
-    }
-
-    let Some(loud_pos) = first_loud else {
-        return (&[], 0.0); // all silent — return empty so caller can skip
-    };
-
-    let pad_samples = (pad_seconds * sample_rate as f32) as usize;
-    let trim_start = loud_pos.saturating_sub(pad_samples);
-    let trim_offset = trim_start as f32 / sample_rate as f32;
-    (&samples[trim_start..], trim_offset)
 }
 
 // --- Prompt decay ---
@@ -1769,6 +1741,7 @@ async fn live_transcription_loop(
     ctx: TranscriptionContext,
     mut stop_rx: oneshot::Receiver<()>,
     mut session_wav_state: Option<SessionWavState>,
+    session: Arc<StdMutex<SessionAccumulators>>,
 ) {
     let source = ctx.config.source.clone().into();
     let check_mic = matches!(source, CaptureSource::MicOnly | CaptureSource::Mixed);
@@ -1776,8 +1749,8 @@ async fn live_transcription_loop(
 
     // Resolve engine-keyed VAD tuning once at loop entry. Whisper uses the
     // frontend-supplied silence_duration_ms / poll cadence; Parakeet uses its
-    // dialogue-tuned defaults (400 ms silence, 100 ms poll, 250 ms pre-roll,
-    // 0.7 offset-hysteresis ratio).
+    // dialogue-tuned defaults (200 ms silence, 100 ms poll, 250 ms pre-roll,
+    // 10 s max chunk).
     let engine_kind = {
         let client_guard = ctx.transcription_client.lock().await;
         client_guard
@@ -1834,12 +1807,6 @@ async fn live_transcription_loop(
         None
     };
 
-    let session = Arc::new(StdMutex::new(SessionAccumulators {
-        shared_prompt: String::new(),
-        total_chunks: 0,
-        total_audio_seconds: 0.0,
-        last_transcription_at: None,
-    }));
     let mut wav_flush_none_count: u32 = 0;
     let mut prompt_seeded_from_backfill = false;
 
@@ -2320,8 +2287,7 @@ async fn build_initial_sources_and_backfill(
             s.speech_start_pos = current;
             s.earliest_next_chunk_pos = current;
             s.silero.read_pos = current;
-            s.silero.last_probability = None;
-            s.silero.stream.reset();
+            s.silero.reset();
         }
     }
 
@@ -3377,14 +3343,23 @@ pub async fn start_live_transcription(
         session_offset_base_seconds,
     };
 
+    let session = Arc::new(StdMutex::new(SessionAccumulators {
+        shared_prompt: String::new(),
+        total_chunks: 0,
+        total_audio_seconds: 0.0,
+        last_transcription_at: None,
+    }));
+
     let task_handle = tokio::spawn({
         let ctx_guard = ctx.clone();
+        let session_for_loop = session.clone();
         async move {
             let result = AssertUnwindSafe(live_transcription_loop(
                 audio_state_clone,
                 ctx,
                 stop_rx,
                 session_wav_state,
+                session_for_loop,
             ))
             .catch_unwind()
             .await;
@@ -3426,6 +3401,7 @@ pub async fn start_live_transcription(
             stop_tx: Some(stop_tx),
             session_id: controller_session_id,
             effective_start_epoch_ms,
+            session,
         },
         vocabulary_hints: vocab_hints,
     });
@@ -3462,34 +3438,23 @@ pub async fn get_live_transcription_status(
 ) -> Result<LiveTranscriptionStatus, CommandError> {
     let guard = live_state.lock().await;
 
-    // TODO: chunks_processed and total_audio_seconds are always 0 because these
-    // counters live inside the async transcription loop (local variables in
-    // `live_transcription_loop`). To report real values, the loop would need to
-    // write to an Arc<AtomicU32> / Arc<AtomicF32> (or a shared struct) that this
-    // command reads. Low priority since the frontend receives accurate per-chunk
-    // values via the "live-transcription-status" event stream.
     match &*guard {
         Some(runtime) => {
             let c = &runtime.controller;
-            if c.is_running() {
-                Ok(LiveTranscriptionStatus {
-                    phase: LiveTranscriptionPhase::Running,
-                    chunks_processed: 0,
-                    total_audio_seconds: 0.0,
-                    error_message: None,
-                    session_id: c.session_id.clone(),
-                    effective_start_epoch_ms: Some(c.effective_start_epoch_ms),
-                })
+            let (chunks_processed, total_audio_seconds) = c.counters();
+            let phase = if c.is_running() {
+                LiveTranscriptionPhase::Running
             } else {
-                Ok(LiveTranscriptionStatus {
-                    phase: LiveTranscriptionPhase::Stopped,
-                    chunks_processed: 0,
-                    total_audio_seconds: 0.0,
-                    error_message: None,
-                    session_id: c.session_id.clone(),
-                    effective_start_epoch_ms: Some(c.effective_start_epoch_ms),
-                })
-            }
+                LiveTranscriptionPhase::Stopped
+            };
+            Ok(LiveTranscriptionStatus {
+                phase,
+                chunks_processed,
+                total_audio_seconds,
+                error_message: None,
+                session_id: c.session_id.clone(),
+                effective_start_epoch_ms: Some(c.effective_start_epoch_ms),
+            })
         }
         None => Ok(LiveTranscriptionStatus {
             phase: LiveTranscriptionPhase::Stopped,
@@ -3522,56 +3487,6 @@ pub async fn update_vocabulary_hints(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_trim_leading_silence_all_loud() {
-        // Signal well above threshold
-        let samples: Vec<f32> = vec![0.5; 1600]; // 0.1s at 16kHz
-        let (trimmed, offset) = trim_leading_silence(&samples, 16000, 0.01, 0.0);
-        assert_eq!(trimmed.len(), 1600);
-        assert!((offset - 0.0).abs() < f32::EPSILON);
-    }
-
-    #[test]
-    fn test_trim_leading_silence_all_silent() {
-        // All zeros — below any threshold
-        let samples: Vec<f32> = vec![0.0; 1600];
-        let (trimmed, offset) = trim_leading_silence(&samples, 16000, 0.01, 0.0);
-        // Returns empty slice when all silent so caller can skip
-        assert!(trimmed.is_empty());
-        assert!((offset - 0.0).abs() < f32::EPSILON);
-    }
-
-    #[test]
-    fn test_trim_leading_silence_with_leading_silence() {
-        // 0.1s silence then 0.1s loud at 16kHz
-        let mut samples = vec![0.0f32; 1600];
-        samples.extend(vec![0.5f32; 1600]);
-        let (trimmed, offset) = trim_leading_silence(&samples, 16000, 0.01, 0.0);
-        // Should trim the leading silence
-        assert!(trimmed.len() < 3200);
-        assert!(offset > 0.0);
-    }
-
-    #[test]
-    fn test_trim_leading_silence_with_pad() {
-        // 0.2s silence then loud at 16kHz
-        let mut samples = vec![0.0f32; 3200];
-        samples.extend(vec![0.5f32; 1600]);
-        // Pad 0.05s before the loud section
-        let (trimmed, offset) = trim_leading_silence(&samples, 16000, 0.01, 0.05);
-        // Offset should be slightly less than the loud section start (due to padding)
-        assert!(offset > 0.0);
-        assert!(trimmed.len() > 1600); // includes some pad
-    }
-
-    #[test]
-    fn test_trim_leading_silence_empty() {
-        let samples: Vec<f32> = vec![];
-        let (trimmed, offset) = trim_leading_silence(&samples, 16000, 0.01, 0.0);
-        assert!(trimmed.is_empty());
-        assert!((offset - 0.0).abs() < f32::EPSILON);
-    }
 
     #[test]
     fn test_capture_source_dto_into() {
@@ -3689,8 +3604,6 @@ mod tests {
         assert!(matches!(action, VadAction::None));
     }
 
-    // --- build_cursor tests ---
-
     // --- Prompt decay tests ---
 
     #[test]
@@ -3783,27 +3696,6 @@ mod tests {
         assert!(!cleared);
         assert_eq!(prompt, "shared prompt");
         assert_eq!(sources[0].accumulated_text, "seeded context");
-    }
-
-    // --- build_cursor tests ---
-
-    #[test]
-    fn test_build_cursor_mic_only() {
-        let sources = vec![SourceVadState::new(AudioSourceLabel::Mic, 42, 0, 48000, 1)];
-        let cursor = build_cursor(&sources);
-        assert_eq!(cursor.mic_pos, 42);
-        assert_eq!(cursor.system_pos, 0);
-    }
-
-    #[test]
-    fn test_build_cursor_both_sources() {
-        let sources = vec![
-            SourceVadState::new(AudioSourceLabel::Mic, 100, 0, 48000, 1),
-            SourceVadState::new(AudioSourceLabel::System, 200, 0, 48000, 2),
-        ];
-        let cursor = build_cursor(&sources);
-        assert_eq!(cursor.mic_pos, 100);
-        assert_eq!(cursor.system_pos, 200);
     }
 
     // --- Stream health decision helper tests ---
@@ -4058,8 +3950,7 @@ mod tests {
         s.speech_start_pos = current;
         s.earliest_next_chunk_pos = current;
         s.silero.read_pos = current;
-        s.silero.last_probability = None;
-        s.silero.stream.reset();
+        s.silero.reset();
 
         assert_eq!(
             s.silero.read_pos, current,

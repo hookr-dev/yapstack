@@ -1,4 +1,4 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 import { useAppStore } from "@/stores/appStore";
 import {
@@ -11,7 +11,8 @@ import {
 /// Shared state and handlers for any UI surface that renders a single
 /// `DictationHistory` entry. Owns the play/pause audio toggle, clipboard
 /// copy, "move to note" (creates a manual session bound to the entry), and
-/// delete.
+/// delete. The audio element is paused and released on unmount so clicking
+/// play and then navigating away doesn't leak playback.
 export function useDictationEntry(entry: DbDictationHistory) {
   const deleteEntry = useAppStore((s) => s.deleteDictationHistoryEntry);
   const loadSessions = useAppStore((s) => s.loadSessions);
@@ -20,6 +21,18 @@ export function useDictationEntry(entry: DbDictationHistory) {
 
   const [playing, setPlaying] = useState(false);
   const audioRef = useRef<HTMLAudioElement | null>(null);
+
+  // Pause + release on unmount.
+  useEffect(() => {
+    return () => {
+      const audio = audioRef.current;
+      if (audio) {
+        audio.pause();
+        audio.src = "";
+        audioRef.current = null;
+      }
+    };
+  }, []);
 
   const handleCopy = async () => {
     try {
@@ -49,8 +62,17 @@ export function useDictationEntry(entry: DbDictationHistory) {
       audioRef.current = null;
     };
     audioRef.current = audio;
-    audio.play();
     setPlaying(true);
+    // `audio.play()` returns a Promise that rejects if playback was
+    // interrupted (e.g. user clicked stop before it started). Swallow it so
+    // the rejection doesn't surface as an unhandled-promise warning, and
+    // unwind the playing flag if the start itself failed.
+    audio.play().catch(() => {
+      if (audioRef.current === audio) {
+        audioRef.current = null;
+        setPlaying(false);
+      }
+    });
   };
 
   const handleMoveToNote = async () => {

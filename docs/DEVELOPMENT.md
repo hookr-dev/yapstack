@@ -238,23 +238,7 @@ App (routes by ?window= param: main → MainApp, dictation → DictationBubble, 
 | `useClickOutside` | Detects clicks outside a ref element. Used by FloatingChatBar for collapse-on-click-outside. |
 
 ### Settings Persistence
-Settings are stored via Zustand's `persist` middleware with `localStorage`. Schema versioned (currently v16) with migrations:
-- v0→v1: `graceSeconds` → `backfillSeconds`
-- v1→v2: Added `silenceDurationMs`, `maxChunkSeconds`, `overlapSeconds`
-- v2→v3: Reset aggressive defaults (500ms→800ms, 15s→30s, 0.5s→1.0s)
-- v3→v4: Added `promptContextChars`
-- v4→v5: Added `theme` (light/dark/system)
-- v5→v6: Added `sidebarCollapsed`
-- v6→v7: Added `bufferMaxSeconds` (300), removed `backfillSeconds`
-- v7→v8: Added `ai` settings (provider config, API keys, model selection)
-- v8→v9: Added `shortcutBindings` (Record<string, string> override map)
-- v9→v10: Added `audioSaveLocation: string | null`
-- v10→v11: Added `dictation: DictationSettings` with defaults
-- v11→v12: Added `outputAction` to existing `DictationSlot`s (default `"paste"`)
-- v12→v13: Added `showRecordingIndicator: boolean` (default `true`)
-- v13→v14: Changed default model `Base` → `Small`, default capture `MicOnly` → `Mixed` (migrates existing users)
-- v14→v15: Added `promptDecaySilenceSeconds` (default 5) — seconds of all-source silence before clearing prompt context
-- v15→v16: Added `activationMode` to dictation settings (default `"hold"`)
+Settings are stored via Zustand's `persist` middleware with `localStorage`. Schema versioned (currently **v23**). See `docs/API_REFERENCE.md` § "Settings Persistence (Zustand)" for the full migration history (v0→v23).
 
 ## Project Structure Conventions
 
