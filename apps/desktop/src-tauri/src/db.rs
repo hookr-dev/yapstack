@@ -510,7 +510,7 @@ pub fn migrations() -> Vec<Migration> {
         },
         Migration {
             version: 15,
-            description: "session_audio_parts table + backfill from sessions.wav_file_path; drop legacy wav columns",
+            description: "session_audio_parts table + backfill from sessions.wav_file_path",
             // Each recording run produces one part. A session's audio is the
             // ordered concatenation of its parts. Resume = append a new part,
             // never mutate prior parts.
@@ -519,10 +519,20 @@ pub fn migrations() -> Vec<Migration> {
             // part_index=0 in the new table. Sample rate isn't stored on the
             // legacy row; default to 48000 (only used for diagnostics).
             //
-            // After backfill, the legacy single-file columns are dropped from
-            // sessions. Frontend reads parts directly via DbAudioPart.
+            // We deliberately do NOT drop the legacy `wav_file_path` /
+            // `wav_duration_seconds` columns from `sessions` here — combining
+            // ALTER TABLE DROP COLUMN with the backfill INSERT in the same
+            // tauri-plugin-sql migration transaction has been seen to fail
+            // on some SQLite builds, leaving the DB in a dead state. The
+            // columns are unused at the TypeScript boundary; they stay
+            // dormant until a future cleanup migration drops them.
+            //
+            // The migration is idempotent so it can re-run cleanly:
+            //   - CREATE TABLE IF NOT EXISTS
+            //   - INSERT OR IGNORE (the (session_id, part_index) UNIQUE
+            //     constraint short-circuits duplicates).
             sql: r#"
-            CREATE TABLE session_audio_parts (
+            CREATE TABLE IF NOT EXISTS session_audio_parts (
                 id TEXT PRIMARY KEY,
                 session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
                 part_index INTEGER NOT NULL,
@@ -533,10 +543,10 @@ pub fn migrations() -> Vec<Migration> {
                 created_at TEXT NOT NULL,
                 UNIQUE (session_id, part_index)
             );
-            CREATE INDEX idx_audio_parts_session
+            CREATE INDEX IF NOT EXISTS idx_audio_parts_session
                 ON session_audio_parts(session_id, part_index);
 
-            INSERT INTO session_audio_parts (
+            INSERT OR IGNORE INTO session_audio_parts (
                 id, session_id, part_index, file_path, format,
                 duration_seconds, sample_rate, created_at
             )
@@ -551,9 +561,6 @@ pub fn migrations() -> Vec<Migration> {
                 COALESCE(updated_at, created_at)
             FROM sessions
             WHERE wav_file_path IS NOT NULL;
-
-            ALTER TABLE sessions DROP COLUMN wav_file_path;
-            ALTER TABLE sessions DROP COLUMN wav_duration_seconds;
         "#,
             kind: MigrationKind::Up,
         },
@@ -657,13 +664,39 @@ mod tests {
         let m = migrations();
         let v15 = &m[14];
         assert_eq!(v15.version, 15);
-        assert!(v15.sql.contains("CREATE TABLE session_audio_parts"));
         assert!(v15
             .sql
-            .contains("ALTER TABLE sessions DROP COLUMN wav_file_path"));
+            .contains("CREATE TABLE IF NOT EXISTS session_audio_parts"));
         assert!(v15
             .sql
-            .contains("ALTER TABLE sessions DROP COLUMN wav_duration_seconds"));
+            .contains("INSERT OR IGNORE INTO session_audio_parts"));
+    }
+
+    #[test]
+    fn test_migration_v15_is_idempotent() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        for m in migrations() {
+            conn.execute_batch(m.sql)
+                .unwrap_or_else(|e| panic!("migration v{} failed: {}", m.version, e));
+        }
+        conn.execute(
+            "INSERT INTO sessions (id, title, source, status, wav_file_path, wav_duration_seconds) \
+             VALUES ('s1', 't', 'MicOnly', 'completed', '/tmp/s1.mp3', 12.5)",
+            [],
+        )
+        .unwrap();
+        let v15_sql = migrations()[14].sql;
+        // Re-applying the migration must not error or double-insert.
+        conn.execute_batch(v15_sql).unwrap();
+        conn.execute_batch(v15_sql).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_audio_parts WHERE session_id = 's1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "re-running v15 must not double-insert parts");
     }
 
     #[test]
