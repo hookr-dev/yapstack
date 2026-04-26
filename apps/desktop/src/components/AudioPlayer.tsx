@@ -185,7 +185,7 @@ export function AudioPlayer({
   };
 
   const seekToGlobal = useCallback(
-    (globalTime: number) => {
+    (globalTime: number, options?: { autoPlay?: boolean }) => {
       if (parts.length === 0) return;
       const clamped = Math.max(0, Math.min(globalTime, globalDuration));
       let newIndex = parts.length - 1;
@@ -196,23 +196,41 @@ export function AudioPlayer({
         }
       }
       const newPartTime = clamped - cumulativeBefore[newIndex];
+      const wantPlay = options?.autoPlay ?? false;
 
       const audio = audioRef.current;
       if (newIndex !== safePartIndex) {
-        wantPlayingAfterSwapRef.current = isPlaying;
+        // Cross-part seek: src swap is async. Stash the seek + play intent;
+        // the loadedmetadata handler applies them once the new part loads.
+        wantPlayingAfterSwapRef.current = wantPlay || isPlaying;
         pendingSeekRef.current = newPartTime;
         setPartIndex(newIndex);
       } else if (audio) {
         audio.currentTime = newPartTime;
         setPartTime(newPartTime);
         onTimeUpdate?.(clamped);
+        if (wantPlay && audio.paused) {
+          audio.play().catch(() => {
+            setIsPlaying(false);
+            onPlayStateChange?.(false);
+          });
+        }
       }
     },
-    [parts.length, cumulativeBefore, globalDuration, safePartIndex, isPlaying, onTimeUpdate],
+    [
+      parts.length,
+      cumulativeBefore,
+      globalDuration,
+      safePartIndex,
+      isPlaying,
+      onTimeUpdate,
+      onPlayStateChange,
+    ],
   );
 
   const handleSeekSlider = useCallback(
     (value: number[]) => {
+      // Slider drag preserves play state; never force-plays.
       seekToGlobal(value[0] ?? 0);
     },
     [seekToGlobal],
@@ -224,13 +242,17 @@ export function AudioPlayer({
     setSpeed(PLAYBACK_SPEEDS[nextIdx]);
   };
 
-  // Expose `seekTo(globalTime)` on the audio element so external callers
-  // (transcript timestamp clicks) can drive playback without knowing about
-  // the parts internals.
+  // Expose `seekTo(globalTime, options?)` on the audio element so external
+  // callers (transcript timestamp clicks) can drive playback without knowing
+  // about the parts internals. `autoPlay` defaults to false to match slider
+  // drag semantics; transcript clicks pass true.
   useEffect(() => {
     if (audioRef.current) {
-      (audioRef.current as HTMLAudioElement & { seekTo?: (t: number) => void }).seekTo =
-        seekToGlobal;
+      (
+        audioRef.current as HTMLAudioElement & {
+          seekTo?: (t: number, options?: { autoPlay?: boolean }) => void;
+        }
+      ).seekTo = seekToGlobal;
     }
   }, [seekToGlobal]);
 
