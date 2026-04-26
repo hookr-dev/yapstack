@@ -464,10 +464,6 @@ export type EngineKindDto = "Whisper" | "Parakeet"
 export type HealthStatus = { status: string; version: string }
 export type LiveTranscriptionConfig = { 
 /**
- * RMS energy threshold below which audio is considered silence. Default: 0.01.
- */
-silence_threshold: number; 
-/**
  * Milliseconds of continuous silence before triggering a chunk. Default: 800.
  */
 silence_duration_ms: number; 

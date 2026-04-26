@@ -253,7 +253,6 @@ export function useDictation() {
       // Start live transcription (pass dictation ID for WAV saving)
       const { language } = s.settings;
       const result = await commands.startLiveTranscription({
-        silence_threshold: 0.01,
         silence_duration_ms: 400,
         max_chunk_seconds: 10,
         backfill_seconds: 0,

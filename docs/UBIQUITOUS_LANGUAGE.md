@@ -71,7 +71,7 @@ The shared vocabulary for YapStack. Use these terms verbatim in code, docs, PRDs
 
 | Term                       | Definition                                                                                                              | Aliases to avoid          |
 | -------------------------- | ----------------------------------------------------------------------------------------------------------------------- | ------------------------- |
-| **Dictation**              | A short, sessionless voice-to-text capture optimized for dropping text into the active app or clipboard.                | Quick note, voice command |
+| **Dictation**              | A short voice-to-text capture optimized for dropping text into the active app or clipboard. Runs through the same live-transcription pipeline as a session, under a synthetic dictation id (not a real `sessions.id`), and finalizes one **Session audio part** at `{dictation_id}.0.{wav\|mp3}`. The audio is kept on the `dictation_history` row regardless of **Output action**; only cancel deletes it.                | Quick note, voice command |
 | **Dictation slot**         | A named, reusable dictation preset. Carries id, name, enabled flag, AI-enabled flag, prompt, output action, and default binding. The slots array is unlimited; one slot ("Raw Dictation") ships by default. | Preset, profile           |
 | **Dictation activation mode** | How a slot's hotkey behaves: `hold` (push-to-talk, recording while held) or `toggle` (press to start/stop).          | Trigger mode              |
 | **Output action**          | What to do with a finished dictation: `paste` into the focused field, `clipboard`, or `new-note` (create a session).    | Insertion mode, sink      |
@@ -141,7 +141,7 @@ The shared vocabulary for YapStack. Use these terms verbatim in code, docs, PRDs
 - An **Engine** runs inside the **Sidecar**; the **Transcription client** is its in-process handle. The engine's readiness is tracked as the **Engine phase**.
 - **Diarization** assigns a **Speaker ID** to a **Segment**; the user maps it to a **Speaker label** per-session (Zustand-persisted, not in SQL).
 - A **Chat** is scoped by a **Context key** (a session id, a folder id, `pinned`, `dictation`, or `global`) and uses one **AI provider** + **API key** + selected model from the **Model catalog**. Session-scoped chats may emit **Citations** that resolve to that session's **Segments**.
-- **Dictation** produces transcribed text without creating a **Session** unless the active **Dictation slot**'s **Output action** is `new-note`. Either way it is logged in **Dictation history** (with an optional session FK).
+- **Dictation** produces transcribed text without creating a **Session** unless the active **Dictation slot**'s **Output action** is `new-note`. Either way it is logged in **Dictation history** (with the finalized **Session audio part**'s path on `wav_file_path`; the `session_id` FK is set only on `new-note`).
 - A **Dictation slot** owns one **Binding** (a **Global hotkey**) and one **Dictation activation mode**.
 - **Capture source** = `Mixed` is the only mode that consults **Mix config** (mic gain, system gain, normalize).
 
@@ -167,9 +167,9 @@ The shared vocabulary for YapStack. Use these terms verbatim in code, docs, PRDs
 
 > **Domain expert:** "The **Audio export format** setting. We always stream a **Session WAV** to disk during recording — that's the working buffer. At finalization, if the format is `wav`, we keep it. If it's `mp3`, we encode at the configured **MP3 bitrate** to produce a **Session MP3** and delete the WAV. The session ends up with exactly one **Session audio** artifact."
 
-> **Dev:** "And **Dictation** — does that produce a session audio artifact too?"
+> **Dev:** "And **Dictation** — does it write to `session_audio_parts`?"
 
-> **Domain expert:** "Only if the slot's **Output action** is `new-note`. Otherwise the audio just feeds transcription, the text goes to **Output action** `paste` or `clipboard`, and the transcript lands in **Dictation history** — no session, no audio kept."
+> **Domain expert:** "Same path as a session, but under a synthetic dictation id rather than a real `sessions.id`. Capture finalizes one **Session audio part** at `{dictation_id}.0.{wav|mp3}` regardless of **Output action**, and that file path lands on the `dictation_history` row (`wav_file_path`, `wav_duration_seconds`) so the user can replay it. The difference between actions is what happens to the *text* — `paste` and `clipboard` route it out of the app, `new-note` also creates a real **Session** and links it via `dictation_history.session_id`. The audio is only deleted on cancel."
 
 > **Dev:** "If I drag a **Session** into a **Folder**, does it leave its current folder?"
 
