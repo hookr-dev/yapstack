@@ -523,6 +523,17 @@ pub fn run() {
             }
             app.manage(Arc::new(db_path.clone()) as DbPath);
 
+            // Retry any deletions that previously failed transiently. Re-checks
+            // trust against the now-seeded TrustedAudioDirs so a tampered DB row
+            // can't trigger a delete outside known audio dirs.
+            let trusted_for_sweep: Vec<PathBuf> =
+                db::list_audio_part_directories(&db_path, &app_audio_dir);
+            db::sweep_pending_deletions(&db_path, |abs| {
+                trusted_for_sweep
+                    .iter()
+                    .any(|dir| is_allowed_audio_path(dir, abs))
+            });
+
             let model_manager = ModelManager::new(app_data_dir);
             app.manage(
                 Arc::new(Mutex::new(model_manager)) as commands::transcription::ModelManagerState
