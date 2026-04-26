@@ -536,11 +536,11 @@ function createAppStore() {
                 segment_count: activeSessionSegments.length,
               });
               // `completeSession` derives `duration_seconds` from
-              // `session_audio_parts` (SUM). The session-part-ready event has
-              // already inserted the part by the time we get here (backend
-              // emits part-ready *before* LivePhase::Stopped). The wall-clock
-              // value is only a fallback for the rare case where WAV finalize
-              // failed and no part landed.
+              // `session_audio_parts` (SUM). Both the part insert (queued by
+              // `onSessionPartReady`) and this completion run on
+              // `segmentQueueTail`, so the part row is in the DB before we
+              // SUM. The wall-clock value is a fallback for the rare case
+              // where WAV finalize failed and no part landed.
               await completeSession(capturedSessionId, durationSeconds).catch((e) => {
                 console.error("Failed to complete session:", e);
               });
@@ -703,20 +703,23 @@ function createAppStore() {
       },
 
       onSessionPartReady: (event) => {
-        const part: DbAudioPart = {
-          id: crypto.randomUUID(),
-          session_id: event.session_id,
-          part_index: event.part_index,
-          file_path: event.file_path,
-          format: event.format,
-          duration_seconds: event.duration_seconds,
-          sample_rate: event.sample_rate,
-          created_at: new Date().toISOString(),
-        };
-        insertAudioPart(part)
-          .then(async () => {
-            // Refresh in-store parts views for the affected session so the
-            // AudioPlayer picks up the new part on the next render.
+        // Enqueue on segmentQueueTail so this insert is strictly ordered
+        // before `setLivePhase("Stopped")`'s completion handler. Without this
+        // ordering, completeSession could read an empty SUM(parts) and
+        // record duration=0 for a session whose audio file was just finalized.
+        enqueueSegmentWork(async () => {
+          const part: DbAudioPart = {
+            id: crypto.randomUUID(),
+            session_id: event.session_id,
+            part_index: event.part_index,
+            file_path: event.file_path,
+            format: event.format,
+            duration_seconds: event.duration_seconds,
+            sample_rate: event.sample_rate,
+            created_at: new Date().toISOString(),
+          };
+          try {
+            await insertAudioPart(part);
             const refreshed = await listSessionAudioParts(event.session_id);
             const { activeSessionId, selectedSessionId } = get();
             const patch: {
@@ -732,10 +735,10 @@ function createAppStore() {
             if (Object.keys(patch).length > 0) {
               set(patch);
             }
-          })
-          .catch((e) => {
+          } catch (e) {
             console.error("Failed to insert audio part:", e);
-          });
+          }
+        });
       },
 
       recoverActiveSession: async (sessionId: string, effectiveStartEpochMs?: number) => {
@@ -1111,8 +1114,26 @@ function createAppStore() {
         if (id === activeSessionId) return;
 
         try {
-          // Delete WAV file if it exists
-          commands.deleteSessionWav(id, get().settings.audioSaveLocation).catch(() => {});
+          // Delete audio files via the parts table — covers parts saved to
+          // different `audioSaveLocation` directories across the session's
+          // lifetime, which the legacy `delete_session_wav` glob would miss.
+          // Fall back to the legacy single-file cleanup for sessions whose
+          // parts row is missing (older imports, etc.).
+          try {
+            const parts = await listSessionAudioParts(id);
+            if (parts.length > 0) {
+              const paths = parts.map((p) => p.file_path);
+              commands.deleteAudioFiles(paths).catch(() => {});
+            } else {
+              commands
+                .deleteSessionWav(id, get().settings.audioSaveLocation)
+                .catch(() => {});
+            }
+          } catch {
+            commands
+              .deleteSessionWav(id, get().settings.audioSaveLocation)
+              .catch(() => {});
+          }
 
           await dbDeleteSession(id);
           await clearDictationSessionLink(id);
@@ -1641,10 +1662,21 @@ function createAppStore() {
           return;
         }
         try {
-          // Clean up WAV files for all sessions (fire-and-forget)
+          // Clean up audio files for all sessions (fire-and-forget). Prefer
+          // the parts table (covers historical custom save locations); fall
+          // back to the legacy single-file glob when there are no parts.
           const audioSaveLocation = get().settings.audioSaveLocation;
           for (const session of get().sessions) {
-            commands.deleteSessionWav(session.id, audioSaveLocation).catch(() => {});
+            try {
+              const parts = await listSessionAudioParts(session.id);
+              if (parts.length > 0) {
+                commands.deleteAudioFiles(parts.map((p) => p.file_path)).catch(() => {});
+              } else {
+                commands.deleteSessionWav(session.id, audioSaveLocation).catch(() => {});
+              }
+            } catch {
+              commands.deleteSessionWav(session.id, audioSaveLocation).catch(() => {});
+            }
           }
           await deleteAllSessions();
           trackSessionsCleared();

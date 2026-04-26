@@ -11,6 +11,7 @@ import { useUpdateCheck } from "@/hooks/useUpdateCheck";
 import { DictationBubble } from "@/components/DictationBubble";
 import { RecordingIndicator } from "@/components/RecordingIndicator";
 import { WINDOWS } from "@/lib/events";
+import { commands } from "@/lib/types";
 
 const WINDOW_POS_KEY = "yapstack-window-position";
 
@@ -41,10 +42,17 @@ const windowType = params.get("window");
 
 function MainApp() {
   const theme = useAppStore((s) => s.settings.theme);
+  const audioSaveLocation = useAppStore((s) => s.settings.audioSaveLocation);
   useGlobalShortcuts();
   useDictation();
   useRecordingIndicator();
   useUpdateCheck();
+
+  // Mirror `audioSaveLocation` to the backend so the `audio-stream://`
+  // protocol handler will serve parts saved outside the default audio dir.
+  useEffect(() => {
+    commands.setAudioBaseOverride(audioSaveLocation).catch(() => {});
+  }, [audioSaveLocation]);
 
   // Apply theme on mount and when setting changes
   useEffect(() => {

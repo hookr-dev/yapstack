@@ -51,6 +51,22 @@ export function AudioPlayer({
   const safePartIndex = Math.min(partIndex, Math.max(parts.length - 1, 0));
   const activePart = parts[safePartIndex];
 
+  // When the parts identity changes (different session opened, parts
+  // reloaded after delete) reset to part 0 / time 0. We use the first part's
+  // src as the identity so appending a new part during a resume — same
+  // session, same first part — does NOT reset playback position.
+  const partsIdentityRef = useRef<string | null>(parts[0]?.src ?? null);
+  useEffect(() => {
+    const next = parts[0]?.src ?? null;
+    if (next !== partsIdentityRef.current) {
+      partsIdentityRef.current = next;
+      setPartIndex(0);
+      setPartTime(0);
+      pendingSeekRef.current = null;
+      wantPlayingAfterSwapRef.current = false;
+    }
+  }, [parts]);
+
   const cumulativeBefore = useMemo(() => {
     const out: number[] = [0];
     for (let i = 0; i < parts.length; i++) {
