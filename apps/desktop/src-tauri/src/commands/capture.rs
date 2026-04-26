@@ -5,7 +5,7 @@ use tauri::Manager;
 use tracing::{error, info, warn};
 
 use super::error::{validate_session_id, CommandError};
-use crate::{is_allowed_audio_path, AudioBaseOverrideState};
+use crate::{is_audio_path_allowed, AudioBaseOverrideState};
 
 use super::audio::{
     AudioManagerState, CaptureResultDto, CaptureSourceDto, MixConfigDto, SessionStatusDto,
@@ -245,29 +245,15 @@ pub async fn set_audio_base_override(
 #[specta::specta]
 pub async fn delete_audio_files(
     app_handle: tauri::AppHandle,
-    override_state: tauri::State<'_, AudioBaseOverrideState>,
     paths: Vec<String>,
 ) -> Result<(), CommandError> {
-    let app_data_dir = app_handle
-        .path()
-        .app_data_dir()
-        .map_err(|e: tauri::Error| CommandError::Internal {
-            message: e.to_string(),
-        })?;
-    let default_base = app_data_dir.join("audio");
-    let override_base = override_state.lock().ok().and_then(|g| g.clone());
-
     for raw in paths {
         let abs = PathBuf::from(&raw);
         if !abs.is_absolute() {
             warn!(path = %raw, "skipping non-absolute audio file delete");
             continue;
         }
-        let allowed_default = is_allowed_audio_path(&default_base, &abs);
-        let allowed_override = override_base
-            .as_ref()
-            .is_some_and(|b| is_allowed_audio_path(b, &abs));
-        if !(allowed_default || allowed_override) {
+        if !is_audio_path_allowed(&app_handle, &abs) {
             warn!(path = %raw, "skipping audio file delete outside allowed bases");
             continue;
         }

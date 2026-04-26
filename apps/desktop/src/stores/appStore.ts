@@ -43,6 +43,7 @@ import {
   listFolders,
   insertAudioPart,
   listSessionAudioParts,
+  listAllAudioPartPaths,
   addSessionToFolder as dbAddSessionToFolder,
   removeSessionFromFolder as dbRemoveSessionFromFolder,
   removeSessionFromAllFolders as dbRemoveSessionFromAllFolders,
@@ -389,6 +390,29 @@ let segmentQueueTail: Promise<void> = Promise.resolve();
 let lastSessionsRefreshTime = 0;
 function enqueueSegmentWork(fn: () => Promise<void>): void {
   segmentQueueTail = segmentQueueTail.then(fn, fn);
+}
+
+/**
+ * Cleans up audio files for a single session. Prefers the parts table
+ * (covers parts saved across multiple `audioSaveLocation` directories during
+ * the session's lifetime); falls back to the legacy session-glob deletion
+ * when there are no parts rows or the parts query fails. Fire-and-forget.
+ */
+async function deleteSessionAudio(
+  sessionId: string,
+  audioSaveLocation: string | null,
+): Promise<void> {
+  let parts: { file_path: string }[] = [];
+  try {
+    parts = await listSessionAudioParts(sessionId);
+  } catch {
+    parts = [];
+  }
+  if (parts.length > 0) {
+    commands.deleteAudioFiles(parts.map((p) => p.file_path)).catch(() => {});
+  } else {
+    commands.deleteSessionWav(sessionId, audioSaveLocation).catch(() => {});
+  }
 }
 
 const defaultSettings: Settings = {
@@ -1114,26 +1138,7 @@ function createAppStore() {
         if (id === activeSessionId) return;
 
         try {
-          // Delete audio files via the parts table — covers parts saved to
-          // different `audioSaveLocation` directories across the session's
-          // lifetime, which the legacy `delete_session_wav` glob would miss.
-          // Fall back to the legacy single-file cleanup for sessions whose
-          // parts row is missing (older imports, etc.).
-          try {
-            const parts = await listSessionAudioParts(id);
-            if (parts.length > 0) {
-              const paths = parts.map((p) => p.file_path);
-              commands.deleteAudioFiles(paths).catch(() => {});
-            } else {
-              commands
-                .deleteSessionWav(id, get().settings.audioSaveLocation)
-                .catch(() => {});
-            }
-          } catch {
-            commands
-              .deleteSessionWav(id, get().settings.audioSaveLocation)
-              .catch(() => {});
-          }
+          deleteSessionAudio(id, get().settings.audioSaveLocation);
 
           await dbDeleteSession(id);
           await clearDictationSessionLink(id);
@@ -1662,21 +1667,22 @@ function createAppStore() {
           return;
         }
         try {
-          // Clean up audio files for all sessions (fire-and-forget). Prefer
-          // the parts table (covers historical custom save locations); fall
-          // back to the legacy single-file glob when there are no parts.
+          // One DB read of all parts paths beats N round-trips through
+          // `listSessionAudioParts(session.id)`. Hand the full list to the
+          // backend in a single IPC; it validates per-path and skips
+          // unknown locations. Sessions with zero parts (manual notes,
+          // legacy single-file dictations) still need the glob cleanup.
           const audioSaveLocation = get().settings.audioSaveLocation;
-          for (const session of get().sessions) {
-            try {
-              const parts = await listSessionAudioParts(session.id);
-              if (parts.length > 0) {
-                commands.deleteAudioFiles(parts.map((p) => p.file_path)).catch(() => {});
-              } else {
-                commands.deleteSessionWav(session.id, audioSaveLocation).catch(() => {});
-              }
-            } catch {
-              commands.deleteSessionWav(session.id, audioSaveLocation).catch(() => {});
+          try {
+            const allPaths = await listAllAudioPartPaths();
+            if (allPaths.length > 0) {
+              commands.deleteAudioFiles(allPaths).catch(() => {});
             }
+          } catch {
+            // ignore — fall through to per-session legacy cleanup below
+          }
+          for (const session of get().sessions) {
+            commands.deleteSessionWav(session.id, audioSaveLocation).catch(() => {});
           }
           await deleteAllSessions();
           trackSessionsCleared();

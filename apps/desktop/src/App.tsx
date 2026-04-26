@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { PhysicalPosition, PhysicalSize } from "@tauri-apps/api/dpi";
 import { AppLayout } from "@/components/AppLayout";
@@ -50,8 +50,15 @@ function MainApp() {
 
   // Mirror `audioSaveLocation` to the backend so the `audio-stream://`
   // protocol handler will serve parts saved outside the default audio dir.
+  // Persist hydration can fire this with the same value on reload — skip
+  // the IPC unless the value actually changed.
+  const lastSentAudioBase = useRef<string | null | undefined>(undefined);
   useEffect(() => {
-    commands.setAudioBaseOverride(audioSaveLocation).catch(() => {});
+    if (lastSentAudioBase.current === audioSaveLocation) return;
+    lastSentAudioBase.current = audioSaveLocation;
+    commands.setAudioBaseOverride(audioSaveLocation).catch((e) => {
+      console.error("Failed to update audio base override:", e);
+    });
   }, [audioSaveLocation]);
 
   // Apply theme on mount and when setting changes

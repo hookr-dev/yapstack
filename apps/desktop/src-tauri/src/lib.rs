@@ -196,6 +196,29 @@ pub(crate) fn is_allowed_audio_path(audio_base_dir: &Path, abs_path: &Path) -> b
     resolved.starts_with(canonical_base)
 }
 
+/// True if `abs_path` resolves under `$APP_DATA_DIR/audio` or under the
+/// override directory the frontend has registered via
+/// `set_audio_base_override`. Single source of truth for the
+/// "where can audio files live" policy used by both the
+/// `audio-stream://` protocol handler and `delete_audio_files`.
+pub(crate) fn is_audio_path_allowed(app: &AppHandle, abs_path: &Path) -> bool {
+    let Ok(app_data_dir) = app.path().app_data_dir() else {
+        return false;
+    };
+    if is_allowed_audio_path(&app_data_dir.join("audio"), abs_path) {
+        return true;
+    }
+    let Some(state) = app.try_state::<AudioBaseOverrideState>() else {
+        return false;
+    };
+    let Ok(guard) = state.lock() else {
+        return false;
+    };
+    guard
+        .as_ref()
+        .is_some_and(|extra| is_allowed_audio_path(extra, abs_path))
+}
+
 fn read_file_range(path: &Path, start: u64, end: u64) -> std::io::Result<Vec<u8>> {
     let length = end
         .checked_sub(start)
@@ -323,30 +346,7 @@ pub fn run() {
             // Otherwise, resolve relative to the default audio directory.
             let file_path = if std::path::Path::new(decoded_path.as_ref()).is_absolute() {
                 let abs_path = std::path::PathBuf::from(decoded_path.as_ref());
-                // Defense-in-depth: verify absolute paths resolve within app data dir
-                let app_data_dir = match ctx.app_handle().path().app_data_dir() {
-                    Ok(d) => d,
-                    Err(_) => {
-                        return tauri::http::Response::builder()
-                            .status(500)
-                            .body(Vec::new())
-                            .unwrap()
-                    }
-                };
-                let base = app_data_dir.join("audio");
-                let mut allowed = is_allowed_audio_path(&base, &abs_path);
-                if !allowed {
-                    if let Some(override_state) =
-                        ctx.app_handle().try_state::<AudioBaseOverrideState>()
-                    {
-                        if let Ok(guard) = override_state.lock() {
-                            if let Some(extra) = guard.as_ref() {
-                                allowed = is_allowed_audio_path(extra, &abs_path);
-                            }
-                        }
-                    }
-                }
-                if !allowed {
+                if !is_audio_path_allowed(ctx.app_handle(), &abs_path) {
                     return tauri::http::Response::builder()
                         .status(403)
                         .body(Vec::new())
