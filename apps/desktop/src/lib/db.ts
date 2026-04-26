@@ -328,6 +328,56 @@ async function ensureRuntimeSchema(db: Database): Promise<void> {
   for (const sql of triggers) {
     await db.execute(sql).catch(() => {});
   }
+
+  // v15 — session_audio_parts. Created here in addition to the migration so
+  // dev DBs whose `_sqlx_migrations` history is misaligned (and where
+  // tauri-plugin-sql is therefore skipping new migrations) still get the
+  // table. Idempotent: the second run is a no-op.
+  await db
+    .execute(
+      `CREATE TABLE IF NOT EXISTS session_audio_parts (
+         id TEXT PRIMARY KEY,
+         session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+         part_index INTEGER NOT NULL,
+         file_path TEXT NOT NULL,
+         format TEXT NOT NULL CHECK (format IN ('wav','mp3')),
+         duration_seconds REAL NOT NULL,
+         sample_rate INTEGER NOT NULL,
+         created_at TEXT NOT NULL,
+         UNIQUE (session_id, part_index)
+       )`,
+    )
+    .catch(() => {});
+  await db
+    .execute(
+      `CREATE INDEX IF NOT EXISTS idx_audio_parts_session
+         ON session_audio_parts(session_id, part_index)`,
+    )
+    .catch(() => {});
+  // Backfill: every existing session with a wav_file_path becomes
+  // part_index=0. INSERT OR IGNORE makes this safe to re-run; the
+  // (session_id, part_index) UNIQUE constraint short-circuits duplicates.
+  // Wrapped in catch() because pre-v5 DBs don't have wav_file_path yet —
+  // they have no audio to backfill anyway.
+  await db
+    .execute(
+      `INSERT OR IGNORE INTO session_audio_parts (
+         id, session_id, part_index, file_path, format,
+         duration_seconds, sample_rate, created_at
+       )
+       SELECT
+         lower(hex(randomblob(16))),
+         id,
+         0,
+         wav_file_path,
+         CASE WHEN wav_file_path LIKE '%.mp3' THEN 'mp3' ELSE 'wav' END,
+         COALESCE(wav_duration_seconds, 0),
+         48000,
+         COALESCE(updated_at, created_at)
+       FROM sessions
+       WHERE wav_file_path IS NOT NULL`,
+    )
+    .catch(() => {});
 }
 
 // --- Session CRUD ---
