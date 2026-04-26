@@ -96,26 +96,36 @@ Registry: [`apps/desktop/src/lib/ai-tools.ts`](../apps/desktop/src/lib/ai-tools.
 ### `ToolDefinition` shape
 
 ```ts
+type ToolKind = "read" | "mutate";
+
+type ToolEffect = "session-meta" | "notes" | "organization" | "transcript";
+
 interface ToolDefinition {
+  kind: ToolKind;                                                    // gates Undo + "Session updated" toast
   schema: ChatCompletionTool;                                        // OpenAI function-call schema
   execute: (args, ctx: ToolContext) => Promise<ExecutedTool | null>; // returns null to skip (no-op)
-  undo:    (undoData, ctx: { sessionId: string }) => Promise<void>;
-  affects?: ToolEffect[];                                            // "session-meta" | "notes"
+  undo:    (undoData, ctx: { sessionId: string }) => Promise<void>;  // no-op for "read" tools
+  affects?: ToolEffect[];                                            // drives content-refresh callbacks
 }
 
 interface ToolContext {
-  sessionId: string;
+  sessionId: string;            // empty string in folder/pinned/all multi-session chats
   currentTitle: string;
   currentNote: DbNote | null;
   isPinned: boolean;
   segments?: DbSegment[];
+  tags?: string[];
+  folderNames?: string[];
+  folderIds?: string[];
+  allowedSessionIds?: string[]; // when set, retrieval tools must restrict results to this set
 }
 
 interface ExecutedTool {
   name: string;
-  label: string;       // short badge label ("Title", "Notes", "Pinned")
-  detail: string;      // one-line description shown in the toast
-  undoData?: unknown;  // opaque blob passed back to undo()
+  label: string;            // short badge label ("Title", "Notes", "Pinned")
+  detail: string;           // one-line description shown in the toast
+  observation?: string;     // text the LLM sees as the tool result for multi-turn chains
+  undoData?: unknown;       // opaque blob passed back to undo() — required for kind: "mutate"
 }
 ```
 

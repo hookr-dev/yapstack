@@ -5,7 +5,7 @@ use tauri::Manager;
 use tracing::{error, info};
 
 use super::error::{validate_session_id, CommandError};
-use crate::audio_path_trusted;
+use crate::audio_dir_trusted;
 
 use super::audio::{
     AudioManagerState, CaptureResultDto, CaptureSourceDto, MixConfigDto, SessionStatusDto,
@@ -239,7 +239,14 @@ pub async fn delete_audio_files(
             failures.push(format!("{raw} (not absolute)"));
             continue;
         }
-        if !audio_path_trusted(&app_handle, &abs) {
+        // Authorize by parent directory rather than the file itself so a row
+        // that points at an already-deleted file still passes — the trust
+        // check shouldn't fail closed just because the target is missing.
+        let Some(parent) = abs.parent() else {
+            failures.push(format!("{raw} (no parent dir)"));
+            continue;
+        };
+        if !audio_dir_trusted(&app_handle, parent) {
             failures.push(format!("{raw} (outside trusted dirs)"));
             continue;
         }

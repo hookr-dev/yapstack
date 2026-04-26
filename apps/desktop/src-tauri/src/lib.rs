@@ -217,6 +217,24 @@ pub(crate) fn audio_path_trusted(app: &AppHandle, abs_path: &Path) -> bool {
     guard.iter().any(|dir| is_allowed_audio_path(dir, abs_path))
 }
 
+/// True if `dir` (canonicalized) is registered in `TrustedAudioDirs`. Useful
+/// when authorizing operations on a path whose target file may not exist —
+/// e.g. an idempotent delete where the row points at an already-removed file
+/// — because canonicalizing a missing file fails closed in
+/// `is_allowed_audio_path`.
+pub(crate) fn audio_dir_trusted(app: &AppHandle, dir: &Path) -> bool {
+    let Some(state) = app.try_state::<TrustedAudioDirs>() else {
+        return false;
+    };
+    let Ok(guard) = state.lock() else {
+        return false;
+    };
+    let Ok(canonical) = std::fs::canonicalize(dir) else {
+        return false;
+    };
+    guard.iter().any(|trusted| canonical.starts_with(trusted))
+}
+
 /// Adds `dir`'s canonical form to the trusted set. Called from the
 /// finalize path each time Rust writes a new part to a directory.
 pub(crate) fn register_trusted_audio_dir(app: &AppHandle, dir: &Path) {
