@@ -198,7 +198,7 @@ App (routes by ?window= param: main → MainApp, dictation → DictationBubble, 
 │               │   │   └── DictationHistoryList (when filter = dictation)
 │               │   │       └── DictationHistoryCard
 │               │   ├── NoteDetailView (session detail)
-│               │   │   ├── SessionHeaderV2 (title, badges, actions dropdown)
+│               │   │   ├── SessionHeader (title, badges, actions dropdown)
 │               │   │   ├── AudioPlayer (play/pause, seek, speed control)
 │               │   │   ├── ResizablePanelGroup (split pane)
 │               │   │   │   ├── ChatView (transcript bubbles)
@@ -227,7 +227,7 @@ App (routes by ?window= param: main → MainApp, dictation → DictationBubble, 
 |------|---------|
 | `useAutoSetup` | One-time engine initialization on mount |
 | `useCaptureEvents` | Listens to backend `capture-status` and `buffer-info` events |
-| `useLiveTranscriptionEvents` | Handles `live-transcription-segment`, `live-transcription-status`, `backfill-complete`, `session-wav-ready` events |
+| `useLiveTranscriptionEvents` | Handles `live-transcription-segment`, `live-transcription-status`, `backfill-complete`, `session-part-ready`, `session-wav-error`, `live-transcription-warning`, `stream-health` events |
 | `useCreateSession` | Derives `canCreate` from engine + capture state, provides `handleNew(useBackfill)` |
 | `useDownloadProgress` | Listens to `model-download-progress` events |
 | `useKeyboardShortcuts` | In-app keyboard shortcuts via capture-phase keydown (mounted in AppLayout). 11 actions. |
@@ -310,10 +310,19 @@ Whisper models are stored in the app's data directory under `models/`:
 
 `export::write_wav_to_temp()` creates temp files with prefix `yapstack_capture_` that persist after creation. The caller (transcription pipeline) is responsible for cleanup. These files accumulate in the system temp directory if not cleaned up.
 
-## WAV File Storage
+## Session Audio Storage
 
-Session WAV files are stored persistently at `$APP_DATA_DIR/audio/{session_id}.wav`. For live transcription sessions, the WAV is streamed incrementally during recording via `SessionWavWriter` (every 300ms the loop extracts new audio from the ring buffer and appends it to the file). This ensures no audio is lost for sessions longer than the ring buffer capacity (180s). When the session stops, the WAV header is finalized and a `"session-wav-ready"` event is emitted to the frontend.
+Session audio is persisted as one file per part in each session's tracked audio directory: `{session_id}.{part_index}.{wav|mp3}`. The default directory is `$APP_DATA_DIR/audio/`; users can override it per-session via the `audioSaveLocation` setting. `session_audio_parts` (migration v15) is the durable source of truth for which files belong to a session — its rows are inserted from Rust at finalize time *before* the `session-part-ready` event fires.
 
-For short sessions or re-export, `export_session_wav` can still extract audio from the ring buffer after the fact. `delete_session_wav` removes the WAV file from disk.
+For live transcription sessions, the file is streamed incrementally during recording via `SessionWavWriter` (every 300 ms the loop extracts new audio from the ring buffer and appends to the file). This ensures no audio is lost for sessions longer than the ring buffer capacity (180s). When the session stops:
 
-The `audio-stream://` custom URI scheme protocol (registered in `lib.rs`) serves these files to the frontend `<audio>` element with range request support for seeking.
+1. The streamed WAV is finalized in the user's `audioExportFormat` — kept as WAV, or re-encoded at `mp3Bitrate` and the source WAV is deleted (MP3 path).
+2. The `session_audio_parts` row is inserted from Rust.
+3. The parent dir is registered with `TrustedAudioDirs` so playback can serve from it.
+4. `session-part-ready` is emitted with `{ session_id, part_index, file_path, format, duration_seconds, sample_rate }`. Empty recordings emit `session-wav-error` instead and the empty file is deleted.
+
+Resuming a session opens a new `SessionWavWriter` at `part_index = N` (cumulative duration of prior parts becomes the segment offset base), so timestamps stay continuous across resumes. Files are not concatenated on disk; the FE concatenates parts at playback time via a parts-aware `seekTo`.
+
+For short sessions or re-export, `export_session_wav` can still extract audio from the ring buffer after the fact. `delete_session_wav` is the legacy single-file cleanup path; per-part cleanup is `delete_audio_files(paths)`, which validates each path against `TrustedAudioDirs` and surfaces failures (the FE can warn or queue retries).
+
+The `audio-stream://` custom URI scheme protocol (registered in `lib.rs`) serves these files to the frontend `<audio>` element with range request support for seeking. Allow-list is seeded at startup from `session_audio_parts.file_path` parents and `audio_save_locations`, then extended at finalize time.

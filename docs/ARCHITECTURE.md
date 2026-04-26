@@ -119,12 +119,24 @@ Frontend: trigger_instant_capture(seconds, source, mix_config)
 ### Session Capture
 ```
 Primary path (live transcription — used by the app for all recordings):
-    start_live_transcription(config with session_id)
-        → Creates SessionWavWriter at $APP_DATA_DIR/audio/{session_id}.wav
+    start_live_transcription(config with session_id, audio_save_location?, audio_export_format)
+        → Resolves the audio dir: audioSaveLocation if set, else $APP_DATA_DIR/audio/
+        → Computes part_index from existing session_audio_parts rows for this session
+          (0 for fresh sessions; N when resuming a session that already has parts)
+        → Creates SessionWavWriter at $AUDIO_DIR/{session_id}.{part_index}.wav
         → Every 300ms: extract_since() from ring buffer → append to WAV file
-        → On stop: final flush → finalize WAV header → emit "session-wav-ready"
-    No audio lost regardless of session length (ring buffer only holds last 300s,
-    but the WAV file captures everything incrementally).
+        → On stop:
+            1. Final flush, then finalize per audioExportFormat:
+               • format = "wav" → keep the WAV
+               • format = "mp3" → re-encode at mp3Bitrate (lame) and DELETE the source WAV
+            2. Insert session_audio_parts row from Rust (durable source of truth)
+            3. Register parent dir with TrustedAudioDirs so the audio-stream:// handler can serve it
+            4. Emit "session-part-ready" with { session_id, part_index, file_path, format,
+               duration_seconds, sample_rate }
+            5. Empty recordings (0 samples written) emit "session-wav-error" instead and the
+               file is deleted
+    No audio lost regardless of session length. Each Resume produces a new part; the FE
+    concatenates parts in part_index order for playback and seeking.
 
 Fallback path (short sessions or re-export):
     start_session() → records write_pos for mic + system buffers
@@ -173,7 +185,8 @@ Frontend: start_live_transcription(config)
     → Extracts the TranscriptionClient from shared state → private Arc<Mutex<Option<Arc<TranscriptionClient>>>>
       (zero contention — other commands get "not available" instead of blocking)
     → Creates TranscriptionContext (immutable: transcription_client, shared_transcription_state, app_handle, config, start time)
-    → If config.session_id set: creates SessionWavWriter at $APP_DATA_DIR/audio/{session_id}.wav
+    → If config.session_id set: creates SessionWavWriter at $AUDIO_DIR/{session_id}.{part_index}.wav
+      (audioSaveLocation if set, else $APP_DATA_DIR/audio/; part_index resumes from existing parts)
     → Spawns async task with two concurrent tracks:
 
     Track 1 — Backfill (if backfill_seconds > 0):
@@ -208,9 +221,12 @@ Frontend: start_live_transcription(config)
         6. On stop: force-chunk any speaking source, then exit loop
 
     → After loop exits (cleanup):
-        1. Final WAV flush + finalize (if session_id was set)
-        2. Emit "session-wav-ready" event with { session_id, file_path, duration_seconds }
-        3. Returns the TranscriptionClient to shared state (even after panic via AssertUnwindSafe)
+        1. Drain in-flight chunk tasks (10 s graceful, then abort)
+        2. Final WAV flush + finalize per audioExportFormat (WAV kept / MP3 re-encoded + WAV deleted)
+        3. Insert the session_audio_parts row from Rust, register the parent dir as trusted, then
+           emit "session-part-ready" with { session_id, part_index, file_path, format,
+           duration_seconds, sample_rate } (or "session-wav-error" on empty recordings)
+        4. Returns the TranscriptionClient to shared state (even after panic via AssertUnwindSafe)
     → Per-source VAD: SourceVadState tracks mic/system independently
     → Prompt context: per-source accumulated_text (up to 1000 chars) truncated to prompt_context_chars (default 350) for Whisper initial_prompt
     → Prompt decay: clears both shared_prompt and per-source accumulated_text after prompt_decay_silence_seconds (default 5s) of
@@ -252,12 +268,12 @@ Startup also runs `db::ensure_runtime_schema()` *before* tauri-plugin-sql wires 
 - **Persistence**: SQLite via `tauri-plugin-sql` (`lib/db.ts`) for sessions, segments, notes, note versions, folders, session_folders (many-to-many), chat messages, dictation history, tags, session_tags, FTS5 search tables, and `session_audio_parts`. DB file at app data dir. 15 SQL migration versions; `segments.speaker_id INTEGER` is added by the frontend's `getDb()` after migrations run.
 - **Type generation**: Specta-generated types in `src/lib/types.ts` (auto-generated, excluded from tsconfig). Tauri command wrappers in `src/lib/tauri.ts`.
 - **Serialization queue**: `onLiveSegment` uses a promise queue (`segmentQueueTail`) to prevent concurrent backfill + live events from racing on DB writes.
-- **Hooks**: `useAutoSetup` (engine init), `useCaptureEvents` (backend status push), `useLiveTranscriptionEvents` (segment/phase/backfill/session-wav-ready events), `useCreateSession` (session creation guard), `useDownloadProgress` (model download), `useKeyboardShortcuts` (in-app capture-phase keydown in AppLayout), `useGlobalShortcuts` (Tauri global-shortcut plugin in App.tsx), `useDictation` (hold-to-talk or toggle mode voice dictation lifecycle in App.tsx), `useRecordingIndicator` (show/hide floating overlay when recording + unfocused, in App.tsx), `useTrayEvents` (listen for tray menu actions, in AppLayout), `useChatMessages` (chat message lifecycle: send, stream, tool execution, undo, DB persistence).
+- **Hooks**: `useAutoSetup` (engine init), `useCaptureEvents` (backend status push), `useLiveTranscriptionEvents` (segment/phase/backfill/session-part-ready/session-wav-error events), `useCreateSession` (session creation guard), `useDownloadProgress` (model download), `useKeyboardShortcuts` (in-app capture-phase keydown in AppLayout), `useGlobalShortcuts` (Tauri global-shortcut plugin in App.tsx), `useDictation` (hold-to-talk or toggle mode voice dictation lifecycle in App.tsx; also registers Escape as a global hotkey while non-idle for cancel), `useDictationEntry` (per-row state for `DictationFeedEntry` and `DictationTrayItem` — copy/play/move-to-note/delete handlers), `useRecordingIndicator` (show/hide floating overlay when recording + unfocused, in App.tsx), `useTrayEvents` (listen for tray menu actions, in AppLayout), `useChatMessages` (chat message lifecycle: send, stream, tool execution, undo, DB persistence).
 - **Navigation**: Three views: `"note-list"` | `"note-detail"` | `"settings"`. `ListFilter` supports `{ type: "all" | "pinned" | "folder" | "dictation", folderId?: string }`.
 - **Views**: `AppLayout` → `AppSidebar` + main content (`NoteCardList` | `NoteDetailView` | `SettingsPanel`). `NoteDetailView` handles multiple layouts:
-  - **Active recording**: `SessionHeaderV2` + `ChatView` (transcript bubbles with backfill indicator) + `RecordingControls`
-  - **Completed transcription**: `SessionHeaderV2` + `AudioPlayer` + resizable split pane (`ChatView` left, `NoteEditor` + `NoteHistoryPanel` right)
-  - **Manual notes**: `SessionHeaderV2` + full-width `NoteEditor` + `NoteHistoryPanel`
+  - **Active recording**: `SessionHeader` + `ChatView` (transcript bubbles with backfill indicator) + `RecordingControls`
+  - **Completed transcription**: `SessionHeader` + `AudioPlayer` + resizable split pane (`ChatView` left, `NoteEditor` + `NoteHistoryPanel` right)
+  - **Manual notes**: `SessionHeader` + full-width `NoteEditor` + `NoteHistoryPanel`
 - **Settings UI**: Tabbed (`AudioTab`, `TranscriptionTab`, `GeneralTab`, `ShortcutsTab`, `DictationTab`). `TranscriptionTab` renders an **engine → model → language cascade**: engine radio (Whisper/Parakeet, peers), conditional model picker (`ModelSection` for Whisper sizes, new `ParakeetModelSection` for Parakeet variants), language dropdown derived from `engineCatalogue` (clamps to "auto" when current language isn't in the new engine's supported set), Switch-style **diarization toggle** (greyed out unless engine supports it; first enable lazily downloads Sortformer + re-inits the client). `GeneralTab` manages theme, audio save location, and session clearing. `DictationTab` manages dictation enable/disable, dynamic slot configuration (name, keybind, output action, AI prompt), and slot add/delete.
 - **Transcript view (`TranscriptSegments.tsx`)**: Wrapper around `EditableSegment` rendered by `ChatView`. Falls back to a flat segment list when no segment carries a `speaker_id` (Whisper sessions render unchanged). Otherwise groups consecutive same-speaker segments under a `Speaker N` header with a 4-color palette. Speaker headers are inline-editable; renames persist to per-session `speakerNames` Zustand map.
 - **AI prompts**: `ai-prompts.ts::getSystemPrompt(directive, ..., { hasSpeakers })` injects a `SPEAKER_INSTRUCTION` paragraph telling the model to attribute statements correctly when the active session has diarization data. `ai.ts::assembleTranscriptContext(segments, speakerNames?)` adds `(SpeakerName)` prefixes per segment.
@@ -331,7 +347,7 @@ User triggers action (quick action button) or freeform message
 | File | Responsibility |
 |------|---------------|
 | `lib/ai-actions.ts` | Self-contained action definitions — each carries phased `directive` string with tool chaining instructions |
-| `lib/ai-tools.ts` | Self-contained tool registry — schema + executor + undo + `affects` + `result` per tool. Six tools. |
+| `lib/ai-tools.ts` | Self-contained tool registry — schema + executor + undo + `affects` + `result` per tool. Ten tools. |
 | `lib/ai-prompts.ts` | Prompt assembly: `GENERAL_DIRECTIVE`, `getSystemPrompt(directive, ...)`, citation/notes guidance |
 | `lib/ai-context.ts` | Context provider types, factory functions for session/multi-session context assembly, `assembleFolderTreeForActions()` |
 | `lib/ai.ts` | OpenAI client, streaming (with and without tools), context assembly, `ToolExecution` types, markdown→HTML via `marked` |
@@ -367,10 +383,10 @@ Built-in actions (all use **two-phase tool chaining**):
 
 | Action | Phase 1 (classify) | Phase 2 (write) | Behavior |
 |--------|-------------------|-----------------|----------|
-| `summarize` | `add_to_folder` | `update_title` + `tag_session` + `save_to_notes` | Structured summary informed by folder context. `requiresTranscript: true`. |
-| `key-points` | `add_to_folder` | `tag_session` + `save_to_notes` (append) | 5-15 bullet points, appended to existing notes |
-| `action-items` | `add_to_folder` | `tag_session` + `save_to_notes` (append) | Numbered action items, appended |
-| `meeting-minutes` | `add_to_folder` | `update_title` + `tag_session` + `save_to_notes` | Professional minutes format. `requiresTranscript: true`. |
+| `summarize` | `search_folders` → `add_session_to_folder` | `update_title` + `tag_session` + `save_to_notes` | Structured summary informed by folder context. `requiresTranscript: true`. |
+| `key-points` | `search_folders` → `add_session_to_folder` | `tag_session` + `save_to_notes` (append) | 5-15 bullet points, appended to existing notes |
+| `action-items` | `search_folders` → `add_session_to_folder` | `tag_session` + `save_to_notes` (append) | Numbered action items, appended |
+| `meeting-minutes` | `search_folders` → `add_session_to_folder` | `update_title` + `tag_session` + `save_to_notes` | Professional minutes format. `requiresTranscript: true`. |
 
 Phase 1 directives explicitly say "Do NOT call other tools yet — wait for folder context results." This forces the multi-turn loop to execute, sending the folder description chain back before Phase 2.
 
@@ -410,16 +426,20 @@ interface ExecutedTool {
 }
 ```
 
-Built-in tools:
+Built-in tools (registered in `ai-tools.ts`):
 
 | Tool | Params | Effects | What it does |
 |------|--------|---------|-------------|
 | `update_title` | `{ title: string }` | `session-meta` | Sets session title (max 80 chars). Undo restores previous title. |
-| `save_to_notes` | `{ content: string, mode: "replace" \| "append" }` | `notes` | Converts markdown → HTML via `marked`, saves/appends to notes. Undo restores previous note content. |
+| `save_to_notes` | `{ content: string, mode: "replace" \| "append" \| "prepend" \| "find_replace", find?: string }` | `notes` | Converts markdown → HTML via `marked`. `replace` overwrites, `append` adds below with separator, `prepend` adds above with separator, `find_replace` does a surgical substring swap (requires `find`, plain-text replacement only — markdown won't render). Undo restores previous note content. |
 | `pin_session` | `{ pinned: boolean }` | `session-meta` | Pins/unpins session (only toggles if state differs). Undo restores previous pin state. |
 | `tag_session` | `{ add: string[], remove?: string[] }` | `organization` | Adds/removes tags. Creates new tags on-the-fly if they don't exist. Source tracked as `"ai"`. |
-| `add_to_folder` | `{ folder_name: string }` | `organization` | Classifies session into a folder by name (case-insensitive). Handles branch conflicts. Returns the folder's hierarchical description chain in `result`. |
-| `get_folder_context` | `{ folder_name?: string }` | (none) | Read-only. Returns the full folder tree with descriptions, or a specific folder's context chain. No undo needed. |
+| `search_folders` | `{ query?: string }` | (none) | Read-only. Returns folder tree (or matches against `query`) with descriptions and `folder_id`s for the LLM to choose from. Phase 1 of folder-aware actions. |
+| `add_session_to_folder` | `{ folder_id: string }` | `organization` | Classifies session into a folder by id (chosen from `search_folders` results). Handles branch conflicts. Returns the folder's hierarchical description chain in `result` so Phase 2 of two-phase actions sees the parent context. |
+| `search_sessions` | `{ query: string, limit?: number }` | (none) | Read-only. FTS5 search across session titles, segment text, and notes. |
+| `search_dictations` | `{ query: string, limit?: number }` | (none) | Read-only. FTS5 search across `dictation_history`. |
+| `get_session_context` | `{ session_id: string }` | (none) | Read-only. Returns full transcript + notes + folders + tags for a referenced session. Used when chat needs to compare or pull from another session. |
+| `replace_in_transcript` | `{ find: string, replacement: string, all?: boolean }` | `notes` (refresh segments) | Edits segment text in the durable DB rows — fixes typos / mis-transcriptions surgically. Undo restores the original text on every touched segment. |
 
 **Post-tool refresh** uses `getToolEffects(toolNames)` to determine what to refresh based on `affects` metadata:
 - `"session-meta"` → refresh sessions list + viewSession
@@ -471,7 +491,7 @@ The consumer (`useChatMessages`) wraps this in a **multi-turn loop** (up to `MAX
 3. Make a new streaming call with the extended conversation
 4. Repeat until the LLM produces text without tool calls, or max rounds hit
 
-This enables **phased tool chaining**: the LLM calls `add_to_folder` in turn 1, receives the folder context chain as a tool result, then uses that context to write an informed summary in turn 2.
+This enables **phased tool chaining**: the LLM calls `search_folders` in turn 1, picks a `folder_id`, calls `add_session_to_folder` in turn 2, receives the folder context chain as a tool result, then uses that context to write an informed summary in turn 3.
 
 **Tool execution state** is tracked via `ToolExecution[]` on `ChatMessage`:
 ```typescript
@@ -507,7 +527,7 @@ In saved notes (via `save_to_notes` tool), citations are converted to `<span dat
 
 When tools execute, badge lines are prepended to the assistant message content for DB persistence:
 ```
-[tool:add_to_folder] Added to "ConsignR"
+[tool:add_session_to_folder] Added to "ConsignR"
 [tool:update_title] Q1 Budget Planning
 [tool:tag_session] Added: meeting, planning
 [tool:save_to_notes] Notes saved
@@ -520,7 +540,7 @@ These persist in `chat_messages` DB. On load, `AIChatMessage.parseToolBadges()` 
 
 `AIContextProvider` wraps `FloatingChatBar` and provides `AIContextValue` via React context. Factory functions in `ai-context.ts` create sources, tools, actions, and system prompt builders for different contexts:
 
-- **Session context** (`createSessionSources`, `createSessionTools`, `createSessionSystemPromptBuilder`) — Single session with toggleable transcript and notes sources. All six tools available. Actions filtered by `getActionsForSession(sessionType)`.
+- **Session context** (`createSessionSources`, `createSessionTools`, `createSessionSystemPromptBuilder`) — Single session with toggleable transcript and notes sources. All ten tools available. Actions filtered by `getActionsForSession(sessionType)`.
 - **Multi-session context** (`createMultiSessionSources`, `createMultiSessionTools`, `createMultiSessionSystemPromptBuilder`) — Folder-level AI chat aggregating sessions. No tools available (read-only analysis). Folder context hierarchy passed as `FolderContextLayer[]`.
 - **Dictation context** (`createDictationSources`, `createDictationSystemPromptBuilder`) — Dictation history AI chat. Read-only analysis of dictation entries. No tools available.
 - **List context** — `resolveListContext(filter, sessions, folders)` returns a `ListChatContext` (contextKey, sources, tools, systemPromptBuilder, placeholder) for any `ListFilter` type. `ListContextBar` renders the `AIContextProvider` + `FloatingChatBar` for non-session views.
@@ -788,20 +808,23 @@ JSON-line protocol over stdin/stdout. Each message is a single JSON object follo
 
 ## Audio Playback
 
-WAV files are stored in `$APP_DATA_DIR/audio/{session_id}.wav` after recording. Playback uses a custom URI scheme protocol:
+Session audio is stored under each session's tracked audio directory as one file per part: `{session_id}.{part_index}.wav` (or `.mp3` if the session was finalized in MP3 format). The default audio dir is `$APP_DATA_DIR/audio/`; users can override it via the `audioSaveLocation` setting, in which case each session's parts live there. Playback uses a custom URI scheme protocol:
 
 ```
-audio-stream://localhost/{filename}.wav
+audio-stream://localhost/{filename}
 ```
 
 ### Why a custom protocol?
-The `convertFileSrc()` asset protocol URL (`asset://localhost/...`) works for `<audio>` elements in production builds but fails cross-origin in dev mode (`localhost:5173` vs `asset.localhost`). The custom `audio-stream` protocol is registered in `lib.rs` and serves WAV files directly from the audio directory.
+The `convertFileSrc()` asset protocol URL (`asset://localhost/...`) works for `<audio>` elements in production builds but fails cross-origin in dev mode (`localhost:5173` vs `asset.localhost`). The custom `audio-stream` protocol is registered in `lib.rs` and serves audio files from any directory listed in `TrustedAudioDirs`. The trust list is seeded on startup from `session_audio_parts.file_path` parents and the `audio_save_locations` table, then extended at recording finalize time.
 
 ### Range request support
-The protocol supports HTTP `Range` headers for audio seeking. Returns `206 Partial Content` for range requests with `Content-Range` header, or `200` with full file for non-range requests. Security: only `.wav` files served, no path traversal allowed.
+The protocol supports HTTP `Range` headers for audio seeking. Returns `206 Partial Content` for range requests with `Content-Range` header, or `200` with full file for non-range requests. Content type is set per extension (`audio/wav` for `.wav`, `audio/mpeg` for `.mp3`). Security: only files inside a trusted dir are served, and path traversal is rejected.
+
+### Multi-part playback and seeking
+`session_audio_parts` is the durable source of truth for which files belong to a session. The frontend reads parts in `part_index` order, and playback / timestamp seeking treats them as a single continuous timeline by routing through a parts-aware `seekTo` (segments carry their per-session offset, not per-file). On a session resume, the new part's `audio_offset_seconds` base is set to the cumulative duration of prior parts.
 
 ### Playback sync
-`AudioPlayer` provides time updates via `requestAnimationFrame`. `ChatView` highlights the active segment by matching `currentPlaybackTime` against `audio_offset_seconds`. Clicking a segment timestamp seeks the audio via `handleSeek`.
+`AudioPlayer` provides time updates via `requestAnimationFrame`. `ChatView` highlights the active segment by matching `currentPlaybackTime` against `audio_offset_seconds`. Clicking a segment timestamp seeks the audio via the parts-aware `handleSeek`.
 
 ## Key Design Decisions
 
@@ -811,4 +834,6 @@ The protocol supports HTTP `Range` headers for audio seeking. Returns `206 Parti
 4. **Feature flags for optional native deps** — `whisper` and `metal` on yapstack-sidecar keep the default build lightweight. System audio is always compiled in via cpal loopback (no feature flag).
 5. **16-bit PCM WAV export** — WAV files are written at the device's native sample rate (e.g. 48kHz). The sidecar resamples to 16kHz mono before Whisper inference. 16-bit quantization is sufficient (-96 dB noise floor).
 6. **Session tracking via write_pos** — Sessions record the ring buffer's monotonic write position at start, then `snapshot_since()` at end. No separate buffer needed. For long sessions (> buffer capacity), `SessionWavWriter` streams audio incrementally to disk every 300ms during the live transcription loop.
-7. **Custom URI scheme for audio** — `audio-stream://` protocol serves WAV files with range request support, avoiding cross-origin issues with the default asset protocol during development.
+7. **Custom URI scheme for audio** — `audio-stream://` protocol serves session audio (WAV or MP3) from any allow-listed directory with range request support, avoiding cross-origin issues with the default asset protocol during development.
+8. **`session_audio_parts` is the durable source of truth for session audio** — Each session has zero or more part rows (`part_index = 0, 1, 2…`); the row is inserted from Rust at finalize time *before* `session-part-ready` is emitted, so a missed FE event can't lose the file. Resuming a session appends a new part rather than overwriting; the FE concatenates parts at playback time. `audio_save_locations` tracks every directory the app has ever written into so reconciliation on next startup can recover orphans even if the row insert was missed.
+9. **`useDictation` registers Escape as a global hotkey only while non-idle** — Escape cancels an in-flight Dictation, suppresses the Output action, deletes the streamed audio, and skips the `dictation_history` write. The hotkey is unregistered when idle so it doesn't override the focused app's normal Escape handling.
