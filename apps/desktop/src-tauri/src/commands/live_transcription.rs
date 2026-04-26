@@ -262,14 +262,26 @@ struct ChunkInput<'a> {
     is_backfill: bool,
 }
 
-/// Session-level mutable accumulators passed through transcription functions.
+/// Cross-loop chunk counters surfaced to `LiveTranscriptionController` for
+/// status reporting. Shared between the live loop and `process_backfill` so
+/// `chunks_processed` / `total_audio_seconds` reflect both sources of work.
 ///
-/// Shared across concurrent per-source chunk tasks via `Arc<StdMutex<_>>`.
 /// All mutation sites lock briefly; the mutex is never held across an await.
-struct SessionAccumulators {
-    shared_prompt: String,
+struct SessionCounters {
     total_chunks: u32,
     total_audio_seconds: f32,
+}
+
+/// Per-loop prompt accumulator. The live loop and `process_backfill` each own
+/// their own instance — they must not share, because backfill bridges its
+/// final accumulated prompt out to `bridged_prompt`, and a concurrent live
+/// chunk writing into the same buffer would either get clobbered by the
+/// bridge or cause the bridge to ship live text back into `bridged_prompt`.
+///
+/// Shared among concurrent per-source live chunk tasks via `Arc<StdMutex<_>>`.
+/// All mutation sites lock briefly; the mutex is never held across an await.
+struct PromptState {
+    shared_prompt: String,
     /// When the last successful transcription occurred. Used for prompt decay —
     /// if no transcription has happened for `prompt_decay_silence_seconds`, all
     /// prompt context is cleared to prevent stale text from causing hallucinations.
@@ -292,10 +304,10 @@ pub(crate) struct LiveTranscriptionController {
     stop_tx: Option<oneshot::Sender<()>>,
     session_id: Option<String>,
     effective_start_epoch_ms: f64,
-    /// Live counters shared with the running loop. The loop mutates these
-    /// in-place when a chunk lands; `get_live_transcription_status` reads
-    /// them via a brief lock to surface real values to the UI.
-    session: Arc<StdMutex<SessionAccumulators>>,
+    /// Live counters shared with the running loop and backfill task. They
+    /// mutate in place when a chunk lands; `get_live_transcription_status`
+    /// reads them via a brief lock to surface real values to the UI.
+    counters: Arc<StdMutex<SessionCounters>>,
 }
 
 impl LiveTranscriptionController {
@@ -305,7 +317,7 @@ impl LiveTranscriptionController {
 
     /// Snapshot the live counters under a short lock.
     fn counters(&self) -> (u32, f32) {
-        let s = self.session.lock().expect("session mutex poisoned");
+        let s = self.counters.lock().expect("counters mutex poisoned");
         (s.total_chunks, s.total_audio_seconds)
     }
 }
@@ -759,7 +771,8 @@ struct PreparedChunk {
 async fn run_chunk_task(
     prepared: PreparedChunk,
     ctx: TranscriptionContext,
-    session: Arc<StdMutex<SessionAccumulators>>,
+    counters: Arc<StdMutex<SessionCounters>>,
+    prompt: Arc<StdMutex<PromptState>>,
 ) -> ChunkTaskOutcome {
     let source_label = prepared.source_label;
     let chunk_index_for_quarantine = prepared.chunk_index;
@@ -781,7 +794,8 @@ async fn run_chunk_task(
         &input,
         &mut chunk_index_mut,
         &mut accumulated_text,
-        &session,
+        &counters,
+        &prompt,
     )
     .await;
 
@@ -1282,17 +1296,21 @@ fn backfill_chunks_from_probabilities(
 /// first N seconds and the rest). Emits segments with offsets in the backfill
 /// window, then sets `backfill_done`.
 ///
-/// The `session` parameter is the **same** `Arc<StdMutex<SessionAccumulators>>`
-/// the live loop holds — backfill chunks update the same counters the live
-/// loop and `get_live_transcription_status` read, so the status surface
-/// reflects backfill + live work together.
+/// `counters` is the same `Arc<StdMutex<SessionCounters>>` the live loop
+/// holds — backfill chunks update the same totals the live loop and
+/// `get_live_transcription_status` read, so the status surface reflects
+/// backfill + live work together. Backfill owns its **own** `PromptState`
+/// (built locally below) so the prompt-bridge step at end-of-backfill can't
+/// race with concurrent live writes — once bridging is done, the bridged
+/// text flows through `ctx.bridged_prompt` to the live loop's
+/// `seed_prompt_from_backfill` instead.
 async fn process_backfill(
     ctx: TranscriptionContext,
     backfill_audio: Vec<(Vec<f32>, u32, AudioSourceLabel)>,
     backfill_done: Arc<AtomicBool>,
     cancel: Arc<AtomicBool>,
     tuning: VadTuning,
-    session: Arc<StdMutex<SessionAccumulators>>,
+    counters: Arc<StdMutex<SessionCounters>>,
 ) {
     info!("backfill: starting concurrent processing");
 
@@ -1322,6 +1340,14 @@ async fn process_backfill(
     // Per-source state
     let mut chunk_indices: Vec<u32> = vec![0; source_entries.len()];
     let mut accumulated_texts: Vec<String> = vec![String::new(); source_entries.len()];
+
+    // Backfill-local prompt accumulator. Kept separate from the live loop's
+    // `PromptState` so the bridge step below can `take` it without racing
+    // concurrent live writes.
+    let backfill_prompt = Arc::new(StdMutex::new(PromptState {
+        shared_prompt: String::new(),
+        last_transcription_at: None,
+    }));
 
     // Interleave: process chunk 0 for all sources, then chunk 1, etc. Keeps
     // cross-source timestamps roughly interleaved instead of emitting all
@@ -1369,32 +1395,37 @@ async fn process_backfill(
                 &input,
                 &mut chunk_indices[source_idx],
                 &mut accumulated_texts[source_idx],
-                &session,
+                &counters,
+                &backfill_prompt,
             )
             .await;
         }
     }
 
     {
-        let s = session.lock().expect("session mutex poisoned");
+        let s = counters.lock().expect("counters mutex poisoned");
         info!(
             "backfill: completed {} chunks, {:.1}s audio",
             s.total_chunks, s.total_audio_seconds
         );
     }
 
-    // Bridge prompt context to live loop (Change 9: move instead of clone)
+    // Bridge backfill's accumulated prompt out to the live loop. Since
+    // `backfill_prompt` is owned only by this task, taking from it here
+    // can't race with live chunks.
     {
-        let mut prompt = ctx.bridged_prompt.lock().await;
+        let mut bridged = ctx.bridged_prompt.lock().await;
         let max_prompt = ctx.config.prompt_context_chars.unwrap_or(350) as usize;
-        let mut s = session.lock().expect("session mutex poisoned");
-        if s.shared_prompt.len() > max_prompt {
-            let boundary = s
+        let mut bp = backfill_prompt
+            .lock()
+            .expect("backfill prompt mutex poisoned");
+        if bp.shared_prompt.len() > max_prompt {
+            let boundary = bp
                 .shared_prompt
-                .ceil_char_boundary(s.shared_prompt.len() - max_prompt);
-            *prompt = s.shared_prompt[boundary..].to_string();
+                .ceil_char_boundary(bp.shared_prompt.len() - max_prompt);
+            *bridged = bp.shared_prompt[boundary..].to_string();
         } else {
-            *prompt = std::mem::take(&mut s.shared_prompt);
+            *bridged = std::mem::take(&mut bp.shared_prompt);
         }
     }
 
@@ -1741,8 +1772,14 @@ async fn live_transcription_loop(
     ctx: TranscriptionContext,
     mut stop_rx: oneshot::Receiver<()>,
     mut session_wav_state: Option<SessionWavState>,
-    session: Arc<StdMutex<SessionAccumulators>>,
+    counters: Arc<StdMutex<SessionCounters>>,
 ) {
+    // Live-loop-private prompt state. Backfill owns its own (see
+    // `process_backfill`); they bridge via `ctx.bridged_prompt`.
+    let prompt = Arc::new(StdMutex::new(PromptState {
+        shared_prompt: String::new(),
+        last_transcription_at: None,
+    }));
     let source = ctx.config.source.clone().into();
     let check_mic = matches!(source, CaptureSource::MicOnly | CaptureSource::Mixed);
     let check_system = matches!(source, CaptureSource::SystemOnly | CaptureSource::Mixed);
@@ -1793,14 +1830,14 @@ async fn live_transcription_loop(
         let backfill_ctx = ctx.clone();
         let backfill_done_clone = backfill_done.clone();
         let backfill_cancel_clone = backfill_cancel.clone();
-        let backfill_session = session.clone();
+        let backfill_counters = counters.clone();
         let handle = tokio::spawn(process_backfill(
             backfill_ctx,
             backfill_audio,
             backfill_done_clone,
             backfill_cancel_clone,
             tuning,
-            backfill_session,
+            backfill_counters,
         ));
         let abort_handle = handle.abort_handle();
         Some((handle, abort_handle))
@@ -1969,7 +2006,7 @@ async fn live_transcription_loop(
         .await;
 
         if !prompt_seeded_from_backfill
-            && seed_prompt_from_backfill(&ctx, &session, &mut sources).await
+            && seed_prompt_from_backfill(&ctx, &prompt, &mut sources).await
         {
             prompt_seeded_from_backfill = true;
         }
@@ -2092,11 +2129,12 @@ async fn live_transcription_loop(
                     .await;
                     if let Some(prepared) = prepared {
                         let task_ctx = ctx.clone();
-                        let task_session = session.clone();
+                        let task_counters = counters.clone();
+                        let task_prompt = prompt.clone();
                         let source_label = prepared.source_label;
                         let fallback_text = prepared.accumulated_text.clone();
                         let handle = tokio::spawn(async move {
-                            run_chunk_task(prepared, task_ctx, task_session).await
+                            run_chunk_task(prepared, task_ctx, task_counters, task_prompt).await
                         });
                         chunk_aborts.push(handle.abort_handle());
                         chunk_tasks.push(Box::pin(async move {
@@ -2133,12 +2171,12 @@ async fn live_transcription_loop(
         }
 
         if fatal {
-            emit_fatal_sidecar_error(&ctx, &session);
+            emit_fatal_sidecar_error(&ctx, &counters);
             exited_fatal = true;
             break;
         }
 
-        run_prompt_decay(&ctx, &session, &mut sources);
+        run_prompt_decay(&ctx, &prompt, &mut sources);
 
         if should_stop {
             break;
@@ -2146,7 +2184,7 @@ async fn live_transcription_loop(
     }
 
     drain_in_flight_chunks(&mut chunk_tasks, &mut chunk_aborts, &mut sources).await;
-    dispatch_final_pending_chunks(&mut sources, &audio_state, &ctx, &session).await;
+    dispatch_final_pending_chunks(&mut sources, &audio_state, &ctx, &counters, &prompt).await;
 
     if let Some(ws) = session_wav_state {
         finalize_session_wav(ws, &audio_state, &ctx).await;
@@ -2169,7 +2207,7 @@ async fn live_transcription_loop(
     }
 
     let (final_chunks, final_audio_seconds) = {
-        let s = session.lock().expect("session mutex poisoned");
+        let s = counters.lock().expect("counters mutex poisoned");
         (s.total_chunks, s.total_audio_seconds)
     };
 
@@ -2300,13 +2338,10 @@ async fn build_initial_sources_and_backfill(
 /// declared unrecoverable. Reads the running totals out of the shared
 /// accumulator so the UI sees the same chunk/audio counts it would on a
 /// normal stop.
-fn emit_fatal_sidecar_error(
-    ctx: &TranscriptionContext,
-    session: &Arc<StdMutex<SessionAccumulators>>,
-) {
+fn emit_fatal_sidecar_error(ctx: &TranscriptionContext, counters: &Arc<StdMutex<SessionCounters>>) {
     error!("live transcription: sidecar died and could not be restarted — stopping");
     let (chunks, audio_secs) = {
-        let s = session.lock().expect("session mutex poisoned");
+        let s = counters.lock().expect("counters mutex poisoned");
         (s.total_chunks, s.total_audio_seconds)
     };
     let _ = ctx.app_handle.emit(
@@ -2330,26 +2365,26 @@ fn emit_fatal_sidecar_error(
 /// hallucinations after a long pause.
 fn run_prompt_decay(
     ctx: &TranscriptionContext,
-    session: &Arc<StdMutex<SessionAccumulators>>,
+    prompt: &Arc<StdMutex<PromptState>>,
     sources: &mut [SourceVadState],
 ) {
     let prompt_decay_secs = ctx.config.prompt_decay_silence_seconds.unwrap_or(5.0);
     let last_at = {
-        let s = session.lock().expect("session mutex poisoned");
-        s.last_transcription_at
+        let p = prompt.lock().expect("prompt mutex poisoned");
+        p.last_transcription_at
     };
     let decayed = {
-        let mut s = session.lock().expect("session mutex poisoned");
-        check_prompt_decay(sources, &mut s.shared_prompt, prompt_decay_secs, last_at)
+        let mut p = prompt.lock().expect("prompt mutex poisoned");
+        check_prompt_decay(sources, &mut p.shared_prompt, prompt_decay_secs, last_at)
     };
     if decayed {
         info!(
             "prompt decay: cleared shared_prompt ({:.1}s since last transcription)",
             last_at.map(|t| t.elapsed().as_secs_f32()).unwrap_or(0.0)
         );
-        session
+        prompt
             .lock()
-            .expect("session mutex poisoned")
+            .expect("prompt mutex poisoned")
             .last_transcription_at = None;
     }
 }
@@ -2426,7 +2461,8 @@ async fn dispatch_final_pending_chunks(
     sources: &mut [SourceVadState],
     audio_state: &AudioManagerState,
     ctx: &TranscriptionContext,
-    session: &Arc<StdMutex<SessionAccumulators>>,
+    counters: &Arc<StdMutex<SessionCounters>>,
+    prompt: &Arc<StdMutex<PromptState>>,
 ) {
     for source in sources.iter_mut() {
         if source.has_in_flight_task {
@@ -2458,9 +2494,10 @@ async fn dispatch_final_pending_chunks(
         .await;
         if let Some(prepared) = prepared {
             let task_ctx = ctx.clone();
-            let task_session = session.clone();
+            let task_counters = counters.clone();
+            let task_prompt = prompt.clone();
             let source_label = prepared.source_label;
-            let final_task = run_chunk_task(prepared, task_ctx, task_session);
+            let final_task = run_chunk_task(prepared, task_ctx, task_counters, task_prompt);
             if tokio::time::timeout(Duration::from_secs(10), final_task)
                 .await
                 .is_err()
@@ -2614,7 +2651,7 @@ async fn handle_empty_wav_flush(
 /// `true` once the seed lands so the caller can flip the one-shot guard.
 async fn seed_prompt_from_backfill(
     ctx: &TranscriptionContext,
-    session: &Arc<StdMutex<SessionAccumulators>>,
+    prompt: &Arc<StdMutex<PromptState>>,
     sources: &mut [SourceVadState],
 ) -> bool {
     let bridged = ctx.bridged_prompt.lock().await;
@@ -2622,11 +2659,11 @@ async fn seed_prompt_from_backfill(
         return false;
     }
     {
-        let mut s = session.lock().expect("session mutex poisoned");
-        if s.shared_prompt.is_empty() {
-            s.shared_prompt = bridged.clone();
+        let mut p = prompt.lock().expect("prompt mutex poisoned");
+        if p.shared_prompt.is_empty() {
+            p.shared_prompt = bridged.clone();
         }
-        s.last_transcription_at = Some(Instant::now());
+        p.last_transcription_at = Some(Instant::now());
     }
     for source in sources.iter_mut() {
         if source.accumulated_text.is_empty() {
@@ -2814,7 +2851,7 @@ async fn transcribe_chunk(
     input: &ChunkInput<'_>,
     chunk_index: &mut u32,
     accumulated_text: &mut String,
-    session: &Arc<StdMutex<SessionAccumulators>>,
+    prompt: &Arc<StdMutex<PromptState>>,
 ) -> TranscribeOutcome {
     let chunk_duration = input.samples.len() as f32 / input.sample_rate as f32;
     if chunk_duration < MIN_CHUNK_DURATION_SECS {
@@ -2909,16 +2946,16 @@ async fn transcribe_chunk(
                     *accumulated_text = accumulated_text[boundary..].to_string();
                 }
                 let max_prompt = ctx.config.prompt_context_chars.unwrap_or(350) as usize;
-                let mut s = session.lock().expect("session mutex poisoned");
-                if !s.shared_prompt.is_empty() {
-                    s.shared_prompt.push(' ');
+                let mut p = prompt.lock().expect("prompt mutex poisoned");
+                if !p.shared_prompt.is_empty() {
+                    p.shared_prompt.push(' ');
                 }
-                s.shared_prompt.push_str(&prompt_text);
-                if s.shared_prompt.len() > max_prompt {
-                    let boundary = s
+                p.shared_prompt.push_str(&prompt_text);
+                if p.shared_prompt.len() > max_prompt {
+                    let boundary = p
                         .shared_prompt
-                        .ceil_char_boundary(s.shared_prompt.len() - max_prompt);
-                    s.shared_prompt = s.shared_prompt[boundary..].to_string();
+                        .ceil_char_boundary(p.shared_prompt.len() - max_prompt);
+                    p.shared_prompt = p.shared_prompt[boundary..].to_string();
                 }
             }
 
@@ -3031,19 +3068,23 @@ async fn transcribe_and_emit_chunk(
     input: &ChunkInput<'_>,
     chunk_index: &mut u32,
     accumulated_text: &mut String,
-    session: &Arc<StdMutex<SessionAccumulators>>,
+    counters: &Arc<StdMutex<SessionCounters>>,
+    prompt: &Arc<StdMutex<PromptState>>,
 ) -> TranscribeOutcome {
-    let outcome = transcribe_chunk(ctx, input, chunk_index, accumulated_text, session).await;
+    let outcome = transcribe_chunk(ctx, input, chunk_index, accumulated_text, prompt).await;
 
     if let TranscribeOutcome::Success(ref result) = outcome {
         // Short critical section — no await held.
         let (total_chunks, total_audio_seconds) = {
-            let mut s = session.lock().expect("session mutex poisoned");
+            let mut s = counters.lock().expect("counters mutex poisoned");
             s.total_chunks += 1;
             s.total_audio_seconds += result.chunk_duration;
-            s.last_transcription_at = Some(Instant::now());
             (s.total_chunks, s.total_audio_seconds)
         };
+        prompt
+            .lock()
+            .expect("prompt mutex poisoned")
+            .last_transcription_at = Some(Instant::now());
 
         let _ = ctx
             .app_handle
@@ -3340,23 +3381,21 @@ pub async fn start_live_transcription(
         session_offset_base_seconds,
     };
 
-    let session = Arc::new(StdMutex::new(SessionAccumulators {
-        shared_prompt: String::new(),
+    let counters = Arc::new(StdMutex::new(SessionCounters {
         total_chunks: 0,
         total_audio_seconds: 0.0,
-        last_transcription_at: None,
     }));
 
     let task_handle = tokio::spawn({
         let ctx_guard = ctx.clone();
-        let session_for_loop = session.clone();
+        let counters_for_loop = counters.clone();
         async move {
             let result = AssertUnwindSafe(live_transcription_loop(
                 audio_state_clone,
                 ctx,
                 stop_rx,
                 session_wav_state,
-                session_for_loop,
+                counters_for_loop,
             ))
             .catch_unwind()
             .await;
@@ -3398,7 +3437,7 @@ pub async fn start_live_transcription(
             stop_tx: Some(stop_tx),
             session_id: controller_session_id,
             effective_start_epoch_ms,
-            session,
+            counters,
         },
         vocabulary_hints: vocab_hints,
     });

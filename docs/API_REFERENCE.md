@@ -715,20 +715,28 @@ Domain types (yapstack-common, yapstack-audio, yapstack-transcription) do not de
 
 ### Custom URI Scheme: `audio-stream`
 
-Registered in `lib.rs` via `register_uri_scheme_protocol`. Serves WAV files from `$APP_DATA_DIR/audio/`.
+Registered in `lib.rs` via `register_uri_scheme_protocol`. Serves session audio
+files (`.wav` or `.mp3`) from any directory in the `TrustedAudioDirs` allow-list
+— seeded at startup from `session_audio_parts` rows + `audio_save_locations`,
+and grown each time Rust finalizes a part. Two URL forms:
 
 ```
-audio-stream://localhost/{filename}.wav
+audio-stream://localhost/{absolute-file-path}     # primary; emitted by convertFileSrc(absPath, "audio-stream")
+audio-stream://localhost/{filename}               # legacy; resolves under $APP_DATA_DIR/audio/
 ```
 
 | Method | Status | Description |
 |--------|--------|-------------|
-| GET (no Range header) | 200 | Full file, `Content-Type: audio/wav`, `Accept-Ranges: bytes` |
+| GET (no Range header) | 200 | Full file, `Content-Type: audio/wav` or `audio/mpeg`, `Accept-Ranges: bytes` |
 | GET (Range: bytes=N-M) | 206 | Partial content, `Content-Range: bytes N-M/total` |
-| Invalid filename | 400 | Non-.wav, path traversal (`..`, `/`, `\`) |
-| File not found | 404 | WAV doesn't exist |
+| Bad extension / traversal | 400 | Path doesn't end in `.wav`/`.mp3`, or relative path contains `/`, `\`, `..` |
+| Untrusted absolute path | 403 | Absolute path is outside every `TrustedAudioDirs` entry |
+| File not found | 404 | File doesn't exist |
 
-Frontend helper: `convertFileSrc(filename, "audio-stream")` generates the URL.
+Frontend helper: `convertFileSrc(absPath, "audio-stream")` generates the URL.
+Pass the full persisted part path (from `session_audio_parts.audio_path`) — the
+synthesized `{session_id}.{part_index}.{ext}` form would skip parts whose
+`audio_save_location` differs from the current setting.
 
 ---
 
@@ -977,10 +985,11 @@ Modular tool registry. Each tool is self-contained with schema, executor, undo h
 | Type | Fields |
 |------|--------|
 | `ToolCallResult` | `{ id, name, arguments: Record<string, unknown> }` |
-| `ExecutedTool` | `{ name, label, detail, toolCallId?, result?, undoData? }` — `result` is sent to LLM as tool-role message, `detail` is human-facing badge |
-| `ToolContext` | `{ sessionId, currentTitle, currentNote: DbNote \| null, isPinned, segments?, tags?, folderIds? }` |
-| `ToolEffect` | `"session-meta" \| "notes" \| "organization"` — declarative side-effect categories |
-| `ToolDefinition` | `{ schema: ChatCompletionTool, execute: (args, ctx) → Promise<ExecutedTool \| null>, undo: (undoData, ctx) → Promise<void>, affects?: ToolEffect[] }` |
+| `ExecutedTool` | `{ name, label, detail, observation?, toolCallId?, result?, undoData? }` — `observation` is the text the LLM sees as the tool result during multi-turn chains; `detail` is the human-facing badge |
+| `ToolContext` | `{ sessionId, currentTitle, currentNote: DbNote \| null, isPinned, segments?, tags?, folderNames?, folderIds?, allowedSessionIds? }` — `sessionId` is empty in multi-session chats; `allowedSessionIds` constrains retrieval-tool results |
+| `ToolKind` | `"read" \| "mutate"` — gates Undo eligibility and the "Session updated" toast |
+| `ToolEffect` | `"session-meta" \| "notes" \| "organization" \| "transcript"` — declarative side-effect categories |
+| `ToolDefinition` | `{ kind: ToolKind, schema: ChatCompletionTool, execute: (args, ctx) → Promise<ExecutedTool \| null>, undo: (undoData, ctx) → Promise<void>, affects?: ToolEffect[] }` |
 
 **Functions**
 | Function | Signature | Description |
@@ -988,7 +997,7 @@ Modular tool registry. Each tool is self-contained with schema, executor, undo h
 | `registerTool` | `(def: ToolDefinition) → void` | Registers a tool in the global registry |
 | `getRegisteredTools` | `() → ChatCompletionTool[]` | Returns every registered tool's schema |
 | `getToolsById` | `(toolIds: string[]) → ChatCompletionTool[]` | Returns schemas for specific tool IDs. Per-context tool selection is the caller's job — see `createSessionTools` / `createMultiSessionTools` in `ai-context.ts`. |
-| `getToolKind` | `(toolName: string) → ToolKind \| undefined` | Returns whether a tool is `"mutating"` or `"retrieval"` (used by the chat UI to render the right badge). |
+| `getToolKind` | `(toolName: string) → ToolKind \| undefined` | Returns the registered tool's `"read"` / `"mutate"` discriminator (used by the chat UI to render the right badge and gate undo eligibility). |
 | `getToolEffects` | `(toolNames: string[]) → Set<ToolEffect>` | Collects effect categories from executed tool names. Used by `NoteDetailView` to determine which data to refresh after tool execution. |
 | `executeTool` | `(name, args, ctx) → Promise<ExecutedTool \| null>` | Executes a tool by name. Returns `null` if the tool is a no-op (e.g., title unchanged). |
 | `captureUndoSnapshot` | `<T>(loader: () => Promise<T>) → Promise<T>` | Helper that loads pre-mutation state for the executor's `undoData`, used by mutating tools so undo restores the prior value. |
@@ -1180,7 +1189,7 @@ Global shortcuts via `@tauri-apps/plugin-global-shortcut`. Mounted in `App.tsx`.
 export function useDictation(): void
 ```
 
-Voice dictation lifecycle (hold-to-talk or toggle mode). Mounted in `App.tsx` (main window only). Manages state machine: `idle → recording → transcribing → processing → done → idle`, plus a `cancelling` branch reachable from any non-idle phase via `yapstack:dictation-cancel`. Listens for `yapstack:dictation-start`, `yapstack:dictation-stop`, and `yapstack:dictation-cancel` custom events. On stop: captures audio via `triggerInstantCapture`, transcribes via `transcribeAudio`, optionally processes with AI, then routes output based on `slot.outputAction`. On cancel: aborts in-flight AI, stops live transcription, deletes the streamed Session WAV, suppresses Output action and Dictation history write — see ARCHITECTURE.md § "Cancellation". Registers Escape as a Global hotkey (via `@tauri-apps/plugin-global-shortcut`) for the lifetime of a non-idle Dictation; the hotkey dispatches `yapstack:dictation-cancel`. Controls the dictation bubble window position and visibility. Includes no-input detection (3s timer → `"no-input"` bubble state). Persists completed dictation entries to `dictation_history` DB table. Correlates WAV files via UUID on `SESSION_WAV_READY` event.
+Voice dictation lifecycle (hold-to-talk or toggle mode). Mounted in `App.tsx` (main window only). Manages state machine: `idle → recording → transcribing → processing → done → idle`, plus a `cancelling` branch reachable from any non-idle phase via `yapstack:dictation-cancel`. Listens for `yapstack:dictation-start`, `yapstack:dictation-stop`, and `yapstack:dictation-cancel` custom events. On start: spins up a live transcription against a synthetic per-dictation session id so backfill, VAD chunking, and the streaming session WAV all reuse the live pipeline. On stop: waits for the loop's `session-part-ready` event to surface the finalized part path (WAV or MP3 per `audioExportFormat`), persists it to `dictation_history`, optionally runs AI post-processing, then routes output per `slot.outputAction`. The captured audio file is preserved regardless of Output action — only an explicit cancel deletes it. On cancel: aborts in-flight AI, stops live transcription, deletes the finalized part via `delete_audio_files`, suppresses Output action and Dictation history write — see ARCHITECTURE.md § "Cancellation". Registers Escape as a Global hotkey (via `@tauri-apps/plugin-global-shortcut`) for the lifetime of a non-idle Dictation; the hotkey dispatches `yapstack:dictation-cancel`. Controls the dictation bubble window position and visibility. Includes no-input detection (3s timer → `"no-input"` bubble state). Correlates parts to dictation entries via the synthetic session id on the `session-part-ready` event.
 
 ### `hooks/useRecordingIndicator.ts`
 

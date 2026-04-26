@@ -149,6 +149,7 @@ export function createSessionTools(sessionId: string): AIContextTools {
         .map((tid) => allTags.find((t) => t.id === tid)?.name)
         .filter((n): n is string => !!n);
       return {
+        scope: "session",
         sessionId,
         currentTitle: session?.title ?? "Untitled",
         currentNote: note,
@@ -257,15 +258,13 @@ export function createMultiSessionTools(
       "search_dictations",
     ],
     contextType: "multi-session",
-    // Retrieval tools don't read from session-scoped ToolContext; they hit
-    // the DB directly. The session-meta fields go unused; allowedSessionIds
-    // is the load-bearing field — it pins retrieval to the Chat's filter
-    // (folder/pinned/all) so the model can't reach outside the user's view.
+    // Retrieval tools don't read session-scoped ToolContext; they hit the DB
+    // directly with `allowedSessionIds` pinning retrieval to the chat's
+    // filter (folder/pinned/all) so the model can't reach outside the
+    // user's view. The discriminated `RetrievalToolContext` keeps the type
+    // honest — no fabricated empty `sessionId`/`currentTitle`/etc.
     getToolContext: async () => ({
-      sessionId: "",
-      currentTitle: "",
-      currentNote: null,
-      isPinned: false,
+      scope: "retrieval",
       allowedSessionIds,
     }),
   };

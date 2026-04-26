@@ -192,8 +192,10 @@ Frontend: start_live_transcription(config)
     Track 1 — Backfill (if backfill_seconds > 0):
         1. Rewind cursors by backfill_seconds from current write_pos
         2. Extract historical audio per source
-        3. Chunk by max_chunk_seconds, trim_leading_silence() each chunk
-        4. Skip entirely silent chunks
+        3. Run vad_chunk_historical_audio() over each source — same Silero
+           state machine the live loop uses, so backfill and live share
+           boundary choices and there's no quality gap at the seam
+        4. Skip entirely silent windows (no chunk emitted)
         5. Transcribe interleaved (window 0 all sources, window 1, etc.)
         6. Emit "live-segment" events with is_backfill=true
         7. Emit "backfill-complete" event
@@ -697,8 +699,8 @@ idle → recording → transcribing → processing → done → idle
 (key press)                                  (450ms display)
 ```
 
-1. **recording**: Key pressed → validate (dictation enabled, engine ready, not in active recording) → show bubble, start timing
-2. **transcribing**: Key released → `triggerInstantCapture()` for elapsed duration → `transcribeAudio()` via the `TranscriptionClient`
+1. **recording**: Key pressed → validate (dictation enabled, engine ready, not in active recording) → start a live transcription against a synthetic per-dictation session id (reuses the live VAD / chunk / streaming-WAV pipeline) → show bubble, start timing
+2. **transcribing**: Key released → `stopLiveTranscription()` finalizes the part → wait up to 1.5 s for the loop's `session-part-ready` event → collect the live segments accumulated during recording into the dictation transcript
 3. **processing**: If `slot.aiEnabled && slot.prompt` → call AI API with transcription + system prompt
 4. **done**: Route output based on `slot.outputAction`:
    - `"paste"`: `clipboard_paste(text, true)` — copies to clipboard + auto-pastes via osascript
@@ -711,9 +713,9 @@ idle → recording → transcribing → processing → done → idle
 Pressing **Escape** while a Dictation is in any non-idle phase (`recording`, `transcribing`, `processing`, or post-failure `done`) fully aborts the Dictation. Implemented entirely in the frontend — no backend changes.
 
 - **Hotkey scope**: `useDictation` registers Escape as a Global hotkey via `@tauri-apps/plugin-global-shortcut` only while a Dictation is non-idle, and unregisters it in `setIdle`. While idle, Escape behaves as the OS / focused app would normally handle it. This is what makes cancel work while the user is focused in another app (the realistic dictation case for `paste` and `clipboard` Output actions).
-- **Cancel reducer** (`handleCancel`): takes ownership by setting `phase = "cancelling"` synchronously, then runs a single linear teardown: abort the AI `AbortController`, resolve the stop-deferred so any waiting `handleStop` unblocks, emit the `cancelled` Bubble state, call `commands.stopLiveTranscription()`, wait up to 1.5 s for the streamed Session WAV to finalize, delete it via `commands.deleteSessionWav`, hold the Bubble for 450 ms, hide, idle.
+- **Cancel reducer** (`handleCancel`): takes ownership by setting `phase = "cancelling"` synchronously, then runs a single linear teardown: abort the AI `AbortController`, resolve the stop-deferred so any waiting `handleStop` unblocks, emit the `cancelled` Bubble state, call `commands.stopLiveTranscription()`, wait up to 1.5 s for the part to finalize (`session-part-ready`), delete it via `commands.deleteAudioFiles`, hold the Bubble for 450 ms, hide, idle.
 - **Cooperative bail-points**: every `await` in `handleStop` and the ghost-transcription guard in `handleStart` are followed by `if (phase() === "cancelling") return;`, so a cancel that arrives mid-stop bails cleanly without double-running teardown.
-- **What is suppressed**: the Output action (`paste` / `clipboard` / `new-note`) does not fire, no `dictation_history` row is written, the streamed Session WAV is deleted, and toggle-mode state is cleared via the existing `dictation-idle` event.
+- **What is suppressed**: the Output action (`paste` / `clipboard` / `new-note`) does not fire, no `dictation_history` row is written, the finalized session part is deleted, and toggle-mode state is cleared via the existing `dictation-idle` event.
 - **What still happens**: the Sidecar's currently-in-flight Chunk transcribe is allowed to finish; its result is discarded by the cancel reducer (no per-request abort IPC). Capture itself is app-wide and stays running, so the next Dictation can start immediately.
 - **Scope**: a regular Session and a Dictation cannot run concurrently (`LiveTranscriptionState` is single-occupancy on the Rust side), so cancel cannot affect a Session's stream. Pressing Escape during a Session does nothing dictation-related — the hotkey isn't registered.
 

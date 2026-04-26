@@ -2,6 +2,7 @@ import { useState, useEffect } from "react";
 import {
   Dialog,
   DialogContent,
+  DialogDescription,
   DialogHeader,
   DialogTitle,
   DialogFooter,
@@ -76,6 +77,11 @@ export function FolderDialog({
           <DialogTitle>
             {mode === "create" ? "New Folder" : "Edit Folder"}
           </DialogTitle>
+          <DialogDescription className="sr-only">
+            {mode === "create"
+              ? "Create a new folder with a name, optional icon, color, and description."
+              : "Edit this folder's name, icon, color, and description."}
+          </DialogDescription>
         </DialogHeader>
 
         <div className="space-y-4">

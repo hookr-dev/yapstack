@@ -17,8 +17,8 @@ type DictationState = "idle" | "recording" | "transcribing" | "processing" | "ca
 // How long the bubble shows "Cancelled" before hiding. Mirrors the existing
 // no-speech / error self-hide window.
 const CANCEL_DISPLAY_MS = 450;
-// How long to wait after stopLiveTranscription for the streamed Session WAV
-// to be finalized (so we can delete it on cancel). Past this we give up.
+// How long to wait after stopLiveTranscription for the part to be finalized
+// (session-part-ready) so we can delete it on cancel. Past this we give up.
 const CANCEL_WAV_GRACE_MS = 1500;
 
 const BUBBLE_WIDTH = 220;
@@ -561,12 +561,13 @@ export function useDictation() {
         duration_ms: Date.now() - startTimeRef.current,
       });
 
-      // Stop live transcription — finalizes the streamed Session WAV and emits
-      // "Stopped". Capture itself is app-wide and stays running.
+      // Stop live transcription — finalizes the session part (WAV or MP3 per
+      // audioExportFormat) and emits "Stopped". Capture itself is app-wide
+      // and stays running.
       await commands.stopLiveTranscription().catch(() => {});
 
-      // Wait briefly for the Session WAV to finalize so we can delete it.
-      // wavInfoRef populates from the SESSION_PART_READY listener, which is
+      // Wait briefly for the part to finalize so we can delete it.
+      // wavInfoRef populates from the session-part-ready listener, which is
       // still mounted at this point.
       const wavDeadline = Date.now() + CANCEL_WAV_GRACE_MS;
       while (!wavInfoRef.current && Date.now() < wavDeadline) {
