@@ -391,10 +391,6 @@ pub enum AudioError {
 pub use client::{TranscriptionClient, TranscriptionResult};
 pub use error::TranscriptionError;
 pub use model::{ModelInfo, ModelManager, ModelSize, ParakeetVariant, SortformerVariant};
-
-/// Backward-compatible alias for the renamed `TranscriptionClient`. Will be
-/// removed once all call sites in the Tauri layer are updated.
-pub type WhisperClient = TranscriptionClient;
 ```
 
 ### ModelManager (`model.rs`)
@@ -603,7 +599,7 @@ pub enum CommandError {
 ```rust
 AudioManagerState        = Arc<Mutex<AudioManager>>
 ModelManagerState        = Arc<Mutex<ModelManager>>
-WhisperClientState       = Arc<Mutex<Option<WhisperClient>>>
+TranscriptionClientState = Arc<Mutex<Option<Arc<TranscriptionClient>>>>
 LiveTranscriptionState   = Arc<Mutex<Option<LiveTranscriptionController>>>
 ```
 
@@ -639,10 +635,9 @@ LiveTranscriptionState   = Arc<Mutex<Option<LiveTranscriptionController>>>
 | `download_model` | `size` | `String` (path) |
 | `delete_model` | `size` | `()` |
 | `transcribe_audio` | `audio_path, language?, initial_prompt?` | `TranscriptionResultDto` |
-| `init_whisper_client` | `size` | `()` (legacy shim — calls the engine-aware path with `EngineKind::Whisper`) |
 | `init_transcription_client` | `engine, whisper_model?, parakeet_variant?, enable_diarization` | `()` |
-| `shutdown_whisper_client` | — | `()` |
-| `get_whisper_status` | — | `WhisperStatusDto { initialized: bool }` |
+| `shutdown_transcription_client` | — | `()` |
+| `get_transcription_status` | — | `TranscriptionStatusDto { initialized: bool }` |
 | `get_engine_catalogue` | — | `Vec<EngineDescriptorDto>` (engine kinds × supported languages × capability flags) |
 | `get_parakeet_models` | — | `Vec<ParakeetModelInfoDto>` |
 | `download_parakeet_model` | `variant: ParakeetVariantDto` | `String` (dir path) |

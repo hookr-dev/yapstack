@@ -1472,14 +1472,11 @@ async fn check_stream_health(
         }
 
         let Some(reason) = reason else { continue };
-        attempt_source_restart(
-            source,
-            audio_state,
-            app_handle,
-            session_wav_state.as_deref_mut(),
-            &reason,
-        )
-        .await;
+        // `as_deref_mut` reborrows the `Option<&mut _>` so each loop
+        // iteration gets a fresh mutable view without consuming the slot.
+        #[allow(clippy::needless_option_as_deref)]
+        let ws_borrow = session_wav_state.as_deref_mut();
+        attempt_source_restart(source, audio_state, app_handle, ws_borrow, &reason).await;
     }
 }
 
@@ -1682,13 +1679,9 @@ async fn attempt_source_restart(
             }
 
             if report.outcome == yapstack_audio::manager::RestartOutcome::BufferReplaced {
-                handle_buffer_replacement(
-                    source,
-                    audio_state,
-                    session_wav_state.as_deref_mut(),
-                    source_name,
-                )
-                .await;
+                #[allow(clippy::needless_option_as_deref)]
+                let ws_borrow = session_wav_state.as_deref_mut();
+                handle_buffer_replacement(source, audio_state, ws_borrow, source_name).await;
             }
 
             let _ = app_handle.emit(

@@ -61,28 +61,29 @@ Each commit leaves the codebase working (`pnpm check` green).
 
 ### Phase 4 — `live_transcription_loop` decomposition
 
-The loop is 923 lines. Extract phases without changing behavior:
+The loop was 923 lines, now ~445. Extracted (each its own commit):
 
-13. Extract `flush_wav_state(...)` for the WAV flush + error counter logic.
-14. Extract `emit_health_status(...)` for stream-health event emission.
-15. Extract `handle_chunk_dispatch(...)` for the VAD-end → transcribe-call path.
-16. Top-level loop becomes orchestration: poll, dispatch, flush, emit, sleep.
-17. Replace threaded-through parameter lists with a single `LiveLoopState` struct passed by `&mut`.
+13. **DONE** — `finalize_session_wav` (post-loop final flush + finalize + DB part-row insert + part-ready emit).
+14. **DONE** — `seed_prompt_from_backfill` (one-shot backfill prompt seeding).
+15. **DONE** — `write_session_wav_samples` + `handle_empty_wav_flush` (the two arms of the per-tick WAV flush).
+16. **DONE** — `drain_in_flight_chunks` + `dispatch_final_pending_chunks` (post-loop chunk-task drain and Phase 3 final dispatch).
+17. **DONE** — `emit_fatal_sidecar_error` + `run_prompt_decay` (per-tick fatal-error emit and decay check).
+18. **DONE** — `build_initial_sources_and_backfill` (pre-loop source-state setup with backfill rewind).
+19. ~~Single `LiveLoopState` struct~~. Skipped — the parameters threaded through are already each cohesive (`audio_state`, `ctx`, `session`, source slice). A wrapper struct would just rename the threading without simplifying it.
 
 ### Phase 5 — `check_stream_health` decomposition
 
-18. Split the 306-line function into the four phases: listener-error check, stall watchdog, diagnostic emission, device-identity poll. Top-level becomes a four-line orchestrator.
+20. **DONE** — Split the 306-line function into `evaluate_listener_signal`, `evaluate_speculative_signals`, `attempt_source_restart`, `handle_buffer_replacement`. Top-level is now a 25-line orchestrator that scans sources, gathers a reason from the layered helpers, and delegates the restart.
 
 ### Phase 6 — Dictation UI consolidation
 
-19. Extract `useDictationEntry()` hook from shared logic of `DictationFeedEntry` and `DictationTrayItem` (copy, play, move-to-note, delete handlers).
-20. Update both components to consume the hook; delete duplicated handler bodies.
+21. **DONE** — Extracted `useDictationEntry()` hook with the playing/audioRef state, store wiring, and copy/play/move-to-note/delete handlers. Both `DictationFeedEntry` and `DictationTrayItem` consume it.
 
 ### Phase 7 — Naming / clarity sweep
 
-21. Rename any local Rust identifiers still using `whisper_` prefix where the value is engine-agnostic (per `UBIQUITOUS_LANGUAGE.md`: prefer **Transcription client**).
-22. Rename functions over ~80 lines whose names don't describe the phases they own (case-by-case, not bulk).
+22. **DONE** (no-op for Rust) — All Rust identifiers were already updated in the live-transcription path (`transcription_client`, `TranscriptionClientState`, etc.). The only remaining `whisper`/`Whisper` identifiers refer legitimately to the Whisper engine.
+23. **DONE** — Extracted `build_effective_prompt` and `recover_from_chunk_failure` from `transcribe_chunk`, which shrank from 261 → 156 lines.
 
 ### Phase 8 — Final docs reconciliation
 
-23. Update CLAUDE.md and `docs/ARCHITECTURE.md` to reflect actual current behavior after the cleanup. Remove any sentences that reference removed code.
+24. **DONE** — Updated `docs/ARCHITECTURE.md`, `docs/API_REFERENCE.md`, `docs/DEVELOPMENT.md` to drop the `WhisperClient` alias references, the `init_whisper_client` legacy shim, and the stale store/migration version numbers; corrected the `db::ensure_runtime_schema()` description.
