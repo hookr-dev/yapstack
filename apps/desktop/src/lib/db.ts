@@ -1073,6 +1073,18 @@ export async function listSessionAudioParts(
   );
 }
 
+/**
+ * Returns every `file_path` registered in `session_audio_parts`. Used by
+ * bulk-delete flows to avoid an N+1 of `listSessionAudioParts` per session.
+ */
+export async function listAllAudioPartPaths(): Promise<string[]> {
+  const db = await getDb();
+  const rows = await db.select<{ file_path: string }[]>(
+    "SELECT file_path FROM session_audio_parts",
+  );
+  return rows.map((r) => r.file_path);
+}
+
 export async function insertAudioPart(part: DbAudioPart): Promise<void> {
   const db = await getDb();
   await db.execute(
