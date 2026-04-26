@@ -1588,9 +1588,9 @@ async fn evaluate_speculative_signals(
     }
 
     // Layer 3: defensive device-identity drift poll. Throttled.
-    let should_check = source.last_device_check_at.is_none_or(|t| {
-        t.elapsed() > Duration::from_secs_f32(DEVICE_IDENTITY_POLL_INTERVAL_SECS)
-    });
+    let should_check = source
+        .last_device_check_at
+        .is_none_or(|t| t.elapsed() > Duration::from_secs_f32(DEVICE_IDENTITY_POLL_INTERVAL_SECS));
     if should_check {
         source.last_device_check_at = Some(Instant::now());
         let drift = match source.label {
@@ -1795,8 +1795,14 @@ async fn live_transcription_loop(
         "live transcription VAD tuning resolved"
     );
 
-    let (mut sources, backfill_audio) =
-        build_initial_sources_and_backfill(&audio_state, &ctx.config, check_mic, check_system, source).await;
+    let (mut sources, backfill_audio) = build_initial_sources_and_backfill(
+        &audio_state,
+        &ctx.config,
+        check_mic,
+        check_system,
+        source,
+    )
+    .await;
 
     // Spawn concurrent backfill processing.
     // `backfill_cancel` is a cooperative cancel flag. On stop we set it true
@@ -2227,10 +2233,7 @@ async fn build_initial_sources_and_backfill(
     check_mic: bool,
     check_system: bool,
     source: CaptureSource,
-) -> (
-    Vec<SourceVadState>,
-    Vec<(Vec<f32>, u32, AudioSourceLabel)>,
-) {
+) -> (Vec<SourceVadState>, Vec<(Vec<f32>, u32, AudioSourceLabel)>) {
     let manager = audio_state.lock().await;
     let positions = manager.buffer_positions();
 
@@ -2554,7 +2557,7 @@ fn write_session_wav_samples(
     }
     ws.flush_positions = new_pos;
     ws.flush_count += 1;
-    if ws.flush_count % WAV_FLUSH_DIAGNOSTIC_INTERVAL == 0 {
+    if ws.flush_count.is_multiple_of(WAV_FLUSH_DIAGNOSTIC_INTERVAL) {
         debug!(
             "session WAV progress: flushes={}, samples_written={}, duration={:.1}s",
             ws.flush_count,
@@ -2818,8 +2821,7 @@ async fn build_effective_prompt(
     let context_part = if accumulated_text.is_empty() {
         ""
     } else if accumulated_text.len() > context_budget {
-        let boundary =
-            accumulated_text.ceil_char_boundary(accumulated_text.len() - context_budget);
+        let boundary = accumulated_text.ceil_char_boundary(accumulated_text.len() - context_budget);
         &accumulated_text[boundary..]
     } else {
         accumulated_text
@@ -4002,9 +4004,9 @@ mod tests {
         // without the `prev_chunk_end` clamp, the second onset's pre-roll
         // would reach back into the first chunk's tail.
         let mut probs: Vec<f32> = Vec::with_capacity(loud_frames * 2 + gap_frames);
-        probs.extend(std::iter::repeat(0.90).take(loud_frames));
-        probs.extend(std::iter::repeat(0.10).take(gap_frames));
-        probs.extend(std::iter::repeat(0.90).take(loud_frames));
+        probs.extend(std::iter::repeat_n(0.90, loud_frames));
+        probs.extend(std::iter::repeat_n(0.10, gap_frames));
+        probs.extend(std::iter::repeat_n(0.90, loud_frames));
 
         let frame_samples = (super::super::silero_vad::FRAME_DURATION_SECS * sr as f32) as usize;
         let total_samples = probs.len() * frame_samples;
