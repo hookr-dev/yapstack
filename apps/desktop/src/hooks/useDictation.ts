@@ -219,10 +219,12 @@ export function useDictation() {
       );
       unlistenSegmentRef.current = segmentUnlisten;
 
-      // Listen for WAV ready event for this dictation
+      // Listen for the part-ready event for this dictation. Dictation always
+      // produces a single part per recording, so we just stash the file
+      // path/duration for the dictation_history insert below.
       const currentDictId = dictationIdRef.current;
       const wavUnlisten = await listenEvent(
-        EVENTS.SESSION_WAV_READY,
+        EVENTS.SESSION_PART_READY,
         (payload) => {
           if (payload.session_id === currentDictId) {
             wavInfoRef.current = {
@@ -565,7 +567,7 @@ export function useDictation() {
       await commands.stopLiveTranscription().catch(() => {});
 
       // Wait briefly for the Session WAV to finalize so we can delete it.
-      // wavInfoRef populates from the SESSION_WAV_READY listener, which is
+      // wavInfoRef populates from the SESSION_PART_READY listener, which is
       // still mounted at this point.
       const wavDeadline = Date.now() + CANCEL_WAV_GRACE_MS;
       while (!wavInfoRef.current && Date.now() < wavDeadline) {

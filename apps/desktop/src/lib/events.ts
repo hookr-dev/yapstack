@@ -13,10 +13,13 @@ export type ModelDownloadProgress = {
   size: string;
 };
 
-export type SessionWavReadyEvent = {
+export type SessionPartReadyEvent = {
   session_id: string;
+  part_index: number;
   file_path: string;
+  format: "wav" | "mp3";
   duration_seconds: number;
+  sample_rate: number;
 };
 
 export type SessionWavErrorEvent = {
@@ -69,7 +72,7 @@ export const EVENTS = {
   LIVE_TRANSCRIPTION_STATUS: "live-transcription-status",
   LIVE_TRANSCRIPTION_WARNING: "live-transcription-warning",
   BACKFILL_COMPLETE: "backfill-complete",
-  SESSION_WAV_READY: "session-wav-ready",
+  SESSION_PART_READY: "session-part-ready",
   SESSION_WAV_ERROR: "session-wav-error",
   SESSION_WAV_WARNING: "session-wav-warning",
   STREAM_HEALTH: "stream-health",
@@ -99,7 +102,7 @@ type EventPayloadMap = {
   [EVENTS.LIVE_TRANSCRIPTION_STATUS]: LiveTranscriptionStatus;
   [EVENTS.LIVE_TRANSCRIPTION_WARNING]: LiveTranscriptionWarningEvent;
   [EVENTS.BACKFILL_COMPLETE]: void;
-  [EVENTS.SESSION_WAV_READY]: SessionWavReadyEvent;
+  [EVENTS.SESSION_PART_READY]: SessionPartReadyEvent;
   [EVENTS.SESSION_WAV_ERROR]: SessionWavErrorEvent;
   [EVENTS.SESSION_WAV_WARNING]: SessionWavWarningEvent;
   [EVENTS.STREAM_HEALTH]: StreamHealthEvent;
