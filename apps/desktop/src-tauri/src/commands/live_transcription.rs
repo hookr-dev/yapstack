@@ -2789,6 +2789,58 @@ async fn finalize_session_wav(
     );
 }
 
+/// Build the `initial_prompt` we'll send to the engine for one chunk:
+/// `"<vocabulary_hints>. <rolling_context>"`. Vocabulary hints (folder/tag
+/// names) prime Whisper for proper nouns and are read fresh per chunk so
+/// mid-recording updates take effect; the hints are snapshotted into an owned
+/// string inside a tight scope so the mutex is dropped before the long
+/// `transcribe_with` await blocks any concurrent `update_vocabulary_hints`
+/// call. Returns `None` only when both vocab and accumulated context are
+/// empty.
+async fn build_effective_prompt(
+    ctx: &TranscriptionContext,
+    accumulated_text: &str,
+) -> Option<String> {
+    let max_prompt = ctx.config.prompt_context_chars.unwrap_or(350) as usize;
+    let vocab_truncated: String = {
+        let vocab_guard = ctx.vocabulary_hints.lock().await;
+        let vocab: &str = vocab_guard.as_str();
+        // Round down to a char boundary — folder/tag names can contain
+        // multibyte codepoints, and a raw byte slice at the 80-byte cap could
+        // land mid-codepoint and panic the live-transcription task.
+        let vocab_budget = vocab.floor_char_boundary(vocab.len().min(80));
+        vocab[..vocab_budget].to_string()
+    };
+    let vocab_budget = vocab_truncated.len();
+    let context_budget = max_prompt.saturating_sub(if vocab_budget > 0 {
+        vocab_budget + 2
+    } else {
+        0
+    });
+
+    if accumulated_text.is_empty() && vocab_budget == 0 {
+        return None;
+    }
+
+    let context_part = if accumulated_text.is_empty() {
+        ""
+    } else if accumulated_text.len() > context_budget {
+        let boundary =
+            accumulated_text.ceil_char_boundary(accumulated_text.len() - context_budget);
+        &accumulated_text[boundary..]
+    } else {
+        accumulated_text
+    };
+
+    if vocab_budget > 0 && !context_part.is_empty() {
+        Some(format!("{}. {}", &vocab_truncated, context_part))
+    } else if vocab_budget > 0 {
+        Some(vocab_truncated)
+    } else {
+        Some(context_part.to_string())
+    }
+}
+
 /// Transcribes a chunk of audio and returns a `TranscribeOutcome`.
 ///
 /// - `Success`: transcription produced segments
@@ -2820,53 +2872,7 @@ async fn transcribe_chunk(
             }
         };
 
-    // Build effective prompt: [vocabulary_hints]. [rolling_context]
-    // Vocabulary hints (folder names) are prepended to help Whisper recognise proper nouns.
-    // Read fresh each chunk so mid-recording updates take effect. Snapshot the
-    // hints into an owned String inside a short scope so the mutex is dropped
-    // before the long `transcribe_with` await — otherwise the
-    // `update_vocabulary_hints` command can block behind a multi-second
-    // sidecar round trip.
-    let max_prompt = ctx.config.prompt_context_chars.unwrap_or(350) as usize;
-    let vocab_truncated: String = {
-        let vocab_guard = ctx.vocabulary_hints.lock().await;
-        let vocab: &str = vocab_guard.as_str();
-        // Round down to a char boundary — folder/tag names can contain
-        // multibyte codepoints, and a raw byte slice at the 80-byte cap
-        // could land mid-codepoint and panic the live-transcription task.
-        let vocab_budget = vocab.floor_char_boundary(vocab.len().min(80));
-        vocab[..vocab_budget].to_string()
-    };
-    let vocab_budget = vocab_truncated.len();
-    let context_budget = max_prompt.saturating_sub(if vocab_budget > 0 {
-        vocab_budget + 2
-    } else {
-        0
-    });
-
-    let combined_prompt: String;
-    let effective_prompt: Option<&str> = if accumulated_text.is_empty() && vocab_budget == 0 {
-        None
-    } else {
-        let context_part = if accumulated_text.is_empty() {
-            ""
-        } else if accumulated_text.len() > context_budget {
-            let boundary =
-                accumulated_text.ceil_char_boundary(accumulated_text.len() - context_budget);
-            &accumulated_text[boundary..]
-        } else {
-            accumulated_text.as_str()
-        };
-
-        if vocab_budget > 0 && !context_part.is_empty() {
-            combined_prompt = format!("{}. {}", &vocab_truncated, context_part);
-            Some(&combined_prompt)
-        } else if vocab_budget > 0 {
-            Some(&vocab_truncated)
-        } else {
-            Some(context_part)
-        }
-    };
+    let effective_prompt = build_effective_prompt(ctx, accumulated_text).await;
 
     // Briefly lock the outer mutex just to clone the inner Arc<TranscriptionClient>.
     // The actual `transcribe_with` await happens *without* holding any outer lock,
@@ -2898,7 +2904,7 @@ async fn transcribe_chunk(
     // input, so passing it would just be ignored. Drop it explicitly so the IPC
     // payload is honest about what was sent.
     let prompt_for_engine = match engine_kind {
-        yapstack_common::types::EngineKind::Whisper => effective_prompt,
+        yapstack_common::types::EngineKind::Whisper => effective_prompt.as_deref(),
         yapstack_common::types::EngineKind::Parakeet => None,
     };
     let transcription_result = client
@@ -2990,68 +2996,62 @@ async fn transcribe_chunk(
         }
         Err(e) => {
             warn!("live transcription: chunk failed: {}, skipping", e);
-
-            // Drop our local Arc clone before attempting restart so the outer
-            // mutex holder can try_unwrap without racing us. `client` (the
-            // Arc we cloned above) went out of scope at the end of the Ok
-            // arm's destructor, but we still hold our `client_arc` binding
-            // from the transcribe section. Drop it explicitly.
+            // Drop our local Arc clone so the restart helper's `try_unwrap`
+            // isn't racing us.
             drop(client);
+            recover_from_chunk_failure(ctx).await
+        }
+    }
+}
 
-            // Check if the sidecar process died — attempt auto-restart.
-            // respawn() needs &mut TranscriptionClient, so we take the Arc
-            // out of the Option, try_unwrap it, respawn, and put it back.
-            // If another task is still holding an Arc clone (e.g. a
-            // concurrent chunk still awaiting a response from the dead
-            // sidecar), try_unwrap fails and we fall through to Skipped —
-            // the other task will hit the same error and one of us will
-            // eventually win the race.
-            let mut client_guard = ctx.transcription_client.lock().await;
-            if let Some(arc_client) = client_guard.take() {
-                if !arc_client.is_running() {
-                    warn!("sidecar process died — attempting restart");
-                    match Arc::try_unwrap(arc_client) {
-                        Ok(mut client) => {
-                            match client.respawn().await {
-                                Ok(()) => {
-                                    info!(
-                                        "sidecar restarted successfully after transcription failure"
-                                    );
-                                    *client_guard = Some(Arc::new(client));
-                                    let _ = ctx.app_handle.emit(
-                                        "live-transcription-warning",
-                                        LiveTranscriptionWarningEvent {
-                                            message: "Transcription engine restarted".into(),
-                                        },
-                                    );
-                                    return TranscribeOutcome::Skipped;
-                                }
-                                Err(restart_err) => {
-                                    error!("sidecar restart failed: {}", restart_err);
-                                    // Put the client back so other tasks can
-                                    // see it as "not running" and try again.
-                                    *client_guard = Some(Arc::new(client));
-                                    return TranscribeOutcome::SidecarDead;
-                                }
-                            }
-                        }
-                        Err(still_shared) => {
-                            // Another task still holds the Arc. Put it back
-                            // untouched; that task will hit the same error
-                            // and we'll try again on the next chunk.
-                            *client_guard = Some(still_shared);
-                            debug!(
-                                "sidecar restart skipped: client still held by another chunk task"
-                            );
-                            return TranscribeOutcome::Skipped;
-                        }
-                    }
-                }
-                // Sidecar still running — just a transient error. Put the
-                // Arc back and let the caller retry.
-                *client_guard = Some(arc_client);
+/// Inspect the transcription client after a chunk error: if the sidecar is
+/// still running the failure was transient and we just retry; if it died,
+/// try to respawn it. respawn needs `&mut TranscriptionClient`, so we
+/// `try_unwrap` the inner `Arc`. When another task still holds a clone (a
+/// concurrent chunk awaiting the dead sidecar's response), the unwrap fails;
+/// we put the `Arc` back untouched and return `Skipped`, letting that other
+/// task hit the same error and retry on the next chunk. Returns the outcome
+/// the caller should propagate.
+async fn recover_from_chunk_failure(ctx: &TranscriptionContext) -> TranscribeOutcome {
+    let mut client_guard = ctx.transcription_client.lock().await;
+    let Some(arc_client) = client_guard.take() else {
+        return TranscribeOutcome::Skipped;
+    };
+    if arc_client.is_running() {
+        // Sidecar still running — just a transient error. Put the Arc back
+        // and let the caller retry.
+        *client_guard = Some(arc_client);
+        return TranscribeOutcome::Skipped;
+    }
+
+    warn!("sidecar process died — attempting restart");
+    match Arc::try_unwrap(arc_client) {
+        Ok(mut client) => match client.respawn().await {
+            Ok(()) => {
+                info!("sidecar restarted successfully after transcription failure");
+                *client_guard = Some(Arc::new(client));
+                let _ = ctx.app_handle.emit(
+                    "live-transcription-warning",
+                    LiveTranscriptionWarningEvent {
+                        message: "Transcription engine restarted".into(),
+                    },
+                );
+                TranscribeOutcome::Skipped
             }
-
+            Err(restart_err) => {
+                error!("sidecar restart failed: {}", restart_err);
+                // Put the client back so other tasks can see it as "not
+                // running" and try again.
+                *client_guard = Some(Arc::new(client));
+                TranscribeOutcome::SidecarDead
+            }
+        },
+        Err(still_shared) => {
+            // Another task still holds the Arc. Put it back untouched; that
+            // task will hit the same error and we'll try again on the next
+            // chunk.
+            *client_guard = Some(still_shared);
+            debug!("sidecar restart skipped: client still held by another chunk task");
             TranscribeOutcome::Skipped
         }
     }
