@@ -40,24 +40,24 @@ Each commit leaves the codebase working (`pnpm check` green).
 
 ### Phase 1 — Confirmed dead code
 
-1. Delete `BackfillChunk<'a>` struct in `live_transcription.rs`. Never instantiated; `VadBackfillChunk` is the live one.
-2. Delete `chunk_at_silence_boundaries()` and its test-only call sites. Backfill exclusively uses `vad_chunk_historical_audio()`.
-3. Delete `prompt_decay_reset()` in `silero_vad.rs`. Kept "for future" with zero callers.
-4. Verify-then-delete the `prompt_seeded_from_backfill` field on `SourceVadState`. If the conditional is unreachable-false in practice, drop the field. If load-bearing, document the invariant and skip.
-5. Drop the unused `getDayLabel` export in `lib/utils.ts`.
-6. Update CLAUDE.md to remove the "alias retained for one release" sentence (alias is gone).
-7. Update CLAUDE.md to correct the `db::ensure_runtime_schema()` description if/where it overstates what the function does.
+1. Delete `BackfillChunk<'a>` struct. **DONE** — `VadBackfillChunk` is the live one.
+2. Delete `chunk_at_silence_boundaries()` and its tests. **DONE** — backfill exclusively uses `vad_chunk_historical_audio()`.
+3. ~~Delete `prompt_decay_reset()`~~. Skipped — function does not exist (audit error).
+4. ~~Delete `prompt_seeded_from_backfill` field~~. Skipped — load-bearing one-shot guard for backfill prompt seeding; without it, the shared prompt would be reseeded every poll iteration.
+5. ~~Drop `getDayLabel` export~~. Skipped — used internally by `groupSessionsByDay` and tested directly.
+6. **DONE** — Removed "alias retained for one release" and `WhisperClient`/`WhisperClientState` references from CLAUDE.md (rename has fully shipped).
+7. **DONE** — Corrected the `db::ensure_runtime_schema()` description, store version (22 → 23), DB schema version (v11 → v15), and `init_whisper_client` references.
 
 ### Phase 2 — Defensive code that can't fire
 
-8. Collapse `should_stall_restart` to its boolean expression.
-9. Drop the `if sample_rate == 0` guard in `stream.rs` if `hound` already errors earlier.
-10. Audit empty-recording `finalize_wav_only()` paths. If unreachable in practice, replace with `expect("…")`. If reachable, leave it but add a one-line comment naming the trigger condition.
+8. **DONE** — Collapsed `should_stall_restart` to a single negated boolean expression.
+9. ~~Drop `if sample_rate == 0` guard~~. Skipped — guard does not exist (audit error).
+10. ~~Audit `finalize_wav_only()` paths~~. Skipped — both call sites are reachable (empty-recording cleanup at session end, WAV-format finalize) and the `fallback_text` panic-recovery path is a legitimate defensive measure for tokio-task panics.
 
 ### Phase 3 — Branch consolidation (no logic change)
 
-11. Reconcile the two WAV flush thresholds (`WAV_FLUSH_ERROR_THRESHOLD = 10`, `WAV_FLUSH_WARNING_INTERVAL = 20`) into clear, symmetric semantics. Document the cadence.
-12. Inline the dictation-skip branch in segment persistence behind a single early return at the call site.
+11. ~~Reconcile the two WAV flush thresholds.~~ Skipped — `ERROR_THRESHOLD = 10` (one-shot user error event), `WARNING_INTERVAL = 20` (periodic log), `DIAGNOSTIC_INTERVAL = 100` (success-path log) each serve a distinct purpose.
+12. ~~Inline the dictation-skip branch in segment persistence.~~ Skipped — already a single early return in `onLiveSegment` at `appStore.ts`.
 
 ### Phase 4 — `live_transcription_loop` decomposition
 
