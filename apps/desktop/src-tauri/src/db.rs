@@ -1,6 +1,17 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use tauri_plugin_sql::{Migration, MigrationKind};
+
+/// Row to insert into `session_audio_parts`. Mirrors the columns in the v15
+/// migration; constructed by both the live finalize path and reconciliation.
+pub struct AudioPartRow {
+    pub session_id: String,
+    pub part_index: u32,
+    pub file_path: String,
+    pub format: &'static str,
+    pub duration_seconds: f32,
+    pub sample_rate: u32,
+}
 
 /// Pre-migration runtime patches. Currently only sweeps stale `recording`
 /// sessions left by a prior crash; runtime *schema* patches (segments.speaker_id)
@@ -110,6 +121,263 @@ fn table_exists(conn: &rusqlite::Connection, name: &str) -> bool {
         |_| Ok(()),
     )
     .is_ok()
+}
+
+/// Inserts a `session_audio_parts` row. Uses INSERT OR IGNORE so a partial
+/// crash that leaves a row already inserted is recoverable on retry.
+pub fn insert_audio_part_row(db_path: &Path, row: &AudioPartRow) -> rusqlite::Result<()> {
+    use rusqlite::params;
+    let conn = rusqlite::Connection::open(db_path)?;
+    let id = format!(
+        "{:016x}{:016x}",
+        rand_u64_from_clock(),
+        rand_u64_from_clock()
+    );
+    let created_at = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    conn.execute(
+        "INSERT OR IGNORE INTO session_audio_parts (
+            id, session_id, part_index, file_path, format,
+            duration_seconds, sample_rate, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        params![
+            id,
+            row.session_id,
+            row.part_index,
+            row.file_path,
+            row.format,
+            row.duration_seconds as f64,
+            row.sample_rate,
+            created_at,
+        ],
+    )?;
+    Ok(())
+}
+
+fn rand_u64_from_clock() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let n = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0) as u64;
+    n ^ (n.wrapping_mul(6364136223846793005).rotate_left(13))
+}
+
+/// Returns canonicalized parent directories of every `session_audio_parts.file_path`,
+/// always including `$APP_DATA_DIR/audio` as the seed. Used to bootstrap the
+/// trusted-audio-dirs set at startup.
+pub fn list_audio_part_directories(db_path: &Path, app_audio_dir: &Path) -> Vec<PathBuf> {
+    use std::collections::HashSet;
+    let mut out: HashSet<PathBuf> = HashSet::new();
+    if let Ok(canon) = std::fs::canonicalize(app_audio_dir) {
+        out.insert(canon);
+    } else {
+        out.insert(app_audio_dir.to_path_buf());
+    }
+    if !db_path.exists() {
+        return out.into_iter().collect();
+    }
+    let Ok(conn) = rusqlite::Connection::open(db_path) else {
+        return out.into_iter().collect();
+    };
+    if !table_exists(&conn, "session_audio_parts") {
+        return out.into_iter().collect();
+    }
+    let mut stmt = match conn
+        .prepare("SELECT DISTINCT file_path FROM session_audio_parts WHERE file_path IS NOT NULL")
+    {
+        Ok(s) => s,
+        Err(_) => return out.into_iter().collect(),
+    };
+    let rows = match stmt.query_map([], |r| r.get::<_, String>(0)) {
+        Ok(r) => r,
+        Err(_) => return out.into_iter().collect(),
+    };
+    for path in rows.flatten() {
+        if let Some(parent) = Path::new(&path).parent() {
+            if let Ok(canon) = std::fs::canonicalize(parent) {
+                out.insert(canon);
+            } else {
+                out.insert(parent.to_path_buf());
+            }
+        }
+    }
+    out.into_iter().collect()
+}
+
+/// Walks each trusted dir for filenames matching `{session_id}.{part_index}.{wav|mp3}`
+/// whose `(session_id, part_index)` row is missing. INSERT OR IGNORE recovers
+/// the row using duration read from file metadata. Rare orphan recovery —
+/// nominal flow has Rust insert the row inline at finalize time.
+pub fn reconcile_audio_parts(db_path: &Path, dirs: &[PathBuf]) {
+    if !db_path.exists() {
+        return;
+    }
+    let Ok(conn) = rusqlite::Connection::open(db_path) else {
+        return;
+    };
+    if !table_exists(&conn, "session_audio_parts") || !table_exists(&conn, "sessions") {
+        return;
+    }
+
+    let mut recovered = 0u32;
+    for dir in dirs {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            let Some((session_id, part_index, format)) = parse_part_filename(&name) else {
+                continue;
+            };
+            // Skip if (session_id, part_index) already exists.
+            let exists: bool = conn
+                .query_row(
+                    "SELECT 1 FROM session_audio_parts WHERE session_id = ? AND part_index = ?",
+                    rusqlite::params![session_id, part_index],
+                    |_| Ok(()),
+                )
+                .is_ok();
+            if exists {
+                continue;
+            }
+            // Skip if the session row doesn't exist (file is unrelated).
+            let session_exists: bool = conn
+                .query_row(
+                    "SELECT 1 FROM sessions WHERE id = ?",
+                    rusqlite::params![session_id],
+                    |_| Ok(()),
+                )
+                .is_ok();
+            if !session_exists {
+                continue;
+            }
+            let abs = entry.path();
+            let (duration, sample_rate) =
+                read_audio_metadata(&abs, format).unwrap_or((0.0, 48_000));
+            let row = AudioPartRow {
+                session_id: session_id.to_string(),
+                part_index,
+                file_path: abs.to_string_lossy().into_owned(),
+                format,
+                duration_seconds: duration,
+                sample_rate,
+            };
+            if insert_audio_part_row(db_path, &row).is_ok() {
+                recovered += 1;
+            }
+        }
+    }
+    if recovered > 0 {
+        tracing::info!("reconcile_audio_parts: recovered {recovered} orphan rows");
+    }
+}
+
+/// Returns `(session_id, part_index, format)` for a filename like
+/// `{uuid-or-hex}.{n}.{wav|mp3}`. Session id is a non-strict shape — accepts
+/// any token without dots — but rejects dictation-style `{id}.wav` (no
+/// part-index segment).
+fn parse_part_filename(name: &str) -> Option<(&str, u32, &'static str)> {
+    let (stem, ext) = name.rsplit_once('.')?;
+    let format = match ext.to_ascii_lowercase().as_str() {
+        "wav" => "wav",
+        "mp3" => "mp3",
+        _ => return None,
+    };
+    let (session_id, idx_str) = stem.rsplit_once('.')?;
+    let part_index: u32 = idx_str.parse().ok()?;
+    if session_id.is_empty() || session_id.contains('.') {
+        return None;
+    }
+    Some((session_id, part_index, format))
+}
+
+/// Returns `(duration_seconds, sample_rate)` for a recovered audio file.
+/// WAV uses `hound`; MP3 parses the first MPEG audio frame header. Returns
+/// `(0.0, 48000)` for unparseable MP3 — playback still works, but resume is
+/// blocked until the part is overwritten by a fresh finalize.
+fn read_audio_metadata(path: &Path, format: &'static str) -> Option<(f32, u32)> {
+    match format {
+        "wav" => {
+            let reader = hound::WavReader::open(path).ok()?;
+            let spec = reader.spec();
+            let sample_rate = spec.sample_rate;
+            let frames = reader.duration() as f32;
+            if sample_rate == 0 {
+                return None;
+            }
+            Some((frames / sample_rate as f32, sample_rate))
+        }
+        "mp3" => {
+            // Read the first 64 KiB; that's enough to skip ID3v2 + locate
+            // a sync. CBR is the only thing the app's encoder produces.
+            let mut buf = [0u8; 64 * 1024];
+            let n = read_prefix(path, &mut buf)?;
+            let (bitrate_bps, sample_rate, id3_size) = mp3_first_frame(&buf[..n])?;
+            let file_len = std::fs::metadata(path).ok()?.len() as i64;
+            let body_bits = ((file_len - id3_size as i64).max(0) as f64) * 8.0;
+            let duration = (body_bits / bitrate_bps as f64) as f32;
+            Some((duration, sample_rate))
+        }
+        _ => None,
+    }
+}
+
+fn read_prefix(path: &Path, buf: &mut [u8]) -> Option<usize> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path).ok()?;
+    let n = f.read(buf).ok()?;
+    Some(n)
+}
+
+/// Parses the first MPEG audio frame header to extract bitrate (bps) and
+/// sample rate. Skips an ID3v2 tag if present and returns its byte length so
+/// callers can compute body size for CBR duration math.
+fn mp3_first_frame(data: &[u8]) -> Option<(u32, u32, usize)> {
+    let id3_size = if data.len() >= 10 && &data[0..3] == b"ID3" {
+        // 28-bit synchsafe int across data[6..10]
+        let s = ((data[6] as usize) << 21)
+            | ((data[7] as usize) << 14)
+            | ((data[8] as usize) << 7)
+            | (data[9] as usize);
+        s + 10
+    } else {
+        0
+    };
+    let h = data.get(id3_size..id3_size + 4)?;
+    if h[0] != 0xFF || (h[1] & 0xE0) != 0xE0 {
+        return None;
+    }
+    let version_id = (h[1] >> 3) & 0x03; // 0=2.5, 2=2, 3=1
+    let layer = (h[1] >> 1) & 0x03; // 1=L3, 2=L2, 3=L1
+    if layer == 0 || version_id == 1 {
+        return None;
+    }
+    let bitrate_idx = ((h[2] >> 4) & 0x0F) as usize;
+    let sample_rate_idx = ((h[2] >> 2) & 0x03) as usize;
+    if bitrate_idx == 0 || bitrate_idx == 0xF || sample_rate_idx == 3 {
+        return None;
+    }
+    let bitrates_v1_l3 = [
+        0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320,
+    ];
+    let bitrates_v2_l3 = [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160];
+    let is_v1 = version_id == 3;
+    let kbps = if is_v1 {
+        bitrates_v1_l3[bitrate_idx]
+    } else {
+        bitrates_v2_l3[bitrate_idx]
+    };
+    let rates_v1 = [44_100u32, 48_000, 32_000];
+    let rates_v2 = [22_050u32, 24_000, 16_000];
+    let rates_v25 = [11_025u32, 12_000, 8_000];
+    let sample_rate = match version_id {
+        3 => rates_v1[sample_rate_idx],
+        2 => rates_v2[sample_rate_idx],
+        _ => rates_v25[sample_rate_idx],
+    };
+    Some((kbps as u32 * 1000, sample_rate, id3_size))
 }
 
 pub fn migrations() -> Vec<Migration> {
@@ -670,6 +938,119 @@ mod tests {
         assert!(v15
             .sql
             .contains("INSERT OR IGNORE INTO session_audio_parts"));
+    }
+
+    #[test]
+    fn parse_part_filename_accepts_session_index_format() {
+        let (sid, idx, fmt) = parse_part_filename("abc-def-123.0.wav").unwrap();
+        assert_eq!(sid, "abc-def-123");
+        assert_eq!(idx, 0);
+        assert_eq!(fmt, "wav");
+
+        let (sid, idx, fmt) = parse_part_filename("uuid.7.mp3").unwrap();
+        assert_eq!(sid, "uuid");
+        assert_eq!(idx, 7);
+        assert_eq!(fmt, "mp3");
+    }
+
+    #[test]
+    fn parse_part_filename_rejects_legacy_dictation_shape() {
+        // `{id}.wav` (no part-index segment) — must not match.
+        assert!(parse_part_filename("abc.wav").is_none());
+        assert!(parse_part_filename("notaudio.txt").is_none());
+        assert!(parse_part_filename("noext").is_none());
+    }
+
+    #[test]
+    fn insert_and_reconcile_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        // Apply all migrations to the test DB.
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        for m in migrations() {
+            conn.execute_batch(m.sql).unwrap();
+        }
+        conn.execute(
+            "INSERT INTO sessions (id, title, source, status) \
+             VALUES ('sess-x', 't', 'MicOnly', 'completed')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        // Write a fake WAV file matching the parts naming scheme into a
+        // standalone audio dir so reconciliation can find it.
+        let audio_dir = dir.path().join("audio");
+        std::fs::create_dir_all(&audio_dir).unwrap();
+        let wav_path = audio_dir.join("sess-x.0.wav");
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&wav_path, spec).unwrap();
+        for _ in 0..16_000 {
+            writer.write_sample(0i16).unwrap();
+        }
+        writer.finalize().unwrap();
+
+        // No row yet — reconciliation should insert one.
+        reconcile_audio_parts(&db_path, &[audio_dir.clone()]);
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let (count, dur, sr): (i64, f64, i64) = conn
+            .query_row(
+                "SELECT COUNT(*), MAX(duration_seconds), MAX(sample_rate) \
+                 FROM session_audio_parts WHERE session_id = 'sess-x'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(sr, 16_000);
+        assert!((dur - 1.0).abs() < 0.01, "expected ~1s, got {dur}");
+
+        // Running reconciliation again must be a no-op (INSERT OR IGNORE).
+        reconcile_audio_parts(&db_path, &[audio_dir.clone()]);
+        let count2: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_audio_parts WHERE session_id = 'sess-x'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count2, 1, "reconciliation must be idempotent");
+    }
+
+    #[test]
+    fn reconcile_skips_files_for_unknown_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        for m in migrations() {
+            conn.execute_batch(m.sql).unwrap();
+        }
+        drop(conn);
+
+        let audio_dir = dir.path().join("audio");
+        std::fs::create_dir_all(&audio_dir).unwrap();
+        let wav_path = audio_dir.join("ghost.0.wav");
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&wav_path, spec).unwrap();
+        writer.write_sample(0i16).unwrap();
+        writer.finalize().unwrap();
+
+        reconcile_audio_parts(&db_path, &[audio_dir]);
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM session_audio_parts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "no row should be inserted for unknown sessions");
     }
 
     #[test]
