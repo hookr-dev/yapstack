@@ -267,13 +267,6 @@ struct SessionAccumulators {
     last_transcription_at: Option<Instant>,
 }
 
-/// A single chunk of backfill audio with its sample rate.
-#[allow(dead_code)] // retained as the pair with chunk_at_silence_boundaries
-struct BackfillChunk<'a> {
-    samples: &'a [f32],
-    sample_rate: u32,
-}
-
 /// One source's backfill data: the raw samples plus VAD-simulated chunk
 /// boundaries (start/end sample indices) produced by `vad_chunk_historical_audio`.
 struct VadBackfillSource {
