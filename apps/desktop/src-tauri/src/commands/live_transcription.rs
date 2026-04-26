@@ -976,10 +976,7 @@ const DEVICE_IDENTITY_POLL_INTERVAL_SECS: f32 = 3.0;
 /// given source. On Windows, system audio loopback produces zero samples when nothing
 /// is playing — this is normal WASAPI behavior, not a stream failure.
 fn should_stall_restart(label: &AudioSourceLabel) -> bool {
-    if cfg!(target_os = "windows") && matches!(label, AudioSourceLabel::System) {
-        return false;
-    }
-    true
+    !(cfg!(target_os = "windows") && matches!(label, AudioSourceLabel::System))
 }
 
 /// Window used by the pre-flight health check to observe whether `write_pos`
