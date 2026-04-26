@@ -8,6 +8,10 @@ import {
   tauriWebviewWindowMock,
   tauriSqlMock,
   tauriCommandsMock,
+  tauriGlobalShortcutMock,
+  tauriPathMock,
+  tauriOpenerMock,
+  tauriDialogMock,
 } from "@/test/tauri-mocks";
 import { setupMatchMedia } from "@/test/match-media";
 import App from "./App";
@@ -17,7 +21,11 @@ vi.mock("@tauri-apps/api/event", () => tauriEventMock());
 vi.mock("@tauri-apps/api/window", () => tauriWindowMock());
 vi.mock("@tauri-apps/api/dpi", () => tauriDpiMock());
 vi.mock("@tauri-apps/api/webviewWindow", () => tauriWebviewWindowMock());
+vi.mock("@tauri-apps/api/path", () => tauriPathMock());
 vi.mock("@tauri-apps/plugin-sql", () => tauriSqlMock());
+vi.mock("@tauri-apps/plugin-global-shortcut", () => tauriGlobalShortcutMock());
+vi.mock("@tauri-apps/plugin-opener", () => tauriOpenerMock());
+vi.mock("@tauri-apps/plugin-dialog", () => tauriDialogMock());
 vi.mock("@/lib/tauri", () => tauriCommandsMock());
 
 beforeEach(() => {

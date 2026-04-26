@@ -986,11 +986,12 @@ Modular tool registry. Each tool is self-contained with schema, executor, undo h
 | Function | Signature | Description |
 |----------|-----------|-------------|
 | `registerTool` | `(def: ToolDefinition) → void` | Registers a tool in the global registry |
-| `getRegisteredTools` | `() → ChatCompletionTool[]` | Returns all tool schemas for the API call |
-| `getToolsForContext` | `(isSessionContext: boolean) → ChatCompletionTool[]` | Returns all tools for session contexts, empty array for multi-session |
-| `getToolsById` | `(toolIds: string[]) → ChatCompletionTool[]` | Returns schemas for specific tool IDs |
+| `getRegisteredTools` | `() → ChatCompletionTool[]` | Returns every registered tool's schema |
+| `getToolsById` | `(toolIds: string[]) → ChatCompletionTool[]` | Returns schemas for specific tool IDs. Per-context tool selection is the caller's job — see `createSessionTools` / `createMultiSessionTools` in `ai-context.ts`. |
+| `getToolKind` | `(toolName: string) → ToolKind \| undefined` | Returns whether a tool is `"mutating"` or `"retrieval"` (used by the chat UI to render the right badge). |
 | `getToolEffects` | `(toolNames: string[]) → Set<ToolEffect>` | Collects effect categories from executed tool names. Used by `NoteDetailView` to determine which data to refresh after tool execution. |
 | `executeTool` | `(name, args, ctx) → Promise<ExecutedTool \| null>` | Executes a tool by name. Returns `null` if the tool is a no-op (e.g., title unchanged). |
+| `captureUndoSnapshot` | `<T>(loader: () => Promise<T>) → Promise<T>` | Helper that loads pre-mutation state for the executor's `undoData`, used by mutating tools so undo restores the prior value. |
 | `undoToolCalls` | `(executed, ctx) → Promise<void>` | Reverses tool executions in LIFO order |
 | `convertCitationsToSegmentRefs` | `(html, segments) → string` | Replaces `[[seg:ID]]` text citations with `<span data-segment-ref>` HTML nodes for Tiptap rendering |
 
@@ -1005,7 +1006,7 @@ Modular tool registry. Each tool is self-contained with schema, executor, undo h
 | `add_session_to_folder` | `{ folder_id: string }` | `findBranchConflicts()` → `dbAddSessionToFolder()` → `getFolderPath()` (returns hierarchical description chain in `result`) | `["organization"]` |
 | `search_sessions` | `{ query: string, limit?: number }` | FTS5 search across session titles, notes, and segment text | `[]` (read-only) |
 | `search_dictations` | `{ query: string, limit?: number }` | FTS5 search across `dictation_history` | `[]` (read-only) |
-| `get_session_context` | `{ session_id: string }` | `getSession()` + `getSessionSegments()` + `getNote()` + `listAllSessionFolders()` + `getSessionTagIds()` | `[]` (read-only) |
+| `get_session_context` | `{ session_ids: string[], scope: "segments" \| "notes" \| "summary" \| "all" }` | For each id (max 5 per call): `getSession()` + scope-conditional `getSessionSegments()` / `getNote()`. `scope="summary"` is currently always null pending a future summarization step. Errors out-of-scope ids when the chat context carries `allowedSessionIds`. | `[]` (read-only) |
 | `replace_in_transcript` | `{ find: string, replacement: string, all?: boolean }` | `getSessionSegments()` → for each match: `editSegmentText()` (preserves `original_text` for undo) | `["notes"]` (refresh segment views) |
 
 ### `lib/ai-prompts.ts`

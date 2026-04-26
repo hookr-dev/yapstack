@@ -296,12 +296,12 @@ The persisted domain model. All writes flow through `tauri-plugin-sql` via `lib/
 - **Session ↔ folder junction** (`session_folders`) — many-to-many. A session can live in multiple folders; branch conflicts detected by `findBranchConflicts()` in `lib/folder-tree.ts`.
 - **Chat messages** (`chat_messages`) — per-session and per-list history (session, folder, all, pinned, dictation). Keyed by `chatContextKey()`.
 - **Dictation history** (`dictation_history`) — per-slot entries with audio path, transcript, and AI-processed output.
-- **Tags** — not yet on `main`. See [`AI_CONTEXT.md`](./AI_CONTEXT.md) § Tags for the pending schema on `feature/knowledge-management` (migration v11 adds `tags` + `session_tags` tables with `manual` / `auto` source and confidence).
+- **Tags** (`tags`, `session_tags`) — flat, AI-applied metadata layered on top of folders. Migration v11 added `tags` (id, name, color, created_at) and `session_tags` (session_id, tag_id, source `manual`/`ai`, confidence, created_at). Folders remain the primary organizational primitive; tags are deliberately non-hierarchical and don't carry descriptions. See [`AI_CONTEXT.md`](./AI_CONTEXT.md) § Tags for the design rationale.
 
 ### See also
 
 - [`FRONTEND.md`](./FRONTEND.md) — Tailwind tokens, shadcn inventory, framework stack, keyboard shortcuts, UX interaction language.
-- [`AI_CONTEXT.md`](./AI_CONTEXT.md) — AI chat context surfaces, tool registry, how to add a new tool, folder hierarchy → prompt mapping, pending tags schema.
+- [`AI_CONTEXT.md`](./AI_CONTEXT.md) — AI chat context surfaces, tool registry, how to add a new tool, folder hierarchy → prompt mapping, tags schema and auto-folder suggestions.
 - [`PRINCIPLES.md`](./PRINCIPLES.md) — Design, testing, and coding posture.
 
 ## AI Chat & Tool Calling
@@ -438,7 +438,7 @@ Built-in tools (registered in `ai-tools.ts`):
 | `add_session_to_folder` | `{ folder_id: string }` | `organization` | Classifies session into a folder by id (chosen from `search_folders` results). Handles branch conflicts. Returns the folder's hierarchical description chain in `result` so Phase 2 of two-phase actions sees the parent context. |
 | `search_sessions` | `{ query: string, limit?: number }` | (none) | Read-only. FTS5 search across session titles, segment text, and notes. |
 | `search_dictations` | `{ query: string, limit?: number }` | (none) | Read-only. FTS5 search across `dictation_history`. |
-| `get_session_context` | `{ session_id: string }` | (none) | Read-only. Returns full transcript + notes + folders + tags for a referenced session. Used when chat needs to compare or pull from another session. |
+| `get_session_context` | `{ session_ids: string[], scope: "segments" \| "notes" \| "summary" \| "all" }` | (none) | Read-only. Expands a list of `session_ids` returned by `search_sessions` into the requested artifact (transcript chunks, notes, both, or a future summary). Hard-capped at 5 ids per call. When the chat context carries `allowedSessionIds`, out-of-scope ids are rejected. |
 | `replace_in_transcript` | `{ find: string, replacement: string, all?: boolean }` | `notes` (refresh segments) | Edits segment text in the durable DB rows — fixes typos / mis-transcriptions surgically. Undo restores the original text on every touched segment. |
 
 **Post-tool refresh** uses `getToolEffects(toolNames)` to determine what to refresh based on `affects` metadata:
@@ -672,7 +672,7 @@ Dictation entries are persisted to SQLite via the `dictation_history` table (DB 
 
 - **DB CRUD**: `insertDictationHistory`, `listDictationHistory`, `getDictationHistory`, `deleteDictationHistory`, `clearDictationHistory`, `updateDictationHistorySessionId` in `lib/db.ts`
 - **Store**: `dictationHistory` state with `loadDictationHistory`, `deleteDictationHistoryEntry`, `clearDictationHistoryEntries` actions
-- **WAV correlation**: On `SESSION_WAV_READY` event, matches by UUID to update the history entry's `session_id`
+- **WAV correlation**: On the `session-part-ready` event, matches by UUID to update the history entry's `wav_file_path`/`wav_duration_seconds` (and `session_id` when the dictation slot's output action is `new-note`).
 - **UI**: `DictationHistoryList` (grouped by day, clear all button) + `DictationHistoryCard` (badges for slot/AI/action, WAV playback, context menu with delete/move-to-note)
 - **Navigation**: "Dictation" button in `AppSidebar` sets `ListFilter { type: "dictation" }`. `NoteCardList` routes to `DictationHistoryList` when filter is dictation.
 

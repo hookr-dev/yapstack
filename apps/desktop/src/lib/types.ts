@@ -501,16 +501,27 @@ prompt_context_chars: number | null;
  */
 prompt_decay_silence_seconds: number | null; 
 /**
- * Session ID for streaming WAV recording. If set, audio is incrementally
- * written to `$APP_DATA_DIR/audio/{session_id}.wav` during the session.
+ * Session ID for streaming session-audio recording. If set, the loop
+ * streams a new **session audio part** to disk during the session and
+ * inserts a `session_audio_parts` row at finalize time before emitting
+ * `session-part-ready`. The on-disk file is
+ * `{audio_save_location || $APP_DATA_DIR/audio/}/{session_id}.{part_index}.{wav|mp3}`,
+ * where `part_index` is 0 for a fresh session and `N` when resuming a
+ * session that already has parts.
  */
 session_id: string | null; 
 /**
- * Custom directory for saving WAV files. If None, uses `$APP_DATA_DIR/audio/`.
+ * Custom directory for saving session audio parts. If None, uses
+ * `$APP_DATA_DIR/audio/`. The directory is registered with
+ * `audio_save_locations` at recording start so reconciliation can
+ * recover orphan parts on the next startup.
  */
 audio_save_location: string | null; 
 /**
- * Audio export format: "wav" or "mp3". Default: "mp3".
+ * Audio export format applied at part finalization: "wav" or "mp3".
+ * Default: "mp3". Choosing "mp3" re-encodes the streamed WAV at
+ * `mp3_bitrate` and deletes the source WAV; "wav" keeps the streamed
+ * file as-is.
  */
 audio_export_format: string | null; 
 /**
