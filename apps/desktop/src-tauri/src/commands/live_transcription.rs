@@ -1441,13 +1441,14 @@ fn source_display_name(label: &AudioSourceLabel) -> &'static str {
     }
 }
 
-/// Checks stream health for all sources and triggers restarts if needed.
-/// Returns `true` if any source was restarted (caller may want to skip VAD this tick).
-///
-/// `session_wav_state` must be passed so that a buffer-replacing restart
-/// can reset the WAV writer's flush position for the affected source —
-/// otherwise the old position against the new buffer stalls WAV writes
-/// until `write_pos` climbs past the stale counter.
+/// Per-tick stream-health pass over every source. Each source is checked
+/// against three layered signals — OS-authoritative listener events first,
+/// then symptom-based detection (cpal error flag, write-position stall,
+/// device-identity drift) gated by a cooldown — and restarted when any one
+/// of them fires. `session_wav_state` is threaded through so a
+/// buffer-replacing restart can reset the WAV writer's flush position;
+/// otherwise the old position against the fresh buffer stalls writes until
+/// the new counter climbs past it.
 async fn check_stream_health(
     sources: &mut [SourceVadState],
     audio_state: &AudioManagerState,
@@ -1456,301 +1457,316 @@ async fn check_stream_health(
 ) {
     for source in sources.iter_mut() {
         if source.restart_attempts >= STREAM_RESTART_MAX_ATTEMPTS {
-            continue; // Already exhausted retries for this source
+            continue;
         }
 
-        let mut needs_restart = false;
-        let mut reason: String = String::new();
+        let mut reason = evaluate_listener_signal(source, audio_state).await;
 
-        // Layer 0: CoreAudio push notification — the OS tells us the
-        // default device changed (AirPods connect, Sound Settings toggle,
-        // another app grabs exclusive output) or the device list changed
-        // (hardware added/removed, which is an earlier signal than the
-        // default-device flip on some macOS versions). This is an
-        // authoritative rebind signal and bypasses cooldown — unlike the
-        // symptom-based layers below, a listener event is a real OS push,
-        // not a speculative retry. The restart_attempts ceiling above still
-        // guards against runaway loops if every rebind somehow fails.
-        //
-        // Before committing to a restart, sleep briefly and re-query the
-        // current default. macOS may report the *old* device as default
-        // momentarily during an AirPods/Bluetooth handshake (cpal#1175);
-        // restarting during that revert window would rebind to the same
-        // dead device. The settle delay lets the OS finish its transition
-        // and the re-check confirms the default is genuinely different
-        // from what we're bound to.
-        let listener_fired = {
-            let manager = audio_state.lock().await;
-            let default_changed = match source.label {
-                AudioSourceLabel::Mic => manager.mic_default_changed(),
-                AudioSourceLabel::System => manager.system_audio_default_changed(),
-            };
-            // Device-list change is a shared signal (consumed once per
-            // tick). Fold it into the listener-fired decision for the first
-            // source that inspects it; subsequent sources in the same tick
-            // see it as already-consumed.
-            let devices_changed = manager.device_list_changed();
-            default_changed || devices_changed
+        if reason.is_none() {
+            let in_cooldown = source.last_restart_at.is_some_and(|t| {
+                t.elapsed() < Duration::from_secs_f32(STREAM_RESTART_COOLDOWN_SECS)
+            });
+            if !in_cooldown {
+                reason = evaluate_speculative_signals(source, audio_state).await;
+            }
+        }
+
+        let Some(reason) = reason else { continue };
+        attempt_source_restart(
+            source,
+            audio_state,
+            app_handle,
+            session_wav_state.as_deref_mut(),
+            &reason,
+        )
+        .await;
+    }
+}
+
+/// Layer 0: OS-authoritative rebind signal. Returns `Some(reason)` only when
+/// the CoreAudio listener fired AND a re-query after a 200 ms settle confirms
+/// the default device is genuinely different from what's bound — macOS can
+/// momentarily revert the default during a Bluetooth handshake (cpal#1175),
+/// so the settle-and-recheck is what keeps us from rebinding to a still-dead
+/// device. Listener signals bypass the speculative-restart cooldown because
+/// they're a real OS push, not a guess.
+async fn evaluate_listener_signal(
+    source: &SourceVadState,
+    audio_state: &AudioManagerState,
+) -> Option<String> {
+    let listener_fired = {
+        let manager = audio_state.lock().await;
+        let default_changed = match source.label {
+            AudioSourceLabel::Mic => manager.mic_default_changed(),
+            AudioSourceLabel::System => manager.system_audio_default_changed(),
         };
-        if listener_fired {
-            // Settle delay — small enough that recovery is fast, long enough
-            // that macOS has committed to the new default device before we
-            // probe again.
-            tokio::time::sleep(Duration::from_millis(200)).await;
+        // Device-list change is a shared signal consumed once per tick; fold
+        // it into the listener-fired decision for the first source that
+        // inspects it.
+        let devices_changed = manager.device_list_changed();
+        default_changed || devices_changed
+    };
+    if !listener_fired {
+        return None;
+    }
 
-            let manager = audio_state.lock().await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let manager = audio_state.lock().await;
+    let bound = match source.label {
+        AudioSourceLabel::Mic => manager.mic_bound_device(),
+        AudioSourceLabel::System => manager.system_audio_bound_device(),
+    }
+    .map(str::to_string);
+    let current_default = match source.label {
+        AudioSourceLabel::Mic => yapstack_audio::manager::live_default_input_name(),
+        AudioSourceLabel::System => yapstack_audio::manager::live_default_output_name(),
+    };
+    let direction = match source.label {
+        AudioSourceLabel::Mic => "input",
+        AudioSourceLabel::System => "output",
+    };
+    match (bound.as_deref(), current_default.as_deref()) {
+        (Some(b), Some(c)) if b != c => {
+            info!(
+                "default {} device change confirmed after settle: '{}' → '{}', rebinding",
+                direction, b, c
+            );
+            Some("default device changed".into())
+        }
+        (Some(b), Some(c)) => {
+            // Listener fired but the default unchanged once the OS finished
+            // settling — spurious / transient signal. Let the stall watchdog
+            // catch a real disconnect.
+            debug!(
+                "listener fired for {} but default unchanged after settle (still '{}' ≈ '{}') — skipping restart",
+                direction, b, c
+            );
+            None
+        }
+        _ => {
+            // Bound name unavailable (stream never started or no device
+            // resolved). Trust the listener and rebind.
+            info!(
+                "default {} device changed (bound='{:?}', current='{:?}'), rebinding",
+                direction, bound, current_default
+            );
+            Some("default device changed".into())
+        }
+    }
+}
+
+/// Layers 1–3: symptom-based detection, gated by the speculative-restart
+/// cooldown in the caller. Layer 1 is the cpal error-callback flag (instant);
+/// Layer 2 is the write-position stall watchdog (~2 s); Layer 3 is the
+/// defensive device-identity drift poll that catches a missed Layer-0 event.
+/// Returns the first reason that fires, or `None` if none do.
+async fn evaluate_speculative_signals(
+    source: &mut SourceVadState,
+    audio_state: &AudioManagerState,
+) -> Option<String> {
+    let manager = audio_state.lock().await;
+
+    // Layer 1: cpal error callback flag.
+    let has_error = match source.label {
+        AudioSourceLabel::Mic => manager.mic_has_stream_error(),
+        AudioSourceLabel::System => manager.system_has_stream_error(),
+    };
+    if has_error {
+        return Some("stream error callback fired".into());
+    }
+
+    // Layer 2: write_pos stall detection. On Windows, system audio loopback
+    // produces zero samples when nothing is playing — that's normal WASAPI
+    // behavior, so `should_stall_restart` skips that case.
+    let current_pos = source_write_pos(&manager, &source.label);
+    if current_pos > source.last_seen_write_pos {
+        source.last_seen_write_pos = current_pos;
+        source.last_write_pos_advance = Instant::now();
+    } else if source.last_write_pos_advance.elapsed()
+        > Duration::from_secs_f32(STREAM_STALL_THRESHOLD_SECS)
+        && should_stall_restart(&source.label)
+    {
+        return Some("write position stalled".into());
+    }
+
+    // Layer 3: defensive device-identity drift poll. Throttled.
+    let should_check = source.last_device_check_at.is_none_or(|t| {
+        t.elapsed() > Duration::from_secs_f32(DEVICE_IDENTITY_POLL_INTERVAL_SECS)
+    });
+    if should_check {
+        source.last_device_check_at = Some(Instant::now());
+        let drift = match source.label {
+            AudioSourceLabel::Mic => manager.mic_input_drifted(),
+            AudioSourceLabel::System => manager.system_audio_output_drifted(),
+        };
+        if let Some(new_name) = drift {
             let bound = match source.label {
                 AudioSourceLabel::Mic => manager.mic_bound_device(),
                 AudioSourceLabel::System => manager.system_audio_bound_device(),
             }
-            .map(str::to_string);
-            let current_default = match source.label {
-                AudioSourceLabel::Mic => yapstack_audio::manager::live_default_input_name(),
-                AudioSourceLabel::System => yapstack_audio::manager::live_default_output_name(),
-            };
-            let direction = match source.label {
-                AudioSourceLabel::Mic => "input",
-                AudioSourceLabel::System => "output",
-            };
-            match (bound.as_deref(), current_default.as_deref()) {
-                (Some(b), Some(c)) if b != c => {
-                    needs_restart = true;
-                    info!(
-                        "default {} device change confirmed after settle: '{}' → '{}', rebinding",
-                        direction, b, c
-                    );
-                    reason = "default device changed".into();
-                }
-                (Some(b), Some(c)) => {
-                    // Listener fired but default is unchanged once the OS
-                    // finished settling — spurious / transient signal.
-                    // Don't restart; let the stall watchdog (Layer 2) catch
-                    // a real disconnect.
-                    debug!(
-                        "listener fired for {} but default unchanged after settle (still '{}' ≈ '{}') — skipping restart",
-                        direction, b, c
-                    );
-                }
-                _ => {
-                    // Bound name unavailable (stream never started or no
-                    // device resolved). Trust the listener and rebind.
-                    needs_restart = true;
-                    info!(
-                        "default {} device changed (bound='{:?}', current='{:?}'), rebinding",
-                        direction, bound, current_default
-                    );
-                    reason = "default device changed".into();
-                }
-            }
+            .map(str::to_string)
+            .unwrap_or_else(|| "<unknown>".into());
+            warn!(
+                "device identity drift without listener event: '{}' → '{}' (rebinding)",
+                bound, new_name
+            );
+            return Some("device identity drift (listener missed)".into());
         }
+    }
 
-        // Cooldown only gates the speculative layers below. Listener events
-        // above are honored immediately because they're OS-authoritative.
-        let in_cooldown = source
-            .last_restart_at
-            .is_some_and(|t| t.elapsed() < Duration::from_secs_f32(STREAM_RESTART_COOLDOWN_SECS));
+    None
+}
 
-        if !needs_restart && !in_cooldown {
-            let manager = audio_state.lock().await;
+/// Run a single restart attempt for `source`. Records the attempt timestamp,
+/// invokes the engine's restart entry point, and on success handles the
+/// buffer-replacement bookkeeping (cursor reset + WAV flush-position reset).
+/// On a same-device rebind, treats the attempt as partial — increments the
+/// retry counter and clears the cooldown so the next tick can try again
+/// immediately instead of waiting 5 s. Emits a `stream-health` event in
+/// every outcome.
+async fn attempt_source_restart(
+    source: &mut SourceVadState,
+    audio_state: &AudioManagerState,
+    app_handle: &AppHandle,
+    mut session_wav_state: Option<&mut SessionWavState>,
+    reason: &str,
+) {
+    let source_name = source_display_name(&source.label);
+    warn!(
+        "stream health: {} needs restart ({}), attempt {}/{}",
+        source_name,
+        reason,
+        source.restart_attempts + 1,
+        STREAM_RESTART_MAX_ATTEMPTS
+    );
 
-            // Layer 1: cpal error callback flag (instant detection)
-            let has_error = match source.label {
-                AudioSourceLabel::Mic => manager.mic_has_stream_error(),
-                AudioSourceLabel::System => manager.system_has_stream_error(),
-            };
-            if has_error {
-                needs_restart = true;
-                reason = "stream error callback fired".into();
-            }
+    source.last_restart_at = Some(Instant::now());
 
-            // Layer 2: write_pos stall detection (~2s latency)
-            // On Windows, system audio loopback produces zero samples when nothing is
-            // playing — this is normal behavior, not a stream failure. Only use stall
-            // detection for mic streams on Windows; system streams rely solely on the
-            // cpal error flag (Layer 1).
-            if !needs_restart {
-                let current_pos = source_write_pos(&manager, &source.label);
-                if current_pos > source.last_seen_write_pos {
-                    source.last_seen_write_pos = current_pos;
-                    source.last_write_pos_advance = Instant::now();
-                } else if source.last_write_pos_advance.elapsed()
-                    > Duration::from_secs_f32(STREAM_STALL_THRESHOLD_SECS)
-                    && should_stall_restart(&source.label)
-                {
-                    needs_restart = true;
-                    reason = "write position stalled".into();
-                }
-            }
-
-            // Layer 3: defensive device-identity drift poll. Only runs when
-            // earlier layers cleared and the throttle has elapsed. Primary
-            // detection is Layer 0; this catches the rare case where the
-            // listener registration silently failed or the OS missed a
-            // property-change notification.
-            if !needs_restart {
-                let should_check = source.last_device_check_at.is_none_or(|t| {
-                    t.elapsed() > Duration::from_secs_f32(DEVICE_IDENTITY_POLL_INTERVAL_SECS)
-                });
-                if should_check {
-                    source.last_device_check_at = Some(Instant::now());
-                    let drift = match source.label {
-                        AudioSourceLabel::Mic => manager.mic_input_drifted(),
-                        AudioSourceLabel::System => manager.system_audio_output_drifted(),
-                    };
-                    if let Some(new_name) = drift {
-                        let bound = match source.label {
-                            AudioSourceLabel::Mic => manager.mic_bound_device(),
-                            AudioSourceLabel::System => manager.system_audio_bound_device(),
-                        }
-                        .map(str::to_string)
-                        .unwrap_or_else(|| "<unknown>".into());
-                        warn!(
-                            "device identity drift without listener event: '{}' → '{}' (rebinding)",
-                            bound, new_name
-                        );
-                        needs_restart = true;
-                        reason = "device identity drift (listener missed)".into();
-                    }
-                }
-            }
+    let restart_result = {
+        let mut manager = audio_state.lock().await;
+        match source.label {
+            AudioSourceLabel::Mic => manager.restart_mic(),
+            AudioSourceLabel::System => manager.restart_system_audio(),
         }
+    };
 
-        if !needs_restart {
-            continue;
-        }
+    match restart_result {
+        Ok(report) => {
+            info!(
+                "stream health: {} restarted successfully (outcome: {:?}, same_device: {}, new_id: {:?})",
+                source_name, report.outcome, report.same_device, report.new_device_id
+            );
 
-        let source_name = source_display_name(&source.label);
-        warn!(
-            "stream health: {} needs restart ({}), attempt {}/{}",
-            source_name,
-            reason,
-            source.restart_attempts + 1,
-            STREAM_RESTART_MAX_ATTEMPTS
-        );
-
-        source.last_restart_at = Some(Instant::now());
-
-        let restart_result = {
-            let mut manager = audio_state.lock().await;
-            match source.label {
-                AudioSourceLabel::Mic => manager.restart_mic(),
-                AudioSourceLabel::System => manager.restart_system_audio(),
-            }
-        };
-
-        match restart_result {
-            Ok(report) => {
-                info!(
-                    "stream health: {} restarted successfully (outcome: {:?}, same_device: {}, new_id: {:?})",
-                    source_name, report.outcome, report.same_device, report.new_device_id
+            // Same-device rebind likely means macOS was still settling after
+            // a Bluetooth handshake (cpal#1175). Treat it like a partial
+            // failure: keep counting attempts and clear the cooldown so the
+            // next tick can retry immediately. Do NOT reset
+            // last_write_pos_advance — the stream hasn't actually recovered,
+            // and Layer 2 should fire on the next tick if write_pos isn't
+            // advancing.
+            if report.same_device {
+                warn!(
+                    "{} restart rebound to the same device ({:?}) — macOS likely still settling; \
+                     retrying on next poll (attempt {}/{})",
+                    source_name,
+                    report.new_device_id,
+                    source.restart_attempts + 1,
+                    STREAM_RESTART_MAX_ATTEMPTS
                 );
-
-                // When the restart rebound to the same device, macOS was
-                // likely still settling after an AirPods/Bluetooth handshake
-                // (cpal#1175: default-device property can revert momentarily).
-                // Treat it like a partial failure: keep incrementing
-                // restart_attempts so the outer MAX_ATTEMPTS cap applies, and
-                // clear the cooldown so the next health tick can retry
-                // immediately instead of waiting 5 s. Do NOT reset
-                // last_write_pos_advance — the stream hasn't actually
-                // recovered, and we want Layer 2 (stall) to fire on the next
-                // tick if the write_pos isn't advancing.
-                if report.same_device {
-                    warn!(
-                        "{} restart rebound to the same device ({:?}) — macOS likely still settling; \
-                         retrying on next poll (attempt {}/{})",
-                        source_name,
-                        report.new_device_id,
-                        source.restart_attempts + 1,
-                        STREAM_RESTART_MAX_ATTEMPTS
-                    );
-                    source.restart_attempts += 1;
-                    source.last_restart_at = None;
-                } else {
-                    source.restart_attempts = 0;
-                    source.last_write_pos_advance = Instant::now();
-                }
-
-                let outcome = report.outcome;
-                if outcome == yapstack_audio::manager::RestartOutcome::BufferReplaced {
-                    // Read the fresh buffer's metadata and reset all cursors.
-                    // The new buffer starts at write_pos = 0, so session /
-                    // cursor / speech-start positions must follow.
-                    let (new_pos, sr, ch) = {
-                        let manager = audio_state.lock().await;
-                        let info = match source.label {
-                            AudioSourceLabel::Mic => manager.mic_buffer_info(),
-                            AudioSourceLabel::System => manager.system_buffer_info(),
-                        };
-                        let pos = source_write_pos(&manager, &source.label);
-                        info.map(|i| (pos, i.sample_rate, i.channels)).unwrap_or((
-                            pos,
-                            source.source_sample_rate,
-                            source.source_channels,
-                        ))
-                    };
-                    source.reset_for_buffer_replacement(new_pos, sr, ch);
-                    warn!(
-                        "{} buffer replaced on restart ({}Hz/{}ch) — source state reset",
-                        source_name, sr, ch
-                    );
-
-                    // The WAV writer's flush_positions point into the old
-                    // buffer; against the new buffer those positions are
-                    // meaningless (new write_pos starts near 0, so
-                    // `snapshot_since` would return nothing until the new
-                    // buffer's counter climbs past the stale position).
-                    // Reset just the affected source's flush position and
-                    // warn if the sample rate no longer matches the WAV
-                    // header — resampling mid-session is deferred; the
-                    // archived WAV will have a speed artifact for the new
-                    // segment but won't stall or crash.
-                    if let Some(ref mut ws) = session_wav_state {
-                        match source.label {
-                            AudioSourceLabel::Mic => ws.flush_positions.mic_pos = new_pos,
-                            AudioSourceLabel::System => ws.flush_positions.system_pos = new_pos,
-                        }
-                        if sr != ws.wav_sample_rate {
-                            info!(
-                                "WAV sample-rate mismatch on {} rebind: writer={}Hz, new buffer={}Hz — extracted samples will be resampled on write",
-                                source_name, ws.wav_sample_rate, sr
-                            );
-                        }
-                    }
-                }
-
-                let _ = app_handle.emit(
-                    "stream-health",
-                    StreamHealthEvent {
-                        source: source.label,
-                        status: "restarted".into(),
-                        message: format!("{} stream restarted ({})", source_name, reason),
-                    },
-                );
-            }
-            Err(e) => {
                 source.restart_attempts += 1;
-                error!(
-                    "stream health: {} restart failed (attempt {}): {}",
-                    source_name, source.restart_attempts, e
-                );
-                let status = if source.restart_attempts >= STREAM_RESTART_MAX_ATTEMPTS {
-                    "restart_abandoned"
-                } else {
-                    "restart_failed"
-                };
-                let _ = app_handle.emit(
-                    "stream-health",
-                    StreamHealthEvent {
-                        source: source.label,
-                        status: status.into(),
-                        message: format!(
-                            "{} stream restart failed: {} (attempt {}/{})",
-                            source_name, e, source.restart_attempts, STREAM_RESTART_MAX_ATTEMPTS
-                        ),
-                    },
-                );
+                source.last_restart_at = None;
+            } else {
+                source.restart_attempts = 0;
+                source.last_write_pos_advance = Instant::now();
             }
+
+            if report.outcome == yapstack_audio::manager::RestartOutcome::BufferReplaced {
+                handle_buffer_replacement(
+                    source,
+                    audio_state,
+                    session_wav_state.as_deref_mut(),
+                    source_name,
+                )
+                .await;
+            }
+
+            let _ = app_handle.emit(
+                "stream-health",
+                StreamHealthEvent {
+                    source: source.label,
+                    status: "restarted".into(),
+                    message: format!("{} stream restarted ({})", source_name, reason),
+                },
+            );
+        }
+        Err(e) => {
+            source.restart_attempts += 1;
+            error!(
+                "stream health: {} restart failed (attempt {}): {}",
+                source_name, source.restart_attempts, e
+            );
+            let status = if source.restart_attempts >= STREAM_RESTART_MAX_ATTEMPTS {
+                "restart_abandoned"
+            } else {
+                "restart_failed"
+            };
+            let _ = app_handle.emit(
+                "stream-health",
+                StreamHealthEvent {
+                    source: source.label,
+                    status: status.into(),
+                    message: format!(
+                        "{} stream restart failed: {} (attempt {}/{})",
+                        source_name, e, source.restart_attempts, STREAM_RESTART_MAX_ATTEMPTS
+                    ),
+                },
+            );
+        }
+    }
+}
+
+/// Buffer-replaced restart bookkeeping. Reads the fresh buffer's metadata
+/// (sample rate, channels, write_pos) and resets every cursor on the source
+/// to point into the new buffer. Also resets just this source's
+/// `flush_positions` on the WAV writer — leaving the old position would stall
+/// WAV writes until the new buffer's counter climbs past it. Sample-rate
+/// mismatch is logged; the per-tick write path resamples on the fly.
+async fn handle_buffer_replacement(
+    source: &mut SourceVadState,
+    audio_state: &AudioManagerState,
+    session_wav_state: Option<&mut SessionWavState>,
+    source_name: &str,
+) {
+    let (new_pos, sr, ch) = {
+        let manager = audio_state.lock().await;
+        let info = match source.label {
+            AudioSourceLabel::Mic => manager.mic_buffer_info(),
+            AudioSourceLabel::System => manager.system_buffer_info(),
+        };
+        let pos = source_write_pos(&manager, &source.label);
+        info.map(|i| (pos, i.sample_rate, i.channels)).unwrap_or((
+            pos,
+            source.source_sample_rate,
+            source.source_channels,
+        ))
+    };
+    source.reset_for_buffer_replacement(new_pos, sr, ch);
+    warn!(
+        "{} buffer replaced on restart ({}Hz/{}ch) — source state reset",
+        source_name, sr, ch
+    );
+
+    if let Some(ws) = session_wav_state {
+        match source.label {
+            AudioSourceLabel::Mic => ws.flush_positions.mic_pos = new_pos,
+            AudioSourceLabel::System => ws.flush_positions.system_pos = new_pos,
+        }
+        if sr != ws.wav_sample_rate {
+            info!(
+                "WAV sample-rate mismatch on {} rebind: writer={}Hz, new buffer={}Hz — extracted samples will be resampled on write",
+                source_name, ws.wav_sample_rate, sr
+            );
         }
     }
 }
