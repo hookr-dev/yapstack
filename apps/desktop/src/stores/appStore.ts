@@ -396,17 +396,27 @@ function enqueueSegmentWork(fn: () => Promise<void>): void {
  * must read the paths *before* dropping the session row, since the
  * cascade on `sessions` delete also nukes `session_audio_parts`. Falls
  * back to the legacy session-glob deletion for sessions with no parts
- * rows (older imports, manual notes).
+ * rows (older imports, manual notes). Awaited so a failure (player still
+ * has the file open, permissions issue, app exit) is logged, surfaced as
+ * a toast, and not silently dropped — the part paths are gone from the
+ * DB by this point and only the closure variable still holds them.
  */
-function deleteSessionAudio(
+async function deleteSessionAudio(
   sessionId: string,
   paths: string[],
   audioSaveLocation: string | null,
-): void {
-  if (paths.length > 0) {
-    commands.deleteAudioFiles(paths).catch(() => {});
-  } else {
-    commands.deleteSessionWav(sessionId, audioSaveLocation).catch(() => {});
+): Promise<void> {
+  try {
+    if (paths.length > 0) {
+      await commands.deleteAudioFiles(paths);
+    } else {
+      await commands.deleteSessionWav(sessionId, audioSaveLocation);
+    }
+  } catch (e) {
+    console.error(`Failed to delete audio for session ${sessionId}:`, e, paths);
+    toast.error("Some audio files were not deleted", {
+      id: `audio-cleanup-${sessionId}`,
+    });
   }
 }
 
@@ -1134,7 +1144,7 @@ function createAppStore() {
             partPaths = [];
           }
           await dbDeleteSession(id);
-          deleteSessionAudio(id, partPaths, get().settings.audioSaveLocation);
+          await deleteSessionAudio(id, partPaths, get().settings.audioSaveLocation);
           await clearDictationSessionLink(id);
           trackSessionDeleted();
           const sessions = await listSessions();
@@ -1667,18 +1677,33 @@ function createAppStore() {
           // unknown locations. Sessions with zero parts (manual notes,
           // legacy single-file dictations) still need the glob cleanup.
           const audioSaveLocation = get().settings.audioSaveLocation;
+          let allPaths: string[] = [];
           try {
-            const allPaths = await listAllAudioPartPaths();
-            if (allPaths.length > 0) {
-              commands.deleteAudioFiles(allPaths).catch(() => {});
-            }
-          } catch {
-            // ignore — fall through to per-session legacy cleanup below
+            allPaths = await listAllAudioPartPaths();
+          } catch (e) {
+            console.error("Failed to list audio parts before clear:", e);
           }
-          for (const session of get().sessions) {
-            commands.deleteSessionWav(session.id, audioSaveLocation).catch(() => {});
-          }
+          // Capture session ids while the table still has them.
+          const sessionIds = get().sessions.map((s) => s.id);
           await deleteAllSessions();
+          if (allPaths.length > 0) {
+            try {
+              await commands.deleteAudioFiles(allPaths);
+            } catch (e) {
+              console.error("Failed to delete bulk audio files:", e);
+              toast.error("Some audio files were not deleted");
+            }
+          }
+          // Legacy single-file dictations: best-effort, awaited so a
+          // failure surfaces. Run sequentially to keep error reporting
+          // sane — clear is not latency-critical.
+          for (const id of sessionIds) {
+            try {
+              await commands.deleteSessionWav(id, audioSaveLocation);
+            } catch (e) {
+              console.error(`Failed to delete legacy WAV for ${id}:`, e);
+            }
+          }
           trackSessionsCleared();
           set({
             sessions: [],

@@ -38,7 +38,46 @@ pub fn ensure_runtime_schema(db_path: &Path) {
         return;
     }
 
+    // Out-of-band of the migration list so dev DBs whose `_sqlx_migrations`
+    // history is ahead of schema can still pick this up. Idempotent; no-op
+    // if already created.
+    let _ = conn.execute(
+        "CREATE TABLE IF NOT EXISTS audio_save_locations (\
+            dir TEXT PRIMARY KEY,\
+            registered_at TEXT NOT NULL DEFAULT (datetime('now'))\
+        )",
+        [],
+    );
+
     close_orphaned_recordings(&conn);
+}
+
+/// Records `dir` in `audio_save_locations`. Called at recording start with
+/// the resolved audio-output directory so reconciliation can scan it on
+/// next startup even if the run dies before any `session_audio_parts` row
+/// is committed. Best-effort: failures are logged and ignored.
+pub fn register_audio_save_location(db_path: &Path, dir: &Path) {
+    if !db_path.exists() {
+        return;
+    }
+    let Ok(conn) = rusqlite::Connection::open(db_path) else {
+        return;
+    };
+    if !table_exists(&conn, "audio_save_locations") {
+        // Should already exist via ensure_runtime_schema; create if not.
+        let _ = conn.execute(
+            "CREATE TABLE IF NOT EXISTS audio_save_locations (\
+                dir TEXT PRIMARY KEY,\
+                registered_at TEXT NOT NULL DEFAULT (datetime('now'))\
+            )",
+            [],
+        );
+    }
+    let canon = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    let _ = conn.execute(
+        "INSERT OR IGNORE INTO audio_save_locations (dir) VALUES (?)",
+        rusqlite::params![canon.to_string_lossy().as_ref()],
+    );
 }
 
 /// At startup the app cannot have a real in-flight recording session, so any
@@ -182,22 +221,32 @@ pub fn list_audio_part_directories(db_path: &Path, app_audio_dir: &Path) -> Vec<
     if !table_exists(&conn, "session_audio_parts") {
         return out.into_iter().collect();
     }
-    let mut stmt = match conn
+    if let Ok(mut stmt) = conn
         .prepare("SELECT DISTINCT file_path FROM session_audio_parts WHERE file_path IS NOT NULL")
     {
-        Ok(s) => s,
-        Err(_) => return out.into_iter().collect(),
-    };
-    let rows = match stmt.query_map([], |r| r.get::<_, String>(0)) {
-        Ok(r) => r,
-        Err(_) => return out.into_iter().collect(),
-    };
-    for path in rows.flatten() {
-        if let Some(parent) = Path::new(&path).parent() {
-            if let Ok(canon) = std::fs::canonicalize(parent) {
-                out.insert(canon);
-            } else {
-                out.insert(parent.to_path_buf());
+        if let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(0)) {
+            for path in rows.flatten() {
+                if let Some(parent) = Path::new(&path).parent() {
+                    let canon =
+                        std::fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
+                    out.insert(canon);
+                }
+            }
+        }
+    }
+    // `audio_save_locations` is registered at recording start and persists
+    // even when no part row landed (crash between finalize and INSERT, or
+    // a brand-new custom dir whose first run has not yet committed). It
+    // closes the gap where reconciliation would otherwise never visit a
+    // newly-chosen audioSaveLocation.
+    if table_exists(&conn, "audio_save_locations") {
+        if let Ok(mut stmt) = conn.prepare("SELECT dir FROM audio_save_locations") {
+            if let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(0)) {
+                for dir in rows.flatten() {
+                    let p = Path::new(&dir);
+                    let canon = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+                    out.insert(canon);
+                }
             }
         }
     }
@@ -1020,6 +1069,79 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count2, 1, "reconciliation must be idempotent");
+    }
+
+    #[test]
+    fn reconcile_seeds_from_audio_save_locations_even_without_part_rows() {
+        // Reproduces the "first run to a brand-new custom dir crashes
+        // before INSERT" case: the dir has a part file but no part row,
+        // and no other row points at it. Reconciliation must still find
+        // it via the registered `audio_save_locations` row.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        for m in migrations() {
+            conn.execute_batch(m.sql).unwrap();
+        }
+        // ensure_runtime_schema would normally create this; do it
+        // explicitly for the test.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS audio_save_locations (\
+                dir TEXT PRIMARY KEY,\
+                registered_at TEXT NOT NULL DEFAULT (datetime('now'))\
+            )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sessions (id, title, source, status) \
+             VALUES ('orphan', 't', 'MicOnly', 'completed')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let custom_dir = dir.path().join("custom-A");
+        std::fs::create_dir_all(&custom_dir).unwrap();
+        register_audio_save_location(&db_path, &custom_dir);
+
+        // Simulated orphan: file exists, no part row.
+        let wav_path = custom_dir.join("orphan.0.wav");
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&wav_path, spec).unwrap();
+        writer.write_sample(0i16).unwrap();
+        writer.finalize().unwrap();
+
+        // Drive reconciliation through the same pipeline lib.rs uses:
+        // list_audio_part_directories must include the registered dir
+        // even though no parts row references it yet.
+        let app_audio_dir = dir.path().join("audio");
+        std::fs::create_dir_all(&app_audio_dir).unwrap();
+        let dirs = list_audio_part_directories(&db_path, &app_audio_dir);
+        assert!(
+            dirs.iter()
+                .any(|d| d == &std::fs::canonicalize(&custom_dir).unwrap()),
+            "registered audio_save_location must be returned for reconciliation: {dirs:?}"
+        );
+
+        reconcile_audio_parts(&db_path, &dirs);
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_audio_parts WHERE session_id = 'orphan'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            count, 1,
+            "orphan in registered custom dir must be recovered"
+        );
     }
 
     #[test]
