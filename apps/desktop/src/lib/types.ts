@@ -143,6 +143,9 @@ async deleteSessionWav(sessionId: string, audioSaveLocation: string | null) : Pr
  * in directories across the session's lifetime if the user changed
  * `audioSaveLocation` between recording runs, and every directory we've
  * ever written a part to is in the set.
+ * 
+ * Returns `Err(CommandError)` if any path could not be deleted, listing
+ * every failed path so the caller can log/toast a useful diagnostic.
  */
 async deleteAudioFiles(paths: string[]) : Promise<Result<null, CommandError>> {
     try {

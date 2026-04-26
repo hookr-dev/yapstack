@@ -48,98 +48,8 @@ pub fn ensure_runtime_schema(db_path: &Path) {
         )",
         [],
     );
-    // `pending_audio_deletions` durably records paths whose `remove_file`
-    // failed transiently (locked, permission denied) after the session row
-    // was already deleted. A startup sweep retries each, so an orphan
-    // never persists across runs even if the user dismissed the error
-    // toast.
-    let _ = conn.execute(
-        "CREATE TABLE IF NOT EXISTS pending_audio_deletions (\
-            path TEXT PRIMARY KEY,\
-            recorded_at TEXT NOT NULL DEFAULT (datetime('now'))\
-        )",
-        [],
-    );
 
     close_orphaned_recordings(&conn);
-}
-
-/// Inserts `path` into `pending_audio_deletions` so a startup sweep can
-/// retry the file removal. Best-effort: failures to record are logged.
-pub fn record_pending_deletion(db_path: &Path, path: &str) {
-    if !db_path.exists() {
-        return;
-    }
-    let Ok(conn) = rusqlite::Connection::open(db_path) else {
-        return;
-    };
-    let _ = conn.execute(
-        "CREATE TABLE IF NOT EXISTS pending_audio_deletions (\
-            path TEXT PRIMARY KEY,\
-            recorded_at TEXT NOT NULL DEFAULT (datetime('now'))\
-        )",
-        [],
-    );
-    if let Err(e) = conn.execute(
-        "INSERT OR IGNORE INTO pending_audio_deletions (path) VALUES (?)",
-        rusqlite::params![path],
-    ) {
-        tracing::warn!("record_pending_deletion: insert failed for {path}: {e}");
-    }
-}
-
-/// Walks `pending_audio_deletions` and retries each removal. Successful
-/// removes drop the row; transient failures stay queued for the next run.
-/// `is_trusted` re-validates each path against the trusted-dirs policy
-/// before deletion so a tampered DB row can't trick us into deleting an
-/// arbitrary file.
-pub fn sweep_pending_deletions<F: Fn(&Path) -> bool>(db_path: &Path, is_trusted: F) {
-    if !db_path.exists() {
-        return;
-    }
-    let Ok(conn) = rusqlite::Connection::open(db_path) else {
-        return;
-    };
-    if !table_exists(&conn, "pending_audio_deletions") {
-        return;
-    }
-    let paths: Vec<String> = match conn.prepare("SELECT path FROM pending_audio_deletions") {
-        Ok(mut stmt) => stmt
-            .query_map([], |r| r.get::<_, String>(0))
-            .ok()
-            .map(|rows| rows.flatten().collect())
-            .unwrap_or_default(),
-        Err(_) => return,
-    };
-    let mut cleared = 0u32;
-    for path in &paths {
-        let abs = Path::new(path);
-        let removed = if !is_trusted(abs) {
-            // Drop untrusted entries from the queue so we don't retry
-            // forever. Don't touch the file — a tampered DB row could
-            // otherwise trick us into deleting an arbitrary path.
-            tracing::warn!("sweep_pending_deletions: dropping untrusted {path}");
-            true
-        } else {
-            match std::fs::remove_file(abs) {
-                Ok(()) => true,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
-                Err(e) => {
-                    tracing::info!(
-                        "sweep_pending_deletions: still failing for {path}: {e}"
-                    );
-                    false
-                }
-            }
-        };
-        if removed {
-            let _ = conn.execute("DELETE FROM pending_audio_deletions WHERE path = ?", [path]);
-            cleared += 1;
-        }
-    }
-    if cleared > 0 {
-        tracing::info!("sweep_pending_deletions: cleared {cleared} orphan paths");
-    }
 }
 
 /// Records `dir` in `audio_save_locations`. Called at recording start with
@@ -1159,53 +1069,6 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count2, 1, "reconciliation must be idempotent");
-    }
-
-    #[test]
-    fn sweep_pending_deletions_clears_existing_files_and_keeps_failures_queued() {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("test.db");
-        let conn = rusqlite::Connection::open(&db_path).unwrap();
-        for m in migrations() {
-            conn.execute_batch(m.sql).unwrap();
-        }
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS pending_audio_deletions (\
-                path TEXT PRIMARY KEY,\
-                recorded_at TEXT NOT NULL DEFAULT (datetime('now'))\
-            )",
-            [],
-        )
-        .unwrap();
-        drop(conn);
-
-        // existing.wav: real file under tempdir, should get deleted
-        let existing = dir.path().join("existing.wav");
-        std::fs::write(&existing, b"x").unwrap();
-        // missing.wav: never existed (NotFound is treated as success)
-        let missing = dir.path().join("missing.wav");
-        // untrusted.wav: real file but outside trust set — must be dropped
-        // from the queue, not deleted.
-        let untrusted = dir.path().join("untrusted.wav");
-        std::fs::write(&untrusted, b"x").unwrap();
-
-        record_pending_deletion(&db_path, &existing.to_string_lossy());
-        record_pending_deletion(&db_path, &missing.to_string_lossy());
-        record_pending_deletion(&db_path, &untrusted.to_string_lossy());
-
-        // Trust = anything matching `existing` or `missing` exactly.
-        let trusted_paths: Vec<PathBuf> = vec![existing.clone(), missing.clone()];
-        sweep_pending_deletions(&db_path, |p| trusted_paths.iter().any(|t| t == p));
-
-        assert!(!existing.exists(), "trusted real file should be deleted");
-        assert!(untrusted.exists(), "untrusted file must NOT be deleted");
-        let conn = rusqlite::Connection::open(&db_path).unwrap();
-        let queued: i64 = conn
-            .query_row("SELECT COUNT(*) FROM pending_audio_deletions", [], |r| {
-                r.get(0)
-            })
-            .unwrap();
-        assert_eq!(queued, 0, "queue must be empty after sweep");
     }
 
     #[test]

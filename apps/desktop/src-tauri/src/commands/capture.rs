@@ -2,10 +2,10 @@ use serde::Serialize;
 use specta::Type;
 use std::path::PathBuf;
 use tauri::Manager;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 use super::error::{validate_session_id, CommandError};
-use crate::{audio_path_trusted, DbPath};
+use crate::audio_path_trusted;
 
 use super::audio::{
     AudioManagerState, CaptureResultDto, CaptureSourceDto, MixConfigDto, SessionStatusDto,
@@ -224,42 +224,29 @@ pub async fn delete_session_wav(
 /// `audioSaveLocation` between recording runs, and every directory we've
 /// ever written a part to is in the set.
 ///
-/// Returns `Err(CommandError)` if any path could not be deleted. Transient
-/// failures (locked file, permission) are also durably recorded in
-/// `pending_audio_deletions` so a startup sweep can retry — even if the
-/// caller dismisses the surfaced error toast, the orphan won't survive
-/// across launches. Untrusted/non-absolute paths are reported as failures
-/// but never queued for retry.
+/// Returns `Err(CommandError)` if any path could not be deleted, listing
+/// every failed path so the caller can log/toast a useful diagnostic.
 #[tauri::command]
 #[specta::specta]
 pub async fn delete_audio_files(
     app_handle: tauri::AppHandle,
     paths: Vec<String>,
 ) -> Result<(), CommandError> {
-    let db_path = app_handle.try_state::<DbPath>();
     let mut failures: Vec<String> = Vec::new();
     for raw in paths {
         let abs = PathBuf::from(&raw);
         if !abs.is_absolute() {
-            warn!(path = %raw, "skipping non-absolute audio file delete");
             failures.push(format!("{raw} (not absolute)"));
             continue;
         }
         if !audio_path_trusted(&app_handle, &abs) {
-            warn!(path = %raw, "skipping audio file delete outside trusted dirs");
             failures.push(format!("{raw} (outside trusted dirs)"));
             continue;
         }
         match std::fs::remove_file(&abs) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => {
-                warn!(path = %raw, error = %e, "audio file delete failed");
-                if let Some(ref dbp) = db_path {
-                    crate::db::record_pending_deletion(dbp.as_path(), &raw);
-                }
-                failures.push(format!("{raw}: {e}"));
-            }
+            Err(e) => failures.push(format!("{raw}: {e}")),
         }
     }
     if failures.is_empty() {
