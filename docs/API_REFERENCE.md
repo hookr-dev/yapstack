@@ -186,10 +186,10 @@ impl AudioManager {
     pub fn with_config(config: AudioConfig) -> Self;
 
     // Capture lifecycle
-    pub fn start_capture(&mut self, source: CaptureSource, mic_device_name: Option<&str>) -> Result<()>;
+    pub fn start_capture(&mut self, source: CaptureSource, mic_device_id: Option<&str>) -> Result<()>;
     pub fn start_mic(&mut self, device_name: Option<&str>) -> Result<()>;
     pub fn start_system_audio(&mut self) -> Result<()>;
-    pub fn start_all(&mut self, mic_device_name: Option<&str>) -> Result<()>;
+    pub fn start_all(&mut self, mic_device_id: Option<&str>) -> Result<()>;
     pub fn stop_all(&mut self) -> Result<()>;
 
     // Status
@@ -608,7 +608,7 @@ LiveTranscriptionState   = Arc<Mutex<Option<LiveTranscriptionController>>>
 |---------|------|---------|
 | `list_audio_devices` | — | `Vec<AudioDeviceInfoDto>` |
 | `get_default_input_device` | — | `AudioDeviceInfoDto` |
-| `start_capture` | `mic_device_name?, capture_source, capture_history_seconds?` | `()` |
+| `start_capture` | `mic_device_id?, capture_source, capture_history_seconds?` | `()` |
 | `stop_capture` | — | `()` |
 | `get_capture_status` | — | `CaptureStatusDto` |
 | `check_system_audio_permission` | — | `PermissionStatusDto` |
@@ -624,9 +624,14 @@ LiveTranscriptionState   = Arc<Mutex<Option<LiveTranscriptionController>>>
 | `end_session` | `source, mix_config?` | `CaptureResultDto` |
 | `get_session_status` | — | `SessionStatusDto` |
 | `export_session_wav` | `session_id, source, duration_seconds, mix_config?` | `SessionWavResultDto` |
-| `delete_session_wav` | `session_id` | `()` |
+| `delete_session_wav` | `session_id, audio_save_location?` | `()` |
+| `delete_audio_files` | `paths: Vec<String>` | `()` (or `Err(CommandError)` whose message lists every path that failed) |
 
-`export_session_wav` extracts audio from ring buffers, writes a persistent WAV to `$APP_DATA_DIR/audio/{session_id}.wav`, and returns the file path + duration. `delete_session_wav` removes the WAV file from disk.
+`export_session_wav` extracts audio from ring buffers, writes a persistent WAV to `$APP_DATA_DIR/audio/{session_id}.wav`, and returns the file path + duration.
+
+`delete_session_wav` is the legacy single-file cleanup path used for sessions that pre-date the v15 `session_audio_parts` migration (and for orphan-glob cleanup in `clearAllSessions`). Real per-part cleanup goes through `delete_audio_files`.
+
+`delete_audio_files` validates each path against the `TrustedAudioDirs` allow-list before unlinking. Failures are surfaced (not swallowed) so the FE can warn or queue retries; the error message lists every path that did not delete.
 
 ### Transcription Commands (`commands/transcription.rs`)
 | Command | Args | Returns |
@@ -661,13 +666,17 @@ Emits `"live-transcription-segment"` events with `LiveSegmentEvent { chunk_index
 
 Emits `"backfill-complete"` event (empty payload) when backfill processing finishes.
 
-Emits `"session-wav-ready"` event with `SessionWavReadyEvent { session_id, file_path, duration_seconds }` when the streaming WAV is finalized after the loop exits.
+Emits `"session-part-ready"` event with `SessionPartReadyEvent { session_id, part_index, file_path, format ("wav" \| "mp3"), duration_seconds, sample_rate }` when the streaming part is finalized after the loop exits. The `session_audio_parts` row is inserted from Rust *before* this event fires, so the DB stays the durable source of truth even if the listener is gone.
+
+Emits `"session-wav-error"` event with `SessionWavErrorEvent { session_id, message }` when an empty recording is detected (0 samples written) or a finalize error occurs. The empty WAV file is deleted in this path.
 
 Emits `"stream-health"` events with `StreamHealthEvent { source: AudioSourceLabel, status: String, message: String }` when a stream error or stall is detected and restart is attempted. Status values: `"restarted"`, `"restart_failed"`, `"restart_abandoned"`.
 
-**`LiveTranscriptionConfig`**: `silence_threshold` (default 0.01), `silence_duration_ms` (default 800), `max_chunk_seconds` (default 30), `backfill_seconds` (default 0), `source`, `mix_config?`, `language?`, `prompt_context_chars?` (default 350), `prompt_decay_silence_seconds?` (default 5.0, set to 0 to disable — seconds of all-source silence before clearing prompt context to prevent hallucination from stale context), `session_id?` (enables streaming WAV recording).
+Emits `"live-transcription-warning"` event with `{ message }` when the sidecar is auto-restarted mid-session after a transcription failure (transient); the loop continues.
 
-**`LiveTranscriptionPhase`**: `Starting`, `Running`, `Stopped`, `Error`.
+**`LiveTranscriptionConfig`**: `silence_threshold` (default 0.01), `silence_duration_ms` (default 800), `max_chunk_seconds` (default 30), `backfill_seconds` (default 0), `source`, `mix_config?`, `language?`, `prompt_context_chars?` (default 350), `prompt_decay_silence_seconds?` (default 5.0, set to 0 to disable — seconds of all-source silence before clearing prompt context to prevent hallucination from stale context), `session_id?` (enables streaming session audio recording into a new part), `audio_save_location?` (override the default `$APP_DATA_DIR/audio/` dir), `audio_export_format?` (`"wav"` or `"mp3"`, default `"mp3"`), `mp3_bitrate?` (kbps, validated against the LAME-supported set; default 64), `diarization?`, `resume?: ResumeConfig` (carries the prior cumulative duration that becomes `session_offset_base_seconds`, plus the next `part_index` so segments and audio parts continue numbering from where the prior run left off).
+
+**`LiveTranscriptionPhase`**: `Running`, `Stopped`, `Error`.
 
 **Internal types** (not exported via Tauri):
 - `TranscriptionContext` — Immutable shared context: `whisper_client` (private Arc), `shared_whisper_state` (for returning client on exit), `app_handle`, `config`, `transcription_start`
@@ -850,16 +859,28 @@ Indexes: `idx_dictation_history_created(created_at)`, `idx_dictation_history_slo
 | 2 | folders table, sessions.folder_id, is_pinned, pinned_at |
 | 3 | Segment editing: original_text, edited_at, deleted_at, hidden |
 | 4 | notes + note_versions tables, sessions.session_type |
-| 5 | sessions.wav_file_path, wav_duration_seconds |
-| 6 | sessions.sort_order, shares table |
+| 5 | sessions.wav_file_path, wav_duration_seconds (superseded by v15; columns retained as fallback duration source) |
+| 6 | sessions.sort_order, shares table (table is currently dormant — defined but unused in app code) |
 | 7 | chat_messages table (CASCADE on session delete) |
 | 8 | chat_messages: add `context_key` NOT NULL, make `session_id` nullable, add `idx_chat_messages_context` index |
 | 9 | folders: add `icon`, `color`, `description` columns. New `session_folders` junction table (many-to-many) with unique constraint and indexes |
 | 10 | `dictation_history` table with indexes |
+| 11 | `tags` and `session_tags` tables (flat, AI-applied metadata; folders remain the primary organizational primitive) |
+| 12 | FTS5 search tables (`segments_fts`, `notes_fts`, `sessions_fts`, `dictations_fts`) with backfill + sync triggers |
+| 13 | `chat_messages.tool_calls` column (persisted tool-call stream for replay) |
+| 14 | `chat_messages` per-LLM-response columns (`send_id`, `sequence`, `tool_call_id`, `observation`, `status`) for accurate multi-turn replay |
+| 15 | `session_audio_parts` table (id, session_id, part_index, file_path, format, duration_seconds, sample_rate, created_at). Backfilled from legacy `wav_file_path` rows. Durable source of truth for session audio files; resumable sessions append a new row per resume. |
+
+**Runtime schema patches** (in `db::ensure_runtime_schema()`, applied before `tauri-plugin-sql` initializes):
+
+- Sweeps stale `recording`-status sessions left by a prior crash (recomputes duration from `session_audio_parts` or `segments`, marks them `completed`).
+- Creates `audio_save_locations` table (idempotent) — every directory the app has written audio into. Used by `scan_missing_audio_parts()` on next startup to recover orphan part files if a row insert was missed.
+
+The `segments.speaker_id INTEGER` column for Parakeet+Sortformer diarization is added by the frontend's `getDb()` after migrations run, sidestepping a "ghost" v11 entry that some local dev DBs picked up from another branch.
 
 ### Settings Persistence (Zustand)
 
-Settings are stored via Zustand's `persist` middleware with `localStorage`. Schema versioned (currently v16).
+Settings are stored via Zustand's `persist` middleware with `localStorage`. Schema versioned (currently **v23**).
 
 | Version | Description |
 |---------|-------------|
@@ -879,6 +900,13 @@ Settings are stored via Zustand's `persist` middleware with `localStorage`. Sche
 | 13→14 | Changed default model `Base` → `Small`, default capture `MicOnly` → `Mixed` (migrates existing users) |
 | 14→15 | Added `promptDecaySilenceSeconds` (default 5) — seconds of all-source silence before clearing prompt context |
 | 15→16 | Added `activationMode` to dictation settings (default `"hold"`) |
+| 16→17 | Existing users marked `onboardingCompleted = true` so they skip the first-run flow |
+| 17→18 | `onboardingCompleted` boolean → structured `onboarding: { completedFlows: Record<string, ISO> }` |
+| 18→19 | Default `Control+Shift+Space` binding written to dictation slot 1 if missing |
+| 19→20 | Replace name-based `selectedMicDevice` with stable id-based `selectedMicDeviceId` (reset to null on upgrade — user re-picks once) |
+| 20→21 | Added `audioExportFormat` (default `"mp3"`) and `mp3Bitrate` (default 64) |
+| 21→22 | Engines become first-class peers: added `selectedEngine` (default `"Whisper"`), `selectedParakeetVariant` (`"TdtV3"`), `diarizationEnabled` (`false`), `speakerNames: Record<string, Record<number, string>>` |
+| 22→23 | Force-disable `diarizationEnabled` on upgrade. Sortformer's chunk-local speaker IDs cause the same person to flip across speaker numbers across chunk boundaries; the IPC + DB + sidecar plumbing stays intact so re-enable is one line away once session-stable IDs land. |
 
 ---
 
@@ -970,11 +998,15 @@ Modular tool registry. Each tool is self-contained with schema, executor, undo h
 | Tool Name | Parameters | DB Operations | Effects |
 |-----------|-----------|---------------|---------|
 | `update_title` | `{ title: string }` | `updateSessionTitle()` | `["session-meta"]` |
-| `save_to_notes` | `{ content: string, mode: "replace" \| "append" }` | `markdownToBasicHtml()` → `convertCitationsToSegmentRefs()` → `saveNote()` | `["notes"]` |
+| `save_to_notes` | `{ content: string, mode: "replace" \| "append" \| "prepend" \| "find_replace", find?: string }` | `markdownToBasicHtml()` → `convertCitationsToSegmentRefs()` → `saveNote()` (per mode: overwrite / append below / prepend above / surgical substring swap) | `["notes"]` |
 | `pin_session` | `{ pinned: boolean }` | `togglePin()` (conditional) | `["session-meta"]` |
 | `tag_session` | `{ add: string[], remove?: string[] }` | `getTagByName()` → `createTag()` → `addSessionTag()` / `removeSessionTag()` | `["organization"]` |
-| `add_to_folder` | `{ folder_name: string }` | `listFolders()` → `findBranchConflicts()` → `dbAddSessionToFolder()` | `["organization"]` |
-| `get_folder_context` | `{ folder_name?: string }` | `listFolders()` → `buildFolderTree()` / `getFolderPath()` | `[]` (read-only) |
+| `search_folders` | `{ query?: string }` | `listFolders()` → optional substring filter against folder names + descriptions | `[]` (read-only) |
+| `add_session_to_folder` | `{ folder_id: string }` | `findBranchConflicts()` → `dbAddSessionToFolder()` → `getFolderPath()` (returns hierarchical description chain in `result`) | `["organization"]` |
+| `search_sessions` | `{ query: string, limit?: number }` | FTS5 search across session titles, notes, and segment text | `[]` (read-only) |
+| `search_dictations` | `{ query: string, limit?: number }` | FTS5 search across `dictation_history` | `[]` (read-only) |
+| `get_session_context` | `{ session_id: string }` | `getSession()` + `getSessionSegments()` + `getNote()` + `listAllSessionFolders()` + `getSessionTagIds()` | `[]` (read-only) |
+| `replace_in_transcript` | `{ find: string, replacement: string, all?: boolean }` | `getSessionSegments()` → for each match: `editSegmentText()` (preserves `original_text` for undo) | `["notes"]` (refresh segment views) |
 
 ### `lib/ai-prompts.ts`
 
