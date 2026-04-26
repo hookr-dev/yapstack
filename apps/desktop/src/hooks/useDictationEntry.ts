@@ -8,6 +8,7 @@ import {
   updateDictationHistorySessionId,
   type DbDictationHistory,
 } from "@/lib/db";
+import { markdownToBasicHtml } from "@/lib/ai";
 
 /// Shared state and handlers for any UI surface that renders a single
 /// `DictationHistory` entry. Owns the play/pause audio toggle, clipboard
@@ -84,7 +85,7 @@ export function useDictationEntry(entry: DbDictationHistory) {
       const sessionId = crypto.randomUUID();
       const title = entry.output_text.slice(0, 60);
       await dbCreateManualSession(sessionId, title);
-      await saveNote(sessionId, `<p>${entry.output_text}</p>`);
+      await saveNote(sessionId, markdownToBasicHtml(entry.output_text));
       await updateDictationHistorySessionId(entry.id, sessionId);
       await loadSessions();
       await loadDictationHistory();

@@ -108,8 +108,16 @@ interface ToolDefinition {
   affects?: ToolEffect[];                                            // drives content-refresh callbacks
 }
 
-interface ToolContext {
-  sessionId: string;            // empty string in folder/pinned/all multi-session chats
+// ToolContext is a discriminated union — multi-session chats no longer
+// fabricate empty session-meta values. Mutating tools narrow via
+// `requireSessionContext(ctx)` and operate on `SessionToolContext`;
+// retrieval tools that work in both scopes (e.g. `search_sessions`) read
+// `allowedSessionIds` directly off the union.
+type ToolContext = SessionToolContext | RetrievalToolContext;
+
+interface SessionToolContext {
+  scope: "session";
+  sessionId: string;
   currentTitle: string;
   currentNote: DbNote | null;
   isPinned: boolean;
@@ -117,7 +125,12 @@ interface ToolContext {
   tags?: string[];
   folderNames?: string[];
   folderIds?: string[];
-  allowedSessionIds?: string[]; // when set, retrieval tools must restrict results to this set
+  allowedSessionIds?: string[]; // reserved for future filtered single-session views
+}
+
+interface RetrievalToolContext {
+  scope: "retrieval";
+  allowedSessionIds: string[];  // pins retrieval tools to the chat's filter (folder/pinned/all)
 }
 
 interface ExecutedTool {

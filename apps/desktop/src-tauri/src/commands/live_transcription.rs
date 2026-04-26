@@ -2369,23 +2369,28 @@ fn run_prompt_decay(
     sources: &mut [SourceVadState],
 ) {
     let prompt_decay_secs = ctx.config.prompt_decay_silence_seconds.unwrap_or(5.0);
-    let last_at = {
-        let p = prompt.lock().expect("prompt mutex poisoned");
-        p.last_transcription_at
-    };
-    let decayed = {
+    // Hold the lock across read/check/clear/timestamp so the decision is
+    // atomic w.r.t. concurrent chunk tasks. Releasing between steps would
+    // let a freshly-completed chunk update `shared_prompt` /
+    // `last_transcription_at` mid-decay, either clearing fresh prompt text
+    // or clobbering a fresh timestamp with `None`.
+    let elapsed = {
         let mut p = prompt.lock().expect("prompt mutex poisoned");
-        check_prompt_decay(sources, &mut p.shared_prompt, prompt_decay_secs, last_at)
+        let last_at = p.last_transcription_at;
+        let decayed =
+            check_prompt_decay(sources, &mut p.shared_prompt, prompt_decay_secs, last_at);
+        if decayed {
+            p.last_transcription_at = None;
+            Some(last_at.map(|t| t.elapsed().as_secs_f32()).unwrap_or(0.0))
+        } else {
+            None
+        }
     };
-    if decayed {
+    if let Some(secs) = elapsed {
         info!(
             "prompt decay: cleared shared_prompt ({:.1}s since last transcription)",
-            last_at.map(|t| t.elapsed().as_secs_f32()).unwrap_or(0.0)
+            secs
         );
-        prompt
-            .lock()
-            .expect("prompt mutex poisoned")
-            .last_transcription_at = None;
     }
 }
 
