@@ -15,7 +15,6 @@ import type { EvalDbStub } from "./runner";
 import type { EvalCase } from "./types";
 
 declare global {
-  // eslint-disable-next-line no-var
   var __evalStub: EvalDbStub | undefined;
 }
 

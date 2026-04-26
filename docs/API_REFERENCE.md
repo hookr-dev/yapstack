@@ -734,7 +734,7 @@ audio-stream://localhost/{filename}               # legacy; resolves under $APP_
 | File not found | 404 | File doesn't exist |
 
 Frontend helper: `convertFileSrc(absPath, "audio-stream")` generates the URL.
-Pass the full persisted part path (from `session_audio_parts.audio_path`) — the
+Pass the full persisted part path (from `session_audio_parts.file_path`) — the
 synthesized `{session_id}.{part_index}.{ext}` form would skip parts whose
 `audio_save_location` differs from the current setting.
 
@@ -761,8 +761,8 @@ Managed via `tauri-plugin-sql` with migrations in `src-tauri/src/db.rs`. Fronten
 | `is_pinned` | INTEGER | 0 or 1 |
 | `pinned_at` | TEXT | Nullable |
 | `session_type` | TEXT | 'transcription' or 'manual' |
-| `wav_file_path` | TEXT | Nullable, path to persisted WAV |
-| `wav_duration_seconds` | REAL | Nullable |
+| `wav_file_path` | TEXT | Nullable. Legacy column retained as a fallback duration source; `session_audio_parts.file_path` is the durable source of truth (and may point to `.wav` or `.mp3`). |
+| `wav_duration_seconds` | REAL | Nullable. Legacy fallback when no `session_audio_parts` rows exist. |
 | `sort_order` | INTEGER | Default 0 |
 
 **segments**
@@ -781,7 +781,7 @@ Managed via `tauri-plugin-sql` with migrations in `src-tauri/src/db.rs`. Fronten
 | `edited_at` | TEXT | Nullable |
 | `deleted_at` | TEXT | Nullable (soft delete) |
 | `hidden` | INTEGER | 0 or 1 |
-| `speaker_id` | INTEGER | Nullable. Set by Parakeet+Sortformer diarization. *Not* added via the migration list — added by `db::ensure_runtime_schema()` at app startup (idempotent ALTER) to sidestep ghost-migration ordering issues on dev DBs. |
+| `speaker_id` | INTEGER | Nullable. Set by Parakeet+Sortformer diarization. *Not* added via the migration list — added by the frontend's `getDb()` after `tauri-plugin-sql` migrations run (idempotent ALTER) to sidestep a ghost v11 entry on dev DBs. |
 
 **folders**
 | Column | Type | Notes |
@@ -853,8 +853,8 @@ Indexes: `idx_session_folders_session(session_id)`, `idx_session_folders_folder(
 | `ai_enabled` | INTEGER | 0 or 1 |
 | `ai_prompt` | TEXT | AI prompt used (if ai_enabled) |
 | `output_action` | TEXT | 'paste', 'clipboard', or 'new-note' |
-| `wav_file_path` | TEXT | Nullable, path to WAV file |
-| `wav_duration_seconds` | REAL | Nullable |
+| `wav_file_path` | TEXT | Nullable, absolute path to the captured audio file (WAV or MP3 — column name is legacy). |
+| `wav_duration_seconds` | REAL | Nullable, captured audio duration in seconds. |
 | `session_id` | TEXT | Nullable, correlated session ID (for new-note output) |
 | `created_at` | TEXT | `datetime('now')` |
 
@@ -986,7 +986,8 @@ Modular tool registry. Each tool is self-contained with schema, executor, undo h
 |------|--------|
 | `ToolCallResult` | `{ id, name, arguments: Record<string, unknown> }` |
 | `ExecutedTool` | `{ name, label, detail, observation?, toolCallId?, result?, undoData? }` — `observation` is the text the LLM sees as the tool result during multi-turn chains; `detail` is the human-facing badge |
-| `ToolContext` | `{ sessionId, currentTitle, currentNote: DbNote \| null, isPinned, segments?, tags?, folderNames?, folderIds?, allowedSessionIds? }` — `sessionId` is empty in multi-session chats; `allowedSessionIds` constrains retrieval-tool results |
+| `ToolContext` | Discriminated union: `SessionToolContext { scope: "session"; sessionId; currentTitle; currentNote: DbNote \| null; isPinned; segments?; tags?; folderNames?; folderIds?; allowedSessionIds? }` for single-session chats, or `RetrievalToolContext { scope: "retrieval"; allowedSessionIds }` for folder/pinned/all chats. Mutating tools narrow via `requireSessionContext(ctx)`. |
+| `requireSessionContext` | `(ctx: ToolContext) → SessionToolContext` | Narrows the union to the session-scoped variant. Throws if called from a retrieval-only chat — that combination is a wiring bug. |
 | `ToolKind` | `"read" \| "mutate"` — gates Undo eligibility and the "Session updated" toast |
 | `ToolEffect` | `"session-meta" \| "notes" \| "organization" \| "transcript"` — declarative side-effect categories |
 | `ToolDefinition` | `{ kind: ToolKind, schema: ChatCompletionTool, execute: (args, ctx) → Promise<ExecutedTool \| null>, undo: (undoData, ctx) → Promise<void>, affects?: ToolEffect[] }` |

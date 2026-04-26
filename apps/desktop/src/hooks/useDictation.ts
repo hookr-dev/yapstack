@@ -6,7 +6,7 @@ import { register as registerGlobalShortcut, unregister as unregisterGlobalShort
 import { useAppStore } from "@/stores/appStore";
 import { commands } from "@/lib/tauri";
 import { EVENTS, WINDOWS, listenEvent, emitEvent, type BubbleState } from "@/lib/events";
-import { createAIClient, getActiveConfig, isAIConfigured } from "@/lib/ai";
+import { createAIClient, getActiveConfig, isAIConfigured, markdownToBasicHtml } from "@/lib/ai";
 import { buildVocabularyHints } from "@/lib/transcription";
 import { createManualSession as dbCreateManualSession, saveNote, insertDictationHistory, listFolders, listTags } from "@/lib/db";
 import { toast } from "sonner";
@@ -424,7 +424,7 @@ export function useDictation() {
             const sessionId = noteSessionId;
             const title = text.slice(0, 60);
             await dbCreateManualSession(sessionId, title);
-            await saveNote(sessionId, `<p>${text}</p>`);
+            await saveNote(sessionId, markdownToBasicHtml(text));
             await focusMainWindow();
             const store = useAppStore.getState();
             await store.loadSessions();
