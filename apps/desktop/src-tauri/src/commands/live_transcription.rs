@@ -3202,6 +3202,16 @@ pub async fn start_live_transcription(
             };
             std::fs::create_dir_all(&audio_dir)?;
 
+            // Persist the chosen audio dir before writing anything. This way
+            // reconciliation on next launch can scan it for orphans even if
+            // the run dies between WAV finalize and `insert_audio_part_row`.
+            // Also register it as trusted so playback works while the run is
+            // still in progress.
+            if let Some(db_path_state) = app_handle.try_state::<crate::DbPath>() {
+                crate::db::register_audio_save_location(db_path_state.as_path(), &audio_dir);
+            }
+            crate::register_trusted_audio_dir(&app_handle, &audio_dir);
+
             // Each recording run produces its own part file. Resume passes the
             // next index; fresh sessions always start at 0.
             let part_index = config.resume.as_ref().map(|r| r.part_index).unwrap_or(0);
