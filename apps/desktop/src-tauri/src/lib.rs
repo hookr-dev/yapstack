@@ -9,8 +9,8 @@ const WINDOW_DICTATION: &str = "dictation";
 const WINDOW_RECORDING_INDICATOR: &str = "recording-indicator";
 
 use std::io::{Read as _, Seek, SeekFrom};
-use std::path::Path;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use tauri::{
@@ -163,6 +163,14 @@ fn show_main_window(app: &AppHandle) {
 type TrayState = Arc<Mutex<Option<TrayIcon>>>;
 type ShutdownSignal = Arc<watch::Sender<bool>>;
 
+/// Optional second base directory the `audio-stream://` protocol handler
+/// is willing to serve files from, on top of the default
+/// `$APP_DATA_DIR/audio`. Set by the frontend to mirror the user's
+/// `audioSaveLocation` setting so audio parts written outside the default
+/// dir are still playable. Held in a sync `Mutex` because the protocol
+/// handler runs on a non-async thread.
+pub type AudioBaseOverrideState = Arc<StdMutex<Option<PathBuf>>>;
+
 fn update_tray_menu(app: &AppHandle, is_capturing: bool, is_recording: bool) {
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
@@ -176,7 +184,7 @@ fn update_tray_menu(app: &AppHandle, is_capturing: bool, is_recording: bool) {
     });
 }
 
-fn is_allowed_audio_path(audio_base_dir: &Path, abs_path: &Path) -> bool {
+pub(crate) fn is_allowed_audio_path(audio_base_dir: &Path, abs_path: &Path) -> bool {
     let resolved = match std::fs::canonicalize(abs_path) {
         Ok(p) => p,
         Err(_) => return false,
@@ -221,6 +229,8 @@ pub fn run() {
             commands::capture::get_session_status,
             commands::capture::export_session_wav,
             commands::capture::delete_session_wav,
+            commands::capture::delete_audio_files,
+            commands::capture::set_audio_base_override,
             commands::transcription::get_available_models,
             commands::transcription::download_model,
             commands::transcription::delete_model,
@@ -324,7 +334,19 @@ pub fn run() {
                     }
                 };
                 let base = app_data_dir.join("audio");
-                if !is_allowed_audio_path(&base, &abs_path) {
+                let mut allowed = is_allowed_audio_path(&base, &abs_path);
+                if !allowed {
+                    if let Some(override_state) =
+                        ctx.app_handle().try_state::<AudioBaseOverrideState>()
+                    {
+                        if let Ok(guard) = override_state.lock() {
+                            if let Some(extra) = guard.as_ref() {
+                                allowed = is_allowed_audio_path(extra, &abs_path);
+                            }
+                        }
+                    }
+                }
+                if !allowed {
                     return tauri::http::Response::builder()
                         .status(403)
                         .body(Vec::new())
@@ -439,6 +461,7 @@ pub fn run() {
         .manage(Arc::new(Mutex::new(AudioManager::new())) as commands::audio::AudioManagerState)
         .manage(Arc::new(Mutex::new(None::<TrayIcon>)) as TrayState)
         .manage(Arc::new(Mutex::new(None)) as commands::live_transcription::LiveTranscriptionState)
+        .manage(Arc::new(StdMutex::new(None::<PathBuf>)) as AudioBaseOverrideState)
         .manage({
             let (tx, _) = watch::channel(false);
             Arc::new(tx) as ShutdownSignal

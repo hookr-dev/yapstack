@@ -136,6 +136,36 @@ async deleteSessionWav(sessionId: string, audioSaveLocation: string | null) : Pr
     else return { status: "error", error: e  as any };
 }
 },
+/**
+ * Deletes the listed absolute audio file paths after verifying each lives
+ * inside `$APP_DATA_DIR/audio` or under the registered audio-base override.
+ * This is what `appStore.deleteSession` uses to clean up a session's parts —
+ * parts may live in different directories across the session's lifetime if
+ * the user changed `audioSaveLocation` between recording runs, so the FE
+ * passes the exact paths from `session_audio_parts`.
+ */
+async deleteAudioFiles(paths: string[]) : Promise<Result<null, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("delete_audio_files", { paths }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Sets (or clears) a second base directory the `audio-stream://` protocol
+ * handler will serve files from, on top of `$APP_DATA_DIR/audio`. Called by
+ * the frontend whenever `settings.audioSaveLocation` loads or changes so
+ * audio parts written to a custom location remain playable.
+ */
+async setAudioBaseOverride(path: string | null) : Promise<Result<null, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("set_audio_base_override", { path }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async getAvailableModels() : Promise<Result<ModelInfoDto[], CommandError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("get_available_models") };

@@ -2,9 +2,10 @@ use serde::Serialize;
 use specta::Type;
 use std::path::PathBuf;
 use tauri::Manager;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use super::error::{validate_session_id, CommandError};
+use crate::{is_allowed_audio_path, AudioBaseOverrideState};
 
 use super::audio::{
     AudioManagerState, CaptureResultDto, CaptureSourceDto, MixConfigDto, SessionStatusDto,
@@ -212,6 +213,69 @@ pub async fn delete_session_wav(
             continue;
         }
         let _ = std::fs::remove_file(entry.path());
+    }
+    Ok(())
+}
+
+/// Sets (or clears) a second base directory the `audio-stream://` protocol
+/// handler will serve files from, on top of `$APP_DATA_DIR/audio`. Called by
+/// the frontend whenever `settings.audioSaveLocation` loads or changes so
+/// audio parts written to a custom location remain playable.
+#[tauri::command]
+#[specta::specta]
+pub async fn set_audio_base_override(
+    state: tauri::State<'_, AudioBaseOverrideState>,
+    path: Option<String>,
+) -> Result<(), CommandError> {
+    let next = path.map(PathBuf::from);
+    let mut guard = state.lock().map_err(|e| CommandError::Internal {
+        message: format!("audio base override mutex poisoned: {e}"),
+    })?;
+    *guard = next;
+    Ok(())
+}
+
+/// Deletes the listed absolute audio file paths after verifying each lives
+/// inside `$APP_DATA_DIR/audio` or under the registered audio-base override.
+/// This is what `appStore.deleteSession` uses to clean up a session's parts —
+/// parts may live in different directories across the session's lifetime if
+/// the user changed `audioSaveLocation` between recording runs, so the FE
+/// passes the exact paths from `session_audio_parts`.
+#[tauri::command]
+#[specta::specta]
+pub async fn delete_audio_files(
+    app_handle: tauri::AppHandle,
+    override_state: tauri::State<'_, AudioBaseOverrideState>,
+    paths: Vec<String>,
+) -> Result<(), CommandError> {
+    let app_data_dir = app_handle
+        .path()
+        .app_data_dir()
+        .map_err(|e: tauri::Error| CommandError::Internal {
+            message: e.to_string(),
+        })?;
+    let default_base = app_data_dir.join("audio");
+    let override_base = override_state.lock().ok().and_then(|g| g.clone());
+
+    for raw in paths {
+        let abs = PathBuf::from(&raw);
+        if !abs.is_absolute() {
+            warn!(path = %raw, "skipping non-absolute audio file delete");
+            continue;
+        }
+        let allowed_default = is_allowed_audio_path(&default_base, &abs);
+        let allowed_override = override_base
+            .as_ref()
+            .is_some_and(|b| is_allowed_audio_path(b, &abs));
+        if !(allowed_default || allowed_override) {
+            warn!(path = %raw, "skipping audio file delete outside allowed bases");
+            continue;
+        }
+        match std::fs::remove_file(&abs) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => warn!(path = %raw, error = %e, "audio file delete failed"),
+        }
     }
     Ok(())
 }

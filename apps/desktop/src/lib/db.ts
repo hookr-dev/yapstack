@@ -50,10 +50,15 @@ export function canResumeSession(
   liveTranscriptionActive: boolean,
   sessionStopping: boolean,
 ): boolean {
+  // A part with duration_seconds <= 0 means we can't compute a continuous
+  // offset for the next run. The migration backfill writes 0 for legacy rows
+  // that never had wav_duration_seconds populated; offering Resume on those
+  // would overlap existing transcript timestamps.
   return (
     session.session_type !== "manual" &&
     session.status === "completed" &&
     parts.length > 0 &&
+    parts.every((p) => p.duration_seconds > 0) &&
     !liveTranscriptionActive &&
     !sessionStopping
   );
