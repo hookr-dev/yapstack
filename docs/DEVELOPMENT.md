@@ -304,7 +304,7 @@ cargo test -p yapstack-audio -- --ignored
 Whisper models are stored in the app's data directory under `models/`:
 - macOS: `~/Library/Application Support/dev.yapstack.app/models/`
 - Whisper models: `ggml-tiny.bin`, `ggml-base.bin`, `ggml-small.bin`, `ggml-medium.bin` — downloaded from `huggingface.co/ggerganov/whisper.cpp`
-- VAD model: `ggml-silero-v6.2.0.bin` (~885KB) — auto-downloaded on first `init_whisper_client` call from `huggingface.co/ggml-org/whisper-vad`. Used by whisper.cpp for voice activity detection preprocessing.
+- VAD model: `ggml-silero-v6.2.0.bin` (~885KB) — auto-downloaded on the first `init_transcription_client` call (Whisper engine path) from `huggingface.co/ggml-org/whisper-vad`. Used by whisper.cpp for voice activity detection preprocessing.
 
 ## Temp File Cleanup
 

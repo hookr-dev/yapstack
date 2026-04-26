@@ -67,7 +67,7 @@ Model management and sidecar client. No whisper-rs / parakeet-rs dependencies �
   - **Whisper VAD** (Silero, ~885KB, auto-downloaded): `vad_model_path`, `download_vad_model`, `ensure_vad_model`.
   - **Parakeet** (multi-file ONNX bundle in `models_dir/parakeet-<variant>/`): `ParakeetVariant::TdtV3`, `parakeet_model_dir`, `parakeet_is_available` (checks all required files), `download_parakeet` (loops over the variant's `files()` list with per-file SHA verify), `delete_parakeet`, `ensure_parakeet`.
   - **Sortformer** (single ONNX file, ~50MB): `SortformerVariant::V2_1`, `sortformer_model_path`, `download_sortformer`, `ensure_sortformer`.
-- `client.rs` (was `whisper.rs`) — `TranscriptionClient` spawns the sidecar process and communicates via JSON-line IPC. `spawn()` takes `engine: EngineKind`, `model_path`, `vad_model_path?` (Whisper-only), `sortformer_model_path?` (Parakeet-only), and `coreml_cache_dir?` (Parakeet-only). `transcribe_with(audio, language, prompt, diarization)` exposes the per-call diarization flag. `respawn()` re-spawns the sidecar preserving engine + all paths + `next_id`. A `WhisperClient` type alias is retained for transitional compat with the Tauri layer.
+- `client.rs` — `TranscriptionClient` spawns the sidecar process and communicates via JSON-line IPC. `spawn()` takes `engine: EngineKind`, `model_path`, `vad_model_path?` (Whisper-only), `sortformer_model_path?` (Parakeet-only), and `coreml_cache_dir?` (Parakeet-only). `transcribe_with(audio, language, prompt, diarization)` exposes the per-call diarization flag. `respawn()` re-spawns the sidecar preserving engine + all paths + `next_id`.
 - `error.rs` — `TranscriptionError` with variants for download, sidecar, timeout, IO, HTTP
 
 ### yapstack-sidecar
@@ -91,7 +91,7 @@ Tauri commands layer. Thin wrappers that convert between domain types and DTOs (
 - `commands/error.rs` — `CommandError` tagged union with 6 error kinds (`Audio`, `Transcription`, `NotInitialized`, `InvalidInput`, `NotFound`, `Internal`). All Tauri commands return `Result<_, CommandError>`. `From` impls for `AudioError`, `TranscriptionError`, `std::io::Error`.
 - `commands/audio.rs` — Device listing, capture start/stop, buffer snapshots, instant capture, session start/end. `MixConfigDto::sanitized()` validates gain values at the command boundary.
 - `commands/transcription.rs` — Model management, transcription, sidecar lifecycle. Locks released before async I/O.
-- `commands/live_transcription.rs` — Real-time transcription controller with per-source VAD (`SourceVadState`), concurrent backfill processing, prompt context windowing, silence trimming, stream health monitoring with auto-restart. Shared `TranscriptionContext` struct for immutable config passing. Extracts `WhisperClient` from shared state for zero-contention private use during the loop. Streams session WAV incrementally via `SessionWavWriter`.
+- `commands/live_transcription.rs` — Real-time transcription controller with per-source VAD (`SourceVadState`), concurrent backfill processing, prompt context windowing, silence trimming, stream health monitoring with auto-restart. Shared `TranscriptionContext` struct for immutable config passing. Extracts the `TranscriptionClient` from shared state for zero-contention private use during the loop. Streams session WAV incrementally via `SessionWavWriter`.
 - `commands/dictation.rs` — `clipboard_paste` command for voice dictation output. Writes text to system clipboard via `pbcopy` (macOS) or `clip` (Windows), optionally triggers auto-paste via `osascript` keystroke simulation.
 - `commands/mod.rs` — `show_overlay_panel`, `hide_overlay_panel` commands (cfg-gated: macOS uses NSPanel via `tauri-nspanel`, non-macOS falls back to WebviewWindow show/hide). `get_autostart_enabled`, `set_autostart_enabled` commands via `tauri-plugin-autostart`.
 
@@ -136,7 +136,6 @@ Fallback path (short sessions or re-export):
 ### Transcription
 ```
 Frontend: init_transcription_client(engine, whisper_model?, parakeet_variant?, enable_diarization)
-                                    (or legacy init_whisper_client(size) — shim that calls the engine-aware path with EngineKind::Whisper)
     → Validates the engine's selected model is on disk; returns NotFound if not
     → For Parakeet+diarization, also ensure_sortformer() (auto-downloads ~50MB Sortformer ONNX)
     → For Whisper, ensure_vad_model() (auto-downloads ~885KB Silero ONNX)
@@ -171,9 +170,9 @@ Frontend: transcribe_audio(wav_path)
 ### Live Transcription
 ```
 Frontend: start_live_transcription(config)
-    → Extracts WhisperClient from shared state → private Arc<Mutex<Option<WhisperClient>>>
+    → Extracts the TranscriptionClient from shared state → private Arc<Mutex<Option<Arc<TranscriptionClient>>>>
       (zero contention — other commands get "not available" instead of blocking)
-    → Creates TranscriptionContext (immutable: whisper_client, shared_whisper_state, app_handle, config, start time)
+    → Creates TranscriptionContext (immutable: transcription_client, shared_transcription_state, app_handle, config, start time)
     → If config.session_id set: creates SessionWavWriter at $APP_DATA_DIR/audio/{session_id}.wav
     → Spawns async task with two concurrent tracks:
 
@@ -204,14 +203,14 @@ Frontend: start_live_transcription(config)
         5. On VadAction::Chunk (silence detected) or ForceChunk (max duration):
             a. extract_sources_since()
             b. write_wav_to_temp() → temp WAV
-            c. WhisperClient.transcribe() with prompt context (last N chars)
+            c. TranscriptionClient.transcribe_with() with prompt context (last N chars; Whisper-only)
             d. Emit "live-segment" event with segments + metadata
         6. On stop: force-chunk any speaking source, then exit loop
 
     → After loop exits (cleanup):
         1. Final WAV flush + finalize (if session_id was set)
         2. Emit "session-wav-ready" event with { session_id, file_path, duration_seconds }
-        3. Returns WhisperClient to shared state (even after panic via AssertUnwindSafe)
+        3. Returns the TranscriptionClient to shared state (even after panic via AssertUnwindSafe)
     → Per-source VAD: SourceVadState tracks mic/system independently
     → Prompt context: per-source accumulated_text (up to 1000 chars) truncated to prompt_context_chars (default 350) for Whisper initial_prompt
     → Prompt decay: clears both shared_prompt and per-source accumulated_text after prompt_decay_silence_seconds (default 5s) of
@@ -243,14 +242,14 @@ The live transcription loop includes a stream health watchdog (`check_stream_hea
 Four `Arc<Mutex<T>>` states managed by Tauri:
 - `AudioManagerState` — audio capture lifecycle, ring buffers, sessions
 - `ModelManagerState` — model download/delete/list (Whisper + Parakeet + Sortformer)
-- `WhisperClientState` — `Option<TranscriptionClient>`, sidecar process lifecycle (alias name kept for backward compat; the wrapped value is the engine-agnostic `TranscriptionClient`, regardless of which engine was selected)
+- `TranscriptionClientState` — `Arc<Mutex<Option<Arc<TranscriptionClient>>>>`, sidecar process lifecycle. Whichever engine is selected, the value here is the engine-agnostic `TranscriptionClient`.
 - `LiveTranscriptionState` — `Option<LiveTranscriptionController>`, live transcription task + stop signal
 
-Startup also runs `db::ensure_runtime_schema()` *before* tauri-plugin-sql wires up — this opens the SQLite DB directly via `rusqlite` and adds `segments.speaker_id INTEGER` if missing. The column is intentionally outside the migration list because some local dev DBs have a "ghost" v11 entry from another branch in `_sqlx_migrations`, which makes sqlx silently refuse any v12+ migration. The startup hook sidesteps the entire ordering problem; idempotent on every boot.
+Startup also runs `db::ensure_runtime_schema()` *before* tauri-plugin-sql wires up — it opens the SQLite DB directly via `rusqlite`, sweeps stale `recording`-status sessions left by a prior crash, and creates the `audio_save_locations` table used by reconciliation on next startup. The Parakeet+Sortformer `segments.speaker_id INTEGER` column is added separately by the frontend's `getDb()` after migrations run, sidestepping a "ghost" v11 entry that some local dev DBs picked up from another branch.
 
 ### Frontend (TypeScript)
-- **State**: Zustand store (`stores/appStore.ts`) with persisted settings (**version 22**, migrations for schema changes). Settings include capture source, **selected engine** (`"Whisper" | "Parakeet"`, peers — Whisper is the upgrade-safe default), Whisper model size, **selected Parakeet variant**, **diarization enabled**, **per-session `speakerNames` map** (renames `Speaker N` → custom labels, persisted client-side), language, VAD params, prompt context, prompt decay silence, theme, sidebar state, buffer size, AI settings, shortcut bindings, audio save location, dictation settings, `showRecordingIndicator`. The store also caches the engine catalogue (`engineCatalogue: EngineDescriptorDto[]`) and Parakeet/Sortformer download status (`parakeetModels`, `sortformerStatus`) loaded on `autoSetup`.
-- **Persistence**: SQLite via `tauri-plugin-sql` (`lib/db.ts`) for sessions, segments, notes, note versions, folders, session_folders (many-to-many), chat messages, and dictation history. DB file at app data dir. 10 DB migration versions; `segments.speaker_id INTEGER` is added by `db::ensure_runtime_schema()` at app startup (outside the migration list — see [API Reference](API_REFERENCE.md) and the comment in `db.rs`).
+- **State**: Zustand store (`stores/appStore.ts`) with persisted settings (**version 23**, migrations for schema changes). Settings include capture source, **selected engine** (`"Whisper" | "Parakeet"`, peers — Whisper is the upgrade-safe default), Whisper model size, **selected Parakeet variant**, **diarization enabled**, **per-session `speakerNames` map** (renames `Speaker N` → custom labels, persisted client-side), language, VAD params, prompt context, prompt decay silence, theme, sidebar state, buffer size, AI settings, shortcut bindings, audio save location, dictation settings, `showRecordingIndicator`. The store also caches the engine catalogue (`engineCatalogue: EngineDescriptorDto[]`) and Parakeet/Sortformer download status (`parakeetModels`, `sortformerStatus`) loaded on `autoSetup`.
+- **Persistence**: SQLite via `tauri-plugin-sql` (`lib/db.ts`) for sessions, segments, notes, note versions, folders, session_folders (many-to-many), chat messages, dictation history, tags, session_tags, FTS5 search tables, and `session_audio_parts`. DB file at app data dir. 15 SQL migration versions; `segments.speaker_id INTEGER` is added by the frontend's `getDb()` after migrations run.
 - **Type generation**: Specta-generated types in `src/lib/types.ts` (auto-generated, excluded from tsconfig). Tauri command wrappers in `src/lib/tauri.ts`.
 - **Serialization queue**: `onLiveSegment` uses a promise queue (`segmentQueueTail`) to prevent concurrent backfill + live events from racing on DB writes.
 - **Hooks**: `useAutoSetup` (engine init), `useCaptureEvents` (backend status push), `useLiveTranscriptionEvents` (segment/phase/backfill/session-wav-ready events), `useCreateSession` (session creation guard), `useDownloadProgress` (model download), `useKeyboardShortcuts` (in-app capture-phase keydown in AppLayout), `useGlobalShortcuts` (Tauri global-shortcut plugin in App.tsx), `useDictation` (hold-to-talk or toggle mode voice dictation lifecycle in App.tsx), `useRecordingIndicator` (show/hide floating overlay when recording + unfocused, in App.tsx), `useTrayEvents` (listen for tray menu actions, in AppLayout), `useChatMessages` (chat message lifecycle: send, stream, tool execution, undo, DB persistence).
@@ -634,7 +633,7 @@ Decoupled side effects via custom DOM events:
 
 ### Overview
 
-Voice dictation via global shortcuts. Supports two activation modes: hold-to-talk (press and hold to record, release to stop) and toggle (press once to start, press again to stop). Dictation operates independently of the main recording feature but shares the WhisperClient (V1 limitation: unavailable during active recording).
+Voice dictation via global shortcuts. Supports two activation modes: hold-to-talk (press and hold to record, release to stop) and toggle (press once to start, press again to stop). Dictation operates independently of the main recording feature but shares the `TranscriptionClient` (V1 limitation: unavailable during active recording).
 
 ### Activation Modes
 
@@ -679,7 +678,7 @@ idle → recording → transcribing → processing → done → idle
 ```
 
 1. **recording**: Key pressed → validate (dictation enabled, engine ready, not in active recording) → show bubble, start timing
-2. **transcribing**: Key released → `triggerInstantCapture()` for elapsed duration → `transcribeAudio()` via WhisperClient
+2. **transcribing**: Key released → `triggerInstantCapture()` for elapsed duration → `transcribeAudio()` via the `TranscriptionClient`
 3. **processing**: If `slot.aiEnabled && slot.prompt` → call AI API with transcription + system prompt
 4. **done**: Route output based on `slot.outputAction`:
    - `"paste"`: `clipboard_paste(text, true)` — copies to clipboard + auto-pastes via osascript
