@@ -5,6 +5,7 @@ use tauri::Manager;
 use tracing::{error, info};
 
 use super::error::{validate_session_id, CommandError};
+use crate::audio_path_trusted;
 
 use super::audio::{
     AudioManagerState, CaptureResultDto, CaptureSourceDto, MixConfigDto, SessionStatusDto,
@@ -191,16 +192,74 @@ pub async fn delete_session_wav(
             })?;
         app_data_dir.join("audio")
     };
-    let mp3_path = audio_dir.join(format!("{session_id}.mp3"));
-    let wav_path = audio_dir.join(format!("{session_id}.wav"));
 
-    if mp3_path.exists() {
-        std::fs::remove_file(&mp3_path)?;
-    }
-    if wav_path.exists() {
-        std::fs::remove_file(&wav_path)?;
+    // Match both the legacy single-file pattern (`{session_id}.wav` —
+    // dictations and pre-parts sessions) and the parts pattern
+    // (`{session_id}.{part_index}.wav`/`.mp3`).
+    let entries = match std::fs::read_dir(&audio_dir) {
+        Ok(it) => it,
+        Err(_) => return Ok(()), // Audio dir doesn't exist; nothing to delete.
+    };
+    let prefix = format!("{session_id}.");
+    for entry in entries.flatten() {
+        let Some(name) = entry.file_name().to_str().map(|s| s.to_string()) else {
+            continue;
+        };
+        if !name.starts_with(&prefix) {
+            continue;
+        }
+        let lower = name.to_ascii_lowercase();
+        if !(lower.ends_with(".wav") || lower.ends_with(".mp3")) {
+            continue;
+        }
+        let _ = std::fs::remove_file(entry.path());
     }
     Ok(())
+}
+
+/// Deletes the listed absolute audio file paths after verifying each lives
+/// in a directory the trusted-audio-dirs set knows about. Used by
+/// `appStore.deleteSession` to clean up a session's parts — parts may live
+/// in directories across the session's lifetime if the user changed
+/// `audioSaveLocation` between recording runs, and every directory we've
+/// ever written a part to is in the set.
+///
+/// Returns `Err(CommandError)` if any path could not be deleted, listing
+/// every failed path so the caller can log/toast a useful diagnostic.
+#[tauri::command]
+#[specta::specta]
+pub async fn delete_audio_files(
+    app_handle: tauri::AppHandle,
+    paths: Vec<String>,
+) -> Result<(), CommandError> {
+    let mut failures: Vec<String> = Vec::new();
+    for raw in paths {
+        let abs = PathBuf::from(&raw);
+        if !abs.is_absolute() {
+            failures.push(format!("{raw} (not absolute)"));
+            continue;
+        }
+        if !audio_path_trusted(&app_handle, &abs) {
+            failures.push(format!("{raw} (outside trusted dirs)"));
+            continue;
+        }
+        match std::fs::remove_file(&abs) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => failures.push(format!("{raw}: {e}")),
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(CommandError::Internal {
+            message: format!(
+                "failed to delete {} audio file(s): {}",
+                failures.len(),
+                failures.join("; ")
+            ),
+        })
+    }
 }
 
 #[cfg(test)]

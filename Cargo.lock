@@ -7946,6 +7946,7 @@ version = "0.1.0-alpha.2"
 dependencies = [
  "chrono",
  "futures-util",
+ "hound",
  "percent-encoding",
  "rusqlite",
  "serde",
@@ -7968,6 +7969,7 @@ dependencies = [
  "tauri-plugin-sql",
  "tauri-plugin-updater",
  "tauri-specta",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-appender",

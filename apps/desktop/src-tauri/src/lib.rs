@@ -8,9 +8,10 @@ const WINDOW_DICTATION: &str = "dictation";
 #[cfg(target_os = "macos")]
 const WINDOW_RECORDING_INDICATOR: &str = "recording-indicator";
 
+use std::collections::HashSet;
 use std::io::{Read as _, Seek, SeekFrom};
-use std::path::Path;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use tauri::{
@@ -163,6 +164,19 @@ fn show_main_window(app: &AppHandle) {
 type TrayState = Arc<Mutex<Option<TrayIcon>>>;
 type ShutdownSignal = Arc<watch::Sender<bool>>;
 
+/// Set of canonicalized directories the `audio-stream://` protocol handler
+/// and `delete_audio_files` will operate on. Seeded at startup from
+/// `$APP_DATA_DIR/audio` plus every distinct directory referenced by
+/// `session_audio_parts.file_path`, then appended whenever Rust finalizes a
+/// new part. Held in a sync `Mutex` because the protocol handler runs on a
+/// non-async thread.
+pub type TrustedAudioDirs = Arc<StdMutex<HashSet<PathBuf>>>;
+
+/// Path to the SQLite DB tauri-plugin-sql owns. Stored as state so commands
+/// (live finalize, reconciliation) can open their own `rusqlite` connections
+/// without re-resolving `app_config_dir` every time.
+pub type DbPath = Arc<PathBuf>;
+
 fn update_tray_menu(app: &AppHandle, is_capturing: bool, is_recording: bool) {
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
@@ -176,7 +190,7 @@ fn update_tray_menu(app: &AppHandle, is_capturing: bool, is_recording: bool) {
     });
 }
 
-fn is_allowed_audio_path(audio_base_dir: &Path, abs_path: &Path) -> bool {
+pub(crate) fn is_allowed_audio_path(audio_base_dir: &Path, abs_path: &Path) -> bool {
     let resolved = match std::fs::canonicalize(abs_path) {
         Ok(p) => p,
         Err(_) => return false,
@@ -186,6 +200,34 @@ fn is_allowed_audio_path(audio_base_dir: &Path, abs_path: &Path) -> bool {
         Err(_) => return false,
     };
     resolved.starts_with(canonical_base)
+}
+
+/// True if `abs_path` resolves under any of the directories registered in
+/// `TrustedAudioDirs`. The set is seeded from `session_audio_parts` at
+/// startup and grown whenever Rust finalizes a part, so it tracks every
+/// location the user has actually saved audio to — not just the current
+/// `audioSaveLocation` setting.
+pub(crate) fn audio_path_trusted(app: &AppHandle, abs_path: &Path) -> bool {
+    let Some(state) = app.try_state::<TrustedAudioDirs>() else {
+        return false;
+    };
+    let Ok(guard) = state.lock() else {
+        return false;
+    };
+    guard.iter().any(|dir| is_allowed_audio_path(dir, abs_path))
+}
+
+/// Adds `dir`'s canonical form to the trusted set. Called from the
+/// finalize path each time Rust writes a new part to a directory.
+pub(crate) fn register_trusted_audio_dir(app: &AppHandle, dir: &Path) {
+    let Some(state) = app.try_state::<TrustedAudioDirs>() else {
+        return;
+    };
+    let Ok(mut guard) = state.lock() else {
+        return;
+    };
+    let canonical = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    guard.insert(canonical);
 }
 
 fn read_file_range(path: &Path, start: u64, end: u64) -> std::io::Result<Vec<u8>> {
@@ -221,6 +263,7 @@ pub fn run() {
             commands::capture::get_session_status,
             commands::capture::export_session_wav,
             commands::capture::delete_session_wav,
+            commands::capture::delete_audio_files,
             commands::transcription::get_available_models,
             commands::transcription::download_model,
             commands::transcription::delete_model,
@@ -313,18 +356,7 @@ pub fn run() {
             // Otherwise, resolve relative to the default audio directory.
             let file_path = if std::path::Path::new(decoded_path.as_ref()).is_absolute() {
                 let abs_path = std::path::PathBuf::from(decoded_path.as_ref());
-                // Defense-in-depth: verify absolute paths resolve within app data dir
-                let app_data_dir = match ctx.app_handle().path().app_data_dir() {
-                    Ok(d) => d,
-                    Err(_) => {
-                        return tauri::http::Response::builder()
-                            .status(500)
-                            .body(Vec::new())
-                            .unwrap()
-                    }
-                };
-                let base = app_data_dir.join("audio");
-                if !is_allowed_audio_path(&base, &abs_path) {
+                if !audio_path_trusted(ctx.app_handle(), &abs_path) {
                     return tauri::http::Response::builder()
                         .status(403)
                         .body(Vec::new())
@@ -439,6 +471,7 @@ pub fn run() {
         .manage(Arc::new(Mutex::new(AudioManager::new())) as commands::audio::AudioManagerState)
         .manage(Arc::new(Mutex::new(None::<TrayIcon>)) as TrayState)
         .manage(Arc::new(Mutex::new(None)) as commands::live_transcription::LiveTranscriptionState)
+        .manage(Arc::new(StdMutex::new(HashSet::<PathBuf>::new())) as TrustedAudioDirs)
         .manage({
             let (tx, _) = watch::channel(false);
             Arc::new(tx) as ShutdownSignal
@@ -473,6 +506,22 @@ pub fn run() {
                 .map(|p| p.join("yapstack.db"))
                 .unwrap_or_else(|_| app_data_dir.join("yapstack.db"));
             db::ensure_runtime_schema(&db_path);
+
+            // Seed the trusted-audio-dirs set from existing parts rows + the
+            // default audio dir, then sweep those dirs for orphan files left
+            // by a crash between WAV finalize and the prior FE-driven INSERT.
+            let app_audio_dir = app_data_dir.join("audio");
+            let trusted_dirs = db::list_audio_part_directories(&db_path, &app_audio_dir);
+            db::reconcile_audio_parts(&db_path, &trusted_dirs);
+            // Re-list after reconciliation so newly-recovered parts'
+            // directories land in the trusted set.
+            let trusted_dirs = db::list_audio_part_directories(&db_path, &app_audio_dir);
+            if let Some(state) = app.try_state::<TrustedAudioDirs>() {
+                if let Ok(mut guard) = state.lock() {
+                    guard.extend(trusted_dirs);
+                }
+            }
+            app.manage(Arc::new(db_path.clone()) as DbPath);
 
             let model_manager = ModelManager::new(app_data_dir);
             app.manage(

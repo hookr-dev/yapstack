@@ -19,9 +19,49 @@ export interface DbSession {
   is_pinned: number;
   pinned_at: string | null;
   session_type: SessionType;
-  wav_file_path: string | null;
-  wav_duration_seconds: number | null;
   sort_order: number;
+}
+
+export type AudioPartFormat = "wav" | "mp3";
+
+/**
+ * One finalized recording run for a session. A session's audio is the
+ * ordered concatenation of its parts (`part_index` 0..N). Parts are immutable
+ * once written; resume appends a new part rather than mutating any prior one.
+ */
+export interface DbAudioPart {
+  id: string;
+  session_id: string;
+  part_index: number;
+  file_path: string;
+  format: AudioPartFormat;
+  duration_seconds: number;
+  sample_rate: number;
+  created_at: string;
+}
+
+/**
+ * Whether a Session is in a state where the Resume Recording action should
+ * be offered. Pure predicate so the same rule can drive multiple UI surfaces.
+ */
+export function canResumeSession(
+  session: DbSession,
+  parts: DbAudioPart[],
+  liveTranscriptionActive: boolean,
+  sessionStopping: boolean,
+): boolean {
+  // A part with duration_seconds <= 0 means we can't compute a continuous
+  // offset for the next run. The migration backfill writes 0 for legacy rows
+  // that never had wav_duration_seconds populated; offering Resume on those
+  // would overlap existing transcript timestamps.
+  return (
+    session.session_type !== "manual" &&
+    session.status === "completed" &&
+    parts.length > 0 &&
+    parts.every((p) => p.duration_seconds > 0) &&
+    !liveTranscriptionActive &&
+    !sessionStopping
+  );
 }
 
 export interface DbNote {
@@ -293,6 +333,56 @@ async function ensureRuntimeSchema(db: Database): Promise<void> {
   for (const sql of triggers) {
     await db.execute(sql).catch(() => {});
   }
+
+  // v15 — session_audio_parts. Created here in addition to the migration so
+  // dev DBs whose `_sqlx_migrations` history is misaligned (and where
+  // tauri-plugin-sql is therefore skipping new migrations) still get the
+  // table. Idempotent: the second run is a no-op.
+  await db
+    .execute(
+      `CREATE TABLE IF NOT EXISTS session_audio_parts (
+         id TEXT PRIMARY KEY,
+         session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+         part_index INTEGER NOT NULL,
+         file_path TEXT NOT NULL,
+         format TEXT NOT NULL CHECK (format IN ('wav','mp3')),
+         duration_seconds REAL NOT NULL,
+         sample_rate INTEGER NOT NULL,
+         created_at TEXT NOT NULL,
+         UNIQUE (session_id, part_index)
+       )`,
+    )
+    .catch(() => {});
+  await db
+    .execute(
+      `CREATE INDEX IF NOT EXISTS idx_audio_parts_session
+         ON session_audio_parts(session_id, part_index)`,
+    )
+    .catch(() => {});
+  // Backfill: every existing session with a wav_file_path becomes
+  // part_index=0. INSERT OR IGNORE makes this safe to re-run; the
+  // (session_id, part_index) UNIQUE constraint short-circuits duplicates.
+  // Wrapped in catch() because pre-v5 DBs don't have wav_file_path yet —
+  // they have no audio to backfill anyway.
+  await db
+    .execute(
+      `INSERT OR IGNORE INTO session_audio_parts (
+         id, session_id, part_index, file_path, format,
+         duration_seconds, sample_rate, created_at
+       )
+       SELECT
+         lower(hex(randomblob(16))),
+         id,
+         0,
+         wav_file_path,
+         CASE WHEN wav_file_path LIKE '%.mp3' THEN 'mp3' ELSE 'wav' END,
+         COALESCE(wav_duration_seconds, 0),
+         48000,
+         COALESCE(updated_at, created_at)
+       FROM sessions
+       WHERE wav_file_path IS NOT NULL`,
+    )
+    .catch(() => {});
 }
 
 // --- Session CRUD ---
@@ -319,19 +409,48 @@ export async function updateSessionTitle(
   );
 }
 
+/**
+ * Marks a session as completed. `duration_seconds` is derived from the SUM
+ * of `session_audio_parts.duration_seconds` — so resumed sessions correctly
+ * carry the full stitched duration. `fallbackDurationSeconds` is used only
+ * when no parts exist (e.g. WAV finalization failed before a part landed),
+ * so we still record *something* useful instead of zero.
+ */
 export async function completeSession(
   id: string,
-  durationSeconds: number,
+  fallbackDurationSeconds: number = 0,
 ): Promise<void> {
   const db = await getDb();
   await db.execute(
     `UPDATE sessions
      SET status = 'completed',
-         duration_seconds = $1,
-         total_segments = (SELECT COUNT(*) FROM segments WHERE session_id = $2),
+         duration_seconds = COALESCE(
+           NULLIF(
+             (SELECT SUM(duration_seconds) FROM session_audio_parts WHERE session_id = $1),
+             0
+           ),
+           $2
+         ),
+         total_segments = (SELECT COUNT(*) FROM segments WHERE session_id = $1),
          updated_at = datetime('now')
-     WHERE id = $2`,
-    [durationSeconds, id],
+     WHERE id = $1`,
+    [id, fallbackDurationSeconds],
+  );
+}
+
+/**
+ * Flips a completed session back to `recording` status — called after the
+ * backend accepts a resume so the sidebar/UI sees the live state. The
+ * reverse transition runs through `completeSession` at the next stop.
+ */
+export async function markSessionRecording(id: string): Promise<void> {
+  const db = await getDb();
+  await db.execute(
+    `UPDATE sessions
+     SET status = 'recording',
+         updated_at = datetime('now')
+     WHERE id = $1`,
+    [id],
   );
 }
 
@@ -942,18 +1061,75 @@ export async function reorderFolders(
   }
 }
 
-// --- WAV file ---
+// --- Audio parts ---
 
-export async function updateSessionWavPath(
-  id: string,
-  wavFilePath: string,
-  wavDurationSeconds: number,
-): Promise<void> {
+export async function listSessionAudioParts(
+  sessionId: string,
+): Promise<DbAudioPart[]> {
+  const db = await getDb();
+  return await db.select<DbAudioPart[]>(
+    "SELECT * FROM session_audio_parts WHERE session_id = $1 ORDER BY part_index ASC",
+    [sessionId],
+  );
+}
+
+/**
+ * Returns every `file_path` registered in `session_audio_parts`. Used by
+ * bulk-delete flows to avoid an N+1 of `listSessionAudioParts` per session.
+ */
+export async function listAllAudioPartPaths(): Promise<string[]> {
+  const db = await getDb();
+  const rows = await db.select<{ file_path: string }[]>(
+    "SELECT file_path FROM session_audio_parts",
+  );
+  return rows.map((r) => r.file_path);
+}
+
+export async function insertAudioPart(part: DbAudioPart): Promise<void> {
   const db = await getDb();
   await db.execute(
-    "UPDATE sessions SET wav_file_path = $1, wav_duration_seconds = $2, updated_at = datetime('now') WHERE id = $3",
-    [wavFilePath, wavDurationSeconds, id],
+    `INSERT INTO session_audio_parts (
+       id, session_id, part_index, file_path, format,
+       duration_seconds, sample_rate, created_at
+     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+    [
+      part.id,
+      part.session_id,
+      part.part_index,
+      part.file_path,
+      part.format,
+      part.duration_seconds,
+      part.sample_rate,
+      part.created_at,
+    ],
   );
+}
+
+/**
+ * Returns the next `part_index` for a session — i.e. how many parts already
+ * exist. Used by the resume flow to compute the next part's filename and the
+ * Segment offset base.
+ */
+export async function nextAudioPartIndex(sessionId: string): Promise<number> {
+  const db = await getDb();
+  const rows = await db.select<{ count: number }[]>(
+    "SELECT COUNT(*) AS count FROM session_audio_parts WHERE session_id = $1",
+    [sessionId],
+  );
+  return rows[0]?.count ?? 0;
+}
+
+/**
+ * Returns the cumulative duration of all parts for a session, used as the
+ * `offset_base_seconds` for resumed Segments so their offsets stay continuous.
+ */
+export async function sumAudioPartsDuration(sessionId: string): Promise<number> {
+  const db = await getDb();
+  const rows = await db.select<{ total: number | null }[]>(
+    "SELECT SUM(duration_seconds) AS total FROM session_audio_parts WHERE session_id = $1",
+    [sessionId],
+  );
+  return rows[0]?.total ?? 0;
 }
 
 // --- Manual session ---
