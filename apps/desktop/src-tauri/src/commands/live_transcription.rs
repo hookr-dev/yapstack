@@ -621,6 +621,13 @@ fn extract_source_audio(
     (Some((mono, buf.sample_rate())), new_pos)
 }
 
+/// Boxed future that yields a `ChunkTaskOutcome` once a spawned chunk
+/// transcribe finishes (or its panic-recovery handler synthesizes one).
+/// Held by `live_transcription_loop`'s `FuturesUnordered` and drained by the
+/// post-loop helpers.
+type ChunkTaskFuture =
+    std::pin::Pin<Box<dyn std::future::Future<Output = ChunkTaskOutcome> + Send>>;
+
 /// Outcome returned from a background chunk task back to the main loop so it
 /// can restore per-source state (accumulated_text) and notice fatal failures.
 struct ChunkTaskOutcome {
@@ -1952,8 +1959,6 @@ async fn live_transcription_loop(
     // invariant "every spawned task → exactly one outcome observed",
     // which keeps `has_in_flight_task` from leaking on panic/cancel and
     // would otherwise silently kill dispatch for that source forever.
-    type ChunkTaskFuture =
-        std::pin::Pin<Box<dyn std::future::Future<Output = ChunkTaskOutcome> + Send>>;
     let mut chunk_tasks: futures_util::stream::FuturesUnordered<ChunkTaskFuture> =
         futures_util::stream::FuturesUnordered::new();
     // Parallel handles so stop can `.abort()` slow tasks immediately —
@@ -2295,120 +2300,8 @@ async fn live_transcription_loop(
         }
     }
 
-    // Drain any still-running chunk tasks so their segments land before we
-    // finalize the session. The `setLivePhase("Stopped")` finalizer on the
-    // frontend awaits `segmentQueueTail`, but for that to help we first
-    // need to actually *dispatch* the segment events — which only happens
-    // when each task's transcribe await completes.
-    if !chunk_tasks.is_empty() {
-        debug!(
-            "live transcription stop: draining {} in-flight chunk tasks",
-            chunk_tasks.len()
-        );
-        use futures_util::stream::StreamExt;
-
-        // Phase 1 — graceful drain. `should_stop` already forced a final chunk
-        // for any actively-speaking source earlier in the loop, *unless* that
-        // source already had a task in-flight (the in_flight gate skipped it).
-        // Collect outcomes so source state can be restored and the blocked
-        // source can issue its deferred final chunk in Phase 3.
-        let mut drained_outcomes: Vec<ChunkTaskOutcome> = Vec::new();
-        let graceful_timed_out = {
-            let drain = async {
-                while let Some(outcome) = chunk_tasks.next().await {
-                    if outcome.sidecar_dead {
-                        warn!("drained chunk task reported sidecar dead");
-                    }
-                    drained_outcomes.push(outcome);
-                }
-            };
-            tokio::time::timeout(Duration::from_secs(10), drain)
-                .await
-                .is_err()
-        };
-
-        // Restore source state from completed outcomes so a source whose
-        // final-chunk dispatch was gated by `has_in_flight_task` becomes
-        // eligible to dispatch its pending speech in Phase 3.
-        for outcome in drained_outcomes {
-            for source in sources.iter_mut() {
-                if source.label == outcome.source_label {
-                    source.has_in_flight_task = false;
-                    source.accumulated_text = outcome.accumulated_text;
-                    break;
-                }
-            }
-        }
-
-        // Phase 2 — abort only on timeout. A hanging sidecar can't indefinitely
-        // block the stop path; we also need each task's `Arc<TranscriptionClient>`
-        // clone released so the post-loop try_unwrap succeeds and shared state is
-        // restored. transcribe_with awaits a oneshot internally; abort drops the
-        // receiver cleanly and the sidecar's response is harmlessly orphaned.
-        if graceful_timed_out {
-            warn!(
-                "live transcription stop: chunk task drain exceeded 10s; \
-                 aborting remaining tasks to reclaim shared state"
-            );
-            for ah in chunk_aborts.drain(..) {
-                ah.abort();
-            }
-            let _ = tokio::time::timeout(Duration::from_secs(2), async {
-                while chunk_tasks.next().await.is_some() {}
-            })
-            .await;
-        }
-    }
-
-    // Phase 3 — final pending-speech dispatch. Any source whose stop-time
-    // `VadAction::Chunk` was skipped because a previous task was still
-    // running now has un-transcribed audio between its frozen
-    // `speech_start_pos` and the current write_pos. Dispatch one synchronous
-    // chunk per source so the final segment lands before we finalize.
-    for source in sources.iter_mut() {
-        if source.has_in_flight_task {
-            // Phase 2 timeout path — we aborted without an outcome landing.
-            // Skipping is safe: the source's state is already considered lost.
-            continue;
-        }
-        let has_pending = {
-            let manager = audio_state.lock().await;
-            let write_pos = source_write_pos(&manager, &source.label);
-            write_pos > source.speech_start_pos
-        };
-        if !has_pending {
-            continue;
-        }
-        debug!(
-            "live transcription stop: dispatching final pending chunk for {:?} \
-             (speech_start_pos={}, blocked by prior in-flight task)",
-            source.label, source.speech_start_pos
-        );
-        let prepared = prepare_chunk_dispatch(
-            source,
-            &audio_state,
-            true,
-            false,
-            ctx.session_offset_base_seconds,
-        )
-        .await;
-        if let Some(prepared) = prepared {
-            let task_ctx = ctx.clone();
-            let task_session = session.clone();
-            let source_label = prepared.source_label;
-            let final_task = run_chunk_task(prepared, task_ctx, task_session);
-            if tokio::time::timeout(Duration::from_secs(10), final_task)
-                .await
-                .is_err()
-            {
-                warn!(
-                    "live transcription stop: final pending chunk for {:?} exceeded 10s — \
-                     segment may be lost",
-                    source_label
-                );
-            }
-        }
-    }
+    drain_in_flight_chunks(&mut chunk_tasks, &mut chunk_aborts, &mut sources).await;
+    dispatch_final_pending_chunks(&mut sources, &audio_state, &ctx, &session).await;
 
     if let Some(ws) = session_wav_state {
         finalize_session_wav(ws, &audio_state, &ctx).await;
@@ -2449,6 +2342,127 @@ async fn live_transcription_loop(
         "live transcription stopped: {} chunks, {:.1}s total audio",
         final_chunks, final_audio_seconds
     );
+}
+
+/// Drain still-running chunk tasks at session stop so their segments dispatch
+/// before finalization. The frontend's stop finalizer waits on
+/// `segmentQueueTail`; that only helps once each task has actually emitted.
+/// Phase 1 grants 10 s of graceful drain (long enough for any in-flight
+/// transcribe to complete) and restores per-source state from each completed
+/// outcome so a source whose final-chunk dispatch was skipped earlier becomes
+/// eligible to issue it. Phase 2 aborts on timeout — needed both to keep stop
+/// bounded and to release each task's `Arc<TranscriptionClient>` clone so the
+/// post-loop `try_unwrap` succeeds.
+async fn drain_in_flight_chunks(
+    chunk_tasks: &mut futures_util::stream::FuturesUnordered<ChunkTaskFuture>,
+    chunk_aborts: &mut Vec<tokio::task::AbortHandle>,
+    sources: &mut [SourceVadState],
+) {
+    if chunk_tasks.is_empty() {
+        return;
+    }
+    debug!(
+        "live transcription stop: draining {} in-flight chunk tasks",
+        chunk_tasks.len()
+    );
+    use futures_util::stream::StreamExt;
+
+    let mut drained_outcomes: Vec<ChunkTaskOutcome> = Vec::new();
+    let graceful_timed_out = {
+        let drain = async {
+            while let Some(outcome) = chunk_tasks.next().await {
+                if outcome.sidecar_dead {
+                    warn!("drained chunk task reported sidecar dead");
+                }
+                drained_outcomes.push(outcome);
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(10), drain)
+            .await
+            .is_err()
+    };
+
+    for outcome in drained_outcomes {
+        for source in sources.iter_mut() {
+            if source.label == outcome.source_label {
+                source.has_in_flight_task = false;
+                source.accumulated_text = outcome.accumulated_text;
+                break;
+            }
+        }
+    }
+
+    if graceful_timed_out {
+        warn!(
+            "live transcription stop: chunk task drain exceeded 10s; \
+             aborting remaining tasks to reclaim shared state"
+        );
+        for ah in chunk_aborts.drain(..) {
+            ah.abort();
+        }
+        let _ = tokio::time::timeout(Duration::from_secs(2), async {
+            while chunk_tasks.next().await.is_some() {}
+        })
+        .await;
+    }
+}
+
+/// Final pending-speech dispatch at session stop. Any source whose stop-time
+/// `VadAction::Chunk` was skipped because a previous task was still running
+/// now has un-transcribed audio between its frozen `speech_start_pos` and the
+/// current write position. Run one synchronous chunk per such source so the
+/// final segment lands before finalization.
+async fn dispatch_final_pending_chunks(
+    sources: &mut [SourceVadState],
+    audio_state: &AudioManagerState,
+    ctx: &TranscriptionContext,
+    session: &Arc<StdMutex<SessionAccumulators>>,
+) {
+    for source in sources.iter_mut() {
+        if source.has_in_flight_task {
+            // Reached only on the Phase 2 abort path — we aborted before an
+            // outcome landed. Skipping is safe: that source's state is already
+            // considered lost.
+            continue;
+        }
+        let has_pending = {
+            let manager = audio_state.lock().await;
+            let write_pos = source_write_pos(&manager, &source.label);
+            write_pos > source.speech_start_pos
+        };
+        if !has_pending {
+            continue;
+        }
+        debug!(
+            "live transcription stop: dispatching final pending chunk for {:?} \
+             (speech_start_pos={}, blocked by prior in-flight task)",
+            source.label, source.speech_start_pos
+        );
+        let prepared = prepare_chunk_dispatch(
+            source,
+            audio_state,
+            true,
+            false,
+            ctx.session_offset_base_seconds,
+        )
+        .await;
+        if let Some(prepared) = prepared {
+            let task_ctx = ctx.clone();
+            let task_session = session.clone();
+            let source_label = prepared.source_label;
+            let final_task = run_chunk_task(prepared, task_ctx, task_session);
+            if tokio::time::timeout(Duration::from_secs(10), final_task)
+                .await
+                .is_err()
+            {
+                warn!(
+                    "live transcription stop: final pending chunk for {:?} exceeded 10s — \
+                     segment may be lost",
+                    source_label
+                );
+            }
+        }
+    }
 }
 
 /// Outcome of a single session-WAV write attempt within the live loop. The
