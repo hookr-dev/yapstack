@@ -1301,73 +1301,6 @@ fn backfill_chunks_from_probabilities(
     chunks
 }
 
-/// Chunk audio into segments of approximately `chunk_size` samples, but refine
-/// boundaries by scanning backward from each split point to find a silence gap.
-/// This avoids splitting mid-word. Falls back to the fixed boundary if no silence
-/// gap is found within the last `search_window` samples.
-#[allow(dead_code)] // retained as fallback; backfill now uses vad_chunk_historical_audio
-fn chunk_at_silence_boundaries(
-    samples: &[f32],
-    chunk_size: usize,
-    sample_rate: u32,
-    silence_threshold: f32,
-) -> Vec<&[f32]> {
-    if samples.is_empty() || chunk_size == 0 {
-        return vec![];
-    }
-
-    // Search backward up to 5 seconds from each boundary
-    let search_window = (5.0 * sample_rate as f32) as usize;
-    // Silence gap must be at least 100ms to be considered a natural pause
-    let min_silence_samples = (0.1 * sample_rate as f32) as usize;
-    // Scan in 10ms windows for RMS
-    let rms_window = (0.01 * sample_rate as f32) as usize;
-
-    let mut chunks = Vec::new();
-    let mut start = 0;
-
-    while start < samples.len() {
-        let nominal_end = (start + chunk_size).min(samples.len());
-
-        // If this is the last chunk or it's short enough, just take the rest
-        if nominal_end >= samples.len() || samples.len() - start <= chunk_size {
-            chunks.push(&samples[start..samples.len()]);
-            break;
-        }
-
-        // Scan backward from nominal_end looking for a silence gap
-        let scan_start = nominal_end.saturating_sub(search_window);
-        let mut best_split = None;
-        let mut silence_run = 0usize;
-
-        // Scan backward in rms_window steps
-        let mut pos = nominal_end;
-        while pos > scan_start + rms_window {
-            pos -= rms_window;
-            let window_end = (pos + rms_window).min(samples.len());
-            let window = &samples[pos..window_end];
-            let rms = (window.iter().map(|s| s * s).sum::<f32>() / window.len() as f32).sqrt();
-
-            if rms < silence_threshold {
-                silence_run += rms_window;
-                if silence_run >= min_silence_samples {
-                    // Found a silence gap — split at the start of this silence region
-                    best_split = Some(pos + silence_run);
-                    break;
-                }
-            } else {
-                silence_run = 0;
-            }
-        }
-
-        let split_at = best_split.unwrap_or(nominal_end);
-        chunks.push(&samples[start..split_at]);
-        start = split_at;
-    }
-
-    chunks
-}
-
 /// Process backfill audio concurrently with the live VAD loop.
 /// Chunks audio by max_chunk_seconds with soft boundaries at silence gaps,
 /// trims leading silence, interleaves across sources.
@@ -3755,58 +3688,6 @@ mod tests {
         let cursor = build_cursor(&sources);
         assert_eq!(cursor.mic_pos, 100);
         assert_eq!(cursor.system_pos, 200);
-    }
-
-    // --- chunk_at_silence_boundaries tests ---
-
-    #[test]
-    fn test_chunk_at_silence_empty() {
-        let chunks = chunk_at_silence_boundaries(&[], 48000, 48000, 0.01);
-        assert!(chunks.is_empty());
-    }
-
-    #[test]
-    fn test_chunk_at_silence_short_audio() {
-        // Audio shorter than chunk_size → single chunk
-        let samples = vec![0.5f32; 16000]; // 1s at 16kHz
-        let chunks = chunk_at_silence_boundaries(&samples, 48000, 16000, 0.01);
-        assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0].len(), 16000);
-    }
-
-    #[test]
-    fn test_chunk_at_silence_splits_at_silence() {
-        // Build audio: 2s loud, 0.2s silence, 2s loud at 16kHz
-        let sr = 16000;
-        let loud_len = 2 * sr;
-        let silence_len = (0.2 * sr as f32) as usize;
-        let mut samples = vec![0.5f32; loud_len];
-        samples.extend(vec![0.0f32; silence_len]);
-        samples.extend(vec![0.5f32; loud_len]);
-        // Total: ~4.2s. Chunk size: 3s (48000 samples at 16kHz).
-        let chunk_size = 3 * sr;
-        let chunks = chunk_at_silence_boundaries(&samples, chunk_size, sr as u32, 0.01);
-        // Should split near the silence gap rather than at the hard 3s boundary
-        assert!(
-            chunks.len() >= 2,
-            "expected at least 2 chunks, got {}",
-            chunks.len()
-        );
-        // The total samples across all chunks should equal the input
-        let total: usize = chunks.iter().map(|c| c.len()).sum();
-        assert_eq!(total, samples.len());
-    }
-
-    #[test]
-    fn test_chunk_at_silence_no_silence_falls_back() {
-        // Continuous loud audio — should fall back to fixed boundaries
-        let sr = 16000usize;
-        let samples = vec![0.5f32; 5 * sr]; // 5s loud
-        let chunk_size = 2 * sr; // 2s chunks
-        let chunks = chunk_at_silence_boundaries(&samples, chunk_size, sr as u32, 0.01);
-        assert!(chunks.len() >= 2);
-        let total: usize = chunks.iter().map(|c| c.len()).sum();
-        assert_eq!(total, samples.len());
     }
 
     // --- Stream health decision helper tests ---
