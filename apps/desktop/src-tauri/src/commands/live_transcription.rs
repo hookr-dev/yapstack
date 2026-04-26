@@ -1786,104 +1786,8 @@ async fn live_transcription_loop(
         "live transcription VAD tuning resolved"
     );
 
-    // Get initial cursor positions and build source list
-    let (mut sources, backfill_audio) = {
-        let manager = audio_state.lock().await;
-        let positions = manager.buffer_positions();
-
-        let has_backfill = ctx.config.backfill_seconds > 0.0;
-        let mut sources: Vec<SourceVadState> = Vec::with_capacity(2);
-        let mut backfill: Vec<(Vec<f32>, u32, AudioSourceLabel)> = Vec::new();
-
-        if check_mic {
-            let (initial_pos, session_start, sr, ch) = if let Some(buf) = manager.mic_buffer() {
-                let sr = buf.sample_rate();
-                let ch = buf.channels();
-                if has_backfill {
-                    let raw = (ctx.config.backfill_seconds * sr as f32 * ch as f32) as usize;
-                    // Round down to frame boundary for correct deinterleaving
-                    let rewind = raw - (raw % ch as usize);
-                    let rewound = positions.mic_pos.saturating_sub(rewind);
-                    (rewound, rewound, sr, ch)
-                } else {
-                    (positions.mic_pos, positions.mic_pos, sr, ch)
-                }
-            } else {
-                (positions.mic_pos, positions.mic_pos, 48000, 1)
-            };
-            sources.push(SourceVadState::new(
-                AudioSourceLabel::Mic,
-                initial_pos,
-                session_start,
-                sr,
-                ch,
-            ));
-        }
-        if check_system {
-            if let Some(buf) = manager.system_buffer() {
-                let sr = buf.sample_rate();
-                let ch = buf.channels();
-                let (initial_pos, session_start) = if has_backfill {
-                    let raw = (ctx.config.backfill_seconds * sr as f32 * ch as f32) as usize;
-                    // Round down to frame boundary for correct deinterleaving
-                    let rewind = raw - (raw % ch as usize);
-                    let rewound = positions.system_pos.saturating_sub(rewind);
-                    (rewound, rewound)
-                } else {
-                    (positions.system_pos, positions.system_pos)
-                };
-                sources.push(SourceVadState::new(
-                    AudioSourceLabel::System,
-                    initial_pos,
-                    session_start,
-                    sr,
-                    ch,
-                ));
-            } else if matches!(source, CaptureSource::Mixed) {
-                warn!("mixed mode: system buffer unavailable, running mic-only");
-            }
-        }
-
-        // Extract backfill audio and reset cursors to current positions
-        if has_backfill {
-            info!(
-                "live transcription: extracted backfill audio ({:.1}s) for concurrent processing",
-                ctx.config.backfill_seconds
-            );
-            for s in sources.iter_mut() {
-                let (audio, current) = extract_source_audio(&manager, &s.label, s.cursor);
-                if let Some((samples, sr)) = audio {
-                    info!(
-                        "backfill extract: source={:?} cursor={} write_pos={} samples={} sr={} duration={:.2}s",
-                        s.label, s.cursor, current, samples.len(), sr, samples.len() as f32 / sr as f32
-                    );
-                    backfill.push((samples, sr, s.label));
-                } else {
-                    warn!(
-                        "backfill: no audio available for source={:?} (cursor={}, write_pos={})",
-                        s.label, s.cursor, current
-                    );
-                }
-                // Reset the full per-source live VAD state to `current`
-                // so the live loop starts from the post-backfill write
-                // position. Without this, Silero would replay every
-                // backfill sample through the *live* detector on the
-                // first few polls, duplicating or delaying speech that
-                // backfill already emitted. We also reset the recurrent
-                // stream state (LSTM memory was initialized at session
-                // start against pre-backfill audio context) and clear the
-                // sticky last_probability.
-                s.cursor = current;
-                s.speech_start_pos = current;
-                s.earliest_next_chunk_pos = current;
-                s.silero.read_pos = current;
-                s.silero.last_probability = None;
-                s.silero.stream.reset();
-            }
-        }
-
-        (sources, backfill)
-    };
+    let (mut sources, backfill_audio) =
+        build_initial_sources_and_backfill(&audio_state, &ctx.config, check_mic, check_system, source).await;
 
     // Spawn concurrent backfill processing.
     // `backfill_cancel` is a cooperative cancel flag. On stop we set it true
@@ -2299,6 +2203,117 @@ async fn live_transcription_loop(
         "live transcription stopped: {} chunks, {:.1}s total audio",
         final_chunks, final_audio_seconds
     );
+}
+
+/// Build the per-source VAD state for the live loop and, if `backfill_seconds`
+/// is non-zero, extract the matching pre-session audio and reset each source's
+/// cursors / Silero stream forward to the current write position. Reading
+/// backfill before the live loop starts guarantees a single coherent snapshot
+/// — the loop then begins polling at the post-backfill cursor. Returns the
+/// initialized sources alongside the backfill audio queued for concurrent
+/// processing.
+async fn build_initial_sources_and_backfill(
+    audio_state: &AudioManagerState,
+    config: &LiveTranscriptionConfig,
+    check_mic: bool,
+    check_system: bool,
+    source: CaptureSource,
+) -> (
+    Vec<SourceVadState>,
+    Vec<(Vec<f32>, u32, AudioSourceLabel)>,
+) {
+    let manager = audio_state.lock().await;
+    let positions = manager.buffer_positions();
+
+    let has_backfill = config.backfill_seconds > 0.0;
+    let mut sources: Vec<SourceVadState> = Vec::with_capacity(2);
+    let mut backfill: Vec<(Vec<f32>, u32, AudioSourceLabel)> = Vec::new();
+
+    if check_mic {
+        let (initial_pos, session_start, sr, ch) = if let Some(buf) = manager.mic_buffer() {
+            let sr = buf.sample_rate();
+            let ch = buf.channels();
+            if has_backfill {
+                let raw = (config.backfill_seconds * sr as f32 * ch as f32) as usize;
+                // Round down to frame boundary for correct deinterleaving.
+                let rewind = raw - (raw % ch as usize);
+                let rewound = positions.mic_pos.saturating_sub(rewind);
+                (rewound, rewound, sr, ch)
+            } else {
+                (positions.mic_pos, positions.mic_pos, sr, ch)
+            }
+        } else {
+            (positions.mic_pos, positions.mic_pos, 48000, 1)
+        };
+        sources.push(SourceVadState::new(
+            AudioSourceLabel::Mic,
+            initial_pos,
+            session_start,
+            sr,
+            ch,
+        ));
+    }
+    if check_system {
+        if let Some(buf) = manager.system_buffer() {
+            let sr = buf.sample_rate();
+            let ch = buf.channels();
+            let (initial_pos, session_start) = if has_backfill {
+                let raw = (config.backfill_seconds * sr as f32 * ch as f32) as usize;
+                let rewind = raw - (raw % ch as usize);
+                let rewound = positions.system_pos.saturating_sub(rewind);
+                (rewound, rewound)
+            } else {
+                (positions.system_pos, positions.system_pos)
+            };
+            sources.push(SourceVadState::new(
+                AudioSourceLabel::System,
+                initial_pos,
+                session_start,
+                sr,
+                ch,
+            ));
+        } else if matches!(source, CaptureSource::Mixed) {
+            warn!("mixed mode: system buffer unavailable, running mic-only");
+        }
+    }
+
+    if has_backfill {
+        info!(
+            "live transcription: extracted backfill audio ({:.1}s) for concurrent processing",
+            config.backfill_seconds
+        );
+        for s in sources.iter_mut() {
+            let (audio, current) = extract_source_audio(&manager, &s.label, s.cursor);
+            if let Some((samples, sr)) = audio {
+                info!(
+                    "backfill extract: source={:?} cursor={} write_pos={} samples={} sr={} duration={:.2}s",
+                    s.label, s.cursor, current, samples.len(), sr, samples.len() as f32 / sr as f32
+                );
+                backfill.push((samples, sr, s.label));
+            } else {
+                warn!(
+                    "backfill: no audio available for source={:?} (cursor={}, write_pos={})",
+                    s.label, s.cursor, current
+                );
+            }
+            // Reset the full per-source live VAD state to `current` so the
+            // live loop starts from the post-backfill write position. Without
+            // this, Silero would replay every backfill sample through the
+            // *live* detector on the first few polls, duplicating or delaying
+            // speech that backfill already emitted. We also reset the
+            // recurrent stream state (LSTM memory was initialized at session
+            // start against pre-backfill audio context) and clear the sticky
+            // last_probability.
+            s.cursor = current;
+            s.speech_start_pos = current;
+            s.earliest_next_chunk_pos = current;
+            s.silero.read_pos = current;
+            s.silero.last_probability = None;
+            s.silero.stream.reset();
+        }
+    }
+
+    (sources, backfill)
 }
 
 /// Emit a final `Error`-phase status event after the sidecar has been
