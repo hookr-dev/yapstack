@@ -2245,55 +2245,12 @@ async fn live_transcription_loop(
         }
 
         if fatal {
-            error!("live transcription: sidecar died and could not be restarted — stopping");
-            let (chunks, audio_secs) = {
-                let s = session.lock().expect("session mutex poisoned");
-                (s.total_chunks, s.total_audio_seconds)
-            };
-            let _ = ctx.app_handle.emit(
-                "live-transcription-status",
-                LiveTranscriptionStatus {
-                    phase: LiveTranscriptionPhase::Error,
-                    chunks_processed: chunks,
-                    total_audio_seconds: audio_secs,
-                    error_message: Some(
-                        "Transcription engine stopped unexpectedly and could not be restarted"
-                            .to_string(),
-                    ),
-                    session_id: ctx.config.session_id.clone(),
-                    effective_start_epoch_ms: None,
-                },
-            );
+            emit_fatal_sidecar_error(&ctx, &session);
             exited_fatal = true;
             break;
         }
 
-        // Prompt decay: clear shared_prompt + accumulated_text when no transcription
-        // has occurred for prompt_decay_silence_seconds (default 5s)
-        let prompt_decay_secs = ctx.config.prompt_decay_silence_seconds.unwrap_or(5.0);
-        let last_at = {
-            let s = session.lock().expect("session mutex poisoned");
-            s.last_transcription_at
-        };
-        let decayed = {
-            let mut s = session.lock().expect("session mutex poisoned");
-            check_prompt_decay(
-                &mut sources,
-                &mut s.shared_prompt,
-                prompt_decay_secs,
-                last_at,
-            )
-        };
-        if decayed {
-            info!(
-                "prompt decay: cleared shared_prompt ({:.1}s since last transcription)",
-                last_at.map(|t| t.elapsed().as_secs_f32()).unwrap_or(0.0)
-            );
-            session
-                .lock()
-                .expect("session mutex poisoned")
-                .last_transcription_at = None;
-        }
+        run_prompt_decay(&ctx, &session, &mut sources);
 
         if should_stop {
             break;
@@ -2342,6 +2299,64 @@ async fn live_transcription_loop(
         "live transcription stopped: {} chunks, {:.1}s total audio",
         final_chunks, final_audio_seconds
     );
+}
+
+/// Emit a final `Error`-phase status event after the sidecar has been
+/// declared unrecoverable. Reads the running totals out of the shared
+/// accumulator so the UI sees the same chunk/audio counts it would on a
+/// normal stop.
+fn emit_fatal_sidecar_error(
+    ctx: &TranscriptionContext,
+    session: &Arc<StdMutex<SessionAccumulators>>,
+) {
+    error!("live transcription: sidecar died and could not be restarted — stopping");
+    let (chunks, audio_secs) = {
+        let s = session.lock().expect("session mutex poisoned");
+        (s.total_chunks, s.total_audio_seconds)
+    };
+    let _ = ctx.app_handle.emit(
+        "live-transcription-status",
+        LiveTranscriptionStatus {
+            phase: LiveTranscriptionPhase::Error,
+            chunks_processed: chunks,
+            total_audio_seconds: audio_secs,
+            error_message: Some(
+                "Transcription engine stopped unexpectedly and could not be restarted".to_string(),
+            ),
+            session_id: ctx.config.session_id.clone(),
+            effective_start_epoch_ms: None,
+        },
+    );
+}
+
+/// Per-tick prompt decay check: clear `shared_prompt` and every source's
+/// `accumulated_text` once `prompt_decay_silence_seconds` have elapsed since
+/// the last successful transcription. Keeps stale context from seeding
+/// hallucinations after a long pause.
+fn run_prompt_decay(
+    ctx: &TranscriptionContext,
+    session: &Arc<StdMutex<SessionAccumulators>>,
+    sources: &mut [SourceVadState],
+) {
+    let prompt_decay_secs = ctx.config.prompt_decay_silence_seconds.unwrap_or(5.0);
+    let last_at = {
+        let s = session.lock().expect("session mutex poisoned");
+        s.last_transcription_at
+    };
+    let decayed = {
+        let mut s = session.lock().expect("session mutex poisoned");
+        check_prompt_decay(sources, &mut s.shared_prompt, prompt_decay_secs, last_at)
+    };
+    if decayed {
+        info!(
+            "prompt decay: cleared shared_prompt ({:.1}s since last transcription)",
+            last_at.map(|t| t.elapsed().as_secs_f32()).unwrap_or(0.0)
+        );
+        session
+            .lock()
+            .expect("session mutex poisoned")
+            .last_transcription_at = None;
+    }
 }
 
 /// Drain still-running chunk tasks at session stop so their segments dispatch
