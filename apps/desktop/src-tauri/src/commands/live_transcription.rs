@@ -2042,116 +2042,25 @@ async fn live_transcription_loop(
             }
         }
 
-        // Write WAV data outside the lock
         if let Some((samples, sr, new_pos)) = wav_flush_data {
             wav_flush_none_count = 0;
             if let Some(ref mut ws) = session_wav_state {
-                // If a mid-session buffer rebind left the extraction at a
-                // different sample rate than the WAV header, resample before
-                // appending so the archived file plays at a single consistent
-                // speed. `yapstack_common::audio::resample` zero-copies when
-                // `sr == ws.wav_sample_rate`.
-                let to_write: std::borrow::Cow<[f32]> = if sr == ws.wav_sample_rate {
-                    std::borrow::Cow::Borrowed(&samples)
-                } else {
-                    match yapstack_common::audio::resample(&samples, sr, ws.wav_sample_rate) {
-                        Ok(cow) => std::borrow::Cow::Owned(cow.into_owned()),
-                        Err(e) => {
-                            error!(
-                                "WAV resample {}Hz → {}Hz failed, dropping {} samples: {}",
-                                sr,
-                                ws.wav_sample_rate,
-                                samples.len(),
-                                e
-                            );
-                            // Advance positions regardless — retrying would
-                            // re-extract the same samples next tick.
-                            ws.flush_positions = new_pos;
-                            continue;
-                        }
-                    }
-                };
-                if let Err(e) = ws.writer.write_samples(&to_write) {
-                    error!(
-                        "session WAV write error ({} samples may be lost): {}",
-                        to_write.len(),
-                        e
-                    );
-                }
-                // Always advance — retrying partial writes would duplicate samples
-                ws.flush_positions = new_pos;
-                // Periodic diagnostic (~every 30s at 300ms intervals)
-                ws.flush_count += 1;
-                if ws.flush_count % WAV_FLUSH_DIAGNOSTIC_INTERVAL == 0 {
-                    debug!(
-                        "session WAV progress: flushes={}, samples_written={}, duration={:.1}s",
-                        ws.flush_count,
-                        ws.writer.samples_written(),
-                        ws.writer.duration_seconds()
-                    );
+                if matches!(
+                    write_session_wav_samples(ws, &samples, sr, new_pos),
+                    WavWriteOutcome::ResampleFailed
+                ) {
+                    continue;
                 }
             }
         } else if session_wav_state.is_some() {
-            wav_flush_none_count += 1;
-            debug!(
-                "session WAV flush: no data (consecutive: {})",
-                wav_flush_none_count
-            );
-            // Only count toward the error threshold after backfill completes.
-            // During backfill, empty flushes are expected because backfill is
-            // consuming ring buffer reads for the first few seconds.
-            if wav_flush_none_count == WAV_FLUSH_ERROR_THRESHOLD {
-                if backfill_done.load(Ordering::Acquire) {
-                    if let Some(ref ws) = session_wav_state {
-                        let has_stream_error = {
-                            let mgr = audio_state.lock().await;
-                            mgr.system_has_stream_error()
-                        };
-                        match classify_empty_flush(ws.source, has_stream_error) {
-                            EmptyFlushClassification::WindowsSilence => {
-                                info!(
-                                    "session WAV: empty extractions for SystemOnly session {} on Windows — emitting warning (no stream error)",
-                                    ws.session_id
-                                );
-                                let _ = ctx.app_handle.emit(
-                                    "session-wav-warning",
-                                    SessionWavWarningEvent {
-                                        session_id: ws.session_id.clone(),
-                                        message:
-                                            "No system audio detected — recording will resume when audio plays"
-                                                .to_string(),
-                                    },
-                                );
-                            }
-                            EmptyFlushClassification::Error => {
-                                warn!(
-                                    "session WAV: 10 consecutive empty extractions for session {} — emitting error event",
-                                    ws.session_id
-                                );
-                                let _ = ctx.app_handle.emit(
-                                    "session-wav-error",
-                                    SessionWavErrorEvent {
-                                        session_id: ws.session_id.clone(),
-                                        message:
-                                            "No audio data available for recording — audio may not be saved"
-                                                .to_string(),
-                                    },
-                                );
-                            }
-                        }
-                    }
-                } else {
-                    debug!("session WAV flush: resetting empty count (backfill still running)");
-                    wav_flush_none_count = 0;
-                }
-            }
-            if wav_flush_none_count.is_multiple_of(WAV_FLUSH_WARNING_INTERVAL) {
-                let silence_secs = wav_flush_none_count as f32 * POLL_INTERVAL_MS as f32 / 1000.0;
-                warn!(
-                    "session WAV flush: {} consecutive empty extractions ({:.1}s) — possible sample rate mismatch or no audio data",
-                    wav_flush_none_count, silence_secs
-                );
-            }
+            handle_empty_wav_flush(
+                &mut wav_flush_none_count,
+                session_wav_state.as_ref(),
+                &audio_state,
+                &ctx,
+                &backfill_done,
+            )
+            .await;
         }
 
         // Stream health watchdog: check for cpal error flags and write_pos stalls.
@@ -2540,6 +2449,138 @@ async fn live_transcription_loop(
         "live transcription stopped: {} chunks, {:.1}s total audio",
         final_chunks, final_audio_seconds
     );
+}
+
+/// Outcome of a single session-WAV write attempt within the live loop. The
+/// only failure the loop cares about is a resample error: when that happens,
+/// the loop skips the rest of the tick so it doesn't act on a half-flushed
+/// state. Every other path (no `SessionWavState`, write success, write error)
+/// is "carry on" from the loop's perspective.
+enum WavWriteOutcome {
+    Wrote,
+    ResampleFailed,
+}
+
+/// Append the just-extracted ring-buffer samples to the streaming session WAV.
+/// Resamples on the fly when the live extraction sample rate diverges from the
+/// header rate (mid-session device rebind), and bumps the periodic-diagnostic
+/// counter on success. `flush_positions` is always advanced — retrying a
+/// partial write would duplicate samples on the next tick.
+fn write_session_wav_samples(
+    ws: &mut SessionWavState,
+    samples: &[f32],
+    sr: u32,
+    new_pos: BufferPositions,
+) -> WavWriteOutcome {
+    let to_write: std::borrow::Cow<[f32]> = if sr == ws.wav_sample_rate {
+        std::borrow::Cow::Borrowed(samples)
+    } else {
+        match yapstack_common::audio::resample(samples, sr, ws.wav_sample_rate) {
+            Ok(cow) => std::borrow::Cow::Owned(cow.into_owned()),
+            Err(e) => {
+                error!(
+                    "WAV resample {}Hz → {}Hz failed, dropping {} samples: {}",
+                    sr,
+                    ws.wav_sample_rate,
+                    samples.len(),
+                    e
+                );
+                // Advance positions regardless — retrying would re-extract the
+                // same samples next tick.
+                ws.flush_positions = new_pos;
+                return WavWriteOutcome::ResampleFailed;
+            }
+        }
+    };
+    if let Err(e) = ws.writer.write_samples(&to_write) {
+        error!(
+            "session WAV write error ({} samples may be lost): {}",
+            to_write.len(),
+            e
+        );
+    }
+    ws.flush_positions = new_pos;
+    ws.flush_count += 1;
+    if ws.flush_count % WAV_FLUSH_DIAGNOSTIC_INTERVAL == 0 {
+        debug!(
+            "session WAV progress: flushes={}, samples_written={}, duration={:.1}s",
+            ws.flush_count,
+            ws.writer.samples_written(),
+            ws.writer.duration_seconds()
+        );
+    }
+    WavWriteOutcome::Wrote
+}
+
+/// Advance the consecutive-empty-flush counter and emit the layered
+/// diagnostics: a one-shot user-facing event the first time the count crosses
+/// `WAV_FLUSH_ERROR_THRESHOLD` (deferred until backfill completes so the
+/// backfill-driven empty window doesn't false-positive), and a periodic warn
+/// log every `WAV_FLUSH_WARNING_INTERVAL` ticks thereafter.
+async fn handle_empty_wav_flush(
+    wav_flush_none_count: &mut u32,
+    session_wav_state: Option<&SessionWavState>,
+    audio_state: &AudioManagerState,
+    ctx: &TranscriptionContext,
+    backfill_done: &Arc<AtomicBool>,
+) {
+    *wav_flush_none_count += 1;
+    debug!(
+        "session WAV flush: no data (consecutive: {})",
+        *wav_flush_none_count
+    );
+    if *wav_flush_none_count == WAV_FLUSH_ERROR_THRESHOLD {
+        if backfill_done.load(Ordering::Acquire) {
+            if let Some(ws) = session_wav_state {
+                let has_stream_error = {
+                    let mgr = audio_state.lock().await;
+                    mgr.system_has_stream_error()
+                };
+                match classify_empty_flush(ws.source, has_stream_error) {
+                    EmptyFlushClassification::WindowsSilence => {
+                        info!(
+                            "session WAV: empty extractions for SystemOnly session {} on Windows — emitting warning (no stream error)",
+                            ws.session_id
+                        );
+                        let _ = ctx.app_handle.emit(
+                            "session-wav-warning",
+                            SessionWavWarningEvent {
+                                session_id: ws.session_id.clone(),
+                                message:
+                                    "No system audio detected — recording will resume when audio plays"
+                                        .to_string(),
+                            },
+                        );
+                    }
+                    EmptyFlushClassification::Error => {
+                        warn!(
+                            "session WAV: 10 consecutive empty extractions for session {} — emitting error event",
+                            ws.session_id
+                        );
+                        let _ = ctx.app_handle.emit(
+                            "session-wav-error",
+                            SessionWavErrorEvent {
+                                session_id: ws.session_id.clone(),
+                                message:
+                                    "No audio data available for recording — audio may not be saved"
+                                        .to_string(),
+                            },
+                        );
+                    }
+                }
+            }
+        } else {
+            debug!("session WAV flush: resetting empty count (backfill still running)");
+            *wav_flush_none_count = 0;
+        }
+    }
+    if wav_flush_none_count.is_multiple_of(WAV_FLUSH_WARNING_INTERVAL) {
+        let silence_secs = *wav_flush_none_count as f32 * POLL_INTERVAL_MS as f32 / 1000.0;
+        warn!(
+            "session WAV flush: {} consecutive empty extractions ({:.1}s) — possible sample rate mismatch or no audio data",
+            *wav_flush_none_count, silence_secs
+        );
+    }
 }
 
 /// Seed the live shared prompt and per-source `accumulated_text` from the
