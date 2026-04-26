@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { PhysicalPosition, PhysicalSize } from "@tauri-apps/api/dpi";
 import { AppLayout } from "@/components/AppLayout";
@@ -11,7 +11,6 @@ import { useUpdateCheck } from "@/hooks/useUpdateCheck";
 import { DictationBubble } from "@/components/DictationBubble";
 import { RecordingIndicator } from "@/components/RecordingIndicator";
 import { WINDOWS } from "@/lib/events";
-import { commands } from "@/lib/types";
 
 const WINDOW_POS_KEY = "yapstack-window-position";
 
@@ -42,24 +41,10 @@ const windowType = params.get("window");
 
 function MainApp() {
   const theme = useAppStore((s) => s.settings.theme);
-  const audioSaveLocation = useAppStore((s) => s.settings.audioSaveLocation);
   useGlobalShortcuts();
   useDictation();
   useRecordingIndicator();
   useUpdateCheck();
-
-  // Mirror `audioSaveLocation` to the backend so the `audio-stream://`
-  // protocol handler will serve parts saved outside the default audio dir.
-  // Persist hydration can fire this with the same value on reload — skip
-  // the IPC unless the value actually changed.
-  const lastSentAudioBase = useRef<string | null | undefined>(undefined);
-  useEffect(() => {
-    if (lastSentAudioBase.current === audioSaveLocation) return;
-    lastSentAudioBase.current = audioSaveLocation;
-    commands.setAudioBaseOverride(audioSaveLocation).catch((e) => {
-      console.error("Failed to update audio base override:", e);
-    });
-  }, [audioSaveLocation]);
 
   // Apply theme on mount and when setting changes
   useEffect(() => {

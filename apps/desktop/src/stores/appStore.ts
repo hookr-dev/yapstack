@@ -41,7 +41,6 @@ import {
   deleteFolder as dbDeleteFolder,
   updateFolderParent as dbUpdateFolderParent,
   listFolders,
-  insertAudioPart,
   listSessionAudioParts,
   listAllAudioPartPaths,
   addSessionToFolder as dbAddSessionToFolder,
@@ -393,23 +392,19 @@ function enqueueSegmentWork(fn: () => Promise<void>): void {
 }
 
 /**
- * Cleans up audio files for a single session. Prefers the parts table
- * (covers parts saved across multiple `audioSaveLocation` directories during
- * the session's lifetime); falls back to the legacy session-glob deletion
- * when there are no parts rows or the parts query fails. Fire-and-forget.
+ * Cleans up audio files given a pre-fetched list of part paths. Caller
+ * must read the paths *before* dropping the session row, since the
+ * cascade on `sessions` delete also nukes `session_audio_parts`. Falls
+ * back to the legacy session-glob deletion for sessions with no parts
+ * rows (older imports, manual notes).
  */
-async function deleteSessionAudio(
+function deleteSessionAudio(
   sessionId: string,
+  paths: string[],
   audioSaveLocation: string | null,
-): Promise<void> {
-  let parts: { file_path: string }[] = [];
-  try {
-    parts = await listSessionAudioParts(sessionId);
-  } catch {
-    parts = [];
-  }
-  if (parts.length > 0) {
-    commands.deleteAudioFiles(parts.map((p) => p.file_path)).catch(() => {});
+): void {
+  if (paths.length > 0) {
+    commands.deleteAudioFiles(paths).catch(() => {});
   } else {
     commands.deleteSessionWav(sessionId, audioSaveLocation).catch(() => {});
   }
@@ -727,23 +722,13 @@ function createAppStore() {
       },
 
       onSessionPartReady: (event) => {
-        // Enqueue on segmentQueueTail so this insert is strictly ordered
-        // before `setLivePhase("Stopped")`'s completion handler. Without this
-        // ordering, completeSession could read an empty SUM(parts) and
-        // record duration=0 for a session whose audio file was just finalized.
+        // The Rust finalize path inserts the parts row before emitting, so
+        // by the time we get here the DB is already authoritative — this
+        // listener just refreshes the in-store views. Enqueue on
+        // segmentQueueTail so the refresh runs strictly before
+        // `setLivePhase("Stopped")`'s completion handler reads SUM(parts).
         enqueueSegmentWork(async () => {
-          const part: DbAudioPart = {
-            id: crypto.randomUUID(),
-            session_id: event.session_id,
-            part_index: event.part_index,
-            file_path: event.file_path,
-            format: event.format,
-            duration_seconds: event.duration_seconds,
-            sample_rate: event.sample_rate,
-            created_at: new Date().toISOString(),
-          };
           try {
-            await insertAudioPart(part);
             const refreshed = await listSessionAudioParts(event.session_id);
             const { activeSessionId, selectedSessionId } = get();
             const patch: {
@@ -760,7 +745,7 @@ function createAppStore() {
               set(patch);
             }
           } catch (e) {
-            console.error("Failed to insert audio part:", e);
+            console.error("Failed to refresh audio parts:", e);
           }
         });
       },
@@ -1138,9 +1123,18 @@ function createAppStore() {
         if (id === activeSessionId) return;
 
         try {
-          deleteSessionAudio(id, get().settings.audioSaveLocation);
-
+          // Read part paths *before* the cascade deletes them. Without this
+          // ordering, the file cleanup would race the row delete and the
+          // helper would fall back to the legacy current-dir glob — orphaning
+          // any parts saved to a different `audioSaveLocation`.
+          let partPaths: string[] = [];
+          try {
+            partPaths = (await listSessionAudioParts(id)).map((p) => p.file_path);
+          } catch {
+            partPaths = [];
+          }
           await dbDeleteSession(id);
+          deleteSessionAudio(id, partPaths, get().settings.audioSaveLocation);
           await clearDictationSessionLink(id);
           trackSessionDeleted();
           const sessions = await listSessions();

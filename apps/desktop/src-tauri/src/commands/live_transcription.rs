@@ -2661,12 +2661,37 @@ async fn live_transcription_loop(
                         duration
                     );
                     let format = if use_mp3 { "mp3" } else { "wav" };
+                    let file_path_str = path.to_string_lossy().to_string();
+
+                    // Insert the parts row from Rust *before* emitting so the
+                    // DB is the durable source of truth even if the FE event
+                    // listener is unavailable (crash, force-quit, window
+                    // closed). The FE handler now just refreshes from DB.
+                    if let Some(db_path_state) = ctx.app_handle.try_state::<crate::DbPath>() {
+                        let row = crate::db::AudioPartRow {
+                            session_id: ws.session_id.clone(),
+                            part_index: ws.part_index,
+                            file_path: file_path_str.clone(),
+                            format,
+                            duration_seconds: duration,
+                            sample_rate: ws.wav_sample_rate,
+                        };
+                        if let Err(e) =
+                            crate::db::insert_audio_part_row(db_path_state.as_path(), &row)
+                        {
+                            error!("insert_audio_part_row failed (will rely on FE refresh): {e}");
+                        }
+                        if let Some(parent) = path.parent() {
+                            crate::register_trusted_audio_dir(&ctx.app_handle, parent);
+                        }
+                    }
+
                     let _ = ctx.app_handle.emit(
                         "session-part-ready",
                         SessionPartReadyEvent {
-                            session_id: ws.session_id,
+                            session_id: ws.session_id.clone(),
                             part_index: ws.part_index,
-                            file_path: path.to_string_lossy().to_string(),
+                            file_path: file_path_str,
                             format: format.to_string(),
                             duration_seconds: duration,
                             sample_rate: ws.wav_sample_rate,

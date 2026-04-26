@@ -5,7 +5,7 @@ use tauri::Manager;
 use tracing::{error, info, warn};
 
 use super::error::{validate_session_id, CommandError};
-use crate::{is_audio_path_allowed, AudioBaseOverrideState};
+use crate::audio_path_trusted;
 
 use super::audio::{
     AudioManagerState, CaptureResultDto, CaptureSourceDto, MixConfigDto, SessionStatusDto,
@@ -217,30 +217,12 @@ pub async fn delete_session_wav(
     Ok(())
 }
 
-/// Sets (or clears) a second base directory the `audio-stream://` protocol
-/// handler will serve files from, on top of `$APP_DATA_DIR/audio`. Called by
-/// the frontend whenever `settings.audioSaveLocation` loads or changes so
-/// audio parts written to a custom location remain playable.
-#[tauri::command]
-#[specta::specta]
-pub async fn set_audio_base_override(
-    state: tauri::State<'_, AudioBaseOverrideState>,
-    path: Option<String>,
-) -> Result<(), CommandError> {
-    let next = path.map(PathBuf::from);
-    let mut guard = state.lock().map_err(|e| CommandError::Internal {
-        message: format!("audio base override mutex poisoned: {e}"),
-    })?;
-    *guard = next;
-    Ok(())
-}
-
 /// Deletes the listed absolute audio file paths after verifying each lives
-/// inside `$APP_DATA_DIR/audio` or under the registered audio-base override.
-/// This is what `appStore.deleteSession` uses to clean up a session's parts —
-/// parts may live in different directories across the session's lifetime if
-/// the user changed `audioSaveLocation` between recording runs, so the FE
-/// passes the exact paths from `session_audio_parts`.
+/// in a directory the trusted-audio-dirs set knows about. Used by
+/// `appStore.deleteSession` to clean up a session's parts — parts may live
+/// in directories across the session's lifetime if the user changed
+/// `audioSaveLocation` between recording runs, and every directory we've
+/// ever written a part to is in the set.
 #[tauri::command]
 #[specta::specta]
 pub async fn delete_audio_files(
@@ -253,8 +235,8 @@ pub async fn delete_audio_files(
             warn!(path = %raw, "skipping non-absolute audio file delete");
             continue;
         }
-        if !is_audio_path_allowed(&app_handle, &abs) {
-            warn!(path = %raw, "skipping audio file delete outside allowed bases");
+        if !audio_path_trusted(&app_handle, &abs) {
+            warn!(path = %raw, "skipping audio file delete outside trusted dirs");
             continue;
         }
         match std::fs::remove_file(&abs) {
