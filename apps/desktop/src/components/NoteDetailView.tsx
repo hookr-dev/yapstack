@@ -125,13 +125,20 @@ export function NoteDetailView() {
     (time: number) => {
       setPlaybackTime(time);
       const audioEl = document.querySelector<
-        HTMLAudioElement & { seekTo?: (t: number) => void }
-      >("audio[data-session-audio]");
-      if (audioEl) {
-        audioEl.currentTime = time;
-        if (audioEl.paused) {
-          audioEl.play().catch(() => { });
+        HTMLAudioElement & {
+          seekTo?: (t: number, options?: { autoPlay?: boolean }) => void;
         }
+      >("audio[data-session-audio]");
+      if (!audioEl) return;
+      // `time` is global across parts; use the player's seekTo so a click
+      // that targets a different part swaps src and applies the seek on
+      // loadedmetadata. Setting `audioEl.currentTime` directly would clamp
+      // to the active part's local duration.
+      if (audioEl.seekTo) {
+        audioEl.seekTo(time, { autoPlay: true });
+      } else {
+        audioEl.currentTime = time;
+        if (audioEl.paused) audioEl.play().catch(() => {});
       }
     },
     [setPlaybackTime],
