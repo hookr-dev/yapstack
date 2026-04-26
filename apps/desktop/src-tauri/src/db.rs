@@ -1,6 +1,17 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use tauri_plugin_sql::{Migration, MigrationKind};
+
+/// Row to insert into `session_audio_parts`. Mirrors the columns in the v15
+/// migration; constructed by both the live finalize path and reconciliation.
+pub struct AudioPartRow {
+    pub session_id: String,
+    pub part_index: u32,
+    pub file_path: String,
+    pub format: &'static str,
+    pub duration_seconds: f32,
+    pub sample_rate: u32,
+}
 
 /// Pre-migration runtime patches. Currently only sweeps stale `recording`
 /// sessions left by a prior crash; runtime *schema* patches (segments.speaker_id)
@@ -27,29 +38,96 @@ pub fn ensure_runtime_schema(db_path: &Path) {
         return;
     }
 
+    // Out-of-band of the migration list so dev DBs whose `_sqlx_migrations`
+    // history is ahead of schema can still pick this up. Idempotent; no-op
+    // if already created.
+    let _ = conn.execute(
+        "CREATE TABLE IF NOT EXISTS audio_save_locations (\
+            dir TEXT PRIMARY KEY,\
+            registered_at TEXT NOT NULL DEFAULT (datetime('now'))\
+        )",
+        [],
+    );
+
     close_orphaned_recordings(&conn);
+}
+
+/// Records `dir` in `audio_save_locations`. Called at recording start with
+/// the resolved audio-output directory so reconciliation can scan it on
+/// next startup even if the run dies before any `session_audio_parts` row
+/// is committed. Best-effort: failures are logged and ignored.
+pub fn register_audio_save_location(db_path: &Path, dir: &Path) {
+    if !db_path.exists() {
+        return;
+    }
+    let Ok(conn) = rusqlite::Connection::open(db_path) else {
+        return;
+    };
+    if !table_exists(&conn, "audio_save_locations") {
+        // Should already exist via ensure_runtime_schema; create if not.
+        let _ = conn.execute(
+            "CREATE TABLE IF NOT EXISTS audio_save_locations (\
+                dir TEXT PRIMARY KEY,\
+                registered_at TEXT NOT NULL DEFAULT (datetime('now'))\
+            )",
+            [],
+        );
+    }
+    let canon = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    let _ = conn.execute(
+        "INSERT OR IGNORE INTO audio_save_locations (dir) VALUES (?)",
+        rusqlite::params![canon.to_string_lossy().as_ref()],
+    );
 }
 
 /// At startup the app cannot have a real in-flight recording session, so any
 /// row left at status='recording' is from a prior crash or force-quit. Empty
-/// ones (no segments, no WAV file) are deleted; the rest are marked completed
-/// with duration recomputed from their segments.
+/// ones (no segments, no audio parts) are deleted; the rest are marked
+/// completed with duration recomputed from their parts (or, as a final
+/// fallback, from their segments' max offset).
 fn close_orphaned_recordings(conn: &rusqlite::Connection) {
-    let deleted = conn
-        .execute(
+    // Newly-installed databases may not yet have the parts table; gate on
+    // its presence so this sweep is forward- and backward-compatible.
+    let has_parts_table = table_exists(conn, "session_audio_parts");
+
+    let deleted = if has_parts_table {
+        conn.execute(
             "DELETE FROM sessions \
              WHERE status = 'recording' \
-               AND wav_file_path IS NULL \
+               AND NOT EXISTS (SELECT 1 FROM segments WHERE session_id = sessions.id) \
+               AND NOT EXISTS (SELECT 1 FROM session_audio_parts WHERE session_id = sessions.id)",
+            [],
+        )
+    } else {
+        conn.execute(
+            "DELETE FROM sessions \
+             WHERE status = 'recording' \
                AND NOT EXISTS (SELECT 1 FROM segments WHERE session_id = sessions.id)",
             [],
         )
-        .unwrap_or_else(|e| {
-            tracing::warn!("close_orphaned_recordings: delete failed: {e}");
-            0
-        });
+    }
+    .unwrap_or_else(|e| {
+        tracing::warn!("close_orphaned_recordings: delete failed: {e}");
+        0
+    });
 
-    let completed = conn
-        .execute(
+    let completed = if has_parts_table {
+        conn.execute(
+            "UPDATE sessions SET \
+                status = 'completed', \
+                total_segments = (SELECT COUNT(*) FROM segments WHERE session_id = sessions.id), \
+                duration_seconds = COALESCE( \
+                    (SELECT SUM(duration_seconds) FROM session_audio_parts WHERE session_id = sessions.id), \
+                    (SELECT MAX(audio_offset_seconds + chunk_duration_seconds) \
+                     FROM segments WHERE session_id = sessions.id), \
+                    duration_seconds \
+                ), \
+                updated_at = datetime('now') \
+             WHERE status = 'recording'",
+            [],
+        )
+    } else {
+        conn.execute(
             "UPDATE sessions SET \
                 status = 'completed', \
                 total_segments = (SELECT COUNT(*) FROM segments WHERE session_id = sessions.id), \
@@ -62,10 +140,11 @@ fn close_orphaned_recordings(conn: &rusqlite::Connection) {
              WHERE status = 'recording'",
             [],
         )
-        .unwrap_or_else(|e| {
-            tracing::warn!("close_orphaned_recordings: update failed: {e}");
-            0
-        });
+    }
+    .unwrap_or_else(|e| {
+        tracing::warn!("close_orphaned_recordings: update failed: {e}");
+        0
+    });
 
     if deleted > 0 || completed > 0 {
         tracing::info!(
@@ -81,6 +160,273 @@ fn table_exists(conn: &rusqlite::Connection, name: &str) -> bool {
         |_| Ok(()),
     )
     .is_ok()
+}
+
+/// Inserts a `session_audio_parts` row. Uses INSERT OR IGNORE so a partial
+/// crash that leaves a row already inserted is recoverable on retry.
+pub fn insert_audio_part_row(db_path: &Path, row: &AudioPartRow) -> rusqlite::Result<()> {
+    use rusqlite::params;
+    let conn = rusqlite::Connection::open(db_path)?;
+    let id = format!(
+        "{:016x}{:016x}",
+        rand_u64_from_clock(),
+        rand_u64_from_clock()
+    );
+    let created_at = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    conn.execute(
+        "INSERT OR IGNORE INTO session_audio_parts (
+            id, session_id, part_index, file_path, format,
+            duration_seconds, sample_rate, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        params![
+            id,
+            row.session_id,
+            row.part_index,
+            row.file_path,
+            row.format,
+            row.duration_seconds as f64,
+            row.sample_rate,
+            created_at,
+        ],
+    )?;
+    Ok(())
+}
+
+fn rand_u64_from_clock() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let n = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0) as u64;
+    n ^ (n.wrapping_mul(6364136223846793005).rotate_left(13))
+}
+
+/// Returns canonicalized parent directories of every `session_audio_parts.file_path`,
+/// always including `$APP_DATA_DIR/audio` as the seed. Used to bootstrap the
+/// trusted-audio-dirs set at startup.
+pub fn list_audio_part_directories(db_path: &Path, app_audio_dir: &Path) -> Vec<PathBuf> {
+    use std::collections::HashSet;
+    let mut out: HashSet<PathBuf> = HashSet::new();
+    if let Ok(canon) = std::fs::canonicalize(app_audio_dir) {
+        out.insert(canon);
+    } else {
+        out.insert(app_audio_dir.to_path_buf());
+    }
+    if !db_path.exists() {
+        return out.into_iter().collect();
+    }
+    let Ok(conn) = rusqlite::Connection::open(db_path) else {
+        return out.into_iter().collect();
+    };
+    if !table_exists(&conn, "session_audio_parts") {
+        return out.into_iter().collect();
+    }
+    if let Ok(mut stmt) = conn
+        .prepare("SELECT DISTINCT file_path FROM session_audio_parts WHERE file_path IS NOT NULL")
+    {
+        if let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(0)) {
+            for path in rows.flatten() {
+                if let Some(parent) = Path::new(&path).parent() {
+                    let canon =
+                        std::fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
+                    out.insert(canon);
+                }
+            }
+        }
+    }
+    // `audio_save_locations` is registered at recording start and persists
+    // even when no part row landed (crash between finalize and INSERT, or
+    // a brand-new custom dir whose first run has not yet committed). It
+    // closes the gap where reconciliation would otherwise never visit a
+    // newly-chosen audioSaveLocation.
+    if table_exists(&conn, "audio_save_locations") {
+        if let Ok(mut stmt) = conn.prepare("SELECT dir FROM audio_save_locations") {
+            if let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(0)) {
+                for dir in rows.flatten() {
+                    let p = Path::new(&dir);
+                    let canon = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+                    out.insert(canon);
+                }
+            }
+        }
+    }
+    out.into_iter().collect()
+}
+
+/// Walks each trusted dir for filenames matching `{session_id}.{part_index}.{wav|mp3}`
+/// whose `(session_id, part_index)` row is missing. INSERT OR IGNORE recovers
+/// the row using duration read from file metadata. Rare orphan recovery —
+/// nominal flow has Rust insert the row inline at finalize time.
+pub fn reconcile_audio_parts(db_path: &Path, dirs: &[PathBuf]) {
+    if !db_path.exists() {
+        return;
+    }
+    let Ok(conn) = rusqlite::Connection::open(db_path) else {
+        return;
+    };
+    if !table_exists(&conn, "session_audio_parts") || !table_exists(&conn, "sessions") {
+        return;
+    }
+
+    let mut recovered = 0u32;
+    for dir in dirs {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            let Some((session_id, part_index, format)) = parse_part_filename(&name) else {
+                continue;
+            };
+            // Skip if (session_id, part_index) already exists.
+            let exists: bool = conn
+                .query_row(
+                    "SELECT 1 FROM session_audio_parts WHERE session_id = ? AND part_index = ?",
+                    rusqlite::params![session_id, part_index],
+                    |_| Ok(()),
+                )
+                .is_ok();
+            if exists {
+                continue;
+            }
+            // Skip if the session row doesn't exist (file is unrelated).
+            let session_exists: bool = conn
+                .query_row(
+                    "SELECT 1 FROM sessions WHERE id = ?",
+                    rusqlite::params![session_id],
+                    |_| Ok(()),
+                )
+                .is_ok();
+            if !session_exists {
+                continue;
+            }
+            let abs = entry.path();
+            let (duration, sample_rate) =
+                read_audio_metadata(&abs, format).unwrap_or((0.0, 48_000));
+            let row = AudioPartRow {
+                session_id: session_id.to_string(),
+                part_index,
+                file_path: abs.to_string_lossy().into_owned(),
+                format,
+                duration_seconds: duration,
+                sample_rate,
+            };
+            if insert_audio_part_row(db_path, &row).is_ok() {
+                recovered += 1;
+            }
+        }
+    }
+    if recovered > 0 {
+        tracing::info!("reconcile_audio_parts: recovered {recovered} orphan rows");
+    }
+}
+
+/// Returns `(session_id, part_index, format)` for a filename like
+/// `{uuid-or-hex}.{n}.{wav|mp3}`. Session id is a non-strict shape — accepts
+/// any token without dots — but rejects dictation-style `{id}.wav` (no
+/// part-index segment).
+fn parse_part_filename(name: &str) -> Option<(&str, u32, &'static str)> {
+    let (stem, ext) = name.rsplit_once('.')?;
+    let format = match ext.to_ascii_lowercase().as_str() {
+        "wav" => "wav",
+        "mp3" => "mp3",
+        _ => return None,
+    };
+    let (session_id, idx_str) = stem.rsplit_once('.')?;
+    let part_index: u32 = idx_str.parse().ok()?;
+    if session_id.is_empty() || session_id.contains('.') {
+        return None;
+    }
+    Some((session_id, part_index, format))
+}
+
+/// Returns `(duration_seconds, sample_rate)` for a recovered audio file.
+/// WAV uses `hound`; MP3 parses the first MPEG audio frame header. Returns
+/// `(0.0, 48000)` for unparseable MP3 — playback still works, but resume is
+/// blocked until the part is overwritten by a fresh finalize.
+fn read_audio_metadata(path: &Path, format: &'static str) -> Option<(f32, u32)> {
+    match format {
+        "wav" => {
+            let reader = hound::WavReader::open(path).ok()?;
+            let spec = reader.spec();
+            let sample_rate = spec.sample_rate;
+            let frames = reader.duration() as f32;
+            if sample_rate == 0 {
+                return None;
+            }
+            Some((frames / sample_rate as f32, sample_rate))
+        }
+        "mp3" => {
+            // Read the first 64 KiB; that's enough to skip ID3v2 + locate
+            // a sync. CBR is the only thing the app's encoder produces.
+            let mut buf = [0u8; 64 * 1024];
+            let n = read_prefix(path, &mut buf)?;
+            let (bitrate_bps, sample_rate, id3_size) = mp3_first_frame(&buf[..n])?;
+            let file_len = std::fs::metadata(path).ok()?.len() as i64;
+            let body_bits = ((file_len - id3_size as i64).max(0) as f64) * 8.0;
+            let duration = (body_bits / bitrate_bps as f64) as f32;
+            Some((duration, sample_rate))
+        }
+        _ => None,
+    }
+}
+
+fn read_prefix(path: &Path, buf: &mut [u8]) -> Option<usize> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path).ok()?;
+    let n = f.read(buf).ok()?;
+    Some(n)
+}
+
+/// Parses the first MPEG audio frame header to extract bitrate (bps) and
+/// sample rate. Skips an ID3v2 tag if present and returns its byte length so
+/// callers can compute body size for CBR duration math.
+fn mp3_first_frame(data: &[u8]) -> Option<(u32, u32, usize)> {
+    let id3_size = if data.len() >= 10 && &data[0..3] == b"ID3" {
+        // 28-bit synchsafe int across data[6..10]
+        let s = ((data[6] as usize) << 21)
+            | ((data[7] as usize) << 14)
+            | ((data[8] as usize) << 7)
+            | (data[9] as usize);
+        s + 10
+    } else {
+        0
+    };
+    let h = data.get(id3_size..id3_size + 4)?;
+    if h[0] != 0xFF || (h[1] & 0xE0) != 0xE0 {
+        return None;
+    }
+    let version_id = (h[1] >> 3) & 0x03; // 0=2.5, 2=2, 3=1
+    let layer = (h[1] >> 1) & 0x03; // 1=L3, 2=L2, 3=L1
+    if layer == 0 || version_id == 1 {
+        return None;
+    }
+    let bitrate_idx = ((h[2] >> 4) & 0x0F) as usize;
+    let sample_rate_idx = ((h[2] >> 2) & 0x03) as usize;
+    if bitrate_idx == 0 || bitrate_idx == 0xF || sample_rate_idx == 3 {
+        return None;
+    }
+    let bitrates_v1_l3 = [
+        0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320,
+    ];
+    let bitrates_v2_l3 = [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160];
+    let is_v1 = version_id == 3;
+    let kbps = if is_v1 {
+        bitrates_v1_l3[bitrate_idx]
+    } else {
+        bitrates_v2_l3[bitrate_idx]
+    };
+    let rates_v1 = [44_100u32, 48_000, 32_000];
+    let rates_v2 = [22_050u32, 24_000, 16_000];
+    let rates_v25 = [11_025u32, 12_000, 8_000];
+    let sample_rate = match version_id {
+        3 => rates_v1[sample_rate_idx],
+        2 => rates_v2[sample_rate_idx],
+        _ => rates_v25[sample_rate_idx],
+    };
+    Some((kbps as u32 * 1000, sample_rate, id3_size))
 }
 
 pub fn migrations() -> Vec<Migration> {
@@ -479,6 +825,62 @@ pub fn migrations() -> Vec<Migration> {
         "#,
             kind: MigrationKind::Up,
         },
+        Migration {
+            version: 15,
+            description: "session_audio_parts table + backfill from sessions.wav_file_path",
+            // Each recording run produces one part. A session's audio is the
+            // ordered concatenation of its parts. Resume = append a new part,
+            // never mutate prior parts.
+            //
+            // Backfill: every existing session with a wav_file_path becomes
+            // part_index=0 in the new table. Sample rate isn't stored on the
+            // legacy row; default to 48000 (only used for diagnostics).
+            //
+            // We deliberately do NOT drop the legacy `wav_file_path` /
+            // `wav_duration_seconds` columns from `sessions` here — combining
+            // ALTER TABLE DROP COLUMN with the backfill INSERT in the same
+            // tauri-plugin-sql migration transaction has been seen to fail
+            // on some SQLite builds, leaving the DB in a dead state. The
+            // columns are unused at the TypeScript boundary; they stay
+            // dormant until a future cleanup migration drops them.
+            //
+            // The migration is idempotent so it can re-run cleanly:
+            //   - CREATE TABLE IF NOT EXISTS
+            //   - INSERT OR IGNORE (the (session_id, part_index) UNIQUE
+            //     constraint short-circuits duplicates).
+            sql: r#"
+            CREATE TABLE IF NOT EXISTS session_audio_parts (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                part_index INTEGER NOT NULL,
+                file_path TEXT NOT NULL,
+                format TEXT NOT NULL CHECK (format IN ('wav','mp3')),
+                duration_seconds REAL NOT NULL,
+                sample_rate INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE (session_id, part_index)
+            );
+            CREATE INDEX IF NOT EXISTS idx_audio_parts_session
+                ON session_audio_parts(session_id, part_index);
+
+            INSERT OR IGNORE INTO session_audio_parts (
+                id, session_id, part_index, file_path, format,
+                duration_seconds, sample_rate, created_at
+            )
+            SELECT
+                lower(hex(randomblob(16))),
+                id,
+                0,
+                wav_file_path,
+                CASE WHEN wav_file_path LIKE '%.mp3' THEN 'mp3' ELSE 'wav' END,
+                COALESCE(wav_duration_seconds, 0),
+                48000,
+                COALESCE(updated_at, created_at)
+            FROM sessions
+            WHERE wav_file_path IS NOT NULL;
+        "#,
+            kind: MigrationKind::Up,
+        },
         // segments.speaker_id is added by `ensure_runtime_schema()` instead —
         // see that function for why.
     ]
@@ -498,7 +900,7 @@ mod tests {
     fn test_migrations_sequential_versions() {
         let m = migrations();
         let actual_versions: Vec<i64> = m.iter().map(|x| x.version).collect();
-        assert_eq!(actual_versions, (1..=14).collect::<Vec<_>>());
+        assert_eq!(actual_versions, (1..=15).collect::<Vec<_>>());
     }
 
     #[test]
@@ -569,9 +971,235 @@ mod tests {
     fn test_migration_count() {
         assert_eq!(
             migrations().len(),
-            14,
-            "v1-v14; segments.speaker_id handled at runtime via ensure_runtime_schema"
+            15,
+            "v1-v15; segments.speaker_id handled at runtime via ensure_runtime_schema"
         );
+    }
+
+    #[test]
+    fn test_migration_v15_creates_session_audio_parts() {
+        let m = migrations();
+        let v15 = &m[14];
+        assert_eq!(v15.version, 15);
+        assert!(v15
+            .sql
+            .contains("CREATE TABLE IF NOT EXISTS session_audio_parts"));
+        assert!(v15
+            .sql
+            .contains("INSERT OR IGNORE INTO session_audio_parts"));
+    }
+
+    #[test]
+    fn parse_part_filename_accepts_session_index_format() {
+        let (sid, idx, fmt) = parse_part_filename("abc-def-123.0.wav").unwrap();
+        assert_eq!(sid, "abc-def-123");
+        assert_eq!(idx, 0);
+        assert_eq!(fmt, "wav");
+
+        let (sid, idx, fmt) = parse_part_filename("uuid.7.mp3").unwrap();
+        assert_eq!(sid, "uuid");
+        assert_eq!(idx, 7);
+        assert_eq!(fmt, "mp3");
+    }
+
+    #[test]
+    fn parse_part_filename_rejects_legacy_dictation_shape() {
+        // `{id}.wav` (no part-index segment) — must not match.
+        assert!(parse_part_filename("abc.wav").is_none());
+        assert!(parse_part_filename("notaudio.txt").is_none());
+        assert!(parse_part_filename("noext").is_none());
+    }
+
+    #[test]
+    fn insert_and_reconcile_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        // Apply all migrations to the test DB.
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        for m in migrations() {
+            conn.execute_batch(m.sql).unwrap();
+        }
+        conn.execute(
+            "INSERT INTO sessions (id, title, source, status) \
+             VALUES ('sess-x', 't', 'MicOnly', 'completed')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        // Write a fake WAV file matching the parts naming scheme into a
+        // standalone audio dir so reconciliation can find it.
+        let audio_dir = dir.path().join("audio");
+        std::fs::create_dir_all(&audio_dir).unwrap();
+        let wav_path = audio_dir.join("sess-x.0.wav");
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&wav_path, spec).unwrap();
+        for _ in 0..16_000 {
+            writer.write_sample(0i16).unwrap();
+        }
+        writer.finalize().unwrap();
+
+        // No row yet — reconciliation should insert one.
+        reconcile_audio_parts(&db_path, &[audio_dir.clone()]);
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let (count, dur, sr): (i64, f64, i64) = conn
+            .query_row(
+                "SELECT COUNT(*), MAX(duration_seconds), MAX(sample_rate) \
+                 FROM session_audio_parts WHERE session_id = 'sess-x'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(sr, 16_000);
+        assert!((dur - 1.0).abs() < 0.01, "expected ~1s, got {dur}");
+
+        // Running reconciliation again must be a no-op (INSERT OR IGNORE).
+        reconcile_audio_parts(&db_path, &[audio_dir.clone()]);
+        let count2: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_audio_parts WHERE session_id = 'sess-x'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count2, 1, "reconciliation must be idempotent");
+    }
+
+    #[test]
+    fn reconcile_seeds_from_audio_save_locations_even_without_part_rows() {
+        // Reproduces the "first run to a brand-new custom dir crashes
+        // before INSERT" case: the dir has a part file but no part row,
+        // and no other row points at it. Reconciliation must still find
+        // it via the registered `audio_save_locations` row.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        for m in migrations() {
+            conn.execute_batch(m.sql).unwrap();
+        }
+        // ensure_runtime_schema would normally create this; do it
+        // explicitly for the test.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS audio_save_locations (\
+                dir TEXT PRIMARY KEY,\
+                registered_at TEXT NOT NULL DEFAULT (datetime('now'))\
+            )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sessions (id, title, source, status) \
+             VALUES ('orphan', 't', 'MicOnly', 'completed')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let custom_dir = dir.path().join("custom-A");
+        std::fs::create_dir_all(&custom_dir).unwrap();
+        register_audio_save_location(&db_path, &custom_dir);
+
+        // Simulated orphan: file exists, no part row.
+        let wav_path = custom_dir.join("orphan.0.wav");
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&wav_path, spec).unwrap();
+        writer.write_sample(0i16).unwrap();
+        writer.finalize().unwrap();
+
+        // Drive reconciliation through the same pipeline lib.rs uses:
+        // list_audio_part_directories must include the registered dir
+        // even though no parts row references it yet.
+        let app_audio_dir = dir.path().join("audio");
+        std::fs::create_dir_all(&app_audio_dir).unwrap();
+        let dirs = list_audio_part_directories(&db_path, &app_audio_dir);
+        assert!(
+            dirs.iter()
+                .any(|d| d == &std::fs::canonicalize(&custom_dir).unwrap()),
+            "registered audio_save_location must be returned for reconciliation: {dirs:?}"
+        );
+
+        reconcile_audio_parts(&db_path, &dirs);
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_audio_parts WHERE session_id = 'orphan'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            count, 1,
+            "orphan in registered custom dir must be recovered"
+        );
+    }
+
+    #[test]
+    fn reconcile_skips_files_for_unknown_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        for m in migrations() {
+            conn.execute_batch(m.sql).unwrap();
+        }
+        drop(conn);
+
+        let audio_dir = dir.path().join("audio");
+        std::fs::create_dir_all(&audio_dir).unwrap();
+        let wav_path = audio_dir.join("ghost.0.wav");
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&wav_path, spec).unwrap();
+        writer.write_sample(0i16).unwrap();
+        writer.finalize().unwrap();
+
+        reconcile_audio_parts(&db_path, &[audio_dir]);
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM session_audio_parts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "no row should be inserted for unknown sessions");
+    }
+
+    #[test]
+    fn test_migration_v15_is_idempotent() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        for m in migrations() {
+            conn.execute_batch(m.sql)
+                .unwrap_or_else(|e| panic!("migration v{} failed: {}", m.version, e));
+        }
+        conn.execute(
+            "INSERT INTO sessions (id, title, source, status, wav_file_path, wav_duration_seconds) \
+             VALUES ('s1', 't', 'MicOnly', 'completed', '/tmp/s1.mp3', 12.5)",
+            [],
+        )
+        .unwrap();
+        let v15_sql = migrations()[14].sql;
+        // Re-applying the migration must not error or double-insert.
+        conn.execute_batch(v15_sql).unwrap();
+        conn.execute_batch(v15_sql).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_audio_parts WHERE session_id = 's1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "re-running v15 must not double-insert parts");
     }
 
     #[test]
@@ -590,9 +1218,8 @@ mod tests {
         // instead of waiting for a user to launch a fresh DB.
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         for m in migrations() {
-            conn.execute_batch(m.sql).unwrap_or_else(|e| {
-                panic!("migration v{} failed: {}", m.version, e)
-            });
+            conn.execute_batch(m.sql)
+                .unwrap_or_else(|e| panic!("migration v{} failed: {}", m.version, e));
         }
         // Sanity-check that the FTS5 tables are queryable post-migration.
         for fts_table in [
@@ -602,14 +1229,10 @@ mod tests {
             "dictations_fts",
         ] {
             let count: i64 = conn
-                .query_row(
-                    &format!("SELECT count(*) FROM {fts_table}"),
-                    [],
-                    |row| row.get(0),
-                )
-                .unwrap_or_else(|e| {
-                    panic!("query against {fts_table} failed: {e}")
-                });
+                .query_row(&format!("SELECT count(*) FROM {fts_table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap_or_else(|e| panic!("query against {fts_table} failed: {e}"));
             assert_eq!(count, 0, "{fts_table} should be empty after migration");
         }
     }

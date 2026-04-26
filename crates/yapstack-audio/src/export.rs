@@ -74,6 +74,11 @@ impl SessionWavWriter {
         })
     }
 
+    /// Returns the WAV's sample rate.
+    pub fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+
     /// Appends mono f32 samples (clamped to [-1.0, 1.0] and converted to i16).
     pub fn write_samples(&mut self, samples: &[f32]) -> Result<()> {
         for &sample in samples {
@@ -129,7 +134,6 @@ pub fn write_wav(samples: &[f32], sample_rate: u32, channels: u16, path: &Path) 
         bits_per_sample: 16,
         sample_format: SampleFormat::Int,
     };
-
     let mut writer = WavWriter::create(path, spec)?;
 
     for &sample in samples {

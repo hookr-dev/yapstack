@@ -22,6 +22,7 @@ import {
   createSession as dbCreateSession,
   updateSessionTitle,
   completeSession,
+  markSessionRecording as dbMarkSessionRecording,
   deleteSession as dbDeleteSession,
   listSessions,
   getSession,
@@ -40,7 +41,8 @@ import {
   deleteFolder as dbDeleteFolder,
   updateFolderParent as dbUpdateFolderParent,
   listFolders,
-  updateSessionWavPath,
+  listSessionAudioParts,
+  listAllAudioPartPaths,
   addSessionToFolder as dbAddSessionToFolder,
   removeSessionFromFolder as dbRemoveSessionFromFolder,
   removeSessionFromAllFolders as dbRemoveSessionFromAllFolders,
@@ -61,7 +63,8 @@ import {
 } from "@/lib/db";
 import type { DbDictationHistory, DbTag } from "@/lib/db";
 import { findBranchConflicts, buildFolderTree, buildChildMap, type FolderTreeNode } from "@/lib/folder-tree";
-import type { DbSession, DbSegment, DbFolder } from "@/lib/db";
+import type { DbSession, DbSegment, DbFolder, DbAudioPart } from "@/lib/db";
+import type { SessionPartReadyEvent } from "@/lib/events";
 import { toast } from "sonner";
 import { DEFAULT_AI_SETTINGS } from "@/lib/ai";
 import { buildVocabularyHints } from "@/lib/transcription";
@@ -205,10 +208,16 @@ interface AppState {
   setDictationSessionId: (id: string | null) => void;
   activeSessionSegments: DbSegment[];
   activeSessionStartTime: number | null;
+  /** Parts of the active session, hydrated on resume so the player and
+   *  duration math have the prior parts in scope. Empty for fresh sessions. */
+  activeSessionParts: DbAudioPart[];
 
   // Viewing a completed session
   viewSessionSegments: DbSegment[];
   viewSession: DbSession | null;
+  /** Parts of the currently-viewed session. The AudioPlayer consumes this
+   *  to play the full session timeline across parts. */
+  viewSessionParts: DbAudioPart[];
 
   // Live transcription
   liveTranscriptionActive: boolean;
@@ -259,7 +268,7 @@ interface AppState {
   setLivePhase: (phase: LiveTranscriptionPhase) => void;
   onLiveSegment: (event: LiveSegmentEvent) => void;
   onBackfillComplete: () => void;
-  onSessionWavReady: (sessionId: string, filePath: string, durationSeconds: number) => void;
+  onSessionPartReady: (event: SessionPartReadyEvent) => void;
   recoverActiveSession: (sessionId: string, effectiveStartEpochMs?: number) => Promise<void>;
 
   // Actions
@@ -267,6 +276,7 @@ interface AppState {
   loadSessions: () => Promise<void>;
   loadFolders: () => Promise<void>;
   createAndStartSession: (backfillSeconds?: number, trigger?: string) => Promise<void>;
+  resumeSession: (sessionId: string) => Promise<void>;
   stopActiveSession: () => Promise<void>;
   openSession: (id: string) => Promise<void>;
   deleteSession: (id: string) => Promise<void>;
@@ -381,6 +391,35 @@ function enqueueSegmentWork(fn: () => Promise<void>): void {
   segmentQueueTail = segmentQueueTail.then(fn, fn);
 }
 
+/**
+ * Cleans up audio files given a pre-fetched list of part paths. Caller
+ * must read the paths *before* dropping the session row, since the
+ * cascade on `sessions` delete also nukes `session_audio_parts`. Falls
+ * back to the legacy session-glob deletion for sessions with no parts
+ * rows (older imports, manual notes). Awaited so a failure (player still
+ * has the file open, permissions issue, app exit) is logged, surfaced as
+ * a toast, and not silently dropped — the part paths are gone from the
+ * DB by this point and only the closure variable still holds them.
+ */
+async function deleteSessionAudio(
+  sessionId: string,
+  paths: string[],
+  audioSaveLocation: string | null,
+): Promise<void> {
+  try {
+    if (paths.length > 0) {
+      await commands.deleteAudioFiles(paths);
+    } else {
+      await commands.deleteSessionWav(sessionId, audioSaveLocation);
+    }
+  } catch (e) {
+    console.error(`Failed to delete audio for session ${sessionId}:`, e, paths);
+    toast.error("Some audio files were not deleted", {
+      id: `audio-cleanup-${sessionId}`,
+    });
+  }
+}
+
 const defaultSettings: Settings = {
   captureSource: "Mixed",
   selectedMicDeviceId: null,
@@ -474,8 +513,10 @@ function createAppStore() {
       dictationSessionId: null,
       activeSessionSegments: [],
       activeSessionStartTime: null,
+      activeSessionParts: [],
       viewSessionSegments: [],
       viewSession: null,
+      viewSessionParts: [],
       liveTranscriptionActive: false,
       livePhase: null,
       backfillActive: false,
@@ -523,13 +564,15 @@ function createAppStore() {
                 duration_seconds: Math.round(durationSeconds),
                 segment_count: activeSessionSegments.length,
               });
+              // `completeSession` derives `duration_seconds` from
+              // `session_audio_parts` (SUM). Both the part insert (queued by
+              // `onSessionPartReady`) and this completion run on
+              // `segmentQueueTail`, so the part row is in the DB before we
+              // SUM. The wall-clock value is a fallback for the rare case
+              // where WAV finalize failed and no part landed.
               await completeSession(capturedSessionId, durationSeconds).catch((e) => {
                 console.error("Failed to complete session:", e);
               });
-
-              // WAV is streamed during the session and finalized by the backend.
-              // The "session-wav-ready" event (handled in useLiveTranscriptionEvents)
-              // updates the DB with the file path and duration.
 
               set({
                 activeSessionId: null,
@@ -688,21 +731,33 @@ function createAppStore() {
         set({ backfillActive: false });
       },
 
-      onSessionWavReady: (sessionId, filePath, durationSeconds) => {
-        updateSessionWavPath(sessionId, filePath, durationSeconds)
-          .then(() => {
-            const { selectedSessionId } = get();
-            if (selectedSessionId === sessionId) {
-              getSession(sessionId).then((session) => {
-                if (session && get().selectedSessionId === sessionId) {
-                  set({ viewSession: session });
-                }
-              });
+      onSessionPartReady: (event) => {
+        // The Rust finalize path inserts the parts row before emitting, so
+        // by the time we get here the DB is already authoritative — this
+        // listener just refreshes the in-store views. Enqueue on
+        // segmentQueueTail so the refresh runs strictly before
+        // `setLivePhase("Stopped")`'s completion handler reads SUM(parts).
+        enqueueSegmentWork(async () => {
+          try {
+            const refreshed = await listSessionAudioParts(event.session_id);
+            const { activeSessionId, selectedSessionId } = get();
+            const patch: {
+              activeSessionParts?: DbAudioPart[];
+              viewSessionParts?: DbAudioPart[];
+            } = {};
+            if (activeSessionId === event.session_id) {
+              patch.activeSessionParts = refreshed;
             }
-          })
-          .catch((e) => {
-            console.error("Failed to update session WAV path:", e);
-          });
+            if (selectedSessionId === event.session_id) {
+              patch.viewSessionParts = refreshed;
+            }
+            if (Object.keys(patch).length > 0) {
+              set(patch);
+            }
+          } catch (e) {
+            console.error("Failed to refresh audio parts:", e);
+          }
+        });
       },
 
       recoverActiveSession: async (sessionId: string, effectiveStartEpochMs?: number) => {
@@ -710,12 +765,16 @@ function createAppStore() {
         if (get().activeSessionId === sessionId) return;
 
         try {
-          const segments = await getSessionSegments(sessionId);
-          const session = await getSession(sessionId);
+          const [segments, session, parts] = await Promise.all([
+            getSessionSegments(sessionId),
+            getSession(sessionId),
+            listSessionAudioParts(sessionId),
+          ]);
 
           set({
             activeSessionId: sessionId,
             activeSessionSegments: segments,
+            activeSessionParts: parts,
             liveTranscriptionActive: true,
             activeSessionStartTime: effectiveStartEpochMs
               ?? (session ? new Date(session.created_at + "Z").getTime() : Date.now()),
@@ -726,6 +785,7 @@ function createAppStore() {
               selectedSessionId: sessionId,
               viewSession: session,
               viewSessionSegments: segments,
+              viewSessionParts: parts,
               currentView: "note-detail",
             });
           }
@@ -890,6 +950,7 @@ function createAppStore() {
         set({
           activeSessionId: sessionId,
           activeSessionSegments: [],
+          activeSessionParts: [],
           activeSessionStartTime: result.data.effective_start_epoch_ms,
           liveTranscriptionActive: true,
           livePhase: "Running",
@@ -901,6 +962,120 @@ function createAppStore() {
         // Reload sidebar
         const sessions = await listSessions();
         set({ sessions });
+      },
+
+      resumeSession: async (sessionId: string) => {
+        const {
+          settings,
+          enginePhase,
+          captureStatus,
+          activeSessionId,
+          liveTranscriptionActive,
+          sessionStopping,
+        } = get();
+
+        if (liveTranscriptionActive || sessionStopping || activeSessionId) {
+          toast.error("Another session or dictation is already running.");
+          return;
+        }
+        if (enginePhase !== "ready") {
+          toast.error("Transcription engine is not ready.");
+          return;
+        }
+        if (captureStatus?.state !== "Capturing") {
+          toast.error("Audio capture is not active.");
+          return;
+        }
+
+        const session = await getSession(sessionId).catch(() => null);
+        if (!session) {
+          toast.error("Could not load session.");
+          return;
+        }
+        if (session.status !== "completed") {
+          toast.error("This session is not in a state that can be resumed.");
+          return;
+        }
+        if (session.session_type === "manual") {
+          toast.error("Manual notes can't be resumed as recordings.");
+          return;
+        }
+
+        const [freshFolders, freshTags, existingSegments, existingParts] = await Promise.all([
+          listFolders(),
+          listTags(),
+          getSessionSegments(sessionId),
+          listSessionAudioParts(sessionId),
+        ]);
+
+        if (existingParts.length === 0) {
+          toast.error("This session has no audio to resume from.");
+          return;
+        }
+
+        const offsetBaseSeconds = existingParts.reduce(
+          (acc, p) => acc + p.duration_seconds,
+          0,
+        );
+        const nextPartIndex = existingParts.length;
+        const vocabHints = buildVocabularyHints(freshFolders, freshTags);
+
+        const config: LiveTranscriptionConfig = {
+          silence_threshold: 0.01,
+          silence_duration_ms: settings.silenceDurationMs,
+          max_chunk_seconds: settings.maxChunkSeconds,
+          backfill_seconds: 0,
+          source: settings.captureSource,
+          mix_config: settings.captureSource === "Mixed" ? settings.mixConfig : null,
+          language: settings.language,
+          prompt_context_chars: settings.promptContextChars,
+          prompt_decay_silence_seconds:
+            settings.promptDecaySilenceSeconds > 0
+              ? settings.promptDecaySilenceSeconds
+              : null,
+          session_id: sessionId,
+          audio_save_location: settings.audioSaveLocation,
+          audio_export_format: settings.audioExportFormat,
+          mp3_bitrate:
+            settings.audioExportFormat === "mp3" ? settings.mp3Bitrate : null,
+          diarization:
+            settings.selectedEngine === "Parakeet" && settings.diarizationEnabled,
+          vocabulary_hints: vocabHints,
+          resume: {
+            part_index: nextPartIndex,
+            offset_base_seconds: offsetBaseSeconds,
+          },
+        };
+
+        const result = await commands.startLiveTranscription(config);
+        if (result.status === "error") {
+          // No DB rollback needed — we deferred the status flip until after
+          // backend success.
+          toast.error(`Could not resume session: ${result.error.message}`);
+          return;
+        }
+
+        // Status flip happens *after* the backend has accepted the start, so a
+        // rejected resume leaves the session as `completed`.
+        await dbMarkSessionRecording(sessionId).catch((e) =>
+          console.error("Failed to flip session to recording:", e),
+        );
+
+        // Sidebar's `isRecording` keys off `activeSessionId`, so we don't
+        // need to reload the sessions list — the badge updates from
+        // activeSessionId alone.
+        set({
+          activeSessionId: sessionId,
+          activeSessionSegments: existingSegments,
+          activeSessionParts: existingParts,
+          activeSessionStartTime: result.data.effective_start_epoch_ms,
+          liveTranscriptionActive: true,
+          livePhase: "Running",
+          currentView: "note-detail",
+          selectedSessionId: sessionId,
+          sessionStopping: false,
+          backfillActive: false,
+        });
       },
 
       stopActiveSession: async () => {
@@ -933,13 +1108,17 @@ function createAppStore() {
         }
 
         try {
-          const session = await getSession(id);
-          const segments = await getSessionSegments(id);
+          const [session, segments, parts] = await Promise.all([
+            getSession(id),
+            getSessionSegments(id),
+            listSessionAudioParts(id),
+          ]);
           set({
             currentView: "note-detail",
             selectedSessionId: id,
             viewSession: session,
             viewSessionSegments: segments,
+            viewSessionParts: parts,
           });
         } catch (e) {
           console.error("Failed to open session:", e);
@@ -954,10 +1133,18 @@ function createAppStore() {
         if (id === activeSessionId) return;
 
         try {
-          // Delete WAV file if it exists
-          commands.deleteSessionWav(id, get().settings.audioSaveLocation).catch(() => {});
-
+          // Read part paths *before* the cascade deletes them. Without this
+          // ordering, the file cleanup would race the row delete and the
+          // helper would fall back to the legacy current-dir glob — orphaning
+          // any parts saved to a different `audioSaveLocation`.
+          let partPaths: string[] = [];
+          try {
+            partPaths = (await listSessionAudioParts(id)).map((p) => p.file_path);
+          } catch {
+            partPaths = [];
+          }
           await dbDeleteSession(id);
+          await deleteSessionAudio(id, partPaths, get().settings.audioSaveLocation);
           await clearDictationSessionLink(id);
           trackSessionDeleted();
           const sessions = await listSessions();
@@ -1484,12 +1671,39 @@ function createAppStore() {
           return;
         }
         try {
-          // Clean up WAV files for all sessions (fire-and-forget)
+          // One DB read of all parts paths beats N round-trips through
+          // `listSessionAudioParts(session.id)`. Hand the full list to the
+          // backend in a single IPC; it validates per-path and skips
+          // unknown locations. Sessions with zero parts (manual notes,
+          // legacy single-file dictations) still need the glob cleanup.
           const audioSaveLocation = get().settings.audioSaveLocation;
-          for (const session of get().sessions) {
-            commands.deleteSessionWav(session.id, audioSaveLocation).catch(() => {});
+          let allPaths: string[] = [];
+          try {
+            allPaths = await listAllAudioPartPaths();
+          } catch (e) {
+            console.error("Failed to list audio parts before clear:", e);
           }
+          // Capture session ids while the table still has them.
+          const sessionIds = get().sessions.map((s) => s.id);
           await deleteAllSessions();
+          if (allPaths.length > 0) {
+            try {
+              await commands.deleteAudioFiles(allPaths);
+            } catch (e) {
+              console.error("Failed to delete bulk audio files:", e);
+              toast.error("Some audio files were not deleted");
+            }
+          }
+          // Legacy single-file dictations: best-effort, awaited so a
+          // failure surfaces. Run sequentially to keep error reporting
+          // sane — clear is not latency-critical.
+          for (const id of sessionIds) {
+            try {
+              await commands.deleteSessionWav(id, audioSaveLocation);
+            } catch (e) {
+              console.error(`Failed to delete legacy WAV for ${id}:`, e);
+            }
+          }
           trackSessionsCleared();
           set({
             sessions: [],

@@ -136,6 +136,25 @@ async deleteSessionWav(sessionId: string, audioSaveLocation: string | null) : Pr
     else return { status: "error", error: e  as any };
 }
 },
+/**
+ * Deletes the listed absolute audio file paths after verifying each lives
+ * in a directory the trusted-audio-dirs set knows about. Used by
+ * `appStore.deleteSession` to clean up a session's parts — parts may live
+ * in directories across the session's lifetime if the user changed
+ * `audioSaveLocation` between recording runs, and every directory we've
+ * ever written a part to is in the set.
+ * 
+ * Returns `Err(CommandError)` if any path could not be deleted, listing
+ * every failed path so the caller can log/toast a useful diagnostic.
+ */
+async deleteAudioFiles(paths: string[]) : Promise<Result<null, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("delete_audio_files", { paths }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async getAvailableModels() : Promise<Result<ModelInfoDto[], CommandError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("get_available_models") };
@@ -509,7 +528,13 @@ diarization?: boolean;
  * Whisper initial_prompt to improve recognition of proper nouns. Ignored
  * for Parakeet sessions (the TDT decoder has no text-prompt input).
  */
-vocabulary_hints: string | null }
+vocabulary_hints: string | null; 
+/**
+ * When set, this run is a resume of an existing Session. The new
+ * recording becomes a fresh audio part appended after the existing parts;
+ * no prior file is read or modified. Backfill is forced to 0.
+ */
+resume?: ResumeConfig | null }
 export type LiveTranscriptionPhase = "Running" | "Stopped" | "Error"
 export type LiveTranscriptionStartResult = { effective_start_epoch_ms: number }
 export type LiveTranscriptionStatus = { phase: LiveTranscriptionPhase; chunks_processed: number; total_audio_seconds: number; error_message: string | null; session_id: string | null; effective_start_epoch_ms: number | null }
@@ -528,6 +553,18 @@ export type ModelSizeDto = "Tiny" | "Base" | "Small" | "Medium"
 export type ParakeetModelInfoDto = { variant: ParakeetVariantDto; downloaded: boolean; display_name: string; approximate_size_bytes: number }
 export type ParakeetVariantDto = "TdtV3"
 export type PermissionStatusDto = "Granted" | "Denied" | "NotDetermined" | "Unavailable"
+export type ResumeConfig = { 
+/**
+ * The index of the new part being recorded — equals the count of
+ * existing parts in the session. The output WAV/MP3 is named
+ * `{session_id}.{part_index}.{ext}`.
+ */
+part_index: number; 
+/**
+ * Cumulative duration of the existing parts. Added to every Segment's
+ * `audio_offset_seconds` so persisted Segments stay continuous.
+ */
+offset_base_seconds: number }
 export type RingBufferInfoDto = { capacity_samples: number; samples_written: number; available_samples: number; capacity_seconds: number; available_seconds: number; sample_rate: number; channels: number }
 export type ScreenCapturePermissionDto = "Granted" | "NotDetermined" | "Unavailable"
 export type SessionStatusDto = { active: boolean; elapsed_seconds: number | null }
