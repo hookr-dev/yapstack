@@ -19,9 +19,13 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import { ArrowLeft, FolderOpen, Loader2, MoreHorizontal, Square, Trash2 } from "lucide-react";
+import { ArrowLeft, FolderOpen, Loader2, Mic, MoreHorizontal, Square, Trash2 } from "lucide-react";
 import type { DbSession } from "@/lib/db";
-import { updateSessionTitle, getSession } from "@/lib/db";
+import {
+  canResumeSession,
+  updateSessionTitle,
+  getSession,
+} from "@/lib/db";
 import { formatDuration, formatElapsed } from "@/lib/utils";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
 
@@ -68,6 +72,10 @@ export function SessionHeader({ session }: { session: DbSession }) {
   const activeSessionId = useAppStore((s) => s.activeSessionId);
   const navigateTo = useAppStore((s) => s.navigateTo);
   const loadSessions = useAppStore((s) => s.loadSessions);
+  const resumeSession = useAppStore((s) => s.resumeSession);
+  const liveTranscriptionActive = useAppStore((s) => s.liveTranscriptionActive);
+  const sessionStopping = useAppStore((s) => s.sessionStopping);
+  const viewSessionParts = useAppStore((s) => s.viewSessionParts);
 
   const isRecording = session.id === activeSessionId;
   const [isEditingTitle, setIsEditingTitle] = useState(false);
@@ -174,12 +182,23 @@ export function SessionHeader({ session }: { session: DbSession }) {
             </Button>
           </DropdownMenuTrigger>
           <DropdownMenuContent align="end">
-            {session.wav_file_path && (
+            {canResumeSession(session, viewSessionParts, liveTranscriptionActive, sessionStopping) && (
+              <DropdownMenuItem onClick={() => resumeSession(session.id)}>
+                <Mic />
+                Resume recording
+              </DropdownMenuItem>
+            )}
+            {viewSessionParts.length > 0 && (
               <DropdownMenuItem
                 onClick={() => {
-                  revealItemInDir(session.wav_file_path!).catch((e) =>
-                    console.error("Failed to reveal file:", e),
-                  );
+                  // Reveal the most recent part. The other parts live in the
+                  // same directory, so this gets the user there either way.
+                  const latest = viewSessionParts[viewSessionParts.length - 1];
+                  if (latest) {
+                    revealItemInDir(latest.file_path).catch((e) =>
+                      console.error("Failed to reveal file:", e),
+                    );
+                  }
                 }}
               >
                 <FolderOpen />

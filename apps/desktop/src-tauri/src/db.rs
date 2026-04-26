@@ -32,24 +32,52 @@ pub fn ensure_runtime_schema(db_path: &Path) {
 
 /// At startup the app cannot have a real in-flight recording session, so any
 /// row left at status='recording' is from a prior crash or force-quit. Empty
-/// ones (no segments, no WAV file) are deleted; the rest are marked completed
-/// with duration recomputed from their segments.
+/// ones (no segments, no audio parts) are deleted; the rest are marked
+/// completed with duration recomputed from their parts (or, as a final
+/// fallback, from their segments' max offset).
 fn close_orphaned_recordings(conn: &rusqlite::Connection) {
-    let deleted = conn
-        .execute(
+    // Newly-installed databases may not yet have the parts table; gate on
+    // its presence so this sweep is forward- and backward-compatible.
+    let has_parts_table = table_exists(conn, "session_audio_parts");
+
+    let deleted = if has_parts_table {
+        conn.execute(
             "DELETE FROM sessions \
              WHERE status = 'recording' \
-               AND wav_file_path IS NULL \
+               AND NOT EXISTS (SELECT 1 FROM segments WHERE session_id = sessions.id) \
+               AND NOT EXISTS (SELECT 1 FROM session_audio_parts WHERE session_id = sessions.id)",
+            [],
+        )
+    } else {
+        conn.execute(
+            "DELETE FROM sessions \
+             WHERE status = 'recording' \
                AND NOT EXISTS (SELECT 1 FROM segments WHERE session_id = sessions.id)",
             [],
         )
-        .unwrap_or_else(|e| {
-            tracing::warn!("close_orphaned_recordings: delete failed: {e}");
-            0
-        });
+    }
+    .unwrap_or_else(|e| {
+        tracing::warn!("close_orphaned_recordings: delete failed: {e}");
+        0
+    });
 
-    let completed = conn
-        .execute(
+    let completed = if has_parts_table {
+        conn.execute(
+            "UPDATE sessions SET \
+                status = 'completed', \
+                total_segments = (SELECT COUNT(*) FROM segments WHERE session_id = sessions.id), \
+                duration_seconds = COALESCE( \
+                    (SELECT SUM(duration_seconds) FROM session_audio_parts WHERE session_id = sessions.id), \
+                    (SELECT MAX(audio_offset_seconds + chunk_duration_seconds) \
+                     FROM segments WHERE session_id = sessions.id), \
+                    duration_seconds \
+                ), \
+                updated_at = datetime('now') \
+             WHERE status = 'recording'",
+            [],
+        )
+    } else {
+        conn.execute(
             "UPDATE sessions SET \
                 status = 'completed', \
                 total_segments = (SELECT COUNT(*) FROM segments WHERE session_id = sessions.id), \
@@ -62,10 +90,11 @@ fn close_orphaned_recordings(conn: &rusqlite::Connection) {
              WHERE status = 'recording'",
             [],
         )
-        .unwrap_or_else(|e| {
-            tracing::warn!("close_orphaned_recordings: update failed: {e}");
-            0
-        });
+    }
+    .unwrap_or_else(|e| {
+        tracing::warn!("close_orphaned_recordings: update failed: {e}");
+        0
+    });
 
     if deleted > 0 || completed > 0 {
         tracing::info!(
@@ -479,6 +508,55 @@ pub fn migrations() -> Vec<Migration> {
         "#,
             kind: MigrationKind::Up,
         },
+        Migration {
+            version: 15,
+            description: "session_audio_parts table + backfill from sessions.wav_file_path; drop legacy wav columns",
+            // Each recording run produces one part. A session's audio is the
+            // ordered concatenation of its parts. Resume = append a new part,
+            // never mutate prior parts.
+            //
+            // Backfill: every existing session with a wav_file_path becomes
+            // part_index=0 in the new table. Sample rate isn't stored on the
+            // legacy row; default to 48000 (only used for diagnostics).
+            //
+            // After backfill, the legacy single-file columns are dropped from
+            // sessions. Frontend reads parts directly via DbAudioPart.
+            sql: r#"
+            CREATE TABLE session_audio_parts (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                part_index INTEGER NOT NULL,
+                file_path TEXT NOT NULL,
+                format TEXT NOT NULL CHECK (format IN ('wav','mp3')),
+                duration_seconds REAL NOT NULL,
+                sample_rate INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE (session_id, part_index)
+            );
+            CREATE INDEX idx_audio_parts_session
+                ON session_audio_parts(session_id, part_index);
+
+            INSERT INTO session_audio_parts (
+                id, session_id, part_index, file_path, format,
+                duration_seconds, sample_rate, created_at
+            )
+            SELECT
+                lower(hex(randomblob(16))),
+                id,
+                0,
+                wav_file_path,
+                CASE WHEN wav_file_path LIKE '%.mp3' THEN 'mp3' ELSE 'wav' END,
+                COALESCE(wav_duration_seconds, 0),
+                48000,
+                COALESCE(updated_at, created_at)
+            FROM sessions
+            WHERE wav_file_path IS NOT NULL;
+
+            ALTER TABLE sessions DROP COLUMN wav_file_path;
+            ALTER TABLE sessions DROP COLUMN wav_duration_seconds;
+        "#,
+            kind: MigrationKind::Up,
+        },
         // segments.speaker_id is added by `ensure_runtime_schema()` instead —
         // see that function for why.
     ]
@@ -498,7 +576,7 @@ mod tests {
     fn test_migrations_sequential_versions() {
         let m = migrations();
         let actual_versions: Vec<i64> = m.iter().map(|x| x.version).collect();
-        assert_eq!(actual_versions, (1..=14).collect::<Vec<_>>());
+        assert_eq!(actual_versions, (1..=15).collect::<Vec<_>>());
     }
 
     #[test]
@@ -569,9 +647,23 @@ mod tests {
     fn test_migration_count() {
         assert_eq!(
             migrations().len(),
-            14,
-            "v1-v14; segments.speaker_id handled at runtime via ensure_runtime_schema"
+            15,
+            "v1-v15; segments.speaker_id handled at runtime via ensure_runtime_schema"
         );
+    }
+
+    #[test]
+    fn test_migration_v15_creates_session_audio_parts() {
+        let m = migrations();
+        let v15 = &m[14];
+        assert_eq!(v15.version, 15);
+        assert!(v15.sql.contains("CREATE TABLE session_audio_parts"));
+        assert!(v15
+            .sql
+            .contains("ALTER TABLE sessions DROP COLUMN wav_file_path"));
+        assert!(v15
+            .sql
+            .contains("ALTER TABLE sessions DROP COLUMN wav_duration_seconds"));
     }
 
     #[test]
@@ -590,9 +682,8 @@ mod tests {
         // instead of waiting for a user to launch a fresh DB.
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         for m in migrations() {
-            conn.execute_batch(m.sql).unwrap_or_else(|e| {
-                panic!("migration v{} failed: {}", m.version, e)
-            });
+            conn.execute_batch(m.sql)
+                .unwrap_or_else(|e| panic!("migration v{} failed: {}", m.version, e));
         }
         // Sanity-check that the FTS5 tables are queryable post-migration.
         for fts_table in [
@@ -602,14 +693,10 @@ mod tests {
             "dictations_fts",
         ] {
             let count: i64 = conn
-                .query_row(
-                    &format!("SELECT count(*) FROM {fts_table}"),
-                    [],
-                    |row| row.get(0),
-                )
-                .unwrap_or_else(|e| {
-                    panic!("query against {fts_table} failed: {e}")
-                });
+                .query_row(&format!("SELECT count(*) FROM {fts_table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap_or_else(|e| panic!("query against {fts_table} failed: {e}"));
             assert_eq!(count, 0, "{fts_table} should be empty after migration");
         }
     }

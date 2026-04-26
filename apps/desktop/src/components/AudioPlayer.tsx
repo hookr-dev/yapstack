@@ -1,55 +1,89 @@
-import { useState, useRef, useEffect, useCallback } from "react";
+import { useState, useRef, useEffect, useCallback, useMemo } from "react";
 import { Slider } from "@/components/ui/slider";
 import { Button } from "@/components/ui/button";
-import { Play, Pause } from "lucide-react";
+import { Play, Pause, Mic } from "lucide-react";
 import { formatTime } from "@/lib/utils";
 import { trackAudioPlaybackStarted } from "@/lib/analytics";
 
 const PLAYBACK_SPEEDS = [0.5, 0.75, 1, 1.25, 1.5, 2] as const;
 
+export interface AudioPart {
+  src: string;
+  duration: number;
+}
+
+/**
+ * Plays an ordered sequence of audio parts as one continuous timeline. Each
+ * part is its own file (WAV or MP3); the player swaps the underlying
+ * `<audio>` element's src when a part ends or when a seek crosses a boundary.
+ *
+ * Timeline math:
+ *   - global time = SUM(parts[0..partIndex-1].duration) + audio.currentTime
+ *   - global duration = SUM(parts.duration)
+ *
+ * `onTimeUpdate` and `onDurationResolved` operate in global time so callers
+ * (transcript timestamp clicks, etc.) don't need to know about parts.
+ */
 export function AudioPlayer({
-  src,
-  duration,
+  parts,
   onTimeUpdate,
   onPlayStateChange,
   onDurationResolved,
+  onResume,
 }: {
-  src: string;
-  duration: number;
+  parts: AudioPart[];
   onTimeUpdate?: (time: number) => void;
   onPlayStateChange?: (playing: boolean) => void;
   onDurationResolved?: (d: number) => void;
+  /** When provided, renders a Resume button to the left of Play. */
+  onResume?: () => void;
 }) {
   const audioRef = useRef<HTMLAudioElement | null>(null);
+  const [partIndex, setPartIndex] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
-  const [currentTime, setCurrentTime] = useState(0);
+  const [partTime, setPartTime] = useState(0);
   const [speed, setSpeed] = useState(1);
-  const [resolvedDuration, setResolvedDuration] = useState(duration);
   const rafRef = useRef<number>(0);
   const lastEmitRef = useRef(0);
+  const pendingSeekRef = useRef<number | null>(null);
+  const wantPlayingAfterSwapRef = useRef(false);
 
-  // Sync resolvedDuration when prop changes (if prop > 0)
-  useEffect(() => {
-    if (duration > 0) {
-      setResolvedDuration(duration);
+  const safePartIndex = Math.min(partIndex, Math.max(parts.length - 1, 0));
+  const activePart = parts[safePartIndex];
+
+  const cumulativeBefore = useMemo(() => {
+    const out: number[] = [0];
+    for (let i = 0; i < parts.length; i++) {
+      out.push(out[i] + (parts[i]?.duration ?? 0));
     }
-  }, [duration]);
+    return out;
+  }, [parts]);
+
+  const globalDuration = cumulativeBefore[parts.length] ?? 0;
+  const globalCurrentTime = (cumulativeBefore[safePartIndex] ?? 0) + partTime;
+
+  useEffect(() => {
+    if (globalDuration > 0) {
+      onDurationResolved?.(globalDuration);
+    }
+  }, [globalDuration, onDurationResolved]);
 
   const updateTime = useCallback(() => {
-    if (audioRef.current) {
-      const t = audioRef.current.currentTime;
-      setCurrentTime(t); // 60fps for smooth slider
-      // Throttle store updates to ~4Hz
+    const audio = audioRef.current;
+    if (audio) {
+      const t = audio.currentTime;
+      setPartTime(t);
       const now = performance.now();
       if (now - lastEmitRef.current >= 250) {
-        onTimeUpdate?.(t);
+        const base = cumulativeBefore[safePartIndex] ?? 0;
+        onTimeUpdate?.(base + t);
         lastEmitRef.current = now;
       }
     }
     if (isPlaying) {
       rafRef.current = requestAnimationFrame(updateTime);
     }
-  }, [isPlaying, onTimeUpdate]);
+  }, [isPlaying, onTimeUpdate, cumulativeBefore, safePartIndex]);
 
   useEffect(() => {
     if (isPlaying) {
@@ -58,35 +92,51 @@ export function AudioPlayer({
     return () => cancelAnimationFrame(rafRef.current);
   }, [isPlaying, updateTime]);
 
+  // Audio element event wiring. When the active part ends, advance to the
+  // next part and continue playback. Cross-part seeks land via
+  // `pendingSeekRef`: we change src, then in `loadedmetadata` we apply the
+  // pending seek and (if appropriate) resume playback.
   useEffect(() => {
     const audio = audioRef.current;
     if (!audio) return;
 
     const handleEnded = () => {
-      setIsPlaying(false);
-      onTimeUpdate?.(audio.currentTime);
-      onPlayStateChange?.(false);
-    };
-
-    // Sync local state when external code seeks (e.g. timestamp click)
-    const handleSeeked = () => {
-      if (audio) {
-        setCurrentTime(audio.currentTime);
-        onTimeUpdate?.(audio.currentTime);
+      const isLast = safePartIndex >= parts.length - 1;
+      if (isLast) {
+        setIsPlaying(false);
+        onPlayStateChange?.(false);
+        const base = cumulativeBefore[safePartIndex] ?? 0;
+        onTimeUpdate?.(base + (parts[safePartIndex]?.duration ?? 0));
+        return;
       }
+      wantPlayingAfterSwapRef.current = true;
+      pendingSeekRef.current = 0;
+      setPartIndex(safePartIndex + 1);
     };
 
-    // Sync play state when external code starts playback
+    const handleSeeked = () => {
+      setPartTime(audio.currentTime);
+      const base = cumulativeBefore[safePartIndex] ?? 0;
+      onTimeUpdate?.(base + audio.currentTime);
+    };
+
     const handlePlay = () => {
       setIsPlaying(true);
       onPlayStateChange?.(true);
     };
 
-    // Use audio element's duration as fallback when prop is 0
     const handleLoadedMetadata = () => {
-      if (audio.duration && isFinite(audio.duration) && audio.duration > 0 && resolvedDuration === 0) {
-        setResolvedDuration(audio.duration);
-        onDurationResolved?.(audio.duration);
+      const target = pendingSeekRef.current;
+      pendingSeekRef.current = null;
+      if (target !== null && isFinite(target)) {
+        audio.currentTime = Math.max(0, target);
+      }
+      if (wantPlayingAfterSwapRef.current) {
+        wantPlayingAfterSwapRef.current = false;
+        audio.play().catch(() => {
+          setIsPlaying(false);
+          onPlayStateChange?.(false);
+        });
       }
     };
 
@@ -100,16 +150,27 @@ export function AudioPlayer({
       audio.removeEventListener("play", handlePlay);
       audio.removeEventListener("loadedmetadata", handleLoadedMetadata);
     };
-  }, [onPlayStateChange, onTimeUpdate, onDurationResolved, resolvedDuration]);
+  }, [
+    safePartIndex,
+    parts,
+    cumulativeBefore,
+    onPlayStateChange,
+    onTimeUpdate,
+  ]);
+
+  // Apply playback rate when speed changes or src swaps in.
+  useEffect(() => {
+    const audio = audioRef.current;
+    if (audio) audio.playbackRate = speed;
+  }, [speed, safePartIndex]);
 
   const togglePlay = () => {
     const audio = audioRef.current;
-    if (!audio) return;
+    if (!audio || parts.length === 0) return;
 
     if (isPlaying) {
       audio.pause();
       setIsPlaying(false);
-      onTimeUpdate?.(audio.currentTime);
       onPlayStateChange?.(false);
     } else {
       audio.play().catch((e) => {
@@ -119,54 +180,88 @@ export function AudioPlayer({
       });
       setIsPlaying(true);
       onPlayStateChange?.(true);
-      trackAudioPlaybackStarted({ duration_seconds: Math.round(resolvedDuration) });
+      trackAudioPlaybackStarted({ duration_seconds: Math.round(globalDuration) });
     }
   };
 
-  const handleSeek = useCallback(
-    (value: number[]) => {
+  const seekToGlobal = useCallback(
+    (globalTime: number) => {
+      if (parts.length === 0) return;
+      const clamped = Math.max(0, Math.min(globalTime, globalDuration));
+      let newIndex = parts.length - 1;
+      for (let i = 0; i < parts.length; i++) {
+        if (clamped < cumulativeBefore[i + 1]) {
+          newIndex = i;
+          break;
+        }
+      }
+      const newPartTime = clamped - cumulativeBefore[newIndex];
+
       const audio = audioRef.current;
-      if (!audio) return;
-      audio.currentTime = value[0];
-      setCurrentTime(value[0]);
-      onTimeUpdate?.(value[0]);
+      if (newIndex !== safePartIndex) {
+        wantPlayingAfterSwapRef.current = isPlaying;
+        pendingSeekRef.current = newPartTime;
+        setPartIndex(newIndex);
+      } else if (audio) {
+        audio.currentTime = newPartTime;
+        setPartTime(newPartTime);
+        onTimeUpdate?.(clamped);
+      }
     },
-    [onTimeUpdate],
+    [parts.length, cumulativeBefore, globalDuration, safePartIndex, isPlaying, onTimeUpdate],
+  );
+
+  const handleSeekSlider = useCallback(
+    (value: number[]) => {
+      seekToGlobal(value[0] ?? 0);
+    },
+    [seekToGlobal],
   );
 
   const cycleSpeed = () => {
     const idx = PLAYBACK_SPEEDS.indexOf(speed as (typeof PLAYBACK_SPEEDS)[number]);
     const nextIdx = (idx + 1) % PLAYBACK_SPEEDS.length;
-    const next = PLAYBACK_SPEEDS[nextIdx];
-    setSpeed(next);
-    if (audioRef.current) {
-      audioRef.current.playbackRate = next;
-    }
+    setSpeed(PLAYBACK_SPEEDS[nextIdx]);
   };
 
-  // Seek to a specific time (called externally via ref or parent)
-  const seekTo = useCallback(
-    (time: number) => {
-      const audio = audioRef.current;
-      if (!audio) return;
-      audio.currentTime = time;
-      setCurrentTime(time);
-      onTimeUpdate?.(time);
-    },
-    [onTimeUpdate],
-  );
-
-  // Expose seekTo via a stable callback the parent can use
+  // Expose `seekTo(globalTime)` on the audio element so external callers
+  // (transcript timestamp clicks) can drive playback without knowing about
+  // the parts internals.
   useEffect(() => {
-    // Store on the audio element for parent access
     if (audioRef.current) {
-      (audioRef.current as HTMLAudioElement & { seekTo?: (t: number) => void }).seekTo = seekTo;
+      (audioRef.current as HTMLAudioElement & { seekTo?: (t: number) => void }).seekTo =
+        seekToGlobal;
     }
-  }, [seekTo]);
+  }, [seekToGlobal]);
 
   return (
     <div className="flex items-center gap-3 border-b px-4 py-2">
-      <audio ref={audioRef} src={src} preload="metadata" data-session-audio />
+      <audio
+        ref={audioRef}
+        src={activePart?.src ?? ""}
+        preload="metadata"
+        data-session-audio
+      />
+
+      {onResume && (
+        <Button
+          variant="ghost"
+          size="icon-xs"
+          onClick={() => {
+            const audio = audioRef.current;
+            if (audio && !audio.paused) {
+              audio.pause();
+              setIsPlaying(false);
+              onPlayStateChange?.(false);
+            }
+            onResume();
+          }}
+          className="text-red-500 hover:text-red-500 hover:bg-red-500/10"
+          title="Resume recording"
+        >
+          <Mic className="h-4 w-4" />
+        </Button>
+      )}
 
       <Button variant="ghost" size="icon-xs" onClick={togglePlay}>
         {isPlaying ? (
@@ -177,20 +272,20 @@ export function AudioPlayer({
       </Button>
 
       <span className="text-xs tabular-nums text-muted-foreground w-10 text-right">
-        {formatTime(currentTime)}
+        {formatTime(globalCurrentTime)}
       </span>
 
       <Slider
         className="flex-1"
         min={0}
-        max={resolvedDuration}
+        max={globalDuration}
         step={0.1}
-        value={[currentTime]}
-        onValueChange={handleSeek}
+        value={[globalCurrentTime]}
+        onValueChange={handleSeekSlider}
       />
 
       <span className="text-xs tabular-nums text-muted-foreground w-10">
-        {formatTime(resolvedDuration)}
+        {formatTime(globalDuration)}
       </span>
 
       <button

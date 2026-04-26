@@ -10,7 +10,7 @@ export function useLiveTranscriptionEvents() {
   const setLivePhase = useAppStore((s) => s.setLivePhase);
   const onLiveSegment = useAppStore((s) => s.onLiveSegment);
   const onBackfillComplete = useAppStore((s) => s.onBackfillComplete);
-  const onSessionWavReady = useAppStore((s) => s.onSessionWavReady);
+  const onSessionPartReady = useAppStore((s) => s.onSessionPartReady);
   const recoverActiveSession = useAppStore((s) => s.recoverActiveSession);
 
   useEffect(() => {
@@ -32,12 +32,8 @@ export function useLiveTranscriptionEvents() {
       listenEvent(EVENTS.BACKFILL_COMPLETE, () => {
         onBackfillComplete();
       }),
-      listenEvent(EVENTS.SESSION_WAV_READY, (payload) => {
-        onSessionWavReady(
-          payload.session_id,
-          payload.file_path,
-          payload.duration_seconds,
-        );
+      listenEvent(EVENTS.SESSION_PART_READY, (payload) => {
+        onSessionPartReady(payload);
       }),
       listenEvent(EVENTS.SESSION_WAV_ERROR, (payload) => {
         toast.error(payload.message);
@@ -76,5 +72,5 @@ export function useLiveTranscriptionEvents() {
     return () => {
       unlisten.then((fns) => fns.forEach((fn) => fn()));
     };
-  }, [setLivePhase, onLiveSegment, onBackfillComplete, onSessionWavReady, recoverActiveSession]);
+  }, [setLivePhase, onLiveSegment, onBackfillComplete, onSessionPartReady, recoverActiveSession]);
 }

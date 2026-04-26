@@ -66,6 +66,22 @@ pub struct LiveTranscriptionConfig {
     /// Whisper initial_prompt to improve recognition of proper nouns. Ignored
     /// for Parakeet sessions (the TDT decoder has no text-prompt input).
     pub vocabulary_hints: Option<String>,
+    /// When set, this run is a resume of an existing Session. The new
+    /// recording becomes a fresh audio part appended after the existing parts;
+    /// no prior file is read or modified. Backfill is forced to 0.
+    #[serde(default)]
+    pub resume: Option<ResumeConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct ResumeConfig {
+    /// The index of the new part being recorded — equals the count of
+    /// existing parts in the session. The output WAV/MP3 is named
+    /// `{session_id}.{part_index}.{ext}`.
+    pub part_index: u32,
+    /// Cumulative duration of the existing parts. Added to every Segment's
+    /// `audio_offset_seconds` so persisted Segments stay continuous.
+    pub offset_base_seconds: f32,
 }
 
 #[derive(Debug, Clone, Serialize, Type)]
@@ -112,10 +128,13 @@ pub struct LiveSegmentEvent {
 }
 
 #[derive(Debug, Clone, Serialize, Type)]
-pub struct SessionWavReadyEvent {
+pub struct SessionPartReadyEvent {
     pub session_id: String,
+    pub part_index: u32,
     pub file_path: String,
+    pub format: String,
     pub duration_seconds: f32,
+    pub sample_rate: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Type)]
@@ -150,6 +169,8 @@ struct SessionWavState {
     source: CaptureSource,
     mix_config: Option<yapstack_audio::MixConfig>,
     session_id: String,
+    /// Index of this part within its session (0 for fresh, N for resume).
+    part_index: u32,
     flush_count: u32,
     /// Sample rate the WAV file's header was opened with. If a source's
     /// ring buffer gets replaced at a different sample rate mid-session
@@ -189,6 +210,10 @@ struct TranscriptionContext {
     bridged_prompt: Arc<Mutex<String>>,
     /// Dynamic vocabulary hints updated by frontend during recording.
     vocabulary_hints: Arc<Mutex<String>>,
+    /// Constant added to every Segment's `audio_offset_seconds` so resumed
+    /// runs produce offsets continuous with prior parts. Zero on a fresh
+    /// Session, equals SUM of prior part durations on a resumed Session.
+    session_offset_base_seconds: f32,
 }
 
 /// Result of transcribing a single chunk.
@@ -630,6 +655,7 @@ async fn prepare_chunk_dispatch(
     audio_state: &AudioManagerState,
     is_force_chunk: bool,
     is_backfill: bool,
+    session_offset_base_seconds: f32,
 ) -> Option<PreparedChunk> {
     let (extraction, new_pos) = {
         let manager = audio_state.lock().await;
@@ -652,10 +678,12 @@ async fn prepare_chunk_dispatch(
         return None;
     }
 
-    // Deterministic offset from buffer position delta.
+    // Deterministic offset from buffer position delta. On a resumed Session,
+    // `session_offset_base_seconds` shifts every live offset past the prior
+    // parts' cumulative duration so persisted Segments stay continuous.
     let samples_since_start = vad.speech_start_pos.saturating_sub(vad.session_start_pos);
-    let audio_offset =
-        samples_since_start as f32 / (vad.source_sample_rate as f32 * vad.source_channels as f32);
+    let audio_offset = session_offset_base_seconds
+        + samples_since_start as f32 / (vad.source_sample_rate as f32 * vad.source_channels as f32);
 
     debug!(
         "live chunk: source={:?} offset={:.2}s duration={:.2}s samples={} (pos: speech={} session_start={}, in-flight dispatch)",
@@ -2349,9 +2377,14 @@ async fn live_transcription_loop(
                         continue;
                     }
                     let is_force = matches!(action, VadAction::ForceChunk);
-                    let prepared =
-                        prepare_chunk_dispatch(&mut sources[i], &audio_state, is_force, false)
-                            .await;
+                    let prepared = prepare_chunk_dispatch(
+                        &mut sources[i],
+                        &audio_state,
+                        is_force,
+                        false,
+                        ctx.session_offset_base_seconds,
+                    )
+                    .await;
                     if let Some(prepared) = prepared {
                         let task_ctx = ctx.clone();
                         let task_session = session.clone();
@@ -2539,7 +2572,14 @@ async fn live_transcription_loop(
              (speech_start_pos={}, blocked by prior in-flight task)",
             source.label, source.speech_start_pos
         );
-        let prepared = prepare_chunk_dispatch(source, &audio_state, true, false).await;
+        let prepared = prepare_chunk_dispatch(
+            source,
+            &audio_state,
+            true,
+            false,
+            ctx.session_offset_base_seconds,
+        )
+        .await;
         if let Some(prepared) = prepared {
             let task_ctx = ctx.clone();
             let task_session = session.clone();
@@ -2615,16 +2655,21 @@ async fn live_transcription_loop(
             match result {
                 Ok((path, duration)) => {
                     info!(
-                        "session WAV finalized: {} ({:.1}s)",
+                        "session part {} finalized: {} ({:.1}s)",
+                        ws.part_index,
                         path.display(),
                         duration
                     );
+                    let format = if use_mp3 { "mp3" } else { "wav" };
                     let _ = ctx.app_handle.emit(
-                        "session-wav-ready",
-                        SessionWavReadyEvent {
+                        "session-part-ready",
+                        SessionPartReadyEvent {
                             session_id: ws.session_id,
+                            part_index: ws.part_index,
                             file_path: path.to_string_lossy().to_string(),
+                            format: format.to_string(),
                             duration_seconds: duration,
+                            sample_rate: ws.wav_sample_rate,
                         },
                     );
                 }
@@ -3051,6 +3096,17 @@ pub async fn start_live_transcription(
     let preflight_source: CaptureSource = config.source.clone().into();
     preflight_stream_health(audio_state.inner(), &preflight_source, &app_handle).await?;
 
+    // Resuming forces backfill to 0 — new audio is captured fresh, not
+    // dredged from the ring buffer.
+    if config.resume.is_some() {
+        config.backfill_seconds = 0.0;
+    }
+    let session_offset_base_seconds = config
+        .resume
+        .as_ref()
+        .map(|r| r.offset_base_seconds.max(0.0))
+        .unwrap_or(0.0);
+
     // Clamp backfill to actual audio available in the buffer.
     let effective_backfill_seconds = {
         let manager = audio_state.lock().await;
@@ -3104,104 +3160,107 @@ pub async fn start_live_transcription(
         .as_millis() as f64;
     let effective_start_epoch_ms = now_unix_ms - effective_backfill_seconds as f64 * 1000.0;
 
-    // Set up streaming WAV writer if session_id is provided
-    let session_wav_state = if let Some(ref session_id) = config.session_id {
-        validate_session_id(session_id)?;
-        let audio_dir = if let Some(ref custom_dir) = config.audio_save_location {
-            std::path::PathBuf::from(custom_dir)
-        } else {
-            app_handle
-                .path()
-                .app_data_dir()
-                .map_err(|e: tauri::Error| CommandError::Internal {
-                    message: format!("failed to resolve app data dir: {e}"),
-                })?
-                .join("audio")
-        };
-        std::fs::create_dir_all(&audio_dir)?;
-
-        // Determine sample rate from active buffers
-        let sample_rate = {
-            let manager = audio_state.lock().await;
-            manager
-                .mic_buffer_info()
-                .map(|i| i.sample_rate)
-                .or_else(|| manager.system_buffer_info().map(|i| i.sample_rate))
-                .unwrap_or(48000)
-        };
-
-        let wav_path = audio_dir.join(format!("{session_id}.wav"));
-        let writer = yapstack_audio::SessionWavWriter::new(wav_path, sample_rate).map_err(|e| {
-            CommandError::Internal {
-                message: format!("failed to create session WAV: {e}"),
-            }
-        })?;
-
-        let source = config.source.clone().into();
-        // Force normalize=false for the streaming WAV writer. Per-chunk normalization
-        // (every ~300ms) causes jarring volume discontinuities — quiet passages get
-        // amplified enormously while loud passages barely change. The user's normalize
-        // setting is meant for the real-time preview, not the archival WAV.
-        let mix_config = config
-            .mix_config
-            .as_ref()
-            .map(|mc| yapstack_audio::MixConfig {
-                mic_gain: mc.mic_gain,
-                system_gain: mc.system_gain,
-                normalize: false,
-            });
-
-        // Rewind flush positions by backfill so the WAV includes backfill audio
-        let flush_positions = {
-            let manager = audio_state.lock().await;
-            let positions = manager.buffer_positions();
-            if effective_backfill_seconds > 0.0 {
-                let mic_rewind = manager
-                    .mic_buffer_info()
-                    .map(|i| {
-                        let raw = (effective_backfill_seconds
-                            * i.sample_rate as f32
-                            * i.channels as f32) as usize;
-                        // Round down to frame boundary for correct deinterleaving
-                        raw - (raw % i.channels as usize)
-                    })
-                    .unwrap_or(0);
-                let sys_rewind = manager
-                    .system_buffer_info()
-                    .map(|i| {
-                        let raw = (effective_backfill_seconds
-                            * i.sample_rate as f32
-                            * i.channels as f32) as usize;
-                        // Round down to frame boundary for correct deinterleaving
-                        raw - (raw % i.channels as usize)
-                    })
-                    .unwrap_or(0);
-                BufferPositions {
-                    mic_pos: positions.mic_pos.saturating_sub(mic_rewind),
-                    system_pos: positions.system_pos.saturating_sub(sys_rewind),
-                }
+    // Set up streaming WAV writer if session_id is provided.
+    let session_wav_state =
+        if let Some(ref session_id) = config.session_id {
+            validate_session_id(session_id)?;
+            let audio_dir = if let Some(ref custom_dir) = config.audio_save_location {
+                std::path::PathBuf::from(custom_dir)
             } else {
-                positions
-            }
+                app_handle
+                    .path()
+                    .app_data_dir()
+                    .map_err(|e: tauri::Error| CommandError::Internal {
+                        message: format!("failed to resolve app data dir: {e}"),
+                    })?
+                    .join("audio")
+            };
+            std::fs::create_dir_all(&audio_dir)?;
+
+            // Each recording run produces its own part file. Resume passes the
+            // next index; fresh sessions always start at 0.
+            let part_index = config.resume.as_ref().map(|r| r.part_index).unwrap_or(0);
+            let wav_path = audio_dir.join(format!("{session_id}.{part_index}.wav"));
+
+            let sample_rate = {
+                let manager = audio_state.lock().await;
+                manager
+                    .mic_buffer_info()
+                    .map(|i| i.sample_rate)
+                    .or_else(|| manager.system_buffer_info().map(|i| i.sample_rate))
+                    .unwrap_or(48000)
+            };
+            let writer = yapstack_audio::SessionWavWriter::new(wav_path.clone(), sample_rate)
+                .map_err(|e| CommandError::Internal {
+                    message: format!("failed to create session WAV: {e}"),
+                })?;
+
+            let source = config.source.clone().into();
+            // Force normalize=false for the streaming WAV writer. Per-chunk normalization
+            // (every ~300ms) causes jarring volume discontinuities — quiet passages get
+            // amplified enormously while loud passages barely change. The user's normalize
+            // setting is meant for the real-time preview, not the archival WAV.
+            let mix_config = config
+                .mix_config
+                .as_ref()
+                .map(|mc| yapstack_audio::MixConfig {
+                    mic_gain: mc.mic_gain,
+                    system_gain: mc.system_gain,
+                    normalize: false,
+                });
+
+            // Rewind flush positions by backfill so the WAV includes backfill audio
+            let flush_positions = {
+                let manager = audio_state.lock().await;
+                let positions = manager.buffer_positions();
+                if effective_backfill_seconds > 0.0 {
+                    let mic_rewind = manager
+                        .mic_buffer_info()
+                        .map(|i| {
+                            let raw = (effective_backfill_seconds
+                                * i.sample_rate as f32
+                                * i.channels as f32) as usize;
+                            // Round down to frame boundary for correct deinterleaving
+                            raw - (raw % i.channels as usize)
+                        })
+                        .unwrap_or(0);
+                    let sys_rewind = manager
+                        .system_buffer_info()
+                        .map(|i| {
+                            let raw = (effective_backfill_seconds
+                                * i.sample_rate as f32
+                                * i.channels as f32) as usize;
+                            // Round down to frame boundary for correct deinterleaving
+                            raw - (raw % i.channels as usize)
+                        })
+                        .unwrap_or(0);
+                    BufferPositions {
+                        mic_pos: positions.mic_pos.saturating_sub(mic_rewind),
+                        system_pos: positions.system_pos.saturating_sub(sys_rewind),
+                    }
+                } else {
+                    positions
+                }
+            };
+
+            info!(
+                "session WAV writer created: session_id={} sample_rate={}",
+                session_id, sample_rate
+            );
+
+            Some(SessionWavState {
+                writer,
+                flush_positions,
+                source,
+                mix_config,
+                session_id: session_id.clone(),
+                part_index,
+                flush_count: 0,
+                wav_sample_rate: sample_rate,
+            })
+        } else {
+            None
         };
-
-        info!(
-            "session WAV writer created: session_id={} sample_rate={}",
-            session_id, sample_rate
-        );
-
-        Some(SessionWavState {
-            writer,
-            flush_positions,
-            source,
-            mix_config,
-            session_id: session_id.clone(),
-            flush_count: 0,
-            wav_sample_rate: sample_rate,
-        })
-    } else {
-        None
-    };
 
     let (stop_tx, stop_rx) = oneshot::channel();
 
@@ -3238,6 +3297,7 @@ pub async fn start_live_transcription(
         config,
         bridged_prompt: Arc::new(Mutex::new(String::new())),
         vocabulary_hints: vocab_hints.clone(),
+        session_offset_base_seconds,
     };
 
     let task_handle = tokio::spawn({
@@ -3809,6 +3869,7 @@ mod tests {
             mp3_bitrate: None,
             diarization: false,
             vocabulary_hints: None,
+            resume: None,
         }
     }
 

@@ -11,7 +11,8 @@ import {
   ResizablePanel,
   ResizableHandle,
 } from "@/components/ui/resizable";
-import { getSession, updateSessionWavPath } from "@/lib/db";
+import { canResumeSession, getSession } from "@/lib/db";
+import type { AudioPart } from "@/components/AudioPlayer";
 import {
   createSessionSources,
   createSessionTools,
@@ -46,6 +47,11 @@ export function NoteDetailView() {
   const noteRefreshCounter = useAppStore((s) => s.noteRefreshCounter);
   const loadSessions = useAppStore((s) => s.loadSessions);
   const incrementNoteRefresh = useAppStore((s) => s.incrementNoteRefresh);
+  const activeSessionParts = useAppStore((s) => s.activeSessionParts);
+  const viewSessionParts = useAppStore((s) => s.viewSessionParts);
+  const resumeSession = useAppStore((s) => s.resumeSession);
+  const liveTranscriptionActive = useAppStore((s) => s.liveTranscriptionActive);
+  const sessionStopping = useAppStore((s) => s.sessionStopping);
 
   const isActiveSession = selectedSessionId === activeSessionId;
 
@@ -131,21 +137,6 @@ export function NoteDetailView() {
     [setPlaybackTime],
   );
 
-  const handleDurationResolved = useCallback(
-    async (d: number) => {
-      if (!session) return;
-      const dbDuration = session.wav_duration_seconds ?? 0;
-      if (dbDuration === 0 && session.wav_file_path && d > 0) {
-        await updateSessionWavPath(session.id, session.wav_file_path, d);
-        const refreshed = await getSession(session.id);
-        if (refreshed) {
-          useAppStore.setState({ viewSession: refreshed });
-        }
-      }
-    },
-    [session],
-  );
-
   if (!session) {
     return (
       <div className="flex flex-1 items-center justify-center">
@@ -156,9 +147,13 @@ export function NoteDetailView() {
   const isEditable = isActiveSession || session.status === "completed";
   const isManual = session.session_type === "manual";
   const isTranscription = !isManual;
-  const hasWav = !!session.wav_file_path;
-  const wavDuration = session.wav_duration_seconds ?? 0;
-  const wavSrc = hasWav ? audioStreamUrl(session.wav_file_path!) : "";
+  const partsForPlayer: AudioPart[] = (
+    isActiveSession ? activeSessionParts : viewSessionParts
+  ).map((p) => ({
+    src: audioStreamUrl(p.file_path),
+    duration: p.duration_seconds,
+  }));
+  const hasAudio = partsForPlayer.length > 0;
 
   const chatBar = selectedSessionId ? (
     <AIContextProvider
@@ -226,13 +221,21 @@ export function NoteDetailView() {
     return (
       <div className="flex flex-1 flex-col min-h-0 view-enter">
         <SessionHeader session={session} />
-        {hasWav && (
+        {hasAudio && (
           <AudioPlayer
-            src={wavSrc}
-            duration={wavDuration}
+            parts={partsForPlayer}
             onTimeUpdate={setPlaybackTime}
             onPlayStateChange={setIsPlaying}
-            onDurationResolved={handleDurationResolved}
+            onResume={
+              canResumeSession(
+                session,
+                viewSessionParts,
+                liveTranscriptionActive,
+                sessionStopping,
+              )
+                ? () => resumeSession(session.id)
+                : undefined
+            }
           />
         )}
         <ResizablePanelGroup orientation="horizontal" className="flex-1">
@@ -242,15 +245,15 @@ export function NoteDetailView() {
                 sessionId={selectedSessionId ?? undefined}
                 segments={segments}
                 isEditable={isEditable}
-                currentPlaybackTime={hasWav ? playbackTime : undefined}
-                onTimestampClick={hasWav ? handleSeek : undefined}
+                currentPlaybackTime={hasAudio ? playbackTime : undefined}
+                onTimestampClick={hasAudio ? handleSeek : undefined}
               />
             </div>
           </ResizablePanel>
           <ResizableHandle />
           <ResizablePanel defaultSize="60%" minSize="25%">
             <div className="relative flex flex-col h-full min-h-0 pb-24">
-              <NoteEditor sessionId={session.id} refreshKey={noteRefreshCounter} onSeekTime={hasWav ? handleSeek : undefined} />
+              <NoteEditor sessionId={session.id} refreshKey={noteRefreshCounter} onSeekTime={hasAudio ? handleSeek : undefined} />
               {chatBar}
             </div>
           </ResizablePanel>

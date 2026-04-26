@@ -191,14 +191,27 @@ pub async fn delete_session_wav(
             })?;
         app_data_dir.join("audio")
     };
-    let mp3_path = audio_dir.join(format!("{session_id}.mp3"));
-    let wav_path = audio_dir.join(format!("{session_id}.wav"));
 
-    if mp3_path.exists() {
-        std::fs::remove_file(&mp3_path)?;
-    }
-    if wav_path.exists() {
-        std::fs::remove_file(&wav_path)?;
+    // Match both the legacy single-file pattern (`{session_id}.wav` —
+    // dictations and pre-parts sessions) and the parts pattern
+    // (`{session_id}.{part_index}.wav`/`.mp3`).
+    let entries = match std::fs::read_dir(&audio_dir) {
+        Ok(it) => it,
+        Err(_) => return Ok(()), // Audio dir doesn't exist; nothing to delete.
+    };
+    let prefix = format!("{session_id}.");
+    for entry in entries.flatten() {
+        let Some(name) = entry.file_name().to_str().map(|s| s.to_string()) else {
+            continue;
+        };
+        if !name.starts_with(&prefix) {
+            continue;
+        }
+        let lower = name.to_ascii_lowercase();
+        if !(lower.ends_with(".wav") || lower.ends_with(".mp3")) {
+            continue;
+        }
+        let _ = std::fs::remove_file(entry.path());
     }
     Ok(())
 }

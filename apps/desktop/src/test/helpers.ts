@@ -20,8 +20,6 @@ export function makeSession(overrides: Partial<DbSession> = {}): DbSession {
     is_pinned: 0,
     pinned_at: null,
     session_type: "recording",
-    wav_file_path: null,
-    wav_duration_seconds: null,
     sort_order: 0,
     ...overrides,
   };
