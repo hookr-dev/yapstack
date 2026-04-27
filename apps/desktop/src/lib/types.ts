@@ -56,22 +56,6 @@ async checkSystemAudioPermission() : Promise<Result<PermissionStatusDto, Command
     else return { status: "error", error: e  as any };
 }
 },
-async snapshotMicAudio(durationSeconds: number | null) : Promise<Result<AudioSnapshotDto | null, CommandError>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("snapshot_mic_audio", { durationSeconds }) };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-async snapshotSystemAudio(durationSeconds: number | null) : Promise<Result<AudioSnapshotDto | null, CommandError>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("snapshot_system_audio", { durationSeconds }) };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
 async getBufferInfo() : Promise<Result<BufferStatusDto, CommandError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("get_buffer_info") };
@@ -83,46 +67,6 @@ async getBufferInfo() : Promise<Result<BufferStatusDto, CommandError>> {
 async peekCaptureEnergy(windowSecs: number) : Promise<Result<CaptureEnergyDto, CommandError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("peek_capture_energy", { windowSecs }) };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-async triggerInstantCapture(seconds: number, source: CaptureSourceDto, mixConfig: MixConfigDto | null) : Promise<Result<CaptureResultDto, CommandError>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("trigger_instant_capture", { seconds, source, mixConfig }) };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-async startSession() : Promise<Result<null, CommandError>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("start_session") };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-async endSession(source: CaptureSourceDto, mixConfig: MixConfigDto | null) : Promise<Result<CaptureResultDto, CommandError>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("end_session", { source, mixConfig }) };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-async getSessionStatus() : Promise<Result<SessionStatusDto, CommandError>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("get_session_status") };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-async exportSessionWav(sessionId: string, source: CaptureSourceDto, durationSeconds: number, mixConfig: MixConfigDto | null, audioSaveLocation: string | null, audioExportFormat: string | null, mp3Bitrate: number | null) : Promise<Result<SessionWavResultDto, CommandError>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("export_session_wav", { sessionId, source, durationSeconds, mixConfig, audioSaveLocation, audioExportFormat, mp3Bitrate }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -437,12 +381,9 @@ async revealLogDir() : Promise<Result<null, CommandError>> {
 /** user-defined types **/
 
 export type AudioDeviceInfoDto = { id: string | null; name: string; device_type: DeviceTypeDto; is_default: boolean }
-export type AudioSnapshotDto = { samples: number[]; sample_rate: number; channels: number; duration_seconds: number }
 export type BufferStatusDto = { mic: RingBufferInfoDto | null; system: RingBufferInfoDto | null }
 export type CaptureEnergyDto = { mic_rms: number | null; system_rms: number | null }
-export type CaptureResultDto = { file_path: string; duration_seconds: number; sample_rate: number; source: CaptureSourceDtoSerialize }
 export type CaptureSourceDto = "MicOnly" | "SystemOnly" | "Mixed"
-export type CaptureSourceDtoSerialize = "MicOnly" | "SystemOnly" | "Mixed"
 export type CaptureStateDto = "Idle" | "Capturing" | "Error"
 export type CaptureStatusDto = { state: CaptureStateDto; mic_active: boolean; system_audio_active: boolean; error_message: string | null }
 /**
@@ -574,8 +515,6 @@ part_index: number;
 offset_base_seconds: number }
 export type RingBufferInfoDto = { capacity_samples: number; samples_written: number; available_samples: number; capacity_seconds: number; available_seconds: number; sample_rate: number; channels: number }
 export type ScreenCapturePermissionDto = "Granted" | "NotDetermined" | "Unavailable"
-export type SessionStatusDto = { active: boolean; elapsed_seconds: number | null }
-export type SessionWavResultDto = { file_path: string; duration_seconds: number }
 export type SortformerModelInfoDto = { variant: SortformerVariantDto; downloaded: boolean; display_name: string; approximate_size_bytes: number }
 export type SortformerVariantDto = "V2_1"
 export type TranscriptSegmentDto = { start_ms: number; end_ms: number; text: string; confidence: number; 

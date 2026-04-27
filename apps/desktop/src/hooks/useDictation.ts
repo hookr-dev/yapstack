@@ -575,7 +575,16 @@ export function useDictation() {
       }
 
       if (wavInfoRef.current) {
-        await commands.deleteSessionWav(dictationIdRef.current, null).catch(() => {});
+        // Delete by exact path so we hit the per-part trusted-dirs path
+        // (NotFound treated as no-op) rather than the legacy session-glob
+        // that scans the audio dir. Surface unexpected failures to the
+        // console — this is the only diagnostic for cancel cleanup.
+        const path = wavInfoRef.current.path;
+        try {
+          await commands.deleteAudioFiles([path]);
+        } catch (err) {
+          console.warn("dictation cancel: failed to delete part", path, err);
+        }
       }
 
       cleanupListeners();

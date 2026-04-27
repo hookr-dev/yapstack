@@ -4,7 +4,7 @@ import { stripHtml } from "./utils";
 // --- Types ---
 
 export type SessionStatus = "recording" | "completed";
-export type SessionType = "manual" | "recording";
+export type SessionType = "manual" | "transcription";
 
 export interface DbSession {
   id: string;

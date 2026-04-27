@@ -306,6 +306,6 @@ For live transcription sessions, the file is streamed incrementally during recor
 
 Resuming a session opens a new `SessionWavWriter` at `part_index = N` (cumulative duration of prior parts becomes the segment offset base), so timestamps stay continuous across resumes. Files are not concatenated on disk; the FE concatenates parts at playback time via a parts-aware `seekTo`.
 
-For short sessions or re-export, `export_session_wav` can still extract audio from the ring buffer after the fact. `delete_session_wav` is the legacy single-file cleanup path; per-part cleanup is `delete_audio_files(paths)`, which validates each path against `TrustedAudioDirs` and surfaces failures (the FE can warn or queue retries).
+`delete_session_wav` is the legacy session-glob cleanup path used by `clearAllSessions` and for sessions that pre-date `session_audio_parts`; per-part cleanup is `delete_audio_files(paths)`, which validates each path against `TrustedAudioDirs` and surfaces failures (the FE can warn or queue retries).
 
 The `audio-stream://` custom URI scheme protocol (registered in `lib.rs`) serves these files to the frontend `<audio>` element with range request support for seeking. Allow-list is seeded at startup from `session_audio_parts.file_path` parents and `audio_save_locations`, then extended at finalize time.

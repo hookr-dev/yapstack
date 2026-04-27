@@ -72,14 +72,6 @@ pub struct RingBufferInfoDto {
     pub channels: u16,
 }
 
-#[derive(Debug, Clone, Serialize, Type)]
-pub struct AudioSnapshotDto {
-    pub samples: Vec<f32>,
-    pub sample_rate: u32,
-    pub channels: u16,
-    pub duration_seconds: f32,
-}
-
 #[derive(Debug, Clone, PartialEq, Serialize, Type)]
 pub struct BufferStatusDto {
     pub mic: Option<RingBufferInfoDto>,
@@ -99,33 +91,11 @@ pub enum CaptureSourceDto {
     Mixed,
 }
 
-#[derive(Debug, Clone, Serialize, Type)]
-pub struct CaptureResultDto {
-    pub file_path: String,
-    pub duration_seconds: f32,
-    pub sample_rate: u32,
-    pub source: CaptureSourceDtoSerialize,
-}
-
-// Separate serialize-only variant for specta compatibility on the response side
-#[derive(Debug, Clone, Serialize, Type)]
-pub enum CaptureSourceDtoSerialize {
-    MicOnly,
-    SystemOnly,
-    Mixed,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct MixConfigDto {
     pub mic_gain: f32,
     pub system_gain: f32,
     pub normalize: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Type)]
-pub struct SessionStatusDto {
-    pub active: bool,
-    pub elapsed_seconds: Option<f32>,
 }
 
 impl From<CaptureSourceDto> for types::CaptureSource {
@@ -134,27 +104,6 @@ impl From<CaptureSourceDto> for types::CaptureSource {
             CaptureSourceDto::MicOnly => types::CaptureSource::MicOnly,
             CaptureSourceDto::SystemOnly => types::CaptureSource::SystemOnly,
             CaptureSourceDto::Mixed => types::CaptureSource::Mixed,
-        }
-    }
-}
-
-impl From<types::CaptureSource> for CaptureSourceDtoSerialize {
-    fn from(s: types::CaptureSource) -> Self {
-        match s {
-            types::CaptureSource::MicOnly => CaptureSourceDtoSerialize::MicOnly,
-            types::CaptureSource::SystemOnly => CaptureSourceDtoSerialize::SystemOnly,
-            types::CaptureSource::Mixed => CaptureSourceDtoSerialize::Mixed,
-        }
-    }
-}
-
-impl From<yapstack_audio::CaptureResult> for CaptureResultDto {
-    fn from(r: yapstack_audio::CaptureResult) -> Self {
-        Self {
-            file_path: r.file_path.to_string_lossy().into_owned(),
-            duration_seconds: r.duration_seconds,
-            sample_rate: r.sample_rate,
-            source: r.source.into(),
         }
     }
 }
@@ -388,60 +337,6 @@ pub async fn check_system_audio_permission(
     Ok(PermissionStatusDto::from(
         manager.check_system_audio_permission(),
     ))
-}
-
-#[tauri::command]
-#[specta::specta]
-pub async fn snapshot_mic_audio(
-    state: tauri::State<'_, AudioManagerState>,
-    duration_seconds: Option<f32>,
-) -> Result<Option<AudioSnapshotDto>, CommandError> {
-    let manager = state.lock().await;
-
-    let samples = match duration_seconds {
-        Some(secs) => manager.snapshot_mic(secs),
-        None => manager.snapshot_mic_all(),
-    };
-
-    Ok(match (samples, manager.mic_buffer_info()) {
-        (Some(s), Some(info)) => {
-            let duration = s.len() as f32 / (info.sample_rate as f32 * info.channels as f32);
-            Some(AudioSnapshotDto {
-                samples: s,
-                sample_rate: info.sample_rate,
-                channels: info.channels,
-                duration_seconds: duration,
-            })
-        }
-        _ => None,
-    })
-}
-
-#[tauri::command]
-#[specta::specta]
-pub async fn snapshot_system_audio(
-    state: tauri::State<'_, AudioManagerState>,
-    duration_seconds: Option<f32>,
-) -> Result<Option<AudioSnapshotDto>, CommandError> {
-    let manager = state.lock().await;
-
-    let samples = match duration_seconds {
-        Some(secs) => manager.snapshot_system(secs),
-        None => manager.snapshot_system_all(),
-    };
-
-    Ok(match (samples, manager.system_buffer_info()) {
-        (Some(s), Some(info)) => {
-            let duration = s.len() as f32 / (info.sample_rate as f32 * info.channels as f32);
-            Some(AudioSnapshotDto {
-                samples: s,
-                sample_rate: info.sample_rate,
-                channels: info.channels,
-                duration_seconds: duration,
-            })
-        }
-        _ => None,
-    })
 }
 
 #[tauri::command]

@@ -123,7 +123,7 @@ export function AppLayout() {
       setActiveSession({
         id: data.sessionId,
         title: data.title ?? "Untitled",
-        sessionType: data.sessionType ?? "recording",
+        sessionType: data.sessionType ?? "transcription",
         isPinned: data.isPinned ?? false,
         totalSegments: data.totalSegments ?? 0,
         createdAt: data.createdAt ?? "",
