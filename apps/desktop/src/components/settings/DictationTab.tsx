@@ -1,4 +1,5 @@
 import { useState, useCallback, useEffect, useRef } from "react";
+import { useDebouncedCallback } from "use-debounce";
 import { useAppStore } from "@/stores/appStore";
 import type { DictationSlot, DictationOutputAction, DictationActivationMode } from "@/stores/appStore";
 import { trackDictationSlotCreated, trackDictationSlotDeleted, trackDictationSlotConfigured } from "@/lib/analytics";
@@ -279,6 +280,31 @@ export function DictationTab() {
     });
   };
 
+  // Coalesce per-keystroke edits to slot fields into one analytics
+  // event per ~2 s edit session. The accumulator lives in a ref so
+  // typing doesn't re-render; the debounced callback fires the event
+  // with the union of changed field names. `flush()` is invoked on
+  // unmount and on pagehide so an event can't be lost when the user
+  // closes the window before the timer elapses (Aptabase's Tauri-side
+  // exit flush only flushes events already enqueued via `track()`).
+  const slotConfigFieldsRef = useRef<Set<string>>(new Set());
+  const flushSlotConfigured = useDebouncedCallback(() => {
+    if (slotConfigFieldsRef.current.size === 0) return;
+    trackDictationSlotConfigured({
+      changed_fields: Array.from(slotConfigFieldsRef.current).join(","),
+    });
+    slotConfigFieldsRef.current.clear();
+  }, 2000);
+
+  useEffect(() => {
+    const onPageHide = () => flushSlotConfigured.flush();
+    window.addEventListener("pagehide", onPageHide);
+    return () => {
+      window.removeEventListener("pagehide", onPageHide);
+      flushSlotConfigured.flush();
+    };
+  }, [flushSlotConfigured]);
+
   const handleSlotUpdate = (id: string, updates: Partial<DictationSlot>) => {
     const newSlots = dictation.slots.map((s) =>
       s.id === id ? { ...s, ...updates } : s,
@@ -286,7 +312,8 @@ export function DictationTab() {
     updateSettings({
       dictation: { ...dictation, slots: newSlots },
     });
-    trackDictationSlotConfigured({ changed_fields: Object.keys(updates).join(",") });
+    for (const k of Object.keys(updates)) slotConfigFieldsRef.current.add(k);
+    flushSlotConfigured();
   };
 
   const handleKeybindCapture = useCallback(
