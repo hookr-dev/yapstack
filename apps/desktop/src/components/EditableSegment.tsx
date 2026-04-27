@@ -163,14 +163,16 @@ export const EditableSegment = memo(forwardRef<
       <ContextMenuTrigger asChild>
         <div
           ref={ref}
-          data-segment-id={segment.id}
           className={cn(
             "flex",
             isMic ? "justify-end" : "justify-start",
             isHidden && "opacity-60",
           )}
         >
-          <div className="max-w-[80%] space-y-0.5">
+          <div
+            data-segment-id={segment.id}
+            className="max-w-[80%] space-y-0.5"
+          >
             <div
               ref={bubbleRef}
               contentEditable={isEditing}
