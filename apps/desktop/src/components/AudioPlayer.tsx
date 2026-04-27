@@ -1,7 +1,8 @@
 import { useState, useRef, useEffect, useCallback, useMemo } from "react";
 import { Slider } from "@/components/ui/slider";
 import { Button } from "@/components/ui/button";
-import { Play, Pause, Mic } from "lucide-react";
+import { Separator } from "@/components/ui/separator";
+import { Play, Pause, Circle } from "lucide-react";
 import { formatTime } from "@/lib/utils";
 import { trackAudioPlaybackStarted } from "@/lib/analytics";
 
@@ -282,23 +283,26 @@ export function AudioPlayer({
       />
 
       {onResume && (
-        <Button
-          variant="ghost"
-          size="icon-xs"
-          onClick={() => {
-            const audio = audioRef.current;
-            if (audio && !audio.paused) {
-              audio.pause();
-              setIsPlaying(false);
-              onPlayStateChange?.(false);
-            }
-            onResume();
-          }}
-          className="text-red-500 hover:text-red-500 hover:bg-red-500/10"
-          title="Resume recording"
-        >
-          <Mic className="h-4 w-4" />
-        </Button>
+        <>
+          <Button
+            variant="ghost"
+            size="icon-xs"
+            onClick={() => {
+              const audio = audioRef.current;
+              if (audio && !audio.paused) {
+                audio.pause();
+                setIsPlaying(false);
+                onPlayStateChange?.(false);
+              }
+              onResume();
+            }}
+            className="text-red-500 hover:text-red-500 hover:bg-red-500/10"
+            title="Resume recording"
+          >
+            <Circle className="h-3 w-3 fill-current" />
+          </Button>
+          <Separator orientation="vertical" className="!h-5" />
+        </>
       )}
 
       <Button variant="ghost" size="icon-xs" onClick={togglePlay}>
