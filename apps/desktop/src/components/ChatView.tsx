@@ -72,7 +72,11 @@ export function ChatView({
 
   const orderedIds = useMemo(() => segments.map((s) => s.id), [segments]);
 
-  // Marquee selection state
+  // Marquee selection state — drag-select on whitespace within the
+  // transcript. Bubbles own their own click handling (incl. ContextMenu
+  // right-click, shift-click range, cmd-click toggle), so the marquee
+  // never starts on a bubble. This keeps the system simple: there's no
+  // click-vs-drag disambiguation for bubbles to fight with.
   const marqueeStartRef = useRef<{ x: number; y: number } | null>(null);
   const [marquee, setMarquee] = useState<{
     left: number;
@@ -80,6 +84,14 @@ export function ChatView({
     width: number;
     height: number;
   } | null>(null);
+  // Edge auto-scroll: 30 px hot zones at top + bottom, linear velocity
+  // ramp capped at 12 px/frame, RAF loop that recomputes the marquee
+  // end-point from the cached pointer each tick so the rect grows as
+  // the viewport scrolls under a stationary cursor.
+  const viewportRef = useRef<HTMLElement | null>(null);
+  const lastPointerRef = useRef<{ x: number; y: number } | null>(null);
+  const scrollRafRef = useRef<number | null>(null);
+  const containerRef = useRef<HTMLElement | null>(null);
 
   // Stick-to-bottom: follow new segments unless the user has scrolled away.
   useEffect(() => {
@@ -179,36 +191,42 @@ export function ChatView({
     [onTimestampClick]
   );
 
-  const handleContainerPointerDown = (e: React.PointerEvent) => {
-    // Only start marquee when the user clicks empty transcript space, not a
-    // segment bubble. Segments have `data-segment-id` on their wrapper.
-    if (e.button !== 0) return;
-    const target = e.target as HTMLElement;
-    if (target.closest("[data-segment-id]")) return;
-    // Block native text-selection (the blue highlight) during marquee —
-    // the drag is ours, not the browser's.
-    e.preventDefault();
-    const container = e.currentTarget as HTMLElement;
-    const rect = container.getBoundingClientRect();
-    marqueeStartRef.current = {
-      x: e.clientX - rect.left + container.scrollLeft,
-      y: e.clientY - rect.top + container.scrollTop,
-    };
-    if (!(e.shiftKey || e.metaKey || e.ctrlKey)) {
-      clearSegmentSelection();
+  const SCROLL_HOT_ZONE = 30; // px from viewport edge that triggers scroll
+  const SCROLL_MAX_VELOCITY = 12; // px / frame at the very edge
+
+  // Compute auto-scroll velocity from a pointer's clientY relative to
+  // the viewport. Linear ramp inside the hot zones, zero otherwise.
+  // Positive = scroll down, negative = scroll up.
+  const computeScrollVelocity = (clientY: number, viewport: HTMLElement) => {
+    const r = viewport.getBoundingClientRect();
+    const distFromTop = clientY - r.top;
+    const distFromBottom = r.bottom - clientY;
+    if (distFromTop < SCROLL_HOT_ZONE && distFromTop >= 0) {
+      const ramp = (SCROLL_HOT_ZONE - distFromTop) / SCROLL_HOT_ZONE;
+      return -Math.min(SCROLL_MAX_VELOCITY, SCROLL_MAX_VELOCITY * ramp);
     }
+    if (distFromBottom < SCROLL_HOT_ZONE && distFromBottom >= 0) {
+      const ramp = (SCROLL_HOT_ZONE - distFromBottom) / SCROLL_HOT_ZONE;
+      return Math.min(SCROLL_MAX_VELOCITY, SCROLL_MAX_VELOCITY * ramp);
+    }
+    // Outside the viewport entirely (pointer captured past the edge):
+    // keep scrolling at max velocity in the appropriate direction.
+    if (distFromTop < 0) return -SCROLL_MAX_VELOCITY;
+    if (distFromBottom < 0) return SCROLL_MAX_VELOCITY;
+    return 0;
   };
 
-  const handleContainerPointerMove = (e: React.PointerEvent) => {
+  // Recompute the marquee rect from the cached pointer position. Called
+  // both on pointermove (cursor moved) and during the auto-scroll RAF
+  // tick (viewport scrolled but cursor stationary).
+  const updateMarqueeFromPointer = () => {
     const start = marqueeStartRef.current;
-    if (!start) return;
-    // Clear any stray native selection the browser may have kicked off
-    // before our preventDefault landed.
-    window.getSelection()?.removeAllRanges();
-    const container = e.currentTarget as HTMLElement;
+    const ptr = lastPointerRef.current;
+    const container = containerRef.current;
+    if (!start || !ptr || !container) return;
     const rect = container.getBoundingClientRect();
-    const x = e.clientX - rect.left + container.scrollLeft;
-    const y = e.clientY - rect.top + container.scrollTop;
+    const x = ptr.x - rect.left + container.scrollLeft;
+    const y = ptr.y - rect.top + container.scrollTop;
     const left = Math.min(start.x, x);
     const top = Math.min(start.y, y);
     const width = Math.abs(x - start.x);
@@ -217,11 +235,94 @@ export function ChatView({
     setMarquee({ left, top, width, height });
   };
 
+  const stopAutoScroll = () => {
+    if (scrollRafRef.current != null) {
+      cancelAnimationFrame(scrollRafRef.current);
+      scrollRafRef.current = null;
+    }
+  };
+
+  const tickAutoScroll = () => {
+    const viewport = viewportRef.current;
+    const ptr = lastPointerRef.current;
+    if (!viewport || !ptr || !marqueeStartRef.current) {
+      scrollRafRef.current = null;
+      return;
+    }
+    const velocity = computeScrollVelocity(ptr.y, viewport);
+    if (velocity === 0) {
+      scrollRafRef.current = null;
+      return;
+    }
+    const before = viewport.scrollTop;
+    viewport.scrollTop = before + velocity;
+    if (viewport.scrollTop !== before) updateMarqueeFromPointer();
+    scrollRafRef.current = requestAnimationFrame(tickAutoScroll);
+  };
+
+  const ensureAutoScrollRunning = () => {
+    if (scrollRafRef.current != null) return;
+    if (!viewportRef.current || !lastPointerRef.current) return;
+    if (computeScrollVelocity(lastPointerRef.current.y, viewportRef.current) === 0) return;
+    scrollRafRef.current = requestAnimationFrame(tickAutoScroll);
+  };
+
+  // Cancel any in-flight RAF when the component unmounts mid-drag.
+  useEffect(() => {
+    return () => stopAutoScroll();
+  }, []);
+
+  const handleContainerPointerDown = (e: React.PointerEvent) => {
+    if (e.button !== 0) return;
+    const target = e.target as HTMLElement;
+    // Bubbles handle their own clicks (incl. shift/cmd modifiers) and
+    // right-click ContextMenu; the marquee only starts on whitespace.
+    // Drag-select bubbles via shift-click instead.
+    if (target.closest("[data-segment-id]")) return;
+    // Pointer capture so pointermove fires past the viewport edge —
+    // required for edge auto-scroll.
+    e.currentTarget.setPointerCapture(e.pointerId);
+    e.preventDefault();
+    const container = e.currentTarget as HTMLElement;
+    containerRef.current = container;
+    // Cache the Radix ScrollArea viewport — that's the actual scrolling
+    // node, not our marquee container.
+    viewportRef.current =
+      scrollAreaRef.current?.querySelector<HTMLElement>(
+        '[data-slot="scroll-area-viewport"]',
+      ) ?? null;
+    const rect = container.getBoundingClientRect();
+    marqueeStartRef.current = {
+      x: e.clientX - rect.left + container.scrollLeft,
+      y: e.clientY - rect.top + container.scrollTop,
+    };
+    lastPointerRef.current = { x: e.clientX, y: e.clientY };
+  };
+
+  const handleContainerPointerMove = (e: React.PointerEvent) => {
+    if (!marqueeStartRef.current) return;
+    window.getSelection()?.removeAllRanges();
+    lastPointerRef.current = { x: e.clientX, y: e.clientY };
+    updateMarqueeFromPointer();
+    ensureAutoScrollRunning();
+  };
+
   const handleContainerPointerUp = (e: React.PointerEvent) => {
+    stopAutoScroll();
+    if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+      e.currentTarget.releasePointerCapture(e.pointerId);
+    }
     const start = marqueeStartRef.current;
     marqueeStartRef.current = null;
+    lastPointerRef.current = null;
+    viewportRef.current = null;
+    containerRef.current = null;
     if (!start || !marquee) {
       setMarquee(null);
+      // Bare click on whitespace (no drag) clears the multi-selection.
+      // Pointerdown only fires on whitespace (we bail on bubbles), so
+      // every no-drag pointerup here was a whitespace click.
+      if (start) clearSegmentSelection();
       return;
     }
     const container = e.currentTarget as HTMLElement;
@@ -286,13 +387,13 @@ export function ChatView({
         <div
           className={
             marquee
-              ? "relative space-y-2 px-3 py-2 select-none"
-              : "relative space-y-2 px-3 py-2"
+              ? "relative min-h-full space-y-2 px-3 py-2 select-none"
+              : "relative min-h-full space-y-2 px-3 py-2"
           }
           onPointerDown={handleContainerPointerDown}
           onPointerMove={handleContainerPointerMove}
           onPointerUp={handleContainerPointerUp}
-          onPointerLeave={handleContainerPointerUp}
+          onPointerCancel={handleContainerPointerUp}
         >
           <TranscriptSegments
             sessionId={sessionId ?? ""}
