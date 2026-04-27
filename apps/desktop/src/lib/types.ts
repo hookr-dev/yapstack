@@ -452,14 +452,23 @@ prompt_context_chars: number | null;
 prompt_decay_silence_seconds: number | null; 
 /**
  * Session ID for streaming session-audio recording. If set, the loop
- * streams a new **session audio part** to disk during the session and
- * inserts a `session_audio_parts` row at finalize time before emitting
- * `session-part-ready`. The on-disk file is
+ * streams a new audio part to disk during the session and emits
+ * `session-part-ready` at finalize time. The on-disk file is
  * `{audio_save_location || $APP_DATA_DIR/audio/}/{session_id}.{part_index}.{wav|mp3}`,
  * where `part_index` is 0 for a fresh session and `N` when resuming a
  * session that already has parts.
  */
 session_id: string | null; 
+/**
+ * When `true`, the finalize path inserts a `session_audio_parts` row
+ * keyed by `session_id` so the DB stays the durable source of truth even
+ * if the FE listener is gone. Set this to `false` for synthetic ids that
+ * are *not* rows in `sessions` — most importantly dictation, where the
+ * id is per-utterance and the finalized file is recorded against
+ * `dictation_history` instead. Defaults to `true` to preserve historical
+ * behavior for actual sessions; the dictation hook flips it off.
+ */
+persist_audio_part?: boolean; 
 /**
  * Custom directory for saving session audio parts. If None, uses
  * `$APP_DATA_DIR/audio/`. The directory is registered with

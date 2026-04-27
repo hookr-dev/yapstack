@@ -106,7 +106,7 @@ The shared vocabulary for YapStack. Use these terms verbatim in code, docs, PRDs
 | **Chat**          | A conversation with an LLM scoped to a context (a session, a folder, the pinned set, dictation history, or global), exposed via the floating chat bar. | Assistant, copilot     |
 | **Context key**   | The string that scopes a chat: `global`, `pinned`, `dictation`, `folder:{id}`, or a session id. Determines what content the LLM sees and where messages are filed. | Scope, channel         |
 | **Chat message**  | One turn (user or assistant) in a chat, persisted in SQLite with its context key.                                                   | Reply, exchange        |
-| **Tool**          | A typed function the LLM can invoke (`update_title`, `save_to_notes`, `pin_session`) via OpenAI tool calling.                       | Action, function call  |
+| **Tool**          | A typed function the LLM can invoke via OpenAI tool calling. Each tool declares a `kind` (`"read"` or `"mutate"`) and an optional `affects` effect set; only `mutate` tools enter the Undo window. The current registry has ten: `update_title`, `save_to_notes`, `pin_session`, `tag_session`, `add_session_to_folder`, `replace_in_transcript` (mutating); `search_folders`, `search_sessions`, `search_dictations`, `get_session_context` (retrieval). | Action, function call  |
 | **Citation**      | An inline `[[seg:ID]]` reference in chat output that resolves to a clickable timestamp chip on a segment.                           | Reference, link        |
 | **Undo window**   | The 10-second period after a tool mutation during which the user can revert it.                                                     | Grace period, rollback |
 | **AI provider**   | An external LLM backend the chat can target: `openai`, `openrouter`, or `custom` (any OpenAI-compatible endpoint).                  | LLM provider, vendor   |
@@ -165,11 +165,11 @@ The shared vocabulary for YapStack. Use these terms verbatim in code, docs, PRDs
 
 > **Dev:** "When a **Session** finalizes, what determines whether we end up with a WAV or an MP3?"
 
-> **Domain expert:** "The **Audio export format** setting. We always stream a **Session WAV** to disk during recording — that's the working buffer. At finalization, if the format is `wav`, we keep it. If it's `mp3`, we encode at the configured **MP3 bitrate** to produce a **Session MP3** and delete the WAV. The session ends up with exactly one **Session audio** artifact."
+> **Domain expert:** "The **Audio export format** setting. We always stream a **Session WAV** to disk during recording — that's the working buffer. At finalization, if the format is `wav`, we keep it. If it's `mp3`, we encode at the configured **MP3 bitrate** to produce a **Session MP3** and delete the WAV. Each recording run produces one such audio artifact — the **Session audio part** for that run. A session that's resumed N times ends up with N+1 parts; the **Audio player** stitches them in `part_index` order at playback time."
 
 > **Dev:** "And **Dictation** — does it write to `session_audio_parts`?"
 
-> **Domain expert:** "Same path as a session, but under a synthetic dictation id rather than a real `sessions.id`. Capture finalizes one **Session audio part** at `{dictation_id}.0.{wav|mp3}` regardless of **Output action**, and that file path lands on the `dictation_history` row (`wav_file_path`, `wav_duration_seconds`) so the user can replay it. The difference between actions is what happens to the *text* — `paste` and `clipboard` route it out of the app, `new-note` also creates a real **Session** and links it via `dictation_history.session_id`. The audio is only deleted on cancel."
+> **Domain expert:** "It uses the same live-transcription pipeline so the chunking, VAD, and streaming-WAV machinery are reused, but it sets `persist_audio_part: false` so finalize *skips* the `session_audio_parts` insert — that table is keyed on `sessions.id` and the dictation id is synthetic. Capture finalizes the file at `{dictation_id}.0.{wav|mp3}` regardless of **Output action**, and the path lands on the `dictation_history` row (`wav_file_path`, `wav_duration_seconds`) so the user can replay it. The difference between actions is what happens to the *text* — `paste` and `clipboard` route it out of the app, `new-note` also creates a real **Session** and links it via `dictation_history.session_id`. The audio is only deleted on cancel."
 
 > **Dev:** "If I drag a **Session** into a **Folder**, does it leave its current folder?"
 

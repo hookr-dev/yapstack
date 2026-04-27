@@ -583,7 +583,7 @@ LiveTranscriptionState   = Arc<Mutex<Option<LiveTranscriptionController>>>
 | `get_capture_status` | — | `CaptureStatusDto` |
 | `check_system_audio_permission` | — | `PermissionStatusDto` |
 | `get_buffer_info` | — | `BufferStatusDto` |
-| `peek_capture_energy` | — | `{ mic_rms, system_rms }` (live RMS used by the recording beacon) |
+| `peek_capture_energy` | `window_secs: f32` (must be finite > 0; `InvalidInput` otherwise) | `{ mic_rms, system_rms }` (live RMS over the last `window_secs`, used by the recording beacon) |
 
 ### Capture Commands (`commands/capture.rs`)
 | Command | Args | Returns |
@@ -978,7 +978,7 @@ Modular tool registry. Each tool is self-contained with schema, executor, undo h
 | `tag_session` | `{ add: string[], remove?: string[] }` | `getTagByName()` → `createTag()` → `addSessionTag()` / `removeSessionTag()` | `["organization"]` |
 | `search_folders` | `{ query?: string }` | `listFolders()` → optional substring filter against folder names + descriptions | `[]` (read-only) |
 | `add_session_to_folder` | `{ folder_id: string }` | `findBranchConflicts()` → `dbAddSessionToFolder()` → `getFolderPath()` (returns hierarchical description chain in `result`) | `["organization"]` |
-| `search_sessions` | `{ query: string, limit?: number }` | FTS5 search across session titles, notes, and segment text | `[]` (read-only) |
+| `search_sessions` | `{ query: string, filters: { folder_id: string \| null, pinned: boolean \| null } \| null, limit?: number }` | FTS5 search across session titles, notes, and segment text. `filters` may be `null` for an unfiltered search; pass an object to restrict by folder and/or pin state. | `[]` (read-only) |
 | `search_dictations` | `{ query: string, limit?: number }` | FTS5 search across `dictation_history` | `[]` (read-only) |
 | `get_session_context` | `{ session_ids: string[], scope: "segments" \| "notes" \| "summary" \| "all" }` | For each id (max 5 per call): `getSession()` + scope-conditional `getSessionSegments()` / `getNote()`. `scope="summary"` is currently always null pending a future summarization step. Errors out-of-scope ids when the chat context carries `allowedSessionIds`. | `[]` (read-only) |
 | `replace_in_transcript` | `{ find: string, replace: string, case_sensitive: boolean }` | Iterate `ctx.segments`, build per-segment `EditPlan` (skip deleted/hidden, escape regex, default case-insensitive). Capped at 50 affected segments per call — narrow `find` if you exceed it. Persists via `updateSegmentText()`, preserving each segment's `original_text` snapshot. | `["transcript"]` (refresh transcript views) |
@@ -1030,6 +1030,7 @@ Context orchestration layer. Provides factory functions to create context source
 | `createMultiSessionTools` | `(allowedSessionIds: string[]) → AIContextTools` | Retrieval-only tools (`search_sessions`, `get_session_context`, `search_folders`, `search_dictations`); no mutations because they need a single `sessionId` and applying them at folder scope is ambiguous. `allowedSessionIds` is the load-bearing field — it pins retrieval to the chat's filter (folder / pinned / all) so the model can't reach outside the user's view. `contextType: "multi-session"`. |
 | `createMultiSessionSystemPromptBuilder` | `(folderContext?: FolderContextLayer[]) → SystemPromptBuilder` | Returns builder that calls `getMultiSessionSystemPrompt` with optional folder context layers. Ignores directive param (multi-session uses its own fixed prompt). |
 | `createDictationSources` | `(entryCount: number) → ContextSource[]` | Dictation history source (non-toggleable). |
+| `createDictationTools` | `() → AIContextTools` | Retrieval surface scoped to dictation only — exposes `search_dictations` and nothing else. `allowedSessionIds: []` so any future tool that consults the field fails closed. `contextType: "multi-session"`. |
 | `createDictationSystemPromptBuilder` | `() → SystemPromptBuilder` | Returns builder that calls `getDictationSystemPrompt`. |
 | `resolveListContext` | `(filter: ListFilter, sessions: DbSession[], folders: Folder[]) → ListChatContext` | Centralizes context resolution for all `ListFilter` types (all, pinned, folder, dictation). Returns contextKey, sources, tools, systemPromptBuilder, and placeholder. |
 | `chatContextKey` | Re-exported from `ai.ts` | `(ctx: ChatContext) → string` — context identity for chat messages |

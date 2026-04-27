@@ -262,6 +262,11 @@ export function useDictation() {
         prompt_context_chars: 350,
         prompt_decay_silence_seconds: 0,
         session_id: dictationIdRef.current,
+        // Dictations are not sessions — the synthetic id has no row in
+        // `sessions`, so don't insert into `session_audio_parts`. The
+        // finalized path is recorded against `dictation_history` instead
+        // (see the session-part-ready listener below).
+        persist_audio_part: false,
         audio_save_location: null,
         audio_export_format: s.settings.audioExportFormat,
         mp3_bitrate: s.settings.audioExportFormat === "mp3" ? s.settings.mp3Bitrate : null,
