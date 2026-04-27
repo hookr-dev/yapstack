@@ -278,7 +278,6 @@ pub fn run() {
             commands::transcription::get_available_models,
             commands::transcription::download_model,
             commands::transcription::delete_model,
-            commands::transcription::transcribe_audio,
             commands::transcription::init_transcription_client,
             commands::transcription::shutdown_transcription_client,
             commands::transcription::get_transcription_status,

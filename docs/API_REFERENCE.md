@@ -603,7 +603,6 @@ The session lifecycle (start, finalize, export) is owned by `start_live_transcri
 | `get_available_models` | — | `Vec<ModelInfoDto>` (Whisper) |
 | `download_model` | `size` | `String` (path) |
 | `delete_model` | `size` | `()` |
-| `transcribe_audio` | `audio_path, language?, initial_prompt?` | `TranscriptionResultDto` |
 | `init_transcription_client` | `engine, whisper_model?, parakeet_variant?, enable_diarization` | `()` |
 | `shutdown_transcription_client` | — | `()` |
 | `get_transcription_status` | — | `TranscriptionStatusDto { initialized: bool }` |
@@ -630,7 +629,7 @@ Emits `"live-transcription-segment"` events with `LiveSegmentEvent { session_id?
 
 Emits `"backfill-complete"` event (empty payload) when backfill processing finishes.
 
-Emits `"session-part-ready"` event with `SessionPartReadyEvent { session_id, part_index, file_path, format ("wav" \| "mp3"), duration_seconds, sample_rate }` when the streaming part is finalized after the loop exits. The `session_audio_parts` row is inserted from Rust *before* this event fires, so the DB stays the durable source of truth even if the listener is gone.
+Emits `"session-part-ready"` event with `SessionPartReadyEvent { session_id, part_index, file_path, format: AudioExportFormatDto ("wav" \| "mp3"), duration_seconds, sample_rate }` when the streaming part is finalized after the loop exits. When `LiveTranscriptionConfig.persist_audio_part` is true (the default — actual sessions), a `session_audio_parts` row is inserted from Rust *before* this event fires, so the DB stays the durable source of truth even if the listener is gone. When the flag is false (dictation), the row insert is skipped — dictation owns its audio path on `dictation_history` instead, and the synthetic `session_id` has no `sessions.id` to FK against.
 
 Emits `"session-wav-error"` event with `SessionWavErrorEvent { session_id, message }` when an empty recording is detected (0 samples written) or a finalize error occurs. The empty WAV file is deleted in this path.
 
@@ -638,7 +637,7 @@ Emits `"stream-health"` events with `StreamHealthEvent { source: AudioSourceLabe
 
 Emits `"live-transcription-warning"` event with `{ message }` when the sidecar is auto-restarted mid-session after a transcription failure (transient); the loop continues.
 
-**`LiveTranscriptionConfig`**: `silence_duration_ms` (default 800; Whisper-only — Parakeet uses a fixed 200 ms), `max_chunk_seconds` (default 30), `backfill_seconds` (default 0), `source`, `mix_config?`, `language?`, `prompt_context_chars?` (default 350), `prompt_decay_silence_seconds?` (default 5.0, set to 0 to disable — seconds of all-source silence before clearing prompt context to prevent hallucination from stale context), `session_id?` (enables streaming session audio recording into a new part), `audio_save_location?` (override the default `$APP_DATA_DIR/audio/` dir), `audio_export_format?` (`"wav"` or `"mp3"`, default `"mp3"`), `mp3_bitrate?` (kbps, validated against the LAME-supported set; default 64), `diarization?`, `vocabulary_hints?` (folder/tag names ≥4 chars, comma-separated, ~80 char budget — Whisper-only), `resume?: ResumeConfig` (carries the prior cumulative duration that becomes `session_offset_base_seconds`, plus the next `part_index` so segments and audio parts continue numbering from where the prior run left off).
+**`LiveTranscriptionConfig`**: `silence_duration_ms` (default 800; Whisper-only — Parakeet uses a fixed 200 ms), `max_chunk_seconds` (default 30), `backfill_seconds` (default 0), `source`, `mix_config?`, `language?`, `prompt_context_chars?` (default 350), `prompt_decay_silence_seconds?` (default 5.0, set to 0 to disable — seconds of all-source silence before clearing prompt context to prevent hallucination from stale context), `session_id?` (enables streaming session audio recording into a new part), `persist_audio_part?: bool` (default `true`; set to `false` for dictation so finalize skips the `session_audio_parts` insert that would FK-orphan against the synthetic id), `audio_save_location?` (override the default `$APP_DATA_DIR/audio/` dir), `audio_export_format?: AudioExportFormatDto` (`"wav"` or `"mp3"`, default `"mp3"`; typed end-to-end so unknown values are rejected at deserialization), `mp3_bitrate?` (kbps, validated against the LAME-supported set; default 64), `diarization?`, `vocabulary_hints?` (folder/tag names ≥4 chars, comma-separated, ~80 char budget — Whisper-only), `resume?: ResumeConfig` (carries the prior cumulative duration that becomes `session_offset_base_seconds`, plus the next `part_index` so segments and audio parts continue numbering from where the prior run left off).
 
 **`LiveTranscriptionPhase`**: `Running`, `Stopped`, `Error`.
 

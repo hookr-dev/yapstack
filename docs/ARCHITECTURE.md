@@ -146,8 +146,8 @@ Frontend: init_transcription_client(engine, whisper_model?, parakeet_variant?, e
     → spawns yapstack-sidecar with: --engine, --model, [--vad-model | --sortformer-model + --coreml-cache-dir]
     → JSON-line IPC over stdin/stdout
 
-Frontend: transcribe_audio(wav_path)
-    → TranscriptionClient.transcribe() / .transcribe_with(diarization=true)
+Live transcription loop (one chunk):
+    → TranscriptionClient.transcribe_with(audio_path, language, prompt, diarization)
     → sends {"type":"transcribe", ..., diarization} to sidecar stdin
     → sidecar dispatches via TranscriptionBackend trait:
 
@@ -216,9 +216,11 @@ Frontend: start_live_transcription(config)
     → After loop exits (cleanup):
         1. Drain in-flight chunk tasks (10 s graceful, then abort)
         2. Final WAV flush + finalize per audioExportFormat (WAV kept / MP3 re-encoded + WAV deleted)
-        3. Insert the session_audio_parts row from Rust, register the parent dir as trusted, then
-           emit "session-part-ready" with { session_id, part_index, file_path, format,
-           duration_seconds, sample_rate } (or "session-wav-error" on empty recordings)
+        3. Register the parent dir as trusted; if config.persist_audio_part is true (default),
+           insert the session_audio_parts row from Rust. Dictation passes false here and stores
+           the path on dictation_history instead. Then emit "session-part-ready" with
+           { session_id, part_index, file_path, format, duration_seconds, sample_rate }
+           (or "session-wav-error" on empty recordings)
         4. Returns the TranscriptionClient to shared state (even after panic via AssertUnwindSafe)
     → Per-source VAD: SourceVadState tracks mic/system independently
     → Prompt context: per-source accumulated_text (up to 1000 chars) truncated to prompt_context_chars (default 350) for Whisper initial_prompt
@@ -837,5 +839,5 @@ The protocol supports HTTP `Range` headers for audio seeking. Returns `206 Parti
 5. **16-bit PCM WAV export** — WAV files are written at the device's native sample rate (e.g. 48kHz). The sidecar resamples to 16kHz mono before Whisper inference. 16-bit quantization is sufficient (-96 dB noise floor).
 6. **Session tracking via write_pos** — Sessions record the ring buffer's monotonic write position at start, then `snapshot_since()` at end. No separate buffer needed. For long sessions (> buffer capacity), `SessionWavWriter` streams audio incrementally to disk every 300ms during the live transcription loop.
 7. **Custom URI scheme for audio** — `audio-stream://` protocol serves session audio (WAV or MP3) from any allow-listed directory with range request support, avoiding cross-origin issues with the default asset protocol during development.
-8. **`session_audio_parts` is the durable source of truth for session audio** — Each session has zero or more part rows (`part_index = 0, 1, 2…`); the row is inserted from Rust at finalize time *before* `session-part-ready` is emitted, so a missed FE event can't lose the file. Resuming a session appends a new part rather than overwriting; the FE concatenates parts at playback time. `audio_save_locations` tracks every directory the app has ever written into so reconciliation on next startup can recover orphans even if the row insert was missed.
+8. **`session_audio_parts` is the durable source of truth for session audio** — Each session has zero or more part rows (`part_index = 0, 1, 2…`); when `LiveTranscriptionConfig.persist_audio_part` is true (default for actual sessions) the row is inserted from Rust at finalize time *before* `session-part-ready` is emitted, so a missed FE event can't lose the file. Dictation flips the flag off — its synthetic per-utterance id has no `sessions.id` row, so the path goes onto `dictation_history` instead and the parts table only ever holds rows that round-trip to a real session. Resuming a session appends a new part rather than overwriting; the FE concatenates parts at playback time. `audio_save_locations` tracks every directory the app has ever written into so reconciliation on next startup can recover orphans even if the row insert was missed.
 9. **`useDictation` registers Escape as a global hotkey only while non-idle** — Escape cancels an in-flight Dictation, suppresses the Output action, deletes the streamed audio, and skips the `dictation_history` write. The hotkey is unregistered when idle so it doesn't override the focused app's normal Escape handling.

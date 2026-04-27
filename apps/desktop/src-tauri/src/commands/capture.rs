@@ -35,6 +35,17 @@ pub async fn delete_session_wav(
         app_data_dir.join("audio")
     };
 
+    // A missing audio dir is a no-op — the cleanup target is gone.
+    // Important: `audio_dir_trusted` canonicalizes the path and fails closed
+    // when the dir doesn't exist, so we have to short-circuit *before* the
+    // trust check or this idempotent path becomes unreachable. (We also
+    // can't fold this into the `read_dir` arm below — that would let a
+    // present-but-unauthorized `audio_save_location` slip through if its
+    // first read-dir error happened to be NotFound.)
+    if !audio_dir.exists() {
+        return Ok(());
+    }
+
     if !audio_dir_trusted(&app_handle, &audio_dir) {
         return Err(CommandError::InvalidInput {
             message: format!(
@@ -46,11 +57,13 @@ pub async fn delete_session_wav(
 
     // Match both the legacy single-file pattern (`{session_id}.wav` —
     // dictations and pre-parts sessions) and the parts pattern
-    // (`{session_id}.{part_index}.wav`/`.mp3`).
-    let entries = match std::fs::read_dir(&audio_dir) {
-        Ok(it) => it,
-        Err(_) => return Ok(()), // Audio dir doesn't exist; nothing to delete.
-    };
+    // (`{session_id}.{part_index}.wav`/`.mp3`). The dir was just verified to
+    // exist + be trusted, so a `read_dir` error here is real (permissions,
+    // I/O) and worth surfacing — the previous `Err(_) => return Ok(())`
+    // swallowed it.
+    let entries = std::fs::read_dir(&audio_dir).map_err(|e| CommandError::Internal {
+        message: format!("read_dir({}) failed: {e}", audio_dir.display()),
+    })?;
     let prefix = format!("{session_id}.");
     let mut failures: Vec<String> = Vec::new();
     for entry in entries.flatten() {
