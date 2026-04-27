@@ -351,6 +351,7 @@ interface AppState {
   ) => void;
   setSegmentSelection: (ids: Set<string>) => void;
   clearSegmentSelection: () => void;
+  setSegmentAnchor: (id: string | null) => void;
   deleteSegments: (ids: string[]) => Promise<void>;
   setSegmentsHidden: (ids: string[], hidden: boolean) => Promise<void>;
 
@@ -1915,12 +1916,25 @@ function createAppStore() {
           });
           return;
         }
-        // range: select everything between lastSelected (or segmentId itself)
-        // and segmentId inclusive, using the provided display order.
-        const anchor = state.lastSelectedSegmentId ?? segmentId;
+        // range: replace the selection with the inclusive range from the
+        // anchor (the last bare/cmd-click pivot) to the clicked segment.
+        // The anchor stays fixed across consecutive shift-clicks so the
+        // user can grow OR shrink the range — Finder / Gmail / Linear
+        // behavior. With no anchor yet (first shift-click after a clear),
+        // fall through to a single-item selection and seed the anchor
+        // there.
+        const anchor = state.lastSelectedSegmentId;
+        if (anchor === null) {
+          set({
+            selectedSegmentIds: new Set([segmentId]),
+            lastSelectedSegmentId: segmentId,
+          });
+          return;
+        }
         const a = orderedIds.indexOf(anchor);
         const b = orderedIds.indexOf(segmentId);
         if (a === -1 || b === -1) {
+          // Stale anchor (e.g., the anchor segment was deleted) — restart.
           set({
             selectedSegmentIds: new Set([segmentId]),
             lastSelectedSegmentId: segmentId,
@@ -1928,9 +1942,9 @@ function createAppStore() {
           return;
         }
         const [lo, hi] = a < b ? [a, b] : [b, a];
-        const next = new Set(existing);
+        const next = new Set<string>();
         for (let i = lo; i <= hi; i++) next.add(orderedIds[i]);
-        set({ selectedSegmentIds: next, lastSelectedSegmentId: segmentId });
+        set({ selectedSegmentIds: next });
       },
 
       setSegmentSelection: (ids) => {
@@ -1946,6 +1960,11 @@ function createAppStore() {
           selectedSegmentIds: new Set(),
           lastSelectedSegmentId: null,
         });
+      },
+
+      setSegmentAnchor: (id) => {
+        if (get().lastSelectedSegmentId === id) return;
+        set({ lastSelectedSegmentId: id });
       },
 
       deleteSegments: async (ids) => {
