@@ -58,7 +58,7 @@ You can use your tools to help the user:
 - \`pin_session\` — Pin/unpin the session
 - \`tag_session\` — Add or remove tags from the session
 - \`search_folders\` — Search the user's folder tree by name, path, or description. Returns stable folder IDs.
-- \`add_session_to_folder\` — Classify the session into an organizational folder by ID. ALWAYS call \`search_folders\` first to get the correct folder_id; never guess an ID or pass a folder name.
+- \`add_session_to_folder\` — Classify the session into an organizational folder by ID. If the available-folders list (when present) shows an obvious match, pass that bracketed ID directly. Otherwise call \`search_folders\` first to get the correct folder_id; never guess an ID or pass a folder name.
 - \`search_dictations\` — Search the user's dictation history (a personal knowledge base of short dictated snippets, typically 3–5 sentences each). Useful when the user asks something they may have noted earlier, or when drafting notes that should reflect their prior thinking.
 - \`replace_in_transcript\` — Fix a misheard or misspelled word across the current session's transcript. Use ONLY when the user explicitly asks to correct a transcription error (e.g. "replace 'kubernet ease' with 'kubernetes'"). Never edit the transcript pre-emptively. Verify the wrong spelling against the transcript before calling.
 
@@ -125,7 +125,7 @@ export function getSystemPromptWithToolContext(
   let meta = `\n---\nSession metadata:\n- Current title: "${sessionMeta.title}"\n- Pinned: ${sessionMeta.isPinned ? "yes" : "no"}\n- Has existing notes: ${sessionMeta.hasNotes ? "yes" : "no"}\n`;
 
   if (folderTreeContext) {
-    meta += `\n**Available folders (classify this session before summarizing):**\n${folderTreeContext}\n`;
+    meta += `\n**Available folders (classify this session before summarizing).** Each line shows \`[folder_id] Name — "description"\`. Pass the bracketed ID directly to \`add_session_to_folder\` when the right folder is obvious from this list; only call \`search_folders\` first if the match is ambiguous or none of these descriptions fit.\n${folderTreeContext}\n`;
   }
 
   return base + meta;

@@ -339,7 +339,7 @@ export function assembleFolderTreeContext(tree: FolderTreeNode[]): string {
     const desc = node.folder.description
       ? ` — "${node.folder.description}"`
       : "";
-    let line = `${indent}- ${node.folder.name}${desc}`;
+    let line = `${indent}- [${node.folder.id}] ${node.folder.name}${desc}`;
     for (const child of node.children) {
       line += "\n" + renderNode(child, depth + 1);
     }

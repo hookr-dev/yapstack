@@ -45,8 +45,8 @@ const RAW_ACTIONS: ActionDefinition[] = [
 You MUST use your tools. Work in two phases:
 
 **Phase 1 — CLASSIFY FIRST:**
-If a folder tree is provided below, call \`search_folders\` to find the best semantic match (consider the folder descriptions), then call \`add_session_to_folder\` with the chosen folder_id. If the session is already in the right folder, or no folders match, skip this.
-IMPORTANT: Do NOT call \`update_title\`, \`tag_session\`, or \`save_to_notes\` yet. Only call \`search_folders\` then \`add_session_to_folder\`, then stop. Wait for the folder context results before proceeding.
+If a folder tree is provided below, pick the best semantic match (consider the folder descriptions) and call \`add_session_to_folder\` with the bracketed folder_id from that list. Only call \`search_folders\` first if the tree's descriptions don't make the match clear, or if you need to look beyond what's listed. If the session is already in the right folder, or no folders match, skip this.
+IMPORTANT: Do NOT call \`update_title\`, \`tag_session\`, or \`save_to_notes\` yet. Stop after \`add_session_to_folder\` (and \`search_folders\` if you needed it) and wait for the folder context results before proceeding.
 
 **Phase 2 — After receiving folder context, proceed:**
 1. If the current title is generic or vague (e.g. "New Session", a timestamp, or "Untitled"), call \`update_title\` with a concise, descriptive title (max 60 chars). Skip if the title already describes the session content.
@@ -81,7 +81,7 @@ Formatting rules:
     directive: `You are a key-points extractor. Work in two phases:
 
 **Phase 1 — CLASSIFY FIRST:**
-If a folder tree is provided below, call \`search_folders\` and then \`add_session_to_folder\` with the chosen folder_id to classify this session into the most appropriate folder. Do NOT call any other tools yet — stop and wait for the folder context results.
+If a folder tree is provided below, pick the best match and call \`add_session_to_folder\` with the bracketed folder_id from that list. Only call \`search_folders\` first if the tree's descriptions don't make the match clear. Do NOT call any other tools yet — stop and wait for the folder context results.
 
 **Phase 2 — After receiving folder context, proceed:**
 1. Call \`tag_session\` to add relevant tags.
@@ -98,7 +98,7 @@ If a folder tree is provided below, call \`search_folders\` and then \`add_sessi
     directive: `You are an action-item extractor. Work in two phases:
 
 **Phase 1 — CLASSIFY FIRST:**
-If a folder tree is provided below, call \`search_folders\` and then \`add_session_to_folder\` with the chosen folder_id to classify this session into the most appropriate folder. Do NOT call any other tools yet — stop and wait for the folder context results.
+If a folder tree is provided below, pick the best match and call \`add_session_to_folder\` with the bracketed folder_id from that list. Only call \`search_folders\` first if the tree's descriptions don't make the match clear. Do NOT call any other tools yet — stop and wait for the folder context results.
 
 **Phase 2 — After receiving folder context, proceed:**
 1. Call \`tag_session\` to add relevant tags.
@@ -116,7 +116,7 @@ If a folder tree is provided below, call \`search_folders\` and then \`add_sessi
     directive: `You are a meeting minutes writer with session management tools. Work in two phases:
 
 **Phase 1 — CLASSIFY FIRST:**
-If a folder tree is provided below, call \`search_folders\` and then \`add_session_to_folder\` with the chosen folder_id to classify this session into the most appropriate folder. Do NOT call any other tools yet — stop and wait for the folder context results.
+If a folder tree is provided below, pick the best match and call \`add_session_to_folder\` with the bracketed folder_id from that list. Only call \`search_folders\` first if the tree's descriptions don't make the match clear. Do NOT call any other tools yet — stop and wait for the folder context results.
 
 **Phase 2 — After receiving folder context, proceed:**
 1. Call \`update_title\` with a concise title for the meeting (max 60 chars). Skip if the title is already descriptive.
