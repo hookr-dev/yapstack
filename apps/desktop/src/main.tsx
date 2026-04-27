@@ -18,6 +18,11 @@ el.__yapstackRoot__ = root;
 root.render(
   <React.StrictMode>
     <App />
-    <Toaster position="bottom-center" />
+    <Toaster
+      position="top-center"
+      closeButton
+      offset={46}
+      duration={2500}
+    />
   </React.StrictMode>,
 );
