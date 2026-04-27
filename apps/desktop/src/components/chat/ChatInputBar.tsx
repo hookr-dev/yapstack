@@ -29,6 +29,7 @@ import type { ActionDefinition } from "@/lib/ai-actions";
 import type { ContextSource } from "@/lib/ai-context";
 import { ContextPill } from "./ContextPill";
 import { ModelPickerPill } from "./ModelPickerPill";
+import { useAppStore } from "@/stores/appStore";
 import { toast } from "sonner";
 
 const MAX_ATTACHMENT_BYTES = 500 * 1024;
@@ -69,6 +70,9 @@ export function ChatInputBar({
   setIsExpanded,
 }: ChatInputBarProps) {
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const selectedSegmentCount = useAppStore(
+    (s) => s.selectedSegmentIds.size,
+  );
 
   const resizeTextarea = useCallback(() => {
     const el = textareaRef.current;
@@ -229,6 +233,11 @@ export function ChatInputBar({
             onToggle={source.toggleable && toggleSource ? () => toggleSource(source.id) : undefined}
             icon={<source.icon className="h-2.5 w-2.5" />}
             label={source.label}
+            suffix={
+              source.type === "transcript" && selectedSegmentCount > 0
+                ? `• ${selectedSegmentCount} selected`
+                : undefined
+            }
           />
         ))}
         {attachments.map((att, i) => (
