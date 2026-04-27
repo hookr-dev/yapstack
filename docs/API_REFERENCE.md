@@ -208,7 +208,9 @@ impl AudioManager {
     pub fn mic_buffer(&self) -> Option<&SharedAudioRingBuffer>;
     pub fn system_buffer(&self) -> Option<&SharedAudioRingBuffer>;
 
-    // Capture extraction (all output is mono — multi-channel data is deinterleaved per buffer)
+    // Capture extraction (all output is mono — multi-channel data is deinterleaved per buffer).
+    // `trigger_instant_capture` is library-only API (no Tauri command exposes it anymore);
+    // production capture goes through the live-transcription pipeline.
     pub fn extract_captured_audio(&self, duration_seconds: f32) -> CapturedAudio;  // channels always 1
     pub fn trigger_instant_capture(&self, seconds: f32, source: CaptureSource, mix_config: Option<&MixConfig>) -> Result<CaptureResult>;
 
@@ -220,7 +222,8 @@ impl AudioManager {
     pub fn extract_sources_since(&self, positions: &BufferPositions) -> Option<SeparateExtraction>;  // per-source extraction (no mixing)
     pub fn peek_energy_rms(&self, positions: &BufferPositions, duration_secs: f32) -> (Option<f32>, Option<f32>);  // zero-alloc RMS via ring_buffer.rms_energy_since()
 
-    // Session API
+    // Session API (library-only; no Tauri command surface — live transcription owns
+    // session lifecycle in production, these are kept for the audio crate's tests).
     pub fn start_session(&mut self) -> Result<()>;       // records write_pos
     pub fn end_session(&mut self, source: CaptureSource, mix_config: Option<&MixConfig>) -> Result<CaptureResult>;
     pub fn is_session_active(&self) -> bool;
@@ -612,24 +615,18 @@ LiveTranscriptionState   = Arc<Mutex<Option<LiveTranscriptionController>>>
 | `stop_capture` | — | `()` |
 | `get_capture_status` | — | `CaptureStatusDto` |
 | `check_system_audio_permission` | — | `PermissionStatusDto` |
-| `snapshot_mic_audio` | `duration_seconds?` | `Option<AudioSnapshotDto>` |
-| `snapshot_system_audio` | `duration_seconds?` | `Option<AudioSnapshotDto>` |
 | `get_buffer_info` | — | `BufferStatusDto` |
+| `peek_capture_energy` | — | `{ mic_rms, system_rms }` (live RMS used by the recording beacon) |
 
 ### Capture Commands (`commands/capture.rs`)
 | Command | Args | Returns |
 |---------|------|---------|
-| `trigger_instant_capture` | `seconds, source, mix_config?` | `CaptureResultDto` |
-| `start_session` | — | `()` |
-| `end_session` | `source, mix_config?` | `CaptureResultDto` |
-| `get_session_status` | — | `SessionStatusDto` |
-| `export_session_wav` | `session_id, source, duration_seconds, mix_config?` | `SessionWavResultDto` |
 | `delete_session_wav` | `session_id, audio_save_location?` | `()` |
 | `delete_audio_files` | `paths: Vec<String>` | `()` (or `Err(CommandError)` whose message lists every path that failed) |
 
-`export_session_wav` extracts audio from ring buffers, writes a persistent WAV to `$APP_DATA_DIR/audio/{session_id}.wav`, and returns the file path + duration.
+`delete_session_wav` is the legacy session-glob cleanup path used by `clearAllSessions` and for sessions that pre-date the v15 `session_audio_parts` migration. Real per-part cleanup goes through `delete_audio_files`.
 
-`delete_session_wav` is the legacy single-file cleanup path used for sessions that pre-date the v15 `session_audio_parts` migration (and for orphan-glob cleanup in `clearAllSessions`). Real per-part cleanup goes through `delete_audio_files`.
+The session lifecycle (start, finalize, export) is owned by `start_live_transcription` / `stop_live_transcription` — there is no separate "instant capture" or `start_session` / `end_session` Tauri surface anymore. Audio finalization is driven by the live loop's streaming `SessionWavWriter` and the `session-part-ready` event; `session_audio_parts` is the durable source of truth.
 
 `delete_audio_files` validates each path against the `TrustedAudioDirs` allow-list before unlinking. Failures are surfaced (not swallowed) so the FE can warn or queue retries; the error message lists every path that did not delete.
 
@@ -662,7 +659,7 @@ All `download_*` commands emit `"model-download-progress"` events to the window 
 | `stop_live_transcription` | — | `()` |
 | `get_live_transcription_status` | — | `LiveTranscriptionStatus` |
 
-Emits `"live-transcription-segment"` events with `LiveSegmentEvent { chunk_index, source, segments, audio_offset_seconds, chunk_duration_seconds, accumulated_text, is_backfill }`. `LiveTranscriptionConfig` carries an optional `diarization: bool` (default false) — honored only when the active engine is Parakeet *and* the sidecar was spawned with a Sortformer model. Each `TranscriptSegmentDto` in `segments` carries `speaker_id: number | null`.
+Emits `"live-transcription-segment"` events with `LiveSegmentEvent { session_id?: string, chunk_index, source, segments, audio_offset_seconds, chunk_duration_seconds, accumulated_text, is_backfill }`. The `session_id` mirrors `LiveTranscriptionConfig.session_id` so multi-session listeners (dictation hook + main view) can route events without stale-state guards. `LiveTranscriptionConfig` carries an optional `diarization: bool` (default false) — honored only when the active engine is Parakeet *and* the sidecar was spawned with a Sortformer model. Each `TranscriptSegmentDto` in `segments` carries `speaker_id: number | null`.
 
 Emits `"backfill-complete"` event (empty payload) when backfill processing finishes.
 
@@ -679,7 +676,7 @@ Emits `"live-transcription-warning"` event with `{ message }` when the sidecar i
 **`LiveTranscriptionPhase`**: `Running`, `Stopped`, `Error`.
 
 **Internal types** (not exported via Tauri):
-- `TranscriptionContext` — Immutable shared context: `whisper_client` (private Arc), `shared_whisper_state` (for returning client on exit), `app_handle`, `config`, `transcription_start`
+- `TranscriptionContext` — Immutable shared context: `transcription_client` (private `Arc<Mutex<Option<Arc<TranscriptionClient>>>>`), `shared_transcription_state` (handle for returning the client on exit), `app_handle`, `config`, `bridged_prompt`, `vocabulary_hints`, `session_offset_base_seconds`
 - `SessionWavState` — Streaming WAV state: `writer`, `flush_positions`, `source`, `mix_config`, `session_id`
 - `SourceVadState` — Per-source VAD: `is_speaking`, `speech_start_pos`, `cursor`, `speech_start_time`, `silence_since`, `chunk_index`, `accumulated_text`, `total_audio_seconds`, `last_seen_write_pos`, `last_write_pos_advance`, `restart_attempts`
 - `VadAction` — `None`, `Chunk` (silence detected), `ForceChunk` (max duration exceeded)
@@ -1017,7 +1014,7 @@ Modular tool registry. Each tool is self-contained with schema, executor, undo h
 | `search_sessions` | `{ query: string, limit?: number }` | FTS5 search across session titles, notes, and segment text | `[]` (read-only) |
 | `search_dictations` | `{ query: string, limit?: number }` | FTS5 search across `dictation_history` | `[]` (read-only) |
 | `get_session_context` | `{ session_ids: string[], scope: "segments" \| "notes" \| "summary" \| "all" }` | For each id (max 5 per call): `getSession()` + scope-conditional `getSessionSegments()` / `getNote()`. `scope="summary"` is currently always null pending a future summarization step. Errors out-of-scope ids when the chat context carries `allowedSessionIds`. | `[]` (read-only) |
-| `replace_in_transcript` | `{ find: string, replacement: string, all?: boolean }` | `getSessionSegments()` → for each match: `editSegmentText()` (preserves `original_text` for undo) | `["notes"]` (refresh segment views) |
+| `replace_in_transcript` | `{ find: string, replace: string, case_sensitive: boolean }` | Iterate `ctx.segments`, build per-segment `EditPlan` (skip deleted/hidden, escape regex, default case-insensitive). Capped at 50 affected segments per call — narrow `find` if you exceed it. Persists via `updateSegmentText()`, preserving each segment's `original_text` snapshot. | `["transcript"]` (refresh transcript views) |
 
 ### `lib/ai-prompts.ts`
 

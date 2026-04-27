@@ -2377,8 +2377,7 @@ fn run_prompt_decay(
     let elapsed = {
         let mut p = prompt.lock().expect("prompt mutex poisoned");
         let last_at = p.last_transcription_at;
-        let decayed =
-            check_prompt_decay(sources, &mut p.shared_prompt, prompt_decay_secs, last_at);
+        let decayed = check_prompt_decay(sources, &mut p.shared_prompt, prompt_decay_secs, last_at);
         if decayed {
             p.last_transcription_at = None;
             Some(last_at.map(|t| t.elapsed().as_secs_f32()).unwrap_or(0.0))

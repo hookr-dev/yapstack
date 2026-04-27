@@ -3,7 +3,7 @@
  * invariant guard. No DB, no LLM — fixtures are hand-rolled DbChatMessage
  * arrays and ChatCompletionMessageParam[] arrays.
  */
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi, afterEach } from "vitest";
 import {
   assembleHistoryForRequest,
   ensureToolResultsFollowToolUse,
@@ -180,6 +180,10 @@ describe("ensureToolResultsFollowToolUse", () => {
   });
 
   it("inserts placeholder for missing tool result", () => {
+    // ensureToolResultsFollowToolUse warns when it has to synthesize a
+    // placeholder. Spy + assert so the test exercises the warning path
+    // without spamming pnpm check stderr.
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
     const input: ChatCompletionMessageParam[] = [
       asst([{ id: "c1", name: "f" }]),
     ];
@@ -190,9 +194,13 @@ describe("ensureToolResultsFollowToolUse", () => {
       tool_call_id: "c1",
       content: "(result missing)",
     });
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    expect(warnSpy.mock.calls[0]?.join(" ")).toContain("c1");
   });
 
   it("drops orphan tool messages with no preceding assistant call", () => {
+    // Same warning-path coverage: ensure the orphan is logged before drop.
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
     const input: ChatCompletionMessageParam[] = [
       { role: "user", content: "hi" },
       tool("c1", "orphan"),
@@ -203,6 +211,12 @@ describe("ensureToolResultsFollowToolUse", () => {
       { role: "user", content: "hi" },
       { role: "assistant", content: "answer" },
     ]);
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    expect(warnSpy.mock.calls[0]?.join(" ")).toContain("c1");
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
   });
 
   it("handles a multi-round conversation end-to-end", () => {

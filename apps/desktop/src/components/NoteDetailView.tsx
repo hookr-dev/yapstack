@@ -67,7 +67,7 @@ export function NoteDetailView() {
   // AI Context setup
   const sources = useMemo(
     () => selectedSessionId
-      ? createSessionSources(selectedSessionId, segments.length, session?.session_type ?? "recording")
+      ? createSessionSources(selectedSessionId, segments.length, session?.session_type ?? "transcription")
       : [],
     [selectedSessionId, segments.length, session?.session_type],
   );
@@ -80,7 +80,7 @@ export function NoteDetailView() {
     [selectedSessionId],
   );
   const sessionActions = useMemo(
-    () => getActionsForSession(session?.session_type ?? "recording"),
+    () => getActionsForSession(session?.session_type ?? "transcription"),
     [session?.session_type],
   );
   const loadSessionFolders = useAppStore((s) => s.loadSessionFolders);

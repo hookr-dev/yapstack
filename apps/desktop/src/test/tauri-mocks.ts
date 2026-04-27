@@ -108,24 +108,9 @@ export const tauriCommandsMock = () => ({
     checkSystemAudioPermission: vi
       .fn()
       .mockResolvedValue({ status: "ok", data: "Granted" }),
-    snapshotMicAudio: vi
-      .fn()
-      .mockResolvedValue({ status: "ok", data: null }),
-    snapshotSystemAudio: vi
-      .fn()
-      .mockResolvedValue({ status: "ok", data: null }),
     getBufferInfo: vi.fn().mockResolvedValue({
       status: "ok",
       data: { mic: null, system: null },
-    }),
-    triggerInstantCapture: vi
-      .fn()
-      .mockResolvedValue({ status: "ok", data: null }),
-    startSession: vi.fn().mockResolvedValue({ status: "ok", data: null }),
-    endSession: vi.fn().mockResolvedValue({ status: "ok", data: null }),
-    getSessionStatus: vi.fn().mockResolvedValue({
-      status: "ok",
-      data: { active: false, elapsed_seconds: null },
     }),
     getAvailableModels: vi
       .fn()
@@ -198,15 +183,6 @@ export const tauriCommandsMock = () => ({
     deleteAudioFiles: vi
       .fn()
       .mockResolvedValue({ status: "ok", data: null }),
-    exportSessionWav: vi.fn().mockResolvedValue({
-      status: "ok",
-      data: {
-        file_path: "",
-        duration_seconds: 0,
-        sample_rate: 16000,
-        format: "wav",
-      },
-    }),
     deleteSessionWav: vi
       .fn()
       .mockResolvedValue({ status: "ok", data: null }),

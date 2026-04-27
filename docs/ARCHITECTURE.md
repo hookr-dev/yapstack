@@ -106,43 +106,30 @@ Microphone/System Audio
     → Vec<f32> samples
 ```
 
-### Instant Capture
-```
-Frontend: trigger_instant_capture(seconds, source, mix_config)
-    → AudioManager.extract_captured_audio() → snapshot from ring buffers
-    → deinterleave_to_mono() per buffer (stereo → mono)
-    → mixer::mix_to_mono() (if Mixed source, requires matching sample rates)
-    → export::write_wav_to_temp() → mono WAV file at device sample rate
-    → CaptureResult { file_path, duration, ... }
-```
-
 ### Session Capture
 ```
-Primary path (live transcription — used by the app for all recordings):
-    start_live_transcription(config with session_id, audio_save_location?, audio_export_format)
-        → Resolves the audio dir: audioSaveLocation if set, else $APP_DATA_DIR/audio/
-        → Computes part_index from existing session_audio_parts rows for this session
-          (0 for fresh sessions; N when resuming a session that already has parts)
-        → Creates SessionWavWriter at $AUDIO_DIR/{session_id}.{part_index}.wav
-        → Every 300ms: extract_since() from ring buffer → append to WAV file
-        → On stop:
-            1. Final flush, then finalize per audioExportFormat:
-               • format = "wav" → keep the WAV
-               • format = "mp3" → re-encode at mp3Bitrate (lame) and DELETE the source WAV
-            2. Insert session_audio_parts row from Rust (durable source of truth)
-            3. Register parent dir with TrustedAudioDirs so the audio-stream:// handler can serve it
-            4. Emit "session-part-ready" with { session_id, part_index, file_path, format,
-               duration_seconds, sample_rate }
-            5. Empty recordings (0 samples written) emit "session-wav-error" instead and the
-               file is deleted
-    No audio lost regardless of session length. Each Resume produces a new part; the FE
-    concatenates parts in part_index order for playback and seeking.
+start_live_transcription(config with session_id, audio_save_location?, audio_export_format)
+    → Resolves the audio dir: audioSaveLocation if set, else $APP_DATA_DIR/audio/
+    → Computes part_index from existing session_audio_parts rows for this session
+      (0 for fresh sessions; N when resuming a session that already has parts)
+    → Creates SessionWavWriter at $AUDIO_DIR/{session_id}.{part_index}.wav
+    → Every 300ms: extract_since() from ring buffer → append to WAV file
+    → On stop:
+        1. Final flush, then finalize per audioExportFormat:
+           • format = "wav" → keep the WAV
+           • format = "mp3" → re-encode at mp3Bitrate (lame) and DELETE the source WAV
+        2. Insert session_audio_parts row from Rust (durable source of truth)
+        3. Register parent dir with TrustedAudioDirs so the audio-stream:// handler can serve it
+        4. Emit "session-part-ready" with { session_id, part_index, file_path, format,
+           duration_seconds, sample_rate }
+        5. Empty recordings (0 samples written) emit "session-wav-error" instead and the
+           file is deleted
 
-Fallback path (short sessions or re-export):
-    start_session() → records write_pos for mic + system buffers
-        ... audio accumulates in ring buffers ...
-    end_session() → snapshot_since(start_pos) → deinterleave_to_mono() → mix → mono WAV → CaptureResult
-    Limited to ring buffer capacity. Kept for export_session_wav re-export.
+No audio lost regardless of session length. Each Resume produces a new part; the FE
+concatenates parts in part_index order for playback and seeking. There is no
+separate "instant capture" or `start_session`/`end_session` Tauri surface — every
+recording (including dictation) goes through the live transcription pipeline against
+its own session id.
 ```
 
 ### Transcription
@@ -291,8 +278,8 @@ Startup also runs `db::ensure_runtime_schema()` *before* tauri-plugin-sql wires 
 
 The persisted domain model. All writes flow through `tauri-plugin-sql` via `lib/db.ts`; the DB file lives in the app data dir.
 
-- **Sessions** (`sessions`) — capture + transcription root. Owns a title, pinned flag, start/end timestamps, optional audio file path (`{id}.wav`), and optional note via `notes.session_id` FK. Session type distinguishes `"capture"` from `"manual"` (no transcript).
-- **Segments** (`segments`) — transcript rows: `(session_id, audio_offset_seconds, text, speaker_id?, is_backfill)`. Writes serialize through the `segmentQueueTail` promise queue to prevent backfill / live races. `speaker_id` is added by `db::ensure_runtime_schema()` at startup (outside the migration list — see note above).
+- **Sessions** (`sessions`) — capture + transcription root. Owns a title, pinned flag, start/end timestamps, zero-or-more `session_audio_parts` rows (one per recording run; resumed sessions append a new part), and optional note via `notes.session_id` FK. `session_type` distinguishes `"transcription"` (recorded + transcribed) from `"manual"` (no transcript — note-only).
+- **Segments** (`segments`) — transcript rows: `(session_id, audio_offset_seconds, text, speaker_id?, is_backfill)`. Writes serialize through the `segmentQueueTail` promise queue to prevent backfill / live races. `speaker_id` is added by the frontend's `getDb()` after migrations run (outside the migration list — see API_REFERENCE schema note).
 - **Notes** (`notes`) + **note versions** (`note_versions`) — rich-text body (Tiptap HTML). Versions persist the history for restore. One note per session.
 - **Folders** (`folders`) — nested via `parent_id` (root has null). Carry `icon`, `color`, `description`. The `description` feeds the AI multi-session system prompt as an organizational layer (see `AI_CONTEXT.md`).
 - **Session ↔ folder junction** (`session_folders`) — many-to-many. A session can live in multiple folders; branch conflicts detected by `findBranchConflicts()` in `lib/folder-tree.ts`.
@@ -441,7 +428,7 @@ Built-in tools (registered in `ai-tools.ts`):
 | `search_sessions` | `{ query: string, limit?: number }` | (none) | Read-only. FTS5 search across session titles, segment text, and notes. |
 | `search_dictations` | `{ query: string, limit?: number }` | (none) | Read-only. FTS5 search across `dictation_history`. |
 | `get_session_context` | `{ session_ids: string[], scope: "segments" \| "notes" \| "summary" \| "all" }` | (none) | Read-only. Expands a list of `session_ids` returned by `search_sessions` into the requested artifact (transcript chunks, notes, both, or a future summary). Hard-capped at 5 ids per call. When the chat context carries `allowedSessionIds`, out-of-scope ids are rejected. |
-| `replace_in_transcript` | `{ find: string, replacement: string, all?: boolean }` | `notes` (refresh segments) | Edits segment text in the durable DB rows — fixes typos / mis-transcriptions surgically. Undo restores the original text on every touched segment. |
+| `replace_in_transcript` | `{ find: string, replace: string, case_sensitive: boolean }` | `transcript` (refresh segments) | Edits segment text in the durable DB rows — fixes typos / mis-transcriptions surgically. Capped at 50 affected segments per call. Undo restores the pre-call text on every touched segment. |
 
 **Post-tool refresh** uses `getToolEffects(toolNames)` to determine what to refresh based on `affects` metadata:
 - `"session-meta"` → refresh sessions list + viewSession
