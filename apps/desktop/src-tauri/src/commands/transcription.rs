@@ -10,7 +10,6 @@ use yapstack_common::engines::engine_catalogue;
 use yapstack_common::types::EngineKind;
 use yapstack_transcription::{
     ModelManager, ModelSize, ParakeetVariant, SortformerVariant, TranscriptionClient,
-    TranscriptionResult,
 };
 
 use super::error::CommandError;
@@ -32,13 +31,6 @@ pub struct ModelInfoDto {
     pub path: Option<String>,
     pub display_name: String,
     pub approximate_size_bytes: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Type)]
-pub struct TranscriptionResultDto {
-    pub text: String,
-    pub segments: Vec<TranscriptSegmentDto>,
-    pub duration_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Type)]
@@ -173,35 +165,15 @@ impl From<yapstack_transcription::ModelInfo> for ModelInfoDto {
     }
 }
 
-impl From<TranscriptionResult> for TranscriptionResultDto {
-    fn from(r: TranscriptionResult) -> Self {
-        Self {
-            text: r.text,
-            segments: r
-                .segments
-                .into_iter()
-                .map(|s| TranscriptSegmentDto {
-                    start_ms: s.start_ms,
-                    end_ms: s.end_ms,
-                    text: s.text,
-                    confidence: s.confidence,
-                    speaker_id: s.speaker_id,
-                })
-                .collect(),
-            duration_ms: r.duration_ms,
-        }
-    }
-}
-
 // --- State types ---
 
 pub type ModelManagerState = Arc<Mutex<ModelManager>>;
-/// The transcription client is wrapped in `Arc` so `transcribe_audio` can
-/// clone a handle out of the state and drop the outer mutex guard before
-/// awaiting the sidecar round-trip. `TranscriptionClient` serializes stdin
-/// writes internally and demuxes responses via per-request oneshots, so
-/// multiple concurrent `&self` calls are safe — the outer mutex only guards
-/// initialization and teardown.
+/// The transcription client is wrapped in `Arc` so the live-transcription
+/// loop can clone a handle out of the state and drop the outer mutex guard
+/// before awaiting the sidecar round-trip. `TranscriptionClient` serializes
+/// stdin writes internally and demuxes responses via per-request oneshots,
+/// so multiple concurrent `&self` calls are safe — the outer mutex only
+/// guards initialization and teardown.
 pub type TranscriptionClientState = Arc<Mutex<Option<Arc<TranscriptionClient>>>>;
 
 // --- Commands ---
@@ -275,58 +247,15 @@ pub async fn delete_model(
 
 #[tauri::command]
 #[specta::specta]
-pub async fn transcribe_audio(
-    state: tauri::State<'_, TranscriptionClientState>,
-    audio_path: String,
-    language: Option<String>,
-    initial_prompt: Option<String>,
-) -> Result<TranscriptionResultDto, CommandError> {
-    info!(path = %audio_path, language = ?language, "transcribing audio");
-    // Clone the Arc<TranscriptionClient> out of the mutex and release the
-    // outer guard immediately. The sidecar round-trip can take seconds;
-    // holding the guard across it would serialize every other consumer of
-    // the client (shutdown, init, live transcription startup) behind this
-    // single transcribe call.
-    let client = {
-        let client_guard = state.lock().await;
-        client_guard.as_ref().cloned()
-    }
-    .ok_or(CommandError::NotInitialized {
-        message: "transcription engine not initialized".into(),
-    })?;
-
-    let result = client
-        .transcribe(
-            &PathBuf::from(&audio_path),
-            language.as_deref(),
-            initial_prompt.as_deref(),
-        )
-        .await
-        .map_err(|e| {
-            error!("transcription failed: {}", e);
-            CommandError::from(e)
-        })?;
-
-    info!(
-        duration_ms = result.duration_ms,
-        text_len = result.text.len(),
-        segments = result.segments.len(),
-        "transcription complete"
-    );
-    Ok(TranscriptionResultDto::from(result))
-}
-
-#[tauri::command]
-#[specta::specta]
 pub async fn shutdown_transcription_client(
     state: tauri::State<'_, TranscriptionClientState>,
 ) -> Result<(), CommandError> {
     info!("shutting down transcription client");
-    // Take the Arc out of the state so new `transcribe_audio` calls see None,
-    // then request graceful shutdown. `shutdown` takes `&self` (it writes a
-    // shutdown request through the internal tokio mutex on stdin), so any
-    // concurrent handle held by an in-flight transcribe still sees a clean
-    // sidecar wind-down rather than a hard process kill.
+    // Take the Arc out of the state, then request graceful shutdown.
+    // `shutdown` takes `&self` (it writes a shutdown request through the
+    // internal tokio mutex on stdin), so any concurrent handle held by an
+    // in-flight live-transcription chunk still sees a clean sidecar
+    // wind-down rather than a hard process kill.
     let arc_client = {
         let mut client_guard = state.lock().await;
         client_guard.take()

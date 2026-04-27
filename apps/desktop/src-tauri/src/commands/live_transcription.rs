@@ -67,11 +67,13 @@ pub struct LiveTranscriptionConfig {
     /// `audio_save_locations` at recording start so reconciliation can
     /// recover orphan parts on the next startup.
     pub audio_save_location: Option<String>,
-    /// Audio export format applied at part finalization: "wav" or "mp3".
-    /// Default: "mp3". Choosing "mp3" re-encodes the streamed WAV at
-    /// `mp3_bitrate` and deletes the source WAV; "wav" keeps the streamed
-    /// file as-is.
-    pub audio_export_format: Option<String>,
+    /// Audio export format applied at part finalization. Default: `Mp3`
+    /// (matches the legacy "no value provided" behaviour). Choosing `Mp3`
+    /// re-encodes the streamed WAV at `mp3_bitrate` and deletes the source
+    /// WAV; `Wav` keeps the streamed file as-is. Typed end-to-end so a stale
+    /// or typo'd caller fails at deserialization rather than silently
+    /// rerouting through the MP3 branch.
+    pub audio_export_format: Option<AudioExportFormatDto>,
     /// MP3 bitrate in kbps (e.g. 64, 128, 192). Only used when format is "mp3".
     pub mp3_bitrate: Option<u16>,
     /// Request speaker diarization on every transcribed chunk. Honored only
@@ -92,6 +94,31 @@ pub struct LiveTranscriptionConfig {
 
 fn default_persist_audio_part() -> bool {
     true
+}
+
+/// Typed surface for the audio finalize format. Lowercase serde tags match
+/// the legacy `"wav"` / `"mp3"` strings the FE already passes and the
+/// `format` field on `SessionPartReadyEvent` already emits, so this is a
+/// drop-in tightening of the Tauri boundary — generated TypeScript becomes
+/// a `"wav" | "mp3"` discriminated union instead of `string | null`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "lowercase")]
+pub enum AudioExportFormatDto {
+    Wav,
+    Mp3,
+}
+
+impl AudioExportFormatDto {
+    pub fn is_mp3(self) -> bool {
+        matches!(self, AudioExportFormatDto::Mp3)
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AudioExportFormatDto::Wav => "wav",
+            AudioExportFormatDto::Mp3 => "mp3",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
@@ -153,7 +180,9 @@ pub struct SessionPartReadyEvent {
     pub session_id: String,
     pub part_index: u32,
     pub file_path: String,
-    pub format: String,
+    /// Always emitted as the typed enum (`"wav"` or `"mp3"`). Listeners can
+    /// branch on this without string-literal guards.
+    pub format: AudioExportFormatDto,
     pub duration_seconds: f32,
     pub sample_rate: u32,
 }
@@ -2752,8 +2781,11 @@ async fn finalize_session_wav(
         return;
     }
 
-    let use_mp3 = ctx.config.audio_export_format.as_deref().unwrap_or("mp3") != "wav";
-    let result = if use_mp3 {
+    let format = ctx
+        .config
+        .audio_export_format
+        .unwrap_or(AudioExportFormatDto::Mp3);
+    let result = if format.is_mp3() {
         ws.writer
             .finalize_as_mp3(ctx.config.mp3_bitrate.unwrap_or(64))
     } else {
@@ -2773,7 +2805,6 @@ async fn finalize_session_wav(
         path.display(),
         duration
     );
-    let format = if use_mp3 { "mp3" } else { "wav" };
     let file_path_str = path.to_string_lossy().to_string();
 
     // Always register the parent dir with TrustedAudioDirs so the
@@ -2797,7 +2828,7 @@ async fn finalize_session_wav(
                 session_id: ws.session_id.clone(),
                 part_index: ws.part_index,
                 file_path: file_path_str.clone(),
-                format,
+                format: format.as_str(),
                 duration_seconds: duration,
                 sample_rate: ws.wav_sample_rate,
             };
@@ -2813,7 +2844,7 @@ async fn finalize_session_wav(
             session_id: ws.session_id,
             part_index: ws.part_index,
             file_path: file_path_str,
-            format: format.to_string(),
+            format,
             duration_seconds: duration,
             sample_rate: ws.wav_sample_rate,
         },
@@ -3179,7 +3210,10 @@ pub async fn start_live_transcription(
     }
     // Validate MP3 bitrate now so a misconfigured session doesn't fail late,
     // after the buffer has been drained into the session WAV with no recovery.
-    let will_write_mp3 = config.audio_export_format.as_deref().unwrap_or("mp3") != "wav";
+    let will_write_mp3 = config
+        .audio_export_format
+        .unwrap_or(AudioExportFormatDto::Mp3)
+        .is_mp3();
     if will_write_mp3 {
         if let Some(kbps) = config.mp3_bitrate {
             yapstack_audio::export::validate_mp3_bitrate(kbps).map_err(|e| {

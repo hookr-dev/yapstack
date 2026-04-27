@@ -117,9 +117,6 @@ export const tauriCommandsMock = () => ({
       .mockResolvedValue({ status: "ok", data: [] }),
     downloadModel: vi.fn().mockResolvedValue({ status: "ok", data: "" }),
     deleteModel: vi.fn().mockResolvedValue({ status: "ok", data: null }),
-    transcribeAudio: vi
-      .fn()
-      .mockResolvedValue({ status: "ok", data: null }),
     initTranscriptionClient: vi
       .fn()
       .mockResolvedValue({ status: "ok", data: null }),

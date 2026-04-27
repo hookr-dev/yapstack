@@ -136,14 +136,6 @@ async deleteModel(size: ModelSizeDto) : Promise<Result<null, CommandError>> {
     else return { status: "error", error: e  as any };
 }
 },
-async transcribeAudio(audioPath: string, language: string | null, initialPrompt: string | null) : Promise<Result<TranscriptionResultDto, CommandError>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("transcribe_audio", { audioPath, language, initialPrompt }) };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
 /**
  * Spawn the sidecar with the requested engine. Whisper requires
  * `whisper_model`; Parakeet requires `parakeet_variant` and may optionally
@@ -394,6 +386,14 @@ async revealLogDir() : Promise<Result<null, CommandError>> {
 /** user-defined types **/
 
 export type AudioDeviceInfoDto = { id: string | null; name: string; device_type: DeviceTypeDto; is_default: boolean }
+/**
+ * Typed surface for the audio finalize format. Lowercase serde tags match
+ * the legacy `"wav"` / `"mp3"` strings the FE already passes and the
+ * `format` field on `SessionPartReadyEvent` already emits, so this is a
+ * drop-in tightening of the Tauri boundary — generated TypeScript becomes
+ * a `"wav" | "mp3"` discriminated union instead of `string | null`.
+ */
+export type AudioExportFormatDto = "wav" | "mp3"
 export type BufferStatusDto = { mic: RingBufferInfoDto | null; system: RingBufferInfoDto | null }
 export type CaptureEnergyDto = { mic_rms: number | null; system_rms: number | null }
 export type CaptureSourceDto = "MicOnly" | "SystemOnly" | "Mixed"
@@ -477,12 +477,14 @@ persist_audio_part?: boolean;
  */
 audio_save_location: string | null; 
 /**
- * Audio export format applied at part finalization: "wav" or "mp3".
- * Default: "mp3". Choosing "mp3" re-encodes the streamed WAV at
- * `mp3_bitrate` and deletes the source WAV; "wav" keeps the streamed
- * file as-is.
+ * Audio export format applied at part finalization. Default: `Mp3`
+ * (matches the legacy "no value provided" behaviour). Choosing `Mp3`
+ * re-encodes the streamed WAV at `mp3_bitrate` and deletes the source
+ * WAV; `Wav` keeps the streamed file as-is. Typed end-to-end so a stale
+ * or typo'd caller fails at deserialization rather than silently
+ * rerouting through the MP3 branch.
  */
-audio_export_format: string | null; 
+audio_export_format: AudioExportFormatDto | null; 
 /**
  * MP3 bitrate in kbps (e.g. 64, 128, 192). Only used when format is "mp3".
  */
@@ -539,13 +541,6 @@ export type RingBufferInfoDto = { capacity_samples: number; samples_written: num
 export type ScreenCapturePermissionDto = "Granted" | "NotDetermined" | "Unavailable"
 export type SortformerModelInfoDto = { variant: SortformerVariantDto; downloaded: boolean; display_name: string; approximate_size_bytes: number }
 export type SortformerVariantDto = "V2_1"
-export type TranscriptSegmentDto = { start_ms: number; end_ms: number; text: string; confidence: number; 
-/**
- * Populated when the active engine is Parakeet *and* diarization
- * was requested for the originating transcribe call. `None` for Whisper.
- */
-speaker_id: number | null }
-export type TranscriptionResultDto = { text: string; segments: TranscriptSegmentDto[]; duration_ms: number }
 export type TranscriptionStatusDto = { initialized: boolean }
 
 /** tauri-specta globals **/
