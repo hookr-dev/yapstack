@@ -37,11 +37,20 @@ export function ChatView({
   const setSegmentSelection = useAppStore((s) => s.setSegmentSelection);
   const clearSegmentSelection = useAppStore((s) => s.clearSegmentSelection);
   const deleteSegments = useAppStore((s) => s.deleteSegments);
+  // `currentPlaybackTime` persists across sessions and is `0` even
+  // when no audio has played, so it isn't a reliable "audio active"
+  // signal — gate playback UI on `isPlaying` instead.
+  const isPlaying = useAppStore((s) => s.isPlaying);
+  const setPlaybackTime = useAppStore((s) => s.setPlaybackTime);
+  const setIsPlaying = useAppStore((s) => s.setIsPlaying);
 
-  // Clear selection when the session being viewed changes.
+  // Playback state is global; reset on session switch so it doesn't
+  // bleed across sessions.
   useEffect(() => {
     clearSegmentSelection();
-  }, [sessionId, clearSegmentSelection]);
+    setPlaybackTime(0);
+    setIsPlaying(false);
+  }, [sessionId, clearSegmentSelection, setPlaybackTime, setIsPlaying]);
 
   // Selection-scoped keyboard shortcuts: Escape clears, Backspace/Delete
   // bulk-deletes. Only fires when the user isn't typing in an input and
@@ -110,21 +119,24 @@ export function ChatView({
 
   // When playback stops, resume following so the next session sticks again.
   useEffect(() => {
-    if (currentPlaybackTime == null) {
+    if (!isPlaying) {
       setUserScrolled(false);
     }
-  }, [currentPlaybackTime]);
+  }, [isPlaying]);
 
   // Auto-scroll to the active segment during playback (unless the user is freed).
   useEffect(() => {
-    if (currentPlaybackTime != null && activeRef.current && !userScrolled) {
-      autoScrollingRef.current = true;
-      activeRef.current.scrollIntoView({ behavior: "smooth", block: "nearest" });
-      setTimeout(() => {
-        autoScrollingRef.current = false;
-      }, 150);
-    }
-  }, [currentPlaybackTime, userScrolled]);
+    if (!isPlaying || !activeRef.current || userScrolled) return;
+    autoScrollingRef.current = true;
+    activeRef.current.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    // Cleanup matters here — the effect re-runs on every timeupdate
+    // tick, so without it stale timers race with subsequent legit
+    // scrolls and flip autoScrollingRef.current mid-gesture.
+    const t = setTimeout(() => {
+      autoScrollingRef.current = false;
+    }, 150);
+    return () => clearTimeout(t);
+  }, [currentPlaybackTime, userScrolled, isPlaying]);
 
   // Disengage stick-to-bottom on user scroll. Programmatic autoscroll only
   // moves the viewport *down*, so any decrease in scrollTop is unambiguously
@@ -142,7 +154,7 @@ export function ChatView({
       const wentUp = newScrollTop < lastScrollTopRef.current - 1;
       lastScrollTopRef.current = newScrollTop;
 
-      if (currentPlaybackTime != null && activeRef.current) {
+      if (isPlaying && activeRef.current) {
         if (autoScrollingRef.current) return;
         const rect = activeRef.current.getBoundingClientRect();
         const vpRect = viewport.getBoundingClientRect();
@@ -166,22 +178,17 @@ export function ChatView({
 
     viewport.addEventListener("scroll", handleScroll, { passive: true });
     return () => viewport.removeEventListener("scroll", handleScroll);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [currentPlaybackTime != null]);
+  }, [isPlaying]);
 
   const handleJumpToCurrent = useCallback(() => {
     setUserScrolled(false);
     requestAnimationFrame(() => {
-      if (currentPlaybackTime != null && activeRef.current) {
-        activeRef.current.scrollIntoView({
-          behavior: "smooth",
-          block: "center",
-        });
-      } else {
-        bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-      }
+      activeRef.current?.scrollIntoView({
+        behavior: "smooth",
+        block: "center",
+      });
     });
-  }, [currentPlaybackTime]);
+  }, []);
 
   const handleTimestampClick = useCallback(
     (time: number) => {
@@ -279,6 +286,11 @@ export function ChatView({
     // right-click ContextMenu; the marquee only starts on whitespace.
     // Drag-select bubbles via shift-click instead.
     if (target.closest("[data-segment-id]")) return;
+    // preventDefault below blocks the focus shift the click would
+    // otherwise cause; explicitly blur so an editing bubble's onBlur
+    // still fires and saves.
+    const active = document.activeElement as HTMLElement | null;
+    if (active && active !== document.body) active.blur();
     // Pointer capture so pointermove fires past the viewport edge —
     // required for edge auto-scroll.
     e.currentTarget.setPointerCapture(e.pointerId);
@@ -360,16 +372,17 @@ export function ChatView({
     setMarquee(null);
   };
 
-  // Find the active segment based on playback time
+  // Find the active segment based on playback time. Null when not
+  // playing — `currentPlaybackTime` alone is unreliable (see above).
   const activeSegmentId = useMemo(() => {
-    if (currentPlaybackTime == null) return null;
+    if (!isPlaying || currentPlaybackTime == null) return null;
     for (let i = segments.length - 1; i >= 0; i--) {
       if (segments[i].audio_offset_seconds <= currentPlaybackTime) {
         return segments[i].id;
       }
     }
     return null;
-  }, [segments, currentPlaybackTime]);
+  }, [segments, currentPlaybackTime, isPlaying]);
 
   if (segments.length === 0 && !backfillActive) {
     return (
@@ -431,7 +444,7 @@ export function ChatView({
         </div>
       </ScrollArea>
       <BulkActionsBar segments={segments} readOnly={!isEditable} />
-      {userScrolled && (
+      {userScrolled && isPlaying && (
         <button
           onClick={handleJumpToCurrent}
           className="absolute bottom-3 left-1/2 -translate-x-1/2 z-10 flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium bg-primary text-primary-foreground rounded-full shadow-md hover:bg-primary/90 transition-colors"
@@ -441,7 +454,7 @@ export function ChatView({
           ) : (
             <ArrowDown className="h-3 w-3" />
           )}
-          {currentPlaybackTime != null ? "Jump to current" : "Jump to latest"}
+          Jump to current
         </button>
       )}
     </div>
