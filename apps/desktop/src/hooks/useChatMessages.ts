@@ -425,7 +425,7 @@ export function useChatMessages(
         // one final round runs without tools so the model is forced to
         // synthesize a textual answer over the accumulated observations
         // instead of leaving the user with a row of tool badges and no prose.
-        const MAX_TOOL_ROUNDS = 3;
+        const MAX_TOOL_ROUNDS = 5;
         let turnMessages = chatMessages;
 
         for (let round = 0; round <= MAX_TOOL_ROUNDS; round++) {
