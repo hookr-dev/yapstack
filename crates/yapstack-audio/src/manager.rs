@@ -1,15 +1,11 @@
 use std::sync::Arc;
-use std::time::Instant;
 
 use tracing::{debug, error, warn};
 use yapstack_common::config::AudioConfig;
 use yapstack_common::types::{CaptureSource, CaptureState, CaptureStatus, PermissionStatus};
 
-use crate::capture::{
-    BufferPositions, CaptureResult, CapturedAudio, SeparateExtraction, SessionMark,
-};
+use crate::capture::{BufferPositions, SeparateExtraction};
 use crate::error::AudioError;
-use crate::export;
 use crate::mic::MicrophoneCapture;
 use crate::mixer::{self, MixConfig};
 use crate::ring_buffer::{AudioRingBuffer, RingBufferInfo, SharedAudioRingBuffer};
@@ -54,7 +50,6 @@ pub struct AudioManager {
     error_message: Option<String>,
     mic_buffer: Option<SharedAudioRingBuffer>,
     system_buffer: Option<SharedAudioRingBuffer>,
-    session_mark: Option<SessionMark>,
     /// Push-based default-device change listeners (macOS only; no-op stubs
     /// elsewhere). `None` if CoreAudio rejected listener registration — the
     /// capture path degrades to the write-pos stall watchdog in that case.
@@ -96,7 +91,6 @@ impl AudioManager {
             error_message: None,
             mic_buffer: None,
             system_buffer: None,
-            session_mark: None,
             input_watcher,
             output_watcher,
             devices_watcher,
@@ -285,34 +279,9 @@ impl AudioManager {
             .unwrap_or(yapstack_common::config::DEFAULT_SAMPLE_RATE)
     }
 
-    /// Returns the sample rate tied to the buffer whose samples the caller
-    /// actually receives for `source`. Using `active_sample_rate()` here would
-    /// return the mic rate even for SystemOnly callers with a stale mic buffer
-    /// present, producing wrong-rate WAV metadata. For Mixed, mic's rate wins
-    /// because `resample_and_mix` upsamples system to mic's rate.
-    fn sample_rate_for_source(&self, source: CaptureSource) -> u32 {
-        match source {
-            CaptureSource::MicOnly => self
-                .mic_buffer
-                .as_ref()
-                .map(|b| b.sample_rate())
-                .unwrap_or_else(|| self.active_sample_rate()),
-            CaptureSource::SystemOnly => self
-                .system_buffer
-                .as_ref()
-                .map(|b| b.sample_rate())
-                .unwrap_or_else(|| self.active_sample_rate()),
-            CaptureSource::Mixed => match (self.mic_buffer.as_ref(), self.system_buffer.as_ref()) {
-                (Some(mb), _) => mb.sample_rate(),
-                (None, Some(sb)) => sb.sample_rate(),
-                (None, None) => self.active_sample_rate(),
-            },
-        }
-    }
-
     /// Resample system audio to match mic rate (if different) and mix to mono.
-    /// Used by instant capture, extract_since, and end_session.
-    /// On resample failure, logs the error and falls back to mic-only audio.
+    /// Used by `extract_since`. On resample failure, logs the error and falls
+    /// back to mic-only audio.
     fn resample_and_mix(
         &self,
         mic_samples: &[f32],
@@ -342,125 +311,6 @@ impl AudioManager {
             }
         }
         mixer::mix_to_mono(mic_samples, system_samples, &config)
-    }
-
-    // --- Capture API ---
-
-    /// Extracts captured audio from the last `duration_seconds` of both buffers.
-    ///
-    /// Each buffer's own sample rate and channel count are used for sample count
-    /// calculation. Multi-channel data is deinterleaved to mono so the returned
-    /// `CapturedAudio` always has `channels == 1`.
-    ///
-    /// **Note:** The returned `sample_rate` is the mic buffer's rate (or system
-    /// buffer's if mic is absent). When mixing sources with different sample rates,
-    /// callers must resample before mixing — see `trigger_instant_capture` and
-    /// `end_session` for examples.
-    pub fn extract_captured_audio(&self, duration_seconds: f32) -> CapturedAudio {
-        let mic = self.mic_buffer.as_ref().map(|b| {
-            let sample_count =
-                (duration_seconds * b.sample_rate() as f32 * b.channels() as f32) as usize;
-            let raw = b.snapshot_samples(sample_count);
-            (
-                mixer::deinterleave_to_mono(&raw, b.channels()).into_owned(),
-                b.sample_rate(),
-            )
-        });
-
-        let system = self.system_buffer.as_ref().map(|b| {
-            let sample_count =
-                (duration_seconds * b.sample_rate() as f32 * b.channels() as f32) as usize;
-            let raw = b.snapshot_samples(sample_count);
-            (
-                mixer::deinterleave_to_mono(&raw, b.channels()).into_owned(),
-                b.sample_rate(),
-            )
-        });
-
-        let mic_sample_rate = mic.as_ref().map(|(_, r)| *r);
-        let system_sample_rate = system.as_ref().map(|(_, r)| *r);
-
-        let mic_samples = mic.map(|(s, _)| s).unwrap_or_default();
-        let system_samples = system.map(|(s, _)| s).unwrap_or_default();
-
-        let sample_rate = self.active_sample_rate();
-
-        let mono_len = mic_samples.len().max(system_samples.len());
-        let actual_duration = mono_len as f32 / sample_rate as f32;
-
-        CapturedAudio {
-            mic_samples,
-            system_samples,
-            mic_sample_rate,
-            system_sample_rate,
-            sample_rate,
-            channels: 1,
-            duration_seconds: actual_duration,
-        }
-    }
-
-    /// Extracts mono audio for a single source over the last `seconds` window
-    /// and returns `(samples, sample_rate)`. For Mixed, resamples system to
-    /// mic's rate before mixing. Returns `Err(NoBufferAvailable)` if the
-    /// requested source has no data.
-    pub fn extract_source_samples(
-        &self,
-        seconds: f32,
-        source: CaptureSource,
-        mix_config: Option<&MixConfig>,
-    ) -> Result<(Vec<f32>, u32)> {
-        let captured = self.extract_captured_audio(seconds);
-        let sample_rate = self.sample_rate_for_source(source);
-
-        let samples = match source {
-            CaptureSource::MicOnly => {
-                if captured.mic_samples.is_empty() {
-                    return Err(AudioError::NoBufferAvailable);
-                }
-                captured.mic_samples
-            }
-            CaptureSource::SystemOnly => {
-                if captured.system_samples.is_empty() {
-                    return Err(AudioError::NoBufferAvailable);
-                }
-                captured.system_samples
-            }
-            CaptureSource::Mixed => {
-                if captured.mic_samples.is_empty() && captured.system_samples.is_empty() {
-                    return Err(AudioError::NoBufferAvailable);
-                }
-                self.resample_and_mix(&captured.mic_samples, &captured.system_samples, mix_config)
-            }
-        };
-
-        if samples.is_empty() {
-            return Err(AudioError::NoBufferAvailable);
-        }
-
-        Ok((samples, sample_rate))
-    }
-
-    /// Performs an instant capture of the last N seconds, writing to a temp WAV file.
-    ///
-    /// All audio is deinterleaved to mono before export. The WAV file is always
-    /// single-channel at the buffer's native sample rate.
-    pub fn trigger_instant_capture(
-        &self,
-        seconds: f32,
-        source: CaptureSource,
-        mix_config: Option<&MixConfig>,
-    ) -> Result<CaptureResult> {
-        let (samples, sample_rate) = self.extract_source_samples(seconds, source, mix_config)?;
-
-        let duration_seconds = samples.len() as f32 / sample_rate as f32;
-        let file_path = export::write_wav_to_temp(&samples, sample_rate, 1)?;
-
-        Ok(CaptureResult {
-            file_path,
-            duration_seconds,
-            sample_rate,
-            source,
-        })
     }
 
     // --- Position tracking API ---
@@ -701,120 +551,6 @@ impl AudioManager {
         });
 
         (mic_energy, system_energy)
-    }
-
-    // --- Session API ---
-
-    /// Starts a recording session by marking the current buffer write positions.
-    pub fn start_session(&mut self) -> Result<()> {
-        if self.session_mark.is_some() {
-            return Err(AudioError::SessionAlreadyActive);
-        }
-
-        let mic_write_pos = self
-            .mic_buffer
-            .as_ref()
-            .map(|b| b.samples_written())
-            .unwrap_or(0);
-        let system_write_pos = self
-            .system_buffer
-            .as_ref()
-            .map(|b| b.samples_written())
-            .unwrap_or(0);
-
-        self.session_mark = Some(SessionMark {
-            mic_write_pos,
-            system_write_pos,
-            started_at: Instant::now(),
-        });
-
-        Ok(())
-    }
-
-    /// Ends the current session, captures all audio since the session started,
-    /// and writes it to a temp WAV file.
-    ///
-    /// Each buffer's own channel count is used for deinterleaving to mono.
-    /// The WAV file is always single-channel.
-    pub fn end_session(
-        &mut self,
-        source: CaptureSource,
-        mix_config: Option<&MixConfig>,
-    ) -> Result<CaptureResult> {
-        let mark = self
-            .session_mark
-            .take()
-            .ok_or(AudioError::NoActiveSession)?;
-
-        let mic_samples = self
-            .mic_buffer
-            .as_ref()
-            .map(|b| {
-                let snap = b.snapshot_since(mark.mic_write_pos);
-                let total_new = b.samples_written().saturating_sub(mark.mic_write_pos);
-                if total_new > b.capacity() {
-                    warn!(
-                        "mic session exceeded buffer capacity ({} > {}), audio truncated",
-                        total_new,
-                        b.capacity()
-                    );
-                }
-                mixer::deinterleave_to_mono(&snap, b.channels()).into_owned()
-            })
-            .unwrap_or_default();
-
-        let system_samples = self
-            .system_buffer
-            .as_ref()
-            .map(|b| {
-                let snap = b.snapshot_since(mark.system_write_pos);
-                let total_new = b.samples_written().saturating_sub(mark.system_write_pos);
-                if total_new > b.capacity() {
-                    warn!(
-                        "system session exceeded buffer capacity ({} > {}), audio truncated",
-                        total_new,
-                        b.capacity()
-                    );
-                }
-                mixer::deinterleave_to_mono(&snap, b.channels()).into_owned()
-            })
-            .unwrap_or_default();
-
-        let sample_rate = self.sample_rate_for_source(source);
-
-        let samples = match source {
-            CaptureSource::MicOnly => mic_samples,
-            CaptureSource::SystemOnly => system_samples,
-            CaptureSource::Mixed => {
-                self.resample_and_mix(&mic_samples, &system_samples, mix_config)
-            }
-        };
-
-        if samples.is_empty() {
-            return Err(AudioError::NoBufferAvailable);
-        }
-
-        let duration_seconds = samples.len() as f32 / sample_rate as f32;
-        let file_path = export::write_wav_to_temp(&samples, sample_rate, 1)?;
-
-        Ok(CaptureResult {
-            file_path,
-            duration_seconds,
-            sample_rate,
-            source,
-        })
-    }
-
-    /// Returns whether a session is currently active.
-    pub fn is_session_active(&self) -> bool {
-        self.session_mark.is_some()
-    }
-
-    /// Returns the elapsed seconds since the session started, if active.
-    pub fn session_elapsed_seconds(&self) -> Option<f32> {
-        self.session_mark
-            .as_ref()
-            .map(|m| m.started_at.elapsed().as_secs_f32())
     }
 
     // --- Config API ---
@@ -1216,35 +952,6 @@ mod tests {
     }
 
     #[test]
-    fn test_session_not_active_initially() {
-        let manager = AudioManager::new();
-        assert!(!manager.is_session_active());
-        assert!(manager.session_elapsed_seconds().is_none());
-    }
-
-    #[test]
-    fn test_end_session_without_start_fails() {
-        let mut manager = AudioManager::new();
-        let result = manager.end_session(CaptureSource::MicOnly, None);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_double_start_session_fails() {
-        let mut manager = AudioManager::new();
-        manager.start_session().unwrap();
-        let result = manager.start_session();
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_instant_capture_without_buffers_fails() {
-        let manager = AudioManager::new();
-        let result = manager.trigger_instant_capture(5.0, CaptureSource::MicOnly, None);
-        assert!(result.is_err());
-    }
-
-    #[test]
     fn test_buffer_positions_no_buffers() {
         let manager = AudioManager::new();
         let pos = manager.buffer_positions();
@@ -1358,240 +1065,6 @@ mod tests {
     }
 
     // --- End-to-end pipeline integration tests ---
-
-    /// f32→i16 quantization tolerance: ~2/32768
-    const ROUNDTRIP_TOLERANCE: f32 = 2.0 / 32767.0;
-
-    /// Read mono WAV samples back as f32.
-    fn read_wav_samples(path: &std::path::Path) -> (Vec<f32>, u32) {
-        let reader = hound::WavReader::open(path).unwrap();
-        let spec = reader.spec();
-        let bit_depth = spec.bits_per_sample;
-        let samples: Vec<f32> = reader
-            .into_samples::<i16>()
-            .map(|s| s.unwrap() as f32 / (1 << (bit_depth - 1)) as f32)
-            .collect();
-        (samples, spec.sample_rate)
-    }
-
-    #[test]
-    fn test_instant_capture_roundtrip_mono() {
-        let mut manager = AudioManager::new();
-        let buffer = Arc::new(AudioRingBuffer::with_duration(10.0, 16000, 1));
-        let input: Vec<f32> = vec![0.25; 16000]; // 1 second
-        buffer.write(&input);
-        manager.mic_buffer = Some(buffer);
-
-        let result = manager
-            .trigger_instant_capture(1.0, CaptureSource::MicOnly, None)
-            .unwrap();
-        assert!(result.duration_seconds > 0.9);
-        assert_eq!(result.sample_rate, 16000);
-
-        let (samples, sr) = read_wav_samples(&result.file_path);
-        assert_eq!(sr, 16000);
-        assert!(!samples.is_empty());
-        for &s in &samples {
-            assert!(
-                (s - 0.25).abs() < ROUNDTRIP_TOLERANCE,
-                "expected ~0.25, got {}",
-                s
-            );
-        }
-        let _ = std::fs::remove_file(&result.file_path);
-    }
-
-    #[test]
-    fn test_instant_capture_roundtrip_stereo_deinterleave() {
-        let mut manager = AudioManager::new();
-        let buffer = Arc::new(AudioRingBuffer::with_duration(10.0, 48000, 2));
-        // Interleaved stereo: L=0.8, R=0.2 → mono average ≈ 0.5
-        let mut input = Vec::with_capacity(96000);
-        for _ in 0..48000 {
-            input.push(0.8);
-            input.push(0.2);
-        }
-        buffer.write(&input);
-        manager.mic_buffer = Some(buffer);
-
-        let result = manager
-            .trigger_instant_capture(1.0, CaptureSource::MicOnly, None)
-            .unwrap();
-        let (samples, sr) = read_wav_samples(&result.file_path);
-        assert_eq!(sr, 48000);
-        for &s in &samples {
-            assert!(
-                (s - 0.5).abs() < ROUNDTRIP_TOLERANCE,
-                "expected ~0.5, got {}",
-                s
-            );
-        }
-        let _ = std::fs::remove_file(&result.file_path);
-    }
-
-    #[test]
-    fn test_session_lifecycle_with_wav_output() {
-        let mut manager = AudioManager::new();
-        let buffer = Arc::new(AudioRingBuffer::with_duration(10.0, 16000, 1));
-        manager.mic_buffer = Some(Arc::clone(&buffer));
-
-        manager.start_session().unwrap();
-        assert!(manager.is_session_active());
-
-        // Write audio during session
-        let signal: Vec<f32> = vec![0.3; 8000]; // 0.5s
-        buffer.write(&signal);
-
-        let result = manager.end_session(CaptureSource::MicOnly, None).unwrap();
-        assert!(!manager.is_session_active());
-        assert!(result.duration_seconds > 0.4);
-
-        let (samples, sr) = read_wav_samples(&result.file_path);
-        assert_eq!(sr, 16000);
-        for &s in &samples {
-            assert!(
-                (s - 0.3).abs() < ROUNDTRIP_TOLERANCE,
-                "expected ~0.3, got {}",
-                s
-            );
-        }
-        let _ = std::fs::remove_file(&result.file_path);
-    }
-
-    #[test]
-    fn test_session_captures_only_session_audio() {
-        let mut manager = AudioManager::new();
-        let buffer = Arc::new(AudioRingBuffer::with_duration(10.0, 16000, 1));
-        manager.mic_buffer = Some(Arc::clone(&buffer));
-
-        // Write pre-session audio
-        let pre_signal: Vec<f32> = vec![0.9; 8000];
-        buffer.write(&pre_signal);
-
-        manager.start_session().unwrap();
-
-        // Write session audio
-        let session_signal: Vec<f32> = vec![0.1; 4000];
-        buffer.write(&session_signal);
-
-        let result = manager.end_session(CaptureSource::MicOnly, None).unwrap();
-
-        let (samples, _) = read_wav_samples(&result.file_path);
-        // Should only contain session audio (~0.1), not pre-session (~0.9)
-        assert_eq!(samples.len(), 4000);
-        for &s in &samples {
-            assert!(
-                (s - 0.1).abs() < ROUNDTRIP_TOLERANCE,
-                "expected ~0.1 (session audio), got {} (may contain pre-session audio)",
-                s
-            );
-        }
-        let _ = std::fs::remove_file(&result.file_path);
-    }
-
-    #[test]
-    fn test_mixed_capture_roundtrip() {
-        let mut manager = AudioManager::new();
-        let mic_buf = Arc::new(AudioRingBuffer::with_duration(10.0, 16000, 1));
-        let sys_buf = Arc::new(AudioRingBuffer::with_duration(10.0, 16000, 1));
-
-        // Asymmetric values so the assertion depends on BOTH sources contributing
-        mic_buf.write(&vec![0.6_f32; 16000]);
-        sys_buf.write(&vec![0.2_f32; 16000]);
-
-        manager.mic_buffer = Some(mic_buf);
-        manager.system_buffer = Some(sys_buf);
-
-        let mix_config = MixConfig {
-            mic_gain: 0.5,
-            system_gain: 0.5,
-            normalize: false,
-        };
-        let result = manager
-            .trigger_instant_capture(1.0, CaptureSource::Mixed, Some(&mix_config))
-            .unwrap();
-
-        let (samples, sr) = read_wav_samples(&result.file_path);
-        assert_eq!(sr, 16000);
-        assert!(!samples.is_empty());
-        // Expected: 0.6*0.5 + 0.2*0.5 = 0.4
-        // If mixer ignores system → 0.3, if ignores mic → 0.1 — both distinguishable
-        for &s in &samples {
-            assert!(
-                (s - 0.4).abs() < ROUNDTRIP_TOLERANCE,
-                "expected ~0.4, got {}",
-                s
-            );
-        }
-        let _ = std::fs::remove_file(&result.file_path);
-    }
-
-    #[test]
-    fn test_mixed_capture_stereo_system_mono_mic() {
-        let mut manager = AudioManager::new();
-        let mic_buf = Arc::new(AudioRingBuffer::with_duration(10.0, 16000, 1));
-        let sys_buf = Arc::new(AudioRingBuffer::with_duration(10.0, 16000, 2));
-
-        mic_buf.write(&vec![0.4_f32; 16000]);
-        // Stereo system: L=0.8, R=0.4 → mono avg = 0.6
-        let mut stereo = Vec::with_capacity(32000);
-        for _ in 0..16000 {
-            stereo.push(0.8);
-            stereo.push(0.4);
-        }
-        sys_buf.write(&stereo);
-
-        manager.mic_buffer = Some(mic_buf);
-        manager.system_buffer = Some(sys_buf);
-
-        let mix_config = MixConfig {
-            mic_gain: 0.5,
-            system_gain: 0.5,
-            normalize: false,
-        };
-        let result = manager
-            .trigger_instant_capture(1.0, CaptureSource::Mixed, Some(&mix_config))
-            .unwrap();
-
-        let (samples, sr) = read_wav_samples(&result.file_path);
-        assert_eq!(sr, 16000);
-        assert!(!samples.is_empty());
-        // mic mono=0.4, system mono=0.6 → 0.4*0.5 + 0.6*0.5 = 0.5
-        // If mixer ignores system → 0.2, if ignores mic → 0.3 — both distinguishable
-        for &s in &samples {
-            assert!(
-                (s - 0.5).abs() < ROUNDTRIP_TOLERANCE,
-                "expected ~0.5, got {}",
-                s
-            );
-        }
-        let _ = std::fs::remove_file(&result.file_path);
-    }
-
-    #[test]
-    fn test_sample_rate_mismatch_instant_capture_resamples() {
-        let mut manager = AudioManager::new();
-        let mic_buf = Arc::new(AudioRingBuffer::with_duration(10.0, 16000, 1));
-        let sys_buf = Arc::new(AudioRingBuffer::with_duration(10.0, 48000, 1));
-
-        mic_buf.write(&vec![0.5_f32; 16000]);
-        sys_buf.write(&vec![0.5_f32; 48000]);
-
-        manager.mic_buffer = Some(mic_buf);
-        manager.system_buffer = Some(sys_buf);
-
-        // Should succeed by resampling system audio to 16kHz
-        let result = manager.trigger_instant_capture(1.0, CaptureSource::Mixed, None);
-        assert!(
-            result.is_ok(),
-            "expected success with resampling, got {:?}",
-            result.err()
-        );
-        let capture = result.unwrap();
-        assert_eq!(capture.sample_rate, 16000);
-        assert!(capture.duration_seconds > 0.5);
-        let _ = std::fs::remove_file(&capture.file_path);
-    }
 
     #[test]
     fn test_sample_rate_mismatch_extract_since_resamples() {
@@ -1850,58 +1323,6 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_source_samples_system_only_reports_system_rate_with_stale_mic() {
-        // Mirror of the extract_since test for the instant-capture / session-export path.
-        // trigger_instant_capture previously used `active_sample_rate()` (mic-preferred),
-        // which wrote SystemOnly audio under the mic rate when a stale mic buffer was
-        // present — garbled duration and playback speed in the exported WAV.
-        let mut manager = AudioManager::new();
-        let mic_buf = Arc::new(AudioRingBuffer::with_duration(10.0, 44100, 1));
-        let sys_buf = Arc::new(AudioRingBuffer::with_duration(10.0, 48000, 2));
-        manager.mic_buffer = Some(Arc::clone(&mic_buf));
-        manager.system_buffer = Some(Arc::clone(&sys_buf));
-        sys_buf.write(&vec![0.3_f32; 9600]); // ~100ms of stereo audio @ 48k
-
-        let (_samples, reported_sr) = manager
-            .extract_source_samples(1.0, CaptureSource::SystemOnly, None)
-            .expect("system extraction returns samples");
-        assert_eq!(
-            reported_sr, 48000,
-            "SystemOnly must report system rate, not mic rate"
-        );
-    }
-
-    #[test]
-    fn test_extract_source_samples_mic_only_reports_mic_rate_with_stale_system() {
-        let mut manager = AudioManager::new();
-        let mic_buf = Arc::new(AudioRingBuffer::with_duration(10.0, 44100, 1));
-        let sys_buf = Arc::new(AudioRingBuffer::with_duration(10.0, 48000, 2));
-        manager.mic_buffer = Some(Arc::clone(&mic_buf));
-        manager.system_buffer = Some(Arc::clone(&sys_buf));
-        mic_buf.write(&vec![0.3_f32; 4410]);
-
-        let (_samples, reported_sr) = manager
-            .extract_source_samples(1.0, CaptureSource::MicOnly, None)
-            .expect("mic extraction returns samples");
-        assert_eq!(reported_sr, 44100, "MicOnly must report mic rate");
-    }
-
-    #[test]
-    fn test_captured_audio_carries_per_source_rates() {
-        let mut manager = AudioManager::new();
-        let mic_buf = Arc::new(AudioRingBuffer::with_duration(10.0, 44100, 1));
-        let sys_buf = Arc::new(AudioRingBuffer::with_duration(10.0, 48000, 2));
-        manager.mic_buffer = Some(Arc::clone(&mic_buf));
-        manager.system_buffer = Some(Arc::clone(&sys_buf));
-        mic_buf.write(&vec![0.2_f32; 100]);
-        sys_buf.write(&vec![0.2_f32; 200]);
-
-        let captured = manager.extract_captured_audio(0.01);
-        assert_eq!(captured.mic_sample_rate, Some(44100));
-        assert_eq!(captured.system_sample_rate, Some(48000));
-    }
-
-    #[test]
     fn test_extract_since_mic_only_reports_mic_rate_with_stale_system_buffer() {
         let mut manager = AudioManager::new();
         let mic_buf = Arc::new(AudioRingBuffer::with_duration(10.0, 44100, 1));
@@ -1997,33 +1418,6 @@ mod tests {
         assert_eq!(new_pos2.mic_pos, 12800);
         // System fully consumed at 0.3s
         assert_eq!(new_pos2.system_pos, 24000 + 14400);
-    }
-
-    #[test]
-    fn test_sample_rate_mismatch_end_session_resamples() {
-        let mut manager = AudioManager::new();
-        let mic_buf = Arc::new(AudioRingBuffer::with_duration(10.0, 16000, 1));
-        let sys_buf = Arc::new(AudioRingBuffer::with_duration(10.0, 48000, 1));
-
-        manager.mic_buffer = Some(Arc::clone(&mic_buf));
-        manager.system_buffer = Some(Arc::clone(&sys_buf));
-
-        manager.start_session().unwrap();
-
-        mic_buf.write(&vec![0.5_f32; 16000]);
-        sys_buf.write(&vec![0.5_f32; 48000]);
-
-        // Should succeed by resampling system audio to 16kHz
-        let result = manager.end_session(CaptureSource::Mixed, None);
-        assert!(
-            result.is_ok(),
-            "expected success with resampling, got {:?}",
-            result.err()
-        );
-        let capture = result.unwrap();
-        assert_eq!(capture.sample_rate, 16000);
-        assert!(capture.duration_seconds > 0.5);
-        let _ = std::fs::remove_file(&capture.file_path);
     }
 
     #[test]

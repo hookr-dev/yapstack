@@ -2015,7 +2015,21 @@ function createAppStore() {
             // model (handles WAV or MP3, treats NotFound as no-op). The
             // legacy session-glob deleter scanned the audio dir and could
             // miss parts that lived under a custom audio_save_location.
-            commands.deleteAudioFiles([entry.wav_file_path]).catch(() => {});
+            // Awaited so a failure (file held by player, perms) is surfaced
+            // before the DB row goes away — otherwise the path is gone and
+            // we have no recovery handle.
+            try {
+              await commands.deleteAudioFiles([entry.wav_file_path]);
+            } catch (cleanupErr) {
+              console.error(
+                `Failed to delete dictation audio for ${id}:`,
+                cleanupErr,
+                entry.wav_file_path,
+              );
+              toast.error("Audio file was not deleted", {
+                id: `dictation-audio-cleanup-${id}`,
+              });
+            }
           }
           await dbDeleteDictationHistoryEntry(id);
           set({ dictationHistory: get().dictationHistory.filter((h) => h.id !== id) });
@@ -2029,12 +2043,21 @@ function createAppStore() {
         try {
           // Batch every entry's stored part path into one deleteAudioFiles
           // call — same per-part trusted-dirs path as the single-entry
-          // delete above; one Tauri call for the whole sweep.
+          // delete above; one Tauri call for the whole sweep. Awaited so a
+          // failure surfaces before the DB rows are dropped (otherwise the
+          // paths are gone and any orphans are silent).
           const paths = get()
             .dictationHistory.map((e) => e.wav_file_path)
             .filter((p): p is string => !!p);
           if (paths.length > 0) {
-            commands.deleteAudioFiles(paths).catch(() => {});
+            try {
+              await commands.deleteAudioFiles(paths);
+            } catch (cleanupErr) {
+              console.error("Failed to delete dictation audio batch:", cleanupErr, paths);
+              toast.error("Some dictation audio files were not deleted", {
+                id: "dictation-audio-cleanup-batch",
+              });
+            }
           }
           await dbClearDictationHistory();
           set({ dictationHistory: [] });

@@ -57,7 +57,7 @@ All audio capture and processing. Core of the application.
 - `manager.rs` — `AudioManager` orchestrates mic + system capture, session tracking, instant capture. Stream restart (`restart_mic`, `restart_system_audio`) preserving ring buffers.
 - `mixer.rs` — Pure functions for mixing mic + system audio with gain/normalization
 - `export.rs` — WAV file export via `hound` (16-bit PCM, f32 clamping). `SessionWavWriter` for incremental streaming WAV during live sessions.
-- `capture.rs` — Data types: `CapturedAudio`, `SessionMark`, `CaptureResult`, `BufferPositions`, `SeparateExtraction`
+- `capture.rs` — Data types: `BufferPositions`, `SeparateExtraction` (the position-based extraction shapes consumed by the live-transcription loop)
 - `error.rs` — `AudioError` enum with `From` impls for cpal and hound errors
 
 ### yapstack-transcription
@@ -396,24 +396,29 @@ Tools are self-contained `ToolDefinition` objects registered at module load. Eac
 - **`affects`** — Array of `ToolEffect` categories for declarative post-execution refresh
 
 ```typescript
-type ToolEffect = "session-meta" | "notes" | "organization";
+type ToolKind = "read" | "mutate";  // gates Undo eligibility + "Session updated" toast
+type ToolEffect = "session-meta" | "notes" | "organization" | "transcript";
 
 interface ToolDefinition {
+  kind: ToolKind;
   schema: ChatCompletionTool;
   execute: (args, ctx: ToolContext) => Promise<ExecutedTool | null>;
-  undo: (undoData, ctx: { sessionId: string }) => Promise<void>;
+  undo: (undoData, ctx: { sessionId: string }) => Promise<void>;  // no-op for kind: "read"
   affects?: ToolEffect[];
 }
 
 interface ExecutedTool {
   name: string;
   label: string;
-  detail: string;           // Human-facing badge text
-  toolCallId?: string;      // OpenAI tool_call ID for multi-turn
-  result?: string;          // Sent back to LLM as tool-role message content
-  undoData?: unknown;
+  detail: string;            // Human-facing badge text
+  observation?: string;      // Text the LLM sees as the tool result for multi-turn chains
+  toolCallId?: string;       // OpenAI tool_call ID for multi-turn
+  result?: string;           // Mirrored into observation when omitted (legacy compat)
+  undoData?: unknown;        // Required for kind: "mutate"
 }
 ```
+
+`ToolContext` is itself a discriminated union — `SessionToolContext { scope: "session", ... }` for single-session chats and `RetrievalToolContext { scope: "retrieval", allowedSessionIds }` for folder/pinned/all chats. Mutating tools narrow with `requireSessionContext(ctx)` so the multi-session path never has to fabricate empty `sessionId`/`currentTitle` values.
 
 Built-in tools (registered in `ai-tools.ts`):
 
@@ -434,6 +439,7 @@ Built-in tools (registered in `ai-tools.ts`):
 - `"session-meta"` → refresh sessions list + viewSession
 - `"notes"` → increment note refresh counter
 - `"organization"` → refresh session folders, session tags, and tags list
+- `"transcript"` → refresh segments (used by `replace_in_transcript` so the live transcript view picks up the durable edits)
 
 **Adding a new tool** requires only a `registerTool({...})` call in `ai-tools.ts` with an `affects` tag. No changes needed in `FloatingChatBar.tsx`, `NoteDetailView.tsx`, or `AIChatMessage.tsx`.
 
@@ -441,9 +447,12 @@ Built-in tools (registered in `ai-tools.ts`):
 
 Before executing tools, `useChatMessages` fetches a `ToolContext` via the provider's `getToolContext()`:
 ```typescript
-{ sessionId, currentTitle, currentNote, isPinned, segments?, tags?, folderIds? }
+// Single-session chat:
+{ scope: "session", sessionId, currentTitle, currentNote, isPinned, segments?, tags?, folderNames?, folderIds?, allowedSessionIds? }
+// Folder / pinned / all chat:
+{ scope: "retrieval", allowedSessionIds }
 ```
-Re-fetched each turn of the multi-turn loop so mutations from previous turns are reflected. `tags` and `folderIds` are populated via parallel DB queries (`getSessionTagIds`, `listAllSessionFolders`). `segments` are used by `save_to_notes` to convert `[[seg:ID]]` citations to interactive `<span>` elements.
+Re-fetched each turn of the multi-turn loop so mutations from previous turns are reflected. `tags`, `folderNames`, `folderIds` are populated via parallel DB queries (`getSessionTagIds`, `listTags`, `listAllSessionFolders`). `segments` are used by `save_to_notes` to convert `[[seg:ID]]` citations to interactive `<span>` elements and by `replace_in_transcript` to plan per-segment edits.
 
 ### Prompt Assembly (`ai-prompts.ts`)
 

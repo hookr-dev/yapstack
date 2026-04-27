@@ -9,7 +9,7 @@ pub mod ring_buffer;
 pub(crate) mod stream;
 pub mod system;
 
-pub use capture::{BufferPositions, CaptureResult, SeparateExtraction};
+pub use capture::{BufferPositions, SeparateExtraction};
 pub use error::AudioError;
 pub use export::SessionWavWriter;
 pub use manager::AudioManager;

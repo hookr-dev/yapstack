@@ -72,6 +72,19 @@ async peekCaptureEnergy(windowSecs: number) : Promise<Result<CaptureEnergyDto, C
     else return { status: "error", error: e  as any };
 }
 },
+/**
+ * Glob-deletes every `{session_id}.*.wav` / `.mp3` under `audio_dir`. Used
+ * for sessions that pre-date the v15 `session_audio_parts` migration (where
+ * the FE has no per-part path to delete) and as the fallback path inside
+ * `appStore.deleteSessionAudio` when the parts list is empty.
+ * 
+ * Authorization: the resolved `audio_dir` must already be in
+ * `TrustedAudioDirs` — otherwise the command returns `InvalidInput` and
+ * nothing is touched. This stops a malicious caller from passing an
+ * arbitrary `audio_save_location` and globbing files outside the
+ * audio-store. Per-file `remove_file` errors (other than `NotFound`) are
+ * collected and surfaced so failures don't get swallowed.
+ */
 async deleteSessionWav(sessionId: string, audioSaveLocation: string | null) : Promise<Result<null, CommandError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("delete_session_wav", { sessionId, audioSaveLocation }) };

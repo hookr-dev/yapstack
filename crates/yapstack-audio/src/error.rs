@@ -38,12 +38,6 @@ pub enum AudioError {
     #[error("WAV export failed: {0}")]
     WavExport(String),
 
-    #[error("no active session")]
-    NoActiveSession,
-
-    #[error("session already active")]
-    SessionAlreadyActive,
-
     #[error("no buffer available")]
     NoBufferAvailable,
 
