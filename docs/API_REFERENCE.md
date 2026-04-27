@@ -113,7 +113,7 @@ Whisper exposes 99 ISO-639 codes; Parakeet TDT v3 exposes 25 European codes.
 ### Re-exports (`lib.rs`)
 
 ```rust
-pub use capture::{BufferPositions, CaptureResult, SeparateExtraction};
+pub use capture::{BufferPositions, SeparateExtraction};
 pub use error::AudioError;
 pub use export::SessionWavWriter;
 pub use manager::AudioManager;
@@ -186,10 +186,10 @@ impl AudioManager {
     pub fn with_config(config: AudioConfig) -> Self;
 
     // Capture lifecycle
-    pub fn start_capture(&mut self, source: CaptureSource, mic_device_name: Option<&str>) -> Result<()>;
+    pub fn start_capture(&mut self, source: CaptureSource, mic_device_id: Option<&str>) -> Result<()>;
     pub fn start_mic(&mut self, device_name: Option<&str>) -> Result<()>;
     pub fn start_system_audio(&mut self) -> Result<()>;
-    pub fn start_all(&mut self, mic_device_name: Option<&str>) -> Result<()>;
+    pub fn start_all(&mut self, mic_device_id: Option<&str>) -> Result<()>;
     pub fn stop_all(&mut self) -> Result<()>;
 
     // Status
@@ -208,23 +208,14 @@ impl AudioManager {
     pub fn mic_buffer(&self) -> Option<&SharedAudioRingBuffer>;
     pub fn system_buffer(&self) -> Option<&SharedAudioRingBuffer>;
 
-    // Capture extraction (all output is mono — multi-channel data is deinterleaved per buffer)
-    pub fn extract_captured_audio(&self, duration_seconds: f32) -> CapturedAudio;  // channels always 1
-    pub fn trigger_instant_capture(&self, seconds: f32, source: CaptureSource, mix_config: Option<&MixConfig>) -> Result<CaptureResult>;
-
-    // Position tracking (used by live transcription)
+    // Position-based extraction (the only capture API; production capture goes
+    // through `start_live_transcription`'s ring-buffer-driven loop).
     pub fn buffer_positions(&self) -> BufferPositions;  // current write positions for both buffers
     pub fn mic_write_pos(&self) -> usize;   // current mic buffer write position (0 if no buffer)
     pub fn system_write_pos(&self) -> usize; // current system buffer write position (0 if no buffer)
     pub fn extract_since(&self, positions: &BufferPositions, source: CaptureSource, mix_config: Option<&MixConfig>) -> Option<(Vec<f32>, u32, BufferPositions)>;
     pub fn extract_sources_since(&self, positions: &BufferPositions) -> Option<SeparateExtraction>;  // per-source extraction (no mixing)
     pub fn peek_energy_rms(&self, positions: &BufferPositions, duration_secs: f32) -> (Option<f32>, Option<f32>);  // zero-alloc RMS via ring_buffer.rms_energy_since()
-
-    // Session API
-    pub fn start_session(&mut self) -> Result<()>;       // records write_pos
-    pub fn end_session(&mut self, source: CaptureSource, mix_config: Option<&MixConfig>) -> Result<CaptureResult>;
-    pub fn is_session_active(&self) -> bool;
-    pub fn session_elapsed_seconds(&self) -> Option<f32>;
 
     // Stream health
     pub fn mic_has_stream_error(&self) -> bool;      // delegates to MicrophoneCapture
@@ -322,22 +313,8 @@ impl SessionWavWriter {
 ### Capture Types (`capture.rs`)
 
 ```rust
-pub struct CapturedAudio {
-    pub mic_samples: Vec<f32>,      // always mono (deinterleaved)
-    pub system_samples: Vec<f32>,   // always mono (deinterleaved)
-    pub sample_rate: u32,
-    pub channels: u16,              // always 1
-    pub duration_seconds: f32,
-}
-
-pub struct SessionMark {
-    pub mic_write_pos: usize,
-    pub system_write_pos: usize,
-    pub started_at: std::time::Instant,
-}
-
-/// Lightweight cursor tracking for both ring buffers.
-/// Used by live transcription to track read positions independently of the session API.
+/// Lightweight cursor tracking for both ring buffers. Used by live
+/// transcription to track read positions across polls.
 pub struct BufferPositions {  // Default
     pub mic_pos: usize,
     pub system_pos: usize,
@@ -348,13 +325,6 @@ pub struct SeparateExtraction {
     pub mic: Option<(Vec<f32>, u32)>,      // (mono_samples, sample_rate)
     pub system: Option<(Vec<f32>, u32)>,   // (mono_samples, sample_rate)
     pub new_positions: BufferPositions,
-}
-
-pub struct CaptureResult {  // Serialize
-    pub file_path: PathBuf,
-    pub duration_seconds: f32,
-    pub sample_rate: u32,
-    pub source: CaptureSource,
 }
 ```
 
@@ -374,9 +344,9 @@ pub enum AudioError {
     NotRunning,
     InvalidBufferConfig(String),
     WavExport(String),
-    NoActiveSession,
-    SessionAlreadyActive,
     NoBufferAvailable,
+    Mp3Encode(String),
+    InvalidBitrate(u16),
 }
 // From impls: cpal errors, hound::Error, std::io::Error
 ```
@@ -391,10 +361,6 @@ pub enum AudioError {
 pub use client::{TranscriptionClient, TranscriptionResult};
 pub use error::TranscriptionError;
 pub use model::{ModelInfo, ModelManager, ModelSize, ParakeetVariant, SortformerVariant};
-
-/// Backward-compatible alias for the renamed `TranscriptionClient`. Will be
-/// removed once all call sites in the Tauri layer are updated.
-pub type WhisperClient = TranscriptionClient;
 ```
 
 ### ModelManager (`model.rs`)
@@ -603,7 +569,7 @@ pub enum CommandError {
 ```rust
 AudioManagerState        = Arc<Mutex<AudioManager>>
 ModelManagerState        = Arc<Mutex<ModelManager>>
-WhisperClientState       = Arc<Mutex<Option<WhisperClient>>>
+TranscriptionClientState = Arc<Mutex<Option<Arc<TranscriptionClient>>>>
 LiveTranscriptionState   = Arc<Mutex<Option<LiveTranscriptionController>>>
 ```
 
@@ -612,25 +578,24 @@ LiveTranscriptionState   = Arc<Mutex<Option<LiveTranscriptionController>>>
 |---------|------|---------|
 | `list_audio_devices` | — | `Vec<AudioDeviceInfoDto>` |
 | `get_default_input_device` | — | `AudioDeviceInfoDto` |
-| `start_capture` | `mic_device_name?, capture_source, capture_history_seconds?` | `()` |
+| `start_capture` | `mic_device_id?, capture_source, capture_history_seconds?` | `()` |
 | `stop_capture` | — | `()` |
 | `get_capture_status` | — | `CaptureStatusDto` |
 | `check_system_audio_permission` | — | `PermissionStatusDto` |
-| `snapshot_mic_audio` | `duration_seconds?` | `Option<AudioSnapshotDto>` |
-| `snapshot_system_audio` | `duration_seconds?` | `Option<AudioSnapshotDto>` |
 | `get_buffer_info` | — | `BufferStatusDto` |
+| `peek_capture_energy` | `window_secs: f32` (must be finite > 0; `InvalidInput` otherwise) | `{ mic_rms, system_rms }` (live RMS over the last `window_secs`, used by the recording beacon) |
 
 ### Capture Commands (`commands/capture.rs`)
 | Command | Args | Returns |
 |---------|------|---------|
-| `trigger_instant_capture` | `seconds, source, mix_config?` | `CaptureResultDto` |
-| `start_session` | — | `()` |
-| `end_session` | `source, mix_config?` | `CaptureResultDto` |
-| `get_session_status` | — | `SessionStatusDto` |
-| `export_session_wav` | `session_id, source, duration_seconds, mix_config?` | `SessionWavResultDto` |
-| `delete_session_wav` | `session_id` | `()` |
+| `delete_session_wav` | `session_id, audio_save_location?` | `()` |
+| `delete_audio_files` | `paths: Vec<String>` | `()` (or `Err(CommandError)` whose message lists every path that failed) |
 
-`export_session_wav` extracts audio from ring buffers, writes a persistent WAV to `$APP_DATA_DIR/audio/{session_id}.wav`, and returns the file path + duration. `delete_session_wav` removes the WAV file from disk.
+`delete_session_wav` is the legacy session-glob cleanup path used by `clearAllSessions` and for sessions that pre-date the v15 `session_audio_parts` migration. Real per-part cleanup goes through `delete_audio_files`.
+
+The session lifecycle (start, finalize, export) is owned by `start_live_transcription` / `stop_live_transcription` — there is no separate "instant capture" or `start_session` / `end_session` Tauri surface anymore. Audio finalization is driven by the live loop's streaming `SessionWavWriter` and the `session-part-ready` event; `session_audio_parts` is the durable source of truth.
+
+`delete_audio_files` validates each path against the `TrustedAudioDirs` allow-list before unlinking. Failures are surfaced (not swallowed) so the FE can warn or queue retries; the error message lists every path that did not delete.
 
 ### Transcription Commands (`commands/transcription.rs`)
 | Command | Args | Returns |
@@ -638,11 +603,9 @@ LiveTranscriptionState   = Arc<Mutex<Option<LiveTranscriptionController>>>
 | `get_available_models` | — | `Vec<ModelInfoDto>` (Whisper) |
 | `download_model` | `size` | `String` (path) |
 | `delete_model` | `size` | `()` |
-| `transcribe_audio` | `audio_path, language?, initial_prompt?` | `TranscriptionResultDto` |
-| `init_whisper_client` | `size` | `()` (legacy shim — calls the engine-aware path with `EngineKind::Whisper`) |
 | `init_transcription_client` | `engine, whisper_model?, parakeet_variant?, enable_diarization` | `()` |
-| `shutdown_whisper_client` | — | `()` |
-| `get_whisper_status` | — | `WhisperStatusDto { initialized: bool }` |
+| `shutdown_transcription_client` | — | `()` |
+| `get_transcription_status` | — | `TranscriptionStatusDto { initialized: bool }` |
 | `get_engine_catalogue` | — | `Vec<EngineDescriptorDto>` (engine kinds × supported languages × capability flags) |
 | `get_parakeet_models` | — | `Vec<ParakeetModelInfoDto>` |
 | `download_parakeet_model` | `variant: ParakeetVariantDto` | `String` (dir path) |
@@ -662,20 +625,24 @@ All `download_*` commands emit `"model-download-progress"` events to the window 
 | `stop_live_transcription` | — | `()` |
 | `get_live_transcription_status` | — | `LiveTranscriptionStatus` |
 
-Emits `"live-transcription-segment"` events with `LiveSegmentEvent { chunk_index, source, segments, audio_offset_seconds, chunk_duration_seconds, accumulated_text, is_backfill }`. `LiveTranscriptionConfig` carries an optional `diarization: bool` (default false) — honored only when the active engine is Parakeet *and* the sidecar was spawned with a Sortformer model. Each `TranscriptSegmentDto` in `segments` carries `speaker_id: number | null`.
+Emits `"live-transcription-segment"` events with `LiveSegmentEvent { session_id?: string, chunk_index, source, segments, audio_offset_seconds, chunk_duration_seconds, accumulated_text, is_backfill }`. The `session_id` mirrors `LiveTranscriptionConfig.session_id` so multi-session listeners (dictation hook + main view) can route events without stale-state guards. `LiveTranscriptionConfig` carries an optional `diarization: bool` (default false) — honored only when the active engine is Parakeet *and* the sidecar was spawned with a Sortformer model. Each `TranscriptSegmentDto` in `segments` carries `speaker_id: number | null`.
 
 Emits `"backfill-complete"` event (empty payload) when backfill processing finishes.
 
-Emits `"session-wav-ready"` event with `SessionWavReadyEvent { session_id, file_path, duration_seconds }` when the streaming WAV is finalized after the loop exits.
+Emits `"session-part-ready"` event with `SessionPartReadyEvent { session_id, part_index, file_path, format: AudioExportFormatDto ("wav" \| "mp3"), duration_seconds, sample_rate }` when the streaming part is finalized after the loop exits. When `LiveTranscriptionConfig.persist_audio_part` is true (the default — actual sessions), a `session_audio_parts` row is inserted from Rust *before* this event fires, so the DB stays the durable source of truth even if the listener is gone. When the flag is false (dictation), the row insert is skipped — dictation owns its audio path on `dictation_history` instead, and the synthetic `session_id` has no `sessions.id` to FK against.
+
+Emits `"session-wav-error"` event with `SessionWavErrorEvent { session_id, message }` when an empty recording is detected (0 samples written) or a finalize error occurs. The empty WAV file is deleted in this path.
 
 Emits `"stream-health"` events with `StreamHealthEvent { source: AudioSourceLabel, status: String, message: String }` when a stream error or stall is detected and restart is attempted. Status values: `"restarted"`, `"restart_failed"`, `"restart_abandoned"`.
 
-**`LiveTranscriptionConfig`**: `silence_threshold` (default 0.01), `silence_duration_ms` (default 800), `max_chunk_seconds` (default 30), `backfill_seconds` (default 0), `source`, `mix_config?`, `language?`, `prompt_context_chars?` (default 350), `prompt_decay_silence_seconds?` (default 5.0, set to 0 to disable — seconds of all-source silence before clearing prompt context to prevent hallucination from stale context), `session_id?` (enables streaming WAV recording).
+Emits `"live-transcription-warning"` event with `{ message }` when the sidecar is auto-restarted mid-session after a transcription failure (transient); the loop continues.
 
-**`LiveTranscriptionPhase`**: `Starting`, `Running`, `Stopped`, `Error`.
+**`LiveTranscriptionConfig`**: `silence_duration_ms` (default 800; Whisper-only — Parakeet uses a fixed 200 ms), `max_chunk_seconds` (default 30), `backfill_seconds` (default 0), `source`, `mix_config?`, `language?`, `prompt_context_chars?` (default 350), `prompt_decay_silence_seconds?` (default 5.0, set to 0 to disable — seconds of all-source silence before clearing prompt context to prevent hallucination from stale context), `session_id?` (enables streaming session audio recording into a new part), `persist_audio_part?: bool` (default `true`; set to `false` for dictation so finalize skips the `session_audio_parts` insert that would FK-orphan against the synthetic id), `audio_save_location?` (override the default `$APP_DATA_DIR/audio/` dir), `audio_export_format?: AudioExportFormatDto` (`"wav"` or `"mp3"`, default `"mp3"`; typed end-to-end so unknown values are rejected at deserialization), `mp3_bitrate?` (kbps, validated against the LAME-supported set; default 64), `diarization?`, `vocabulary_hints?` (folder/tag names ≥4 chars, comma-separated, ~80 char budget — Whisper-only), `resume?: ResumeConfig` (carries the prior cumulative duration that becomes `session_offset_base_seconds`, plus the next `part_index` so segments and audio parts continue numbering from where the prior run left off).
+
+**`LiveTranscriptionPhase`**: `Running`, `Stopped`, `Error`.
 
 **Internal types** (not exported via Tauri):
-- `TranscriptionContext` — Immutable shared context: `whisper_client` (private Arc), `shared_whisper_state` (for returning client on exit), `app_handle`, `config`, `transcription_start`
+- `TranscriptionContext` — Immutable shared context: `transcription_client` (private `Arc<Mutex<Option<Arc<TranscriptionClient>>>>`), `shared_transcription_state` (handle for returning the client on exit), `app_handle`, `config`, `bridged_prompt`, `vocabulary_hints`, `session_offset_base_seconds`
 - `SessionWavState` — Streaming WAV state: `writer`, `flush_positions`, `source`, `mix_config`, `session_id`
 - `SourceVadState` — Per-source VAD: `is_speaking`, `speech_start_pos`, `cursor`, `speech_start_time`, `silence_since`, `chunk_index`, `accumulated_text`, `total_audio_seconds`, `last_seen_write_pos`, `last_write_pos_advance`, `restart_attempts`
 - `VadAction` — `None`, `Chunk` (silence detected), `ForceChunk` (max duration exceeded)
@@ -711,20 +678,28 @@ Domain types (yapstack-common, yapstack-audio, yapstack-transcription) do not de
 
 ### Custom URI Scheme: `audio-stream`
 
-Registered in `lib.rs` via `register_uri_scheme_protocol`. Serves WAV files from `$APP_DATA_DIR/audio/`.
+Registered in `lib.rs` via `register_uri_scheme_protocol`. Serves session audio
+files (`.wav` or `.mp3`) from any directory in the `TrustedAudioDirs` allow-list
+— seeded at startup from `session_audio_parts` rows + `audio_save_locations`,
+and grown each time Rust finalizes a part. Two URL forms:
 
 ```
-audio-stream://localhost/{filename}.wav
+audio-stream://localhost/{absolute-file-path}     # primary; emitted by convertFileSrc(absPath, "audio-stream")
+audio-stream://localhost/{filename}               # legacy; resolves under $APP_DATA_DIR/audio/
 ```
 
 | Method | Status | Description |
 |--------|--------|-------------|
-| GET (no Range header) | 200 | Full file, `Content-Type: audio/wav`, `Accept-Ranges: bytes` |
+| GET (no Range header) | 200 | Full file, `Content-Type: audio/wav` or `audio/mpeg`, `Accept-Ranges: bytes` |
 | GET (Range: bytes=N-M) | 206 | Partial content, `Content-Range: bytes N-M/total` |
-| Invalid filename | 400 | Non-.wav, path traversal (`..`, `/`, `\`) |
-| File not found | 404 | WAV doesn't exist |
+| Bad extension / traversal | 400 | Path doesn't end in `.wav`/`.mp3`, or relative path contains `/`, `\`, `..` |
+| Untrusted absolute path | 403 | Absolute path is outside every `TrustedAudioDirs` entry |
+| File not found | 404 | File doesn't exist |
 
-Frontend helper: `convertFileSrc(filename, "audio-stream")` generates the URL.
+Frontend helper: `convertFileSrc(absPath, "audio-stream")` generates the URL.
+Pass the full persisted part path (from `session_audio_parts.file_path`) — the
+synthesized `{session_id}.{part_index}.{ext}` form would skip parts whose
+`audio_save_location` differs from the current setting.
 
 ---
 
@@ -749,8 +724,8 @@ Managed via `tauri-plugin-sql` with migrations in `src-tauri/src/db.rs`. Fronten
 | `is_pinned` | INTEGER | 0 or 1 |
 | `pinned_at` | TEXT | Nullable |
 | `session_type` | TEXT | 'transcription' or 'manual' |
-| `wav_file_path` | TEXT | Nullable, path to persisted WAV |
-| `wav_duration_seconds` | REAL | Nullable |
+| `wav_file_path` | TEXT | Nullable. Legacy column retained as a fallback duration source; `session_audio_parts.file_path` is the durable source of truth (and may point to `.wav` or `.mp3`). |
+| `wav_duration_seconds` | REAL | Nullable. Legacy fallback when no `session_audio_parts` rows exist. |
 | `sort_order` | INTEGER | Default 0 |
 
 **segments**
@@ -769,7 +744,7 @@ Managed via `tauri-plugin-sql` with migrations in `src-tauri/src/db.rs`. Fronten
 | `edited_at` | TEXT | Nullable |
 | `deleted_at` | TEXT | Nullable (soft delete) |
 | `hidden` | INTEGER | 0 or 1 |
-| `speaker_id` | INTEGER | Nullable. Set by Parakeet+Sortformer diarization. *Not* added via the migration list — added by `db::ensure_runtime_schema()` at app startup (idempotent ALTER) to sidestep ghost-migration ordering issues on dev DBs. |
+| `speaker_id` | INTEGER | Nullable. Set by Parakeet+Sortformer diarization. *Not* added via the migration list — added by the frontend's `getDb()` after `tauri-plugin-sql` migrations run (idempotent ALTER) to sidestep a ghost v11 entry on dev DBs. |
 
 **folders**
 | Column | Type | Notes |
@@ -841,8 +816,8 @@ Indexes: `idx_session_folders_session(session_id)`, `idx_session_folders_folder(
 | `ai_enabled` | INTEGER | 0 or 1 |
 | `ai_prompt` | TEXT | AI prompt used (if ai_enabled) |
 | `output_action` | TEXT | 'paste', 'clipboard', or 'new-note' |
-| `wav_file_path` | TEXT | Nullable, path to WAV file |
-| `wav_duration_seconds` | REAL | Nullable |
+| `wav_file_path` | TEXT | Nullable, absolute path to the captured audio file (WAV or MP3 — column name is legacy). |
+| `wav_duration_seconds` | REAL | Nullable, captured audio duration in seconds. |
 | `session_id` | TEXT | Nullable, correlated session ID (for new-note output) |
 | `created_at` | TEXT | `datetime('now')` |
 
@@ -855,16 +830,28 @@ Indexes: `idx_dictation_history_created(created_at)`, `idx_dictation_history_slo
 | 2 | folders table, sessions.folder_id, is_pinned, pinned_at |
 | 3 | Segment editing: original_text, edited_at, deleted_at, hidden |
 | 4 | notes + note_versions tables, sessions.session_type |
-| 5 | sessions.wav_file_path, wav_duration_seconds |
-| 6 | sessions.sort_order, shares table |
+| 5 | sessions.wav_file_path, wav_duration_seconds (superseded by v15; columns retained as fallback duration source) |
+| 6 | sessions.sort_order, shares table (table is currently dormant — defined but unused in app code) |
 | 7 | chat_messages table (CASCADE on session delete) |
 | 8 | chat_messages: add `context_key` NOT NULL, make `session_id` nullable, add `idx_chat_messages_context` index |
 | 9 | folders: add `icon`, `color`, `description` columns. New `session_folders` junction table (many-to-many) with unique constraint and indexes |
 | 10 | `dictation_history` table with indexes |
+| 11 | `tags` and `session_tags` tables (flat, AI-applied metadata; folders remain the primary organizational primitive) |
+| 12 | FTS5 search tables (`segments_fts`, `notes_fts`, `sessions_fts`, `dictations_fts`) with backfill + sync triggers |
+| 13 | `chat_messages.tool_calls` column (persisted tool-call stream for replay) |
+| 14 | `chat_messages` per-LLM-response columns (`send_id`, `sequence`, `tool_call_id`, `observation`, `status`) for accurate multi-turn replay |
+| 15 | `session_audio_parts` table (id, session_id, part_index, file_path, format, duration_seconds, sample_rate, created_at). Backfilled from legacy `wav_file_path` rows. Durable source of truth for session audio files; resumable sessions append a new row per resume. |
+
+**Runtime schema patches** (in `db::ensure_runtime_schema()`, applied before `tauri-plugin-sql` initializes):
+
+- Sweeps stale `recording`-status sessions left by a prior crash (recomputes duration from `session_audio_parts` or `segments`, marks them `completed`).
+- Creates `audio_save_locations` table (idempotent) — every directory the app has written audio into. Used by `scan_missing_audio_parts()` on next startup to recover orphan part files if a row insert was missed.
+
+The `segments.speaker_id INTEGER` column for Parakeet+Sortformer diarization is added by the frontend's `getDb()` after migrations run, sidestepping a "ghost" v11 entry that some local dev DBs picked up from another branch.
 
 ### Settings Persistence (Zustand)
 
-Settings are stored via Zustand's `persist` middleware with `localStorage`. Schema versioned (currently v16).
+Settings are stored via Zustand's `persist` middleware with `localStorage`. Schema versioned (currently **v23**).
 
 | Version | Description |
 |---------|-------------|
@@ -884,6 +871,13 @@ Settings are stored via Zustand's `persist` middleware with `localStorage`. Sche
 | 13→14 | Changed default model `Base` → `Small`, default capture `MicOnly` → `Mixed` (migrates existing users) |
 | 14→15 | Added `promptDecaySilenceSeconds` (default 5) — seconds of all-source silence before clearing prompt context |
 | 15→16 | Added `activationMode` to dictation settings (default `"hold"`) |
+| 16→17 | Existing users marked `onboardingCompleted = true` so they skip the first-run flow |
+| 17→18 | `onboardingCompleted` boolean → structured `onboarding: { completedFlows: Record<string, ISO> }` |
+| 18→19 | Default `Control+Shift+Space` binding written to dictation slot 1 if missing |
+| 19→20 | Replace name-based `selectedMicDevice` with stable id-based `selectedMicDeviceId` (reset to null on upgrade — user re-picks once) |
+| 20→21 | Added `audioExportFormat` (default `"mp3"`) and `mp3Bitrate` (default 64) |
+| 21→22 | Engines become first-class peers: added `selectedEngine` (default `"Whisper"`), `selectedParakeetVariant` (`"TdtV3"`), `diarizationEnabled` (`false`), `speakerNames: Record<string, Record<number, string>>` |
+| 22→23 | Force-disable `diarizationEnabled` on upgrade. Sortformer's chunk-local speaker IDs cause the same person to flip across speaker numbers across chunk boundaries; the IPC + DB + sidecar plumbing stays intact so re-enable is one line away once session-stable IDs land. |
 
 ---
 
@@ -954,20 +948,23 @@ Modular tool registry. Each tool is self-contained with schema, executor, undo h
 | Type | Fields |
 |------|--------|
 | `ToolCallResult` | `{ id, name, arguments: Record<string, unknown> }` |
-| `ExecutedTool` | `{ name, label, detail, toolCallId?, result?, undoData? }` — `result` is sent to LLM as tool-role message, `detail` is human-facing badge |
-| `ToolContext` | `{ sessionId, currentTitle, currentNote: DbNote \| null, isPinned, segments?, tags?, folderIds? }` |
-| `ToolEffect` | `"session-meta" \| "notes" \| "organization"` — declarative side-effect categories |
-| `ToolDefinition` | `{ schema: ChatCompletionTool, execute: (args, ctx) → Promise<ExecutedTool \| null>, undo: (undoData, ctx) → Promise<void>, affects?: ToolEffect[] }` |
+| `ExecutedTool` | `{ name, label, detail, observation?, toolCallId?, result?, undoData? }` — `observation` is the text the LLM sees as the tool result during multi-turn chains; `detail` is the human-facing badge |
+| `ToolContext` | Discriminated union: `SessionToolContext { scope: "session"; sessionId; currentTitle; currentNote: DbNote \| null; isPinned; segments?; tags?; folderNames?; folderIds?; allowedSessionIds? }` for single-session chats, or `RetrievalToolContext { scope: "retrieval"; allowedSessionIds }` for folder/pinned/all chats. Mutating tools narrow via `requireSessionContext(ctx)`. |
+| `requireSessionContext` | `(ctx: ToolContext) → SessionToolContext` | Narrows the union to the session-scoped variant. Throws if called from a retrieval-only chat — that combination is a wiring bug. |
+| `ToolKind` | `"read" \| "mutate"` — gates Undo eligibility and the "Session updated" toast |
+| `ToolEffect` | `"session-meta" \| "notes" \| "organization" \| "transcript"` — declarative side-effect categories |
+| `ToolDefinition` | `{ kind: ToolKind, schema: ChatCompletionTool, execute: (args, ctx) → Promise<ExecutedTool \| null>, undo: (undoData, ctx) → Promise<void>, affects?: ToolEffect[] }` |
 
 **Functions**
 | Function | Signature | Description |
 |----------|-----------|-------------|
 | `registerTool` | `(def: ToolDefinition) → void` | Registers a tool in the global registry |
-| `getRegisteredTools` | `() → ChatCompletionTool[]` | Returns all tool schemas for the API call |
-| `getToolsForContext` | `(isSessionContext: boolean) → ChatCompletionTool[]` | Returns all tools for session contexts, empty array for multi-session |
-| `getToolsById` | `(toolIds: string[]) → ChatCompletionTool[]` | Returns schemas for specific tool IDs |
+| `getRegisteredTools` | `() → ChatCompletionTool[]` | Returns every registered tool's schema |
+| `getToolsById` | `(toolIds: string[]) → ChatCompletionTool[]` | Returns schemas for specific tool IDs. Per-context tool selection is the caller's job — see `createSessionTools` / `createMultiSessionTools` in `ai-context.ts`. |
+| `getToolKind` | `(toolName: string) → ToolKind \| undefined` | Returns the registered tool's `"read"` / `"mutate"` discriminator (used by the chat UI to render the right badge and gate undo eligibility). |
 | `getToolEffects` | `(toolNames: string[]) → Set<ToolEffect>` | Collects effect categories from executed tool names. Used by `NoteDetailView` to determine which data to refresh after tool execution. |
 | `executeTool` | `(name, args, ctx) → Promise<ExecutedTool \| null>` | Executes a tool by name. Returns `null` if the tool is a no-op (e.g., title unchanged). |
+| `captureUndoSnapshot` | `<T>(loader: () => Promise<T>) → Promise<T>` | Helper that loads pre-mutation state for the executor's `undoData`, used by mutating tools so undo restores the prior value. |
 | `undoToolCalls` | `(executed, ctx) → Promise<void>` | Reverses tool executions in LIFO order |
 | `convertCitationsToSegmentRefs` | `(html, segments) → string` | Replaces `[[seg:ID]]` text citations with `<span data-segment-ref>` HTML nodes for Tiptap rendering |
 
@@ -975,11 +972,15 @@ Modular tool registry. Each tool is self-contained with schema, executor, undo h
 | Tool Name | Parameters | DB Operations | Effects |
 |-----------|-----------|---------------|---------|
 | `update_title` | `{ title: string }` | `updateSessionTitle()` | `["session-meta"]` |
-| `save_to_notes` | `{ content: string, mode: "replace" \| "append" }` | `markdownToBasicHtml()` → `convertCitationsToSegmentRefs()` → `saveNote()` | `["notes"]` |
+| `save_to_notes` | `{ content: string, mode: "replace" \| "append" \| "prepend" \| "find_replace", find?: string }` | `markdownToBasicHtml()` → `convertCitationsToSegmentRefs()` → `saveNote()` (per mode: overwrite / append below / prepend above / surgical substring swap) | `["notes"]` |
 | `pin_session` | `{ pinned: boolean }` | `togglePin()` (conditional) | `["session-meta"]` |
 | `tag_session` | `{ add: string[], remove?: string[] }` | `getTagByName()` → `createTag()` → `addSessionTag()` / `removeSessionTag()` | `["organization"]` |
-| `add_to_folder` | `{ folder_name: string }` | `listFolders()` → `findBranchConflicts()` → `dbAddSessionToFolder()` | `["organization"]` |
-| `get_folder_context` | `{ folder_name?: string }` | `listFolders()` → `buildFolderTree()` / `getFolderPath()` | `[]` (read-only) |
+| `search_folders` | `{ query?: string }` | `listFolders()` → optional substring filter against folder names + descriptions | `[]` (read-only) |
+| `add_session_to_folder` | `{ folder_id: string }` | `findBranchConflicts()` → `dbAddSessionToFolder()` → `getFolderPath()` (returns hierarchical description chain in `result`) | `["organization"]` |
+| `search_sessions` | `{ query: string, filters: { folder_id: string \| null, pinned: boolean \| null } \| null, limit?: number }` | FTS5 search across session titles, notes, and segment text. `filters` may be `null` for an unfiltered search; pass an object to restrict by folder and/or pin state. | `[]` (read-only) |
+| `search_dictations` | `{ query: string, limit?: number }` | FTS5 search across `dictation_history` | `[]` (read-only) |
+| `get_session_context` | `{ session_ids: string[], scope: "segments" \| "notes" \| "summary" \| "all" }` | For each id (max 5 per call): `getSession()` + scope-conditional `getSessionSegments()` / `getNote()`. `scope="summary"` is currently always null pending a future summarization step. Errors out-of-scope ids when the chat context carries `allowedSessionIds`. | `[]` (read-only) |
+| `replace_in_transcript` | `{ find: string, replace: string, case_sensitive: boolean }` | Iterate `ctx.segments`, build per-segment `EditPlan` (skip deleted/hidden, escape regex, default case-insensitive). Capped at 50 affected segments per call — narrow `find` if you exceed it. Persists via `updateSegmentText()`, preserving each segment's `original_text` snapshot. | `["transcript"]` (refresh transcript views) |
 
 ### `lib/ai-prompts.ts`
 
@@ -1022,12 +1023,13 @@ Context orchestration layer. Provides factory functions to create context source
 | Function | Signature | Description |
 |----------|-----------|-------------|
 | `createSessionSources` | `(sessionId, segmentCount, sessionType) → ContextSource[]` | Transcript + notes sources. Omits transcript source for `"manual"` session type. |
-| `createSessionTools` | `(sessionId) → AIContextTools` | All three tools with session-specific `ToolContext` (fetches live session/note/segment state). `contextType: "session"`. |
+| `createSessionTools` | `(sessionId) → AIContextTools` | All ten tools (`update_title`, `save_to_notes`, `pin_session`, `tag_session`, `search_folders`, `add_session_to_folder`, `search_sessions`, `search_dictations`, `get_session_context`, `replace_in_transcript`) with session-specific `ToolContext` (fetches live session/note/segment state). `contextType: "session"`. |
 | `createSessionSystemPromptBuilder` | `(sessionId) → SystemPromptBuilder` | Returns builder that fetches session metadata and calls `getSystemPromptWithToolContext(directive, ...)`. |
 | `createMultiSessionSources` | `(sessionIds, count) → ContextSource[]` | Sessions list source (non-toggleable) + notes source (toggleable). |
-| `createMultiSessionTools` | `() → AIContextTools` | Empty tools (read-only, no mutations). `contextType: "multi-session"`. |
+| `createMultiSessionTools` | `(allowedSessionIds: string[]) → AIContextTools` | Retrieval-only tools (`search_sessions`, `get_session_context`, `search_folders`, `search_dictations`); no mutations because they need a single `sessionId` and applying them at folder scope is ambiguous. `allowedSessionIds` is the load-bearing field — it pins retrieval to the chat's filter (folder / pinned / all) so the model can't reach outside the user's view. `contextType: "multi-session"`. |
 | `createMultiSessionSystemPromptBuilder` | `(folderContext?: FolderContextLayer[]) → SystemPromptBuilder` | Returns builder that calls `getMultiSessionSystemPrompt` with optional folder context layers. Ignores directive param (multi-session uses its own fixed prompt). |
 | `createDictationSources` | `(entryCount: number) → ContextSource[]` | Dictation history source (non-toggleable). |
+| `createDictationTools` | `() → AIContextTools` | Retrieval surface scoped to dictation only — exposes `search_dictations` and nothing else. `allowedSessionIds: []` so any future tool that consults the field fails closed. `contextType: "multi-session"`. |
 | `createDictationSystemPromptBuilder` | `() → SystemPromptBuilder` | Returns builder that calls `getDictationSystemPrompt`. |
 | `resolveListContext` | `(filter: ListFilter, sessions: DbSession[], folders: Folder[]) → ListChatContext` | Centralizes context resolution for all `ListFilter` types (all, pinned, folder, dictation). Returns contextKey, sources, tools, systemPromptBuilder, and placeholder. |
 | `chatContextKey` | Re-exported from `ai.ts` | `(ctx: ChatContext) → string` — context identity for chat messages |
@@ -1078,7 +1080,7 @@ Popover-based model selector. Groups models by provider, shows recommended model
 | Type | Definition |
 |------|-----------|
 | `SessionStatus` | `"recording" \| "completed"` |
-| `SessionType` | `"manual" \| "recording"` |
+| `SessionType` | `"manual" \| "transcription"` (matches the `sessions.session_type` DB column) |
 
 These replace raw strings in `DbSession.status` and `DbSession.session_type` respectively.
 
@@ -1152,7 +1154,7 @@ Global shortcuts via `@tauri-apps/plugin-global-shortcut`. Mounted in `App.tsx`.
 export function useDictation(): void
 ```
 
-Voice dictation lifecycle (hold-to-talk or toggle mode). Mounted in `App.tsx` (main window only). Manages state machine: `idle → recording → transcribing → processing → done → idle`, plus a `cancelling` branch reachable from any non-idle phase via `yapstack:dictation-cancel`. Listens for `yapstack:dictation-start`, `yapstack:dictation-stop`, and `yapstack:dictation-cancel` custom events. On stop: captures audio via `triggerInstantCapture`, transcribes via `transcribeAudio`, optionally processes with AI, then routes output based on `slot.outputAction`. On cancel: aborts in-flight AI, stops live transcription, deletes the streamed Session WAV, suppresses Output action and Dictation history write — see ARCHITECTURE.md § "Cancellation". Registers Escape as a Global hotkey (via `@tauri-apps/plugin-global-shortcut`) for the lifetime of a non-idle Dictation; the hotkey dispatches `yapstack:dictation-cancel`. Controls the dictation bubble window position and visibility. Includes no-input detection (3s timer → `"no-input"` bubble state). Persists completed dictation entries to `dictation_history` DB table. Correlates WAV files via UUID on `SESSION_WAV_READY` event.
+Voice dictation lifecycle (hold-to-talk or toggle mode). Mounted in `App.tsx` (main window only). Manages state machine: `idle → recording → transcribing → processing → done → idle`, plus a `cancelling` branch reachable from any non-idle phase via `yapstack:dictation-cancel`. Listens for `yapstack:dictation-start`, `yapstack:dictation-stop`, and `yapstack:dictation-cancel` custom events. On start: spins up a live transcription against a synthetic per-dictation session id so backfill, VAD chunking, and the streaming session WAV all reuse the live pipeline. On stop: waits for the loop's `session-part-ready` event to surface the finalized part path (WAV or MP3 per `audioExportFormat`), persists it to `dictation_history`, optionally runs AI post-processing, then routes output per `slot.outputAction`. The captured audio file is preserved regardless of Output action — only an explicit cancel deletes it. On cancel: aborts in-flight AI, stops live transcription, deletes the finalized part via `delete_audio_files`, suppresses Output action and Dictation history write — see ARCHITECTURE.md § "Cancellation". Registers Escape as a Global hotkey (via `@tauri-apps/plugin-global-shortcut`) for the lifetime of a non-idle Dictation; the hotkey dispatches `yapstack:dictation-cancel`. Controls the dictation bubble window position and visibility. Includes no-input detection (3s timer → `"no-input"` bubble state). Correlates parts to dictation entries via the synthetic session id on the `session-part-ready` event.
 
 ### `hooks/useRecordingIndicator.ts`
 

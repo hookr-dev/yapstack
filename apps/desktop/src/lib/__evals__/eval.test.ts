@@ -15,7 +15,6 @@ import type { EvalDbStub } from "./runner";
 import type { EvalCase } from "./types";
 
 declare global {
-  // eslint-disable-next-line no-var
   var __evalStub: EvalDbStub | undefined;
 }
 
@@ -70,6 +69,7 @@ vi.mock("@tauri-apps/plugin-sql", () => ({
 
 // Imports must come AFTER vi.mock blocks.
 const { executeTool, getToolKind } = await import("@/lib/ai-tools");
+type ToolContext = import("@/lib/ai-tools").ToolContext;
 const { buildEvalDbStub } = await import("./runner");
 
 const cases = import.meta.glob<EvalCase>("./cases/*.json", {
@@ -98,7 +98,8 @@ describe("Chat agent eval cases", () => {
           .filter((sf) => sf.session_id === sessionId)
           .map((sf) => sf.folder_id);
 
-        const ctx = {
+        const ctx: ToolContext = {
+          scope: "session",
           sessionId,
           currentTitle: session?.title ?? "",
           currentNote: note

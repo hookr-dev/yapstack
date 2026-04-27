@@ -19,7 +19,7 @@ export function makeSession(overrides: Partial<DbSession> = {}): DbSession {
     folder_id: null,
     is_pinned: 0,
     pinned_at: null,
-    session_type: "recording",
+    session_type: "transcription",
     sort_order: 0,
     ...overrides,
   };

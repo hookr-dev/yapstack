@@ -29,8 +29,6 @@ pub enum AudioSourceLabel {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct LiveTranscriptionConfig {
-    /// RMS energy threshold below which audio is considered silence. Default: 0.01.
-    pub silence_threshold: f32,
     /// Milliseconds of continuous silence before triggering a chunk. Default: 800.
     pub silence_duration_ms: u32,
     /// Force a chunk after this many seconds of continuous speech. Default: 30.
@@ -48,13 +46,34 @@ pub struct LiveTranscriptionConfig {
     /// Seconds of all-source silence before clearing prompt context to prevent
     /// hallucination from stale context. Default: 5.0. Set to 0 to disable.
     pub prompt_decay_silence_seconds: Option<f32>,
-    /// Session ID for streaming WAV recording. If set, audio is incrementally
-    /// written to `$APP_DATA_DIR/audio/{session_id}.wav` during the session.
+    /// Session ID for streaming session-audio recording. If set, the loop
+    /// streams a new audio part to disk during the session and emits
+    /// `session-part-ready` at finalize time. The on-disk file is
+    /// `{audio_save_location || $APP_DATA_DIR/audio/}/{session_id}.{part_index}.{wav|mp3}`,
+    /// where `part_index` is 0 for a fresh session and `N` when resuming a
+    /// session that already has parts.
     pub session_id: Option<String>,
-    /// Custom directory for saving WAV files. If None, uses `$APP_DATA_DIR/audio/`.
+    /// When `true`, the finalize path inserts a `session_audio_parts` row
+    /// keyed by `session_id` so the DB stays the durable source of truth even
+    /// if the FE listener is gone. Set this to `false` for synthetic ids that
+    /// are *not* rows in `sessions` — most importantly dictation, where the
+    /// id is per-utterance and the finalized file is recorded against
+    /// `dictation_history` instead. Defaults to `true` to preserve historical
+    /// behavior for actual sessions; the dictation hook flips it off.
+    #[serde(default = "default_persist_audio_part")]
+    pub persist_audio_part: bool,
+    /// Custom directory for saving session audio parts. If None, uses
+    /// `$APP_DATA_DIR/audio/`. The directory is registered with
+    /// `audio_save_locations` at recording start so reconciliation can
+    /// recover orphan parts on the next startup.
     pub audio_save_location: Option<String>,
-    /// Audio export format: "wav" or "mp3". Default: "mp3".
-    pub audio_export_format: Option<String>,
+    /// Audio export format applied at part finalization. Default: `Mp3`
+    /// (matches the legacy "no value provided" behaviour). Choosing `Mp3`
+    /// re-encodes the streamed WAV at `mp3_bitrate` and deletes the source
+    /// WAV; `Wav` keeps the streamed file as-is. Typed end-to-end so a stale
+    /// or typo'd caller fails at deserialization rather than silently
+    /// rerouting through the MP3 branch.
+    pub audio_export_format: Option<AudioExportFormatDto>,
     /// MP3 bitrate in kbps (e.g. 64, 128, 192). Only used when format is "mp3".
     pub mp3_bitrate: Option<u16>,
     /// Request speaker diarization on every transcribed chunk. Honored only
@@ -71,6 +90,35 @@ pub struct LiveTranscriptionConfig {
     /// no prior file is read or modified. Backfill is forced to 0.
     #[serde(default)]
     pub resume: Option<ResumeConfig>,
+}
+
+fn default_persist_audio_part() -> bool {
+    true
+}
+
+/// Typed surface for the audio finalize format. Lowercase serde tags match
+/// the legacy `"wav"` / `"mp3"` strings the FE already passes and the
+/// `format` field on `SessionPartReadyEvent` already emits, so this is a
+/// drop-in tightening of the Tauri boundary — generated TypeScript becomes
+/// a `"wav" | "mp3"` discriminated union instead of `string | null`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "lowercase")]
+pub enum AudioExportFormatDto {
+    Wav,
+    Mp3,
+}
+
+impl AudioExportFormatDto {
+    pub fn is_mp3(self) -> bool {
+        matches!(self, AudioExportFormatDto::Mp3)
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AudioExportFormatDto::Wav => "wav",
+            AudioExportFormatDto::Mp3 => "mp3",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
@@ -132,7 +180,9 @@ pub struct SessionPartReadyEvent {
     pub session_id: String,
     pub part_index: u32,
     pub file_path: String,
-    pub format: String,
+    /// Always emitted as the typed enum (`"wav"` or `"mp3"`). Listeners can
+    /// branch on this without string-literal guards.
+    pub format: AudioExportFormatDto,
     pub duration_seconds: f32,
     pub sample_rate: u32,
 }
@@ -178,6 +228,10 @@ struct SessionWavState {
     /// to this rate before `write_samples` so the archived file plays at
     /// a single consistent speed.
     wav_sample_rate: u32,
+    /// When `true`, finalize inserts a `session_audio_parts` row keyed by
+    /// `session_id`. Set to `false` for dictation, whose `session_id` is a
+    /// synthetic per-utterance value with no `sessions` row backing it.
+    persist_audio_part: bool,
 }
 
 // --- Shared context ---
@@ -253,25 +307,30 @@ struct ChunkInput<'a> {
     is_backfill: bool,
 }
 
-/// Session-level mutable accumulators passed through transcription functions.
+/// Cross-loop chunk counters surfaced to `LiveTranscriptionController` for
+/// status reporting. Shared between the live loop and `process_backfill` so
+/// `chunks_processed` / `total_audio_seconds` reflect both sources of work.
 ///
-/// Shared across concurrent per-source chunk tasks via `Arc<StdMutex<_>>`.
 /// All mutation sites lock briefly; the mutex is never held across an await.
-struct SessionAccumulators {
-    shared_prompt: String,
+struct SessionCounters {
     total_chunks: u32,
     total_audio_seconds: f32,
+}
+
+/// Per-loop prompt accumulator. The live loop and `process_backfill` each own
+/// their own instance — they must not share, because backfill bridges its
+/// final accumulated prompt out to `bridged_prompt`, and a concurrent live
+/// chunk writing into the same buffer would either get clobbered by the
+/// bridge or cause the bridge to ship live text back into `bridged_prompt`.
+///
+/// Shared among concurrent per-source live chunk tasks via `Arc<StdMutex<_>>`.
+/// All mutation sites lock briefly; the mutex is never held across an await.
+struct PromptState {
+    shared_prompt: String,
     /// When the last successful transcription occurred. Used for prompt decay —
     /// if no transcription has happened for `prompt_decay_silence_seconds`, all
     /// prompt context is cleared to prevent stale text from causing hallucinations.
     last_transcription_at: Option<Instant>,
-}
-
-/// A single chunk of backfill audio with its sample rate.
-#[allow(dead_code)] // retained as the pair with chunk_at_silence_boundaries
-struct BackfillChunk<'a> {
-    samples: &'a [f32],
-    sample_rate: u32,
 }
 
 /// One source's backfill data: the raw samples plus VAD-simulated chunk
@@ -290,11 +349,21 @@ pub(crate) struct LiveTranscriptionController {
     stop_tx: Option<oneshot::Sender<()>>,
     session_id: Option<String>,
     effective_start_epoch_ms: f64,
+    /// Live counters shared with the running loop and backfill task. They
+    /// mutate in place when a chunk lands; `get_live_transcription_status`
+    /// reads them via a brief lock to surface real values to the UI.
+    counters: Arc<StdMutex<SessionCounters>>,
 }
 
 impl LiveTranscriptionController {
     pub fn is_running(&self) -> bool {
         !self.task_handle.is_finished()
+    }
+
+    /// Snapshot the live counters under a short lock.
+    fn counters(&self) -> (u32, f32) {
+        let s = self.counters.lock().expect("counters mutex poisoned");
+        (s.total_chunks, s.total_audio_seconds)
     }
 }
 
@@ -579,21 +648,6 @@ fn emit_status(
     );
 }
 
-/// Reconstruct `BufferPositions` from the source vec. Retained as a
-/// general helper and exercised by tests; the live loop no longer needs
-/// it now that Silero VAD extracts samples per-source via `extract_source_audio`.
-#[allow(dead_code)]
-fn build_cursor(sources: &[SourceVadState]) -> BufferPositions {
-    let mut pos = BufferPositions::default();
-    for s in sources {
-        match s.label {
-            AudioSourceLabel::Mic => pos.mic_pos = s.cursor,
-            AudioSourceLabel::System => pos.system_pos = s.cursor,
-        }
-    }
-    pos
-}
-
 /// Get the current write position for a source from the manager.
 fn source_write_pos(manager: &AudioManager, label: &AudioSourceLabel) -> usize {
     match label {
@@ -628,6 +682,13 @@ fn extract_source_audio(
     (Some((mono, buf.sample_rate())), new_pos)
 }
 
+/// Boxed future that yields a `ChunkTaskOutcome` once a spawned chunk
+/// transcribe finishes (or its panic-recovery handler synthesizes one).
+/// Held by `live_transcription_loop`'s `FuturesUnordered` and drained by the
+/// post-loop helpers.
+type ChunkTaskFuture =
+    std::pin::Pin<Box<dyn std::future::Future<Output = ChunkTaskOutcome> + Send>>;
+
 /// Outcome returned from a background chunk task back to the main loop so it
 /// can restore per-source state (accumulated_text) and notice fatal failures.
 struct ChunkTaskOutcome {
@@ -656,13 +717,14 @@ async fn prepare_chunk_dispatch(
     is_force_chunk: bool,
     is_backfill: bool,
     session_offset_base_seconds: f32,
+    max_chunk_duration: Duration,
 ) -> Option<PreparedChunk> {
     let (extraction, new_pos) = {
         let manager = audio_state.lock().await;
         extract_source_audio(&manager, &vad.label, vad.speech_start_pos)
     };
 
-    let Some((samples, sample_rate)) = extraction else {
+    let Some((mut samples, sample_rate)) = extraction else {
         // Nothing new in the buffer since last read — advance the cursor to
         // the latest write_pos but leave speech_start_pos so we'll pick up
         // the ongoing utterance on the next poll.
@@ -670,20 +732,51 @@ async fn prepare_chunk_dispatch(
         return None;
     };
 
-    let chunk_duration = samples.len() as f32 / sample_rate as f32;
-    if chunk_duration < MIN_CHUNK_DURATION_SECS {
+    let extracted_duration = samples.len() as f32 / sample_rate as f32;
+    if extracted_duration < MIN_CHUNK_DURATION_SECS {
         // Too short — don't dispatch yet and don't advance speech_start_pos.
         // Next poll re-extracts this region together with whatever arrives.
         vad.cursor = new_pos;
         return None;
     }
 
+    // Cap the dispatched chunk at `max_chunk_duration`. When a prior chunk
+    // sits in flight longer than its own audio duration (e.g. Parakeet's
+    // RTFx degrades on long inputs), the next dispatch otherwise covers the
+    // entire wait window plus 10 s — and the chunk after that grows again,
+    // ad infinitum. Latency-first policy: keep the *tail* (most recent
+    // audio) and drop the head, so the live transcript catches up to "now"
+    // instead of replaying a stale backlog. `speech_start_pos` is still
+    // advanced to `new_pos` below, so the dropped head is permanently gone
+    // — the alternative (rewind speech_start_pos to mid-extraction) would
+    // re-queue the dropped head on the next poll and reintroduce the
+    // unbounded queue we're fixing.
+    let max_samples = (max_chunk_duration.as_secs_f32() * sample_rate as f32) as usize;
+    let dropped_head_samples = samples.len().saturating_sub(max_samples);
+    let dropped_head_seconds = dropped_head_samples as f32 / sample_rate as f32;
+    if dropped_head_samples > 0 {
+        warn!(
+            "live chunk: source={:?} extracted {:.2}s exceeds max_chunk_duration {:.2}s — \
+             dropping {:.2}s head to keep latency bounded \
+             (likely sidecar wall time exceeded chunk duration)",
+            vad.label,
+            extracted_duration,
+            max_chunk_duration.as_secs_f32(),
+            dropped_head_seconds,
+        );
+        samples.drain(..dropped_head_samples);
+    }
+    let chunk_duration = samples.len() as f32 / sample_rate as f32;
+
     // Deterministic offset from buffer position delta. On a resumed Session,
     // `session_offset_base_seconds` shifts every live offset past the prior
-    // parts' cumulative duration so persisted Segments stay continuous.
+    // parts' cumulative duration so persisted Segments stay continuous. When
+    // we drop the head, the offset shifts forward by the dropped duration so
+    // segment timestamps still match the audio we actually sent.
     let samples_since_start = vad.speech_start_pos.saturating_sub(vad.session_start_pos);
     let audio_offset = session_offset_base_seconds
-        + samples_since_start as f32 / (vad.source_sample_rate as f32 * vad.source_channels as f32);
+        + samples_since_start as f32 / (vad.source_sample_rate as f32 * vad.source_channels as f32)
+        + dropped_head_seconds;
 
     debug!(
         "live chunk: source={:?} offset={:.2}s duration={:.2}s samples={} (pos: speech={} session_start={}, in-flight dispatch)",
@@ -755,7 +848,8 @@ struct PreparedChunk {
 async fn run_chunk_task(
     prepared: PreparedChunk,
     ctx: TranscriptionContext,
-    session: Arc<StdMutex<SessionAccumulators>>,
+    counters: Arc<StdMutex<SessionCounters>>,
+    prompt: Arc<StdMutex<PromptState>>,
 ) -> ChunkTaskOutcome {
     let source_label = prepared.source_label;
     let chunk_index_for_quarantine = prepared.chunk_index;
@@ -777,7 +871,8 @@ async fn run_chunk_task(
         &input,
         &mut chunk_index_mut,
         &mut accumulated_text,
-        &session,
+        &counters,
+        &prompt,
     )
     .await;
 
@@ -875,40 +970,6 @@ async fn advance_idle_cursor(vad: &mut SourceVadState, audio_state: &AudioManage
     vad.speech_start_pos = new_pos;
 }
 
-/// Trim leading silence from mono audio. Returns (trimmed_slice, offset_seconds).
-/// Scans in small windows; keeps a pad before first detected energy to avoid
-/// clipping speech onset. Returns an empty slice if the chunk is entirely silent.
-#[allow(dead_code)] // kept for tests + potential fallback path
-fn trim_leading_silence(
-    samples: &[f32],
-    sample_rate: u32,
-    silence_threshold: f32,
-    pad_seconds: f32,
-) -> (&[f32], f32) {
-    let window_samples = (sample_rate as f32 * 0.05) as usize; // 50 ms windows
-    if window_samples == 0 || samples.is_empty() {
-        return (samples, 0.0);
-    }
-
-    let mut first_loud = None;
-    for (i, window) in samples.chunks(window_samples).enumerate() {
-        let rms = (window.iter().map(|s| s * s).sum::<f32>() / window.len() as f32).sqrt();
-        if rms > silence_threshold {
-            first_loud = Some(i * window_samples);
-            break;
-        }
-    }
-
-    let Some(loud_pos) = first_loud else {
-        return (&[], 0.0); // all silent — return empty so caller can skip
-    };
-
-    let pad_samples = (pad_seconds * sample_rate as f32) as usize;
-    let trim_start = loud_pos.saturating_sub(pad_samples);
-    let trim_offset = trim_start as f32 / sample_rate as f32;
-    (&samples[trim_start..], trim_offset)
-}
-
 // --- Prompt decay ---
 
 /// Clear prompt context when no successful transcription has occurred within
@@ -983,10 +1044,7 @@ const DEVICE_IDENTITY_POLL_INTERVAL_SECS: f32 = 3.0;
 /// given source. On Windows, system audio loopback produces zero samples when nothing
 /// is playing — this is normal WASAPI behavior, not a stream failure.
 fn should_stall_restart(label: &AudioSourceLabel) -> bool {
-    if cfg!(target_os = "windows") && matches!(label, AudioSourceLabel::System) {
-        return false;
-    }
-    true
+    !(cfg!(target_os = "windows") && matches!(label, AudioSourceLabel::System))
 }
 
 /// Window used by the pre-flight health check to observe whether `write_pos`
@@ -1308,83 +1366,28 @@ fn backfill_chunks_from_probabilities(
     chunks
 }
 
-/// Chunk audio into segments of approximately `chunk_size` samples, but refine
-/// boundaries by scanning backward from each split point to find a silence gap.
-/// This avoids splitting mid-word. Falls back to the fixed boundary if no silence
-/// gap is found within the last `search_window` samples.
-#[allow(dead_code)] // retained as fallback; backfill now uses vad_chunk_historical_audio
-fn chunk_at_silence_boundaries(
-    samples: &[f32],
-    chunk_size: usize,
-    sample_rate: u32,
-    silence_threshold: f32,
-) -> Vec<&[f32]> {
-    if samples.is_empty() || chunk_size == 0 {
-        return vec![];
-    }
-
-    // Search backward up to 5 seconds from each boundary
-    let search_window = (5.0 * sample_rate as f32) as usize;
-    // Silence gap must be at least 100ms to be considered a natural pause
-    let min_silence_samples = (0.1 * sample_rate as f32) as usize;
-    // Scan in 10ms windows for RMS
-    let rms_window = (0.01 * sample_rate as f32) as usize;
-
-    let mut chunks = Vec::new();
-    let mut start = 0;
-
-    while start < samples.len() {
-        let nominal_end = (start + chunk_size).min(samples.len());
-
-        // If this is the last chunk or it's short enough, just take the rest
-        if nominal_end >= samples.len() || samples.len() - start <= chunk_size {
-            chunks.push(&samples[start..samples.len()]);
-            break;
-        }
-
-        // Scan backward from nominal_end looking for a silence gap
-        let scan_start = nominal_end.saturating_sub(search_window);
-        let mut best_split = None;
-        let mut silence_run = 0usize;
-
-        // Scan backward in rms_window steps
-        let mut pos = nominal_end;
-        while pos > scan_start + rms_window {
-            pos -= rms_window;
-            let window_end = (pos + rms_window).min(samples.len());
-            let window = &samples[pos..window_end];
-            let rms = (window.iter().map(|s| s * s).sum::<f32>() / window.len() as f32).sqrt();
-
-            if rms < silence_threshold {
-                silence_run += rms_window;
-                if silence_run >= min_silence_samples {
-                    // Found a silence gap — split at the start of this silence region
-                    best_split = Some(pos + silence_run);
-                    break;
-                }
-            } else {
-                silence_run = 0;
-            }
-        }
-
-        let split_at = best_split.unwrap_or(nominal_end);
-        chunks.push(&samples[start..split_at]);
-        start = split_at;
-    }
-
-    chunks
-}
-
-/// Process backfill audio concurrently with the live VAD loop.
-/// Chunks audio by max_chunk_seconds with soft boundaries at silence gaps,
-/// trims leading silence, interleaves across sources.
-/// Emits segments with offsets 0..backfill_seconds, then emits a `backfill-complete` event.
+/// Process backfill audio concurrently with the live VAD loop. Each source's
+/// chunk boundaries come from `vad_chunk_historical_audio`, which runs the
+/// same Silero-driven state machine the live loop uses; backfill and live
+/// segmentation share boundary choices (no quality gap between a session's
+/// first N seconds and the rest). Emits segments with offsets in the backfill
+/// window, then sets `backfill_done`.
+///
+/// `counters` is the same `Arc<StdMutex<SessionCounters>>` the live loop
+/// holds — backfill chunks update the same totals the live loop and
+/// `get_live_transcription_status` read, so the status surface reflects
+/// backfill + live work together. Backfill owns its **own** `PromptState`
+/// (built locally below) so the prompt-bridge step at end-of-backfill can't
+/// race with concurrent live writes — once bridging is done, the bridged
+/// text flows through `ctx.bridged_prompt` to the live loop's
+/// `seed_prompt_from_backfill` instead.
 async fn process_backfill(
     ctx: TranscriptionContext,
     backfill_audio: Vec<(Vec<f32>, u32, AudioSourceLabel)>,
     backfill_done: Arc<AtomicBool>,
     cancel: Arc<AtomicBool>,
     tuning: VadTuning,
+    counters: Arc<StdMutex<SessionCounters>>,
 ) {
     info!("backfill: starting concurrent processing");
 
@@ -1414,10 +1417,12 @@ async fn process_backfill(
     // Per-source state
     let mut chunk_indices: Vec<u32> = vec![0; source_entries.len()];
     let mut accumulated_texts: Vec<String> = vec![String::new(); source_entries.len()];
-    let session = Arc::new(StdMutex::new(SessionAccumulators {
+
+    // Backfill-local prompt accumulator. Kept separate from the live loop's
+    // `PromptState` so the bridge step below can `take` it without racing
+    // concurrent live writes.
+    let backfill_prompt = Arc::new(StdMutex::new(PromptState {
         shared_prompt: String::new(),
-        total_chunks: 0,
-        total_audio_seconds: 0.0,
         last_transcription_at: None,
     }));
 
@@ -1467,32 +1472,37 @@ async fn process_backfill(
                 &input,
                 &mut chunk_indices[source_idx],
                 &mut accumulated_texts[source_idx],
-                &session,
+                &counters,
+                &backfill_prompt,
             )
             .await;
         }
     }
 
     {
-        let s = session.lock().expect("session mutex poisoned");
+        let s = counters.lock().expect("counters mutex poisoned");
         info!(
             "backfill: completed {} chunks, {:.1}s audio",
             s.total_chunks, s.total_audio_seconds
         );
     }
 
-    // Bridge prompt context to live loop (Change 9: move instead of clone)
+    // Bridge backfill's accumulated prompt out to the live loop. Since
+    // `backfill_prompt` is owned only by this task, taking from it here
+    // can't race with live chunks.
     {
-        let mut prompt = ctx.bridged_prompt.lock().await;
+        let mut bridged = ctx.bridged_prompt.lock().await;
         let max_prompt = ctx.config.prompt_context_chars.unwrap_or(350) as usize;
-        let mut s = session.lock().expect("session mutex poisoned");
-        if s.shared_prompt.len() > max_prompt {
-            let boundary = s
+        let mut bp = backfill_prompt
+            .lock()
+            .expect("backfill prompt mutex poisoned");
+        if bp.shared_prompt.len() > max_prompt {
+            let boundary = bp
                 .shared_prompt
-                .ceil_char_boundary(s.shared_prompt.len() - max_prompt);
-            *prompt = s.shared_prompt[boundary..].to_string();
+                .ceil_char_boundary(bp.shared_prompt.len() - max_prompt);
+            *bridged = bp.shared_prompt[boundary..].to_string();
         } else {
-            *prompt = std::mem::take(&mut s.shared_prompt);
+            *bridged = std::mem::take(&mut bp.shared_prompt);
         }
     }
 
@@ -1511,13 +1521,14 @@ fn source_display_name(label: &AudioSourceLabel) -> &'static str {
     }
 }
 
-/// Checks stream health for all sources and triggers restarts if needed.
-/// Returns `true` if any source was restarted (caller may want to skip VAD this tick).
-///
-/// `session_wav_state` must be passed so that a buffer-replacing restart
-/// can reset the WAV writer's flush position for the affected source —
-/// otherwise the old position against the new buffer stalls WAV writes
-/// until `write_pos` climbs past the stale counter.
+/// Per-tick stream-health pass over every source. Each source is checked
+/// against three layered signals — OS-authoritative listener events first,
+/// then symptom-based detection (cpal error flag, write-position stall,
+/// device-identity drift) gated by a cooldown — and restarted when any one
+/// of them fires. `session_wav_state` is threaded through so a
+/// buffer-replacing restart can reset the WAV writer's flush position;
+/// otherwise the old position against the fresh buffer stalls writes until
+/// the new counter climbs past it.
 async fn check_stream_health(
     sources: &mut [SourceVadState],
     audio_state: &AudioManagerState,
@@ -1526,301 +1537,309 @@ async fn check_stream_health(
 ) {
     for source in sources.iter_mut() {
         if source.restart_attempts >= STREAM_RESTART_MAX_ATTEMPTS {
-            continue; // Already exhausted retries for this source
+            continue;
         }
 
-        let mut needs_restart = false;
-        let mut reason: String = String::new();
+        let mut reason = evaluate_listener_signal(source, audio_state).await;
 
-        // Layer 0: CoreAudio push notification — the OS tells us the
-        // default device changed (AirPods connect, Sound Settings toggle,
-        // another app grabs exclusive output) or the device list changed
-        // (hardware added/removed, which is an earlier signal than the
-        // default-device flip on some macOS versions). This is an
-        // authoritative rebind signal and bypasses cooldown — unlike the
-        // symptom-based layers below, a listener event is a real OS push,
-        // not a speculative retry. The restart_attempts ceiling above still
-        // guards against runaway loops if every rebind somehow fails.
-        //
-        // Before committing to a restart, sleep briefly and re-query the
-        // current default. macOS may report the *old* device as default
-        // momentarily during an AirPods/Bluetooth handshake (cpal#1175);
-        // restarting during that revert window would rebind to the same
-        // dead device. The settle delay lets the OS finish its transition
-        // and the re-check confirms the default is genuinely different
-        // from what we're bound to.
-        let listener_fired = {
-            let manager = audio_state.lock().await;
-            let default_changed = match source.label {
-                AudioSourceLabel::Mic => manager.mic_default_changed(),
-                AudioSourceLabel::System => manager.system_audio_default_changed(),
-            };
-            // Device-list change is a shared signal (consumed once per
-            // tick). Fold it into the listener-fired decision for the first
-            // source that inspects it; subsequent sources in the same tick
-            // see it as already-consumed.
-            let devices_changed = manager.device_list_changed();
-            default_changed || devices_changed
+        if reason.is_none() {
+            let in_cooldown = source.last_restart_at.is_some_and(|t| {
+                t.elapsed() < Duration::from_secs_f32(STREAM_RESTART_COOLDOWN_SECS)
+            });
+            if !in_cooldown {
+                reason = evaluate_speculative_signals(source, audio_state).await;
+            }
+        }
+
+        let Some(reason) = reason else { continue };
+        // `as_deref_mut` reborrows the `Option<&mut _>` so each loop
+        // iteration gets a fresh mutable view without consuming the slot.
+        #[allow(clippy::needless_option_as_deref)]
+        let ws_borrow = session_wav_state.as_deref_mut();
+        attempt_source_restart(source, audio_state, app_handle, ws_borrow, &reason).await;
+    }
+}
+
+/// Layer 0: OS-authoritative rebind signal. Returns `Some(reason)` only when
+/// the CoreAudio listener fired AND a re-query after a 200 ms settle confirms
+/// the default device is genuinely different from what's bound — macOS can
+/// momentarily revert the default during a Bluetooth handshake (cpal#1175),
+/// so the settle-and-recheck is what keeps us from rebinding to a still-dead
+/// device. Listener signals bypass the speculative-restart cooldown because
+/// they're a real OS push, not a guess.
+async fn evaluate_listener_signal(
+    source: &SourceVadState,
+    audio_state: &AudioManagerState,
+) -> Option<String> {
+    let listener_fired = {
+        let manager = audio_state.lock().await;
+        let default_changed = match source.label {
+            AudioSourceLabel::Mic => manager.mic_default_changed(),
+            AudioSourceLabel::System => manager.system_audio_default_changed(),
         };
-        if listener_fired {
-            // Settle delay — small enough that recovery is fast, long enough
-            // that macOS has committed to the new default device before we
-            // probe again.
-            tokio::time::sleep(Duration::from_millis(200)).await;
+        // Device-list change is a shared signal consumed once per tick; fold
+        // it into the listener-fired decision for the first source that
+        // inspects it.
+        let devices_changed = manager.device_list_changed();
+        default_changed || devices_changed
+    };
+    if !listener_fired {
+        return None;
+    }
 
-            let manager = audio_state.lock().await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let manager = audio_state.lock().await;
+    let bound = match source.label {
+        AudioSourceLabel::Mic => manager.mic_bound_device(),
+        AudioSourceLabel::System => manager.system_audio_bound_device(),
+    }
+    .map(str::to_string);
+    let current_default = match source.label {
+        AudioSourceLabel::Mic => yapstack_audio::manager::live_default_input_name(),
+        AudioSourceLabel::System => yapstack_audio::manager::live_default_output_name(),
+    };
+    let direction = match source.label {
+        AudioSourceLabel::Mic => "input",
+        AudioSourceLabel::System => "output",
+    };
+    match (bound.as_deref(), current_default.as_deref()) {
+        (Some(b), Some(c)) if b != c => {
+            info!(
+                "default {} device change confirmed after settle: '{}' → '{}', rebinding",
+                direction, b, c
+            );
+            Some("default device changed".into())
+        }
+        (Some(b), Some(c)) => {
+            // Listener fired but the default unchanged once the OS finished
+            // settling — spurious / transient signal. Let the stall watchdog
+            // catch a real disconnect.
+            debug!(
+                "listener fired for {} but default unchanged after settle (still '{}' ≈ '{}') — skipping restart",
+                direction, b, c
+            );
+            None
+        }
+        _ => {
+            // Bound name unavailable (stream never started or no device
+            // resolved). Trust the listener and rebind.
+            info!(
+                "default {} device changed (bound='{:?}', current='{:?}'), rebinding",
+                direction, bound, current_default
+            );
+            Some("default device changed".into())
+        }
+    }
+}
+
+/// Layers 1–3: symptom-based detection, gated by the speculative-restart
+/// cooldown in the caller. Layer 1 is the cpal error-callback flag (instant);
+/// Layer 2 is the write-position stall watchdog (~2 s); Layer 3 is the
+/// defensive device-identity drift poll that catches a missed Layer-0 event.
+/// Returns the first reason that fires, or `None` if none do.
+async fn evaluate_speculative_signals(
+    source: &mut SourceVadState,
+    audio_state: &AudioManagerState,
+) -> Option<String> {
+    let manager = audio_state.lock().await;
+
+    // Layer 1: cpal error callback flag.
+    let has_error = match source.label {
+        AudioSourceLabel::Mic => manager.mic_has_stream_error(),
+        AudioSourceLabel::System => manager.system_has_stream_error(),
+    };
+    if has_error {
+        return Some("stream error callback fired".into());
+    }
+
+    // Layer 2: write_pos stall detection. On Windows, system audio loopback
+    // produces zero samples when nothing is playing — that's normal WASAPI
+    // behavior, so `should_stall_restart` skips that case.
+    let current_pos = source_write_pos(&manager, &source.label);
+    if current_pos > source.last_seen_write_pos {
+        source.last_seen_write_pos = current_pos;
+        source.last_write_pos_advance = Instant::now();
+    } else if source.last_write_pos_advance.elapsed()
+        > Duration::from_secs_f32(STREAM_STALL_THRESHOLD_SECS)
+        && should_stall_restart(&source.label)
+    {
+        return Some("write position stalled".into());
+    }
+
+    // Layer 3: defensive device-identity drift poll. Throttled.
+    let should_check = source
+        .last_device_check_at
+        .is_none_or(|t| t.elapsed() > Duration::from_secs_f32(DEVICE_IDENTITY_POLL_INTERVAL_SECS));
+    if should_check {
+        source.last_device_check_at = Some(Instant::now());
+        let drift = match source.label {
+            AudioSourceLabel::Mic => manager.mic_input_drifted(),
+            AudioSourceLabel::System => manager.system_audio_output_drifted(),
+        };
+        if let Some(new_name) = drift {
             let bound = match source.label {
                 AudioSourceLabel::Mic => manager.mic_bound_device(),
                 AudioSourceLabel::System => manager.system_audio_bound_device(),
             }
-            .map(str::to_string);
-            let current_default = match source.label {
-                AudioSourceLabel::Mic => yapstack_audio::manager::live_default_input_name(),
-                AudioSourceLabel::System => yapstack_audio::manager::live_default_output_name(),
-            };
-            let direction = match source.label {
-                AudioSourceLabel::Mic => "input",
-                AudioSourceLabel::System => "output",
-            };
-            match (bound.as_deref(), current_default.as_deref()) {
-                (Some(b), Some(c)) if b != c => {
-                    needs_restart = true;
-                    info!(
-                        "default {} device change confirmed after settle: '{}' → '{}', rebinding",
-                        direction, b, c
-                    );
-                    reason = "default device changed".into();
-                }
-                (Some(b), Some(c)) => {
-                    // Listener fired but default is unchanged once the OS
-                    // finished settling — spurious / transient signal.
-                    // Don't restart; let the stall watchdog (Layer 2) catch
-                    // a real disconnect.
-                    debug!(
-                        "listener fired for {} but default unchanged after settle (still '{}' ≈ '{}') — skipping restart",
-                        direction, b, c
-                    );
-                }
-                _ => {
-                    // Bound name unavailable (stream never started or no
-                    // device resolved). Trust the listener and rebind.
-                    needs_restart = true;
-                    info!(
-                        "default {} device changed (bound='{:?}', current='{:?}'), rebinding",
-                        direction, bound, current_default
-                    );
-                    reason = "default device changed".into();
-                }
-            }
+            .map(str::to_string)
+            .unwrap_or_else(|| "<unknown>".into());
+            warn!(
+                "device identity drift without listener event: '{}' → '{}' (rebinding)",
+                bound, new_name
+            );
+            return Some("device identity drift (listener missed)".into());
         }
+    }
 
-        // Cooldown only gates the speculative layers below. Listener events
-        // above are honored immediately because they're OS-authoritative.
-        let in_cooldown = source
-            .last_restart_at
-            .is_some_and(|t| t.elapsed() < Duration::from_secs_f32(STREAM_RESTART_COOLDOWN_SECS));
+    None
+}
 
-        if !needs_restart && !in_cooldown {
-            let manager = audio_state.lock().await;
+/// Run a single restart attempt for `source`. Records the attempt timestamp,
+/// invokes the engine's restart entry point, and on success handles the
+/// buffer-replacement bookkeeping (cursor reset + WAV flush-position reset).
+/// On a same-device rebind, treats the attempt as partial — increments the
+/// retry counter and clears the cooldown so the next tick can try again
+/// immediately instead of waiting 5 s. Emits a `stream-health` event in
+/// every outcome.
+async fn attempt_source_restart(
+    source: &mut SourceVadState,
+    audio_state: &AudioManagerState,
+    app_handle: &AppHandle,
+    mut session_wav_state: Option<&mut SessionWavState>,
+    reason: &str,
+) {
+    let source_name = source_display_name(&source.label);
+    warn!(
+        "stream health: {} needs restart ({}), attempt {}/{}",
+        source_name,
+        reason,
+        source.restart_attempts + 1,
+        STREAM_RESTART_MAX_ATTEMPTS
+    );
 
-            // Layer 1: cpal error callback flag (instant detection)
-            let has_error = match source.label {
-                AudioSourceLabel::Mic => manager.mic_has_stream_error(),
-                AudioSourceLabel::System => manager.system_has_stream_error(),
-            };
-            if has_error {
-                needs_restart = true;
-                reason = "stream error callback fired".into();
-            }
+    source.last_restart_at = Some(Instant::now());
 
-            // Layer 2: write_pos stall detection (~2s latency)
-            // On Windows, system audio loopback produces zero samples when nothing is
-            // playing — this is normal behavior, not a stream failure. Only use stall
-            // detection for mic streams on Windows; system streams rely solely on the
-            // cpal error flag (Layer 1).
-            if !needs_restart {
-                let current_pos = source_write_pos(&manager, &source.label);
-                if current_pos > source.last_seen_write_pos {
-                    source.last_seen_write_pos = current_pos;
-                    source.last_write_pos_advance = Instant::now();
-                } else if source.last_write_pos_advance.elapsed()
-                    > Duration::from_secs_f32(STREAM_STALL_THRESHOLD_SECS)
-                    && should_stall_restart(&source.label)
-                {
-                    needs_restart = true;
-                    reason = "write position stalled".into();
-                }
-            }
-
-            // Layer 3: defensive device-identity drift poll. Only runs when
-            // earlier layers cleared and the throttle has elapsed. Primary
-            // detection is Layer 0; this catches the rare case where the
-            // listener registration silently failed or the OS missed a
-            // property-change notification.
-            if !needs_restart {
-                let should_check = source.last_device_check_at.is_none_or(|t| {
-                    t.elapsed() > Duration::from_secs_f32(DEVICE_IDENTITY_POLL_INTERVAL_SECS)
-                });
-                if should_check {
-                    source.last_device_check_at = Some(Instant::now());
-                    let drift = match source.label {
-                        AudioSourceLabel::Mic => manager.mic_input_drifted(),
-                        AudioSourceLabel::System => manager.system_audio_output_drifted(),
-                    };
-                    if let Some(new_name) = drift {
-                        let bound = match source.label {
-                            AudioSourceLabel::Mic => manager.mic_bound_device(),
-                            AudioSourceLabel::System => manager.system_audio_bound_device(),
-                        }
-                        .map(str::to_string)
-                        .unwrap_or_else(|| "<unknown>".into());
-                        warn!(
-                            "device identity drift without listener event: '{}' → '{}' (rebinding)",
-                            bound, new_name
-                        );
-                        needs_restart = true;
-                        reason = "device identity drift (listener missed)".into();
-                    }
-                }
-            }
+    let restart_result = {
+        let mut manager = audio_state.lock().await;
+        match source.label {
+            AudioSourceLabel::Mic => manager.restart_mic(),
+            AudioSourceLabel::System => manager.restart_system_audio(),
         }
+    };
 
-        if !needs_restart {
-            continue;
-        }
+    match restart_result {
+        Ok(report) => {
+            info!(
+                "stream health: {} restarted successfully (outcome: {:?}, same_device: {}, new_id: {:?})",
+                source_name, report.outcome, report.same_device, report.new_device_id
+            );
 
-        let source_name = source_display_name(&source.label);
-        warn!(
-            "stream health: {} needs restart ({}), attempt {}/{}",
-            source_name,
-            reason,
-            source.restart_attempts + 1,
-            STREAM_RESTART_MAX_ATTEMPTS
-        );
-
-        source.last_restart_at = Some(Instant::now());
-
-        let restart_result = {
-            let mut manager = audio_state.lock().await;
-            match source.label {
-                AudioSourceLabel::Mic => manager.restart_mic(),
-                AudioSourceLabel::System => manager.restart_system_audio(),
-            }
-        };
-
-        match restart_result {
-            Ok(report) => {
-                info!(
-                    "stream health: {} restarted successfully (outcome: {:?}, same_device: {}, new_id: {:?})",
-                    source_name, report.outcome, report.same_device, report.new_device_id
+            // Same-device rebind likely means macOS was still settling after
+            // a Bluetooth handshake (cpal#1175). Treat it like a partial
+            // failure: keep counting attempts and clear the cooldown so the
+            // next tick can retry immediately. Do NOT reset
+            // last_write_pos_advance — the stream hasn't actually recovered,
+            // and Layer 2 should fire on the next tick if write_pos isn't
+            // advancing.
+            if report.same_device {
+                warn!(
+                    "{} restart rebound to the same device ({:?}) — macOS likely still settling; \
+                     retrying on next poll (attempt {}/{})",
+                    source_name,
+                    report.new_device_id,
+                    source.restart_attempts + 1,
+                    STREAM_RESTART_MAX_ATTEMPTS
                 );
-
-                // When the restart rebound to the same device, macOS was
-                // likely still settling after an AirPods/Bluetooth handshake
-                // (cpal#1175: default-device property can revert momentarily).
-                // Treat it like a partial failure: keep incrementing
-                // restart_attempts so the outer MAX_ATTEMPTS cap applies, and
-                // clear the cooldown so the next health tick can retry
-                // immediately instead of waiting 5 s. Do NOT reset
-                // last_write_pos_advance — the stream hasn't actually
-                // recovered, and we want Layer 2 (stall) to fire on the next
-                // tick if the write_pos isn't advancing.
-                if report.same_device {
-                    warn!(
-                        "{} restart rebound to the same device ({:?}) — macOS likely still settling; \
-                         retrying on next poll (attempt {}/{})",
-                        source_name,
-                        report.new_device_id,
-                        source.restart_attempts + 1,
-                        STREAM_RESTART_MAX_ATTEMPTS
-                    );
-                    source.restart_attempts += 1;
-                    source.last_restart_at = None;
-                } else {
-                    source.restart_attempts = 0;
-                    source.last_write_pos_advance = Instant::now();
-                }
-
-                let outcome = report.outcome;
-                if outcome == yapstack_audio::manager::RestartOutcome::BufferReplaced {
-                    // Read the fresh buffer's metadata and reset all cursors.
-                    // The new buffer starts at write_pos = 0, so session /
-                    // cursor / speech-start positions must follow.
-                    let (new_pos, sr, ch) = {
-                        let manager = audio_state.lock().await;
-                        let info = match source.label {
-                            AudioSourceLabel::Mic => manager.mic_buffer_info(),
-                            AudioSourceLabel::System => manager.system_buffer_info(),
-                        };
-                        let pos = source_write_pos(&manager, &source.label);
-                        info.map(|i| (pos, i.sample_rate, i.channels)).unwrap_or((
-                            pos,
-                            source.source_sample_rate,
-                            source.source_channels,
-                        ))
-                    };
-                    source.reset_for_buffer_replacement(new_pos, sr, ch);
-                    warn!(
-                        "{} buffer replaced on restart ({}Hz/{}ch) — source state reset",
-                        source_name, sr, ch
-                    );
-
-                    // The WAV writer's flush_positions point into the old
-                    // buffer; against the new buffer those positions are
-                    // meaningless (new write_pos starts near 0, so
-                    // `snapshot_since` would return nothing until the new
-                    // buffer's counter climbs past the stale position).
-                    // Reset just the affected source's flush position and
-                    // warn if the sample rate no longer matches the WAV
-                    // header — resampling mid-session is deferred; the
-                    // archived WAV will have a speed artifact for the new
-                    // segment but won't stall or crash.
-                    if let Some(ref mut ws) = session_wav_state {
-                        match source.label {
-                            AudioSourceLabel::Mic => ws.flush_positions.mic_pos = new_pos,
-                            AudioSourceLabel::System => ws.flush_positions.system_pos = new_pos,
-                        }
-                        if sr != ws.wav_sample_rate {
-                            info!(
-                                "WAV sample-rate mismatch on {} rebind: writer={}Hz, new buffer={}Hz — extracted samples will be resampled on write",
-                                source_name, ws.wav_sample_rate, sr
-                            );
-                        }
-                    }
-                }
-
-                let _ = app_handle.emit(
-                    "stream-health",
-                    StreamHealthEvent {
-                        source: source.label,
-                        status: "restarted".into(),
-                        message: format!("{} stream restarted ({})", source_name, reason),
-                    },
-                );
-            }
-            Err(e) => {
                 source.restart_attempts += 1;
-                error!(
-                    "stream health: {} restart failed (attempt {}): {}",
-                    source_name, source.restart_attempts, e
-                );
-                let status = if source.restart_attempts >= STREAM_RESTART_MAX_ATTEMPTS {
-                    "restart_abandoned"
-                } else {
-                    "restart_failed"
-                };
-                let _ = app_handle.emit(
-                    "stream-health",
-                    StreamHealthEvent {
-                        source: source.label,
-                        status: status.into(),
-                        message: format!(
-                            "{} stream restart failed: {} (attempt {}/{})",
-                            source_name, e, source.restart_attempts, STREAM_RESTART_MAX_ATTEMPTS
-                        ),
-                    },
-                );
+                source.last_restart_at = None;
+            } else {
+                source.restart_attempts = 0;
+                source.last_write_pos_advance = Instant::now();
             }
+
+            if report.outcome == yapstack_audio::manager::RestartOutcome::BufferReplaced {
+                #[allow(clippy::needless_option_as_deref)]
+                let ws_borrow = session_wav_state.as_deref_mut();
+                handle_buffer_replacement(source, audio_state, ws_borrow, source_name).await;
+            }
+
+            let _ = app_handle.emit(
+                "stream-health",
+                StreamHealthEvent {
+                    source: source.label,
+                    status: "restarted".into(),
+                    message: format!("{} stream restarted ({})", source_name, reason),
+                },
+            );
+        }
+        Err(e) => {
+            source.restart_attempts += 1;
+            error!(
+                "stream health: {} restart failed (attempt {}): {}",
+                source_name, source.restart_attempts, e
+            );
+            let status = if source.restart_attempts >= STREAM_RESTART_MAX_ATTEMPTS {
+                "restart_abandoned"
+            } else {
+                "restart_failed"
+            };
+            let _ = app_handle.emit(
+                "stream-health",
+                StreamHealthEvent {
+                    source: source.label,
+                    status: status.into(),
+                    message: format!(
+                        "{} stream restart failed: {} (attempt {}/{})",
+                        source_name, e, source.restart_attempts, STREAM_RESTART_MAX_ATTEMPTS
+                    ),
+                },
+            );
+        }
+    }
+}
+
+/// Buffer-replaced restart bookkeeping. Reads the fresh buffer's metadata
+/// (sample rate, channels, write_pos) and resets every cursor on the source
+/// to point into the new buffer. Also resets just this source's
+/// `flush_positions` on the WAV writer — leaving the old position would stall
+/// WAV writes until the new buffer's counter climbs past it. Sample-rate
+/// mismatch is logged; the per-tick write path resamples on the fly.
+async fn handle_buffer_replacement(
+    source: &mut SourceVadState,
+    audio_state: &AudioManagerState,
+    session_wav_state: Option<&mut SessionWavState>,
+    source_name: &str,
+) {
+    let (new_pos, sr, ch) = {
+        let manager = audio_state.lock().await;
+        let info = match source.label {
+            AudioSourceLabel::Mic => manager.mic_buffer_info(),
+            AudioSourceLabel::System => manager.system_buffer_info(),
+        };
+        let pos = source_write_pos(&manager, &source.label);
+        info.map(|i| (pos, i.sample_rate, i.channels)).unwrap_or((
+            pos,
+            source.source_sample_rate,
+            source.source_channels,
+        ))
+    };
+    source.reset_for_buffer_replacement(new_pos, sr, ch);
+    warn!(
+        "{} buffer replaced on restart ({}Hz/{}ch) — source state reset",
+        source_name, sr, ch
+    );
+
+    if let Some(ws) = session_wav_state {
+        match source.label {
+            AudioSourceLabel::Mic => ws.flush_positions.mic_pos = new_pos,
+            AudioSourceLabel::System => ws.flush_positions.system_pos = new_pos,
+        }
+        if sr != ws.wav_sample_rate {
+            info!(
+                "WAV sample-rate mismatch on {} rebind: writer={}Hz, new buffer={}Hz — extracted samples will be resampled on write",
+                source_name, ws.wav_sample_rate, sr
+            );
         }
     }
 }
@@ -1830,15 +1849,22 @@ async fn live_transcription_loop(
     ctx: TranscriptionContext,
     mut stop_rx: oneshot::Receiver<()>,
     mut session_wav_state: Option<SessionWavState>,
+    counters: Arc<StdMutex<SessionCounters>>,
 ) {
+    // Live-loop-private prompt state. Backfill owns its own (see
+    // `process_backfill`); they bridge via `ctx.bridged_prompt`.
+    let prompt = Arc::new(StdMutex::new(PromptState {
+        shared_prompt: String::new(),
+        last_transcription_at: None,
+    }));
     let source = ctx.config.source.clone().into();
     let check_mic = matches!(source, CaptureSource::MicOnly | CaptureSource::Mixed);
     let check_system = matches!(source, CaptureSource::SystemOnly | CaptureSource::Mixed);
 
     // Resolve engine-keyed VAD tuning once at loop entry. Whisper uses the
     // frontend-supplied silence_duration_ms / poll cadence; Parakeet uses its
-    // dialogue-tuned defaults (400 ms silence, 100 ms poll, 250 ms pre-roll,
-    // 0.7 offset-hysteresis ratio).
+    // dialogue-tuned defaults (200 ms silence, 100 ms poll, 250 ms pre-roll,
+    // 10 s max chunk).
     let engine_kind = {
         let client_guard = ctx.transcription_client.lock().await;
         client_guard
@@ -1856,104 +1882,14 @@ async fn live_transcription_loop(
         "live transcription VAD tuning resolved"
     );
 
-    // Get initial cursor positions and build source list
-    let (mut sources, backfill_audio) = {
-        let manager = audio_state.lock().await;
-        let positions = manager.buffer_positions();
-
-        let has_backfill = ctx.config.backfill_seconds > 0.0;
-        let mut sources: Vec<SourceVadState> = Vec::with_capacity(2);
-        let mut backfill: Vec<(Vec<f32>, u32, AudioSourceLabel)> = Vec::new();
-
-        if check_mic {
-            let (initial_pos, session_start, sr, ch) = if let Some(buf) = manager.mic_buffer() {
-                let sr = buf.sample_rate();
-                let ch = buf.channels();
-                if has_backfill {
-                    let raw = (ctx.config.backfill_seconds * sr as f32 * ch as f32) as usize;
-                    // Round down to frame boundary for correct deinterleaving
-                    let rewind = raw - (raw % ch as usize);
-                    let rewound = positions.mic_pos.saturating_sub(rewind);
-                    (rewound, rewound, sr, ch)
-                } else {
-                    (positions.mic_pos, positions.mic_pos, sr, ch)
-                }
-            } else {
-                (positions.mic_pos, positions.mic_pos, 48000, 1)
-            };
-            sources.push(SourceVadState::new(
-                AudioSourceLabel::Mic,
-                initial_pos,
-                session_start,
-                sr,
-                ch,
-            ));
-        }
-        if check_system {
-            if let Some(buf) = manager.system_buffer() {
-                let sr = buf.sample_rate();
-                let ch = buf.channels();
-                let (initial_pos, session_start) = if has_backfill {
-                    let raw = (ctx.config.backfill_seconds * sr as f32 * ch as f32) as usize;
-                    // Round down to frame boundary for correct deinterleaving
-                    let rewind = raw - (raw % ch as usize);
-                    let rewound = positions.system_pos.saturating_sub(rewind);
-                    (rewound, rewound)
-                } else {
-                    (positions.system_pos, positions.system_pos)
-                };
-                sources.push(SourceVadState::new(
-                    AudioSourceLabel::System,
-                    initial_pos,
-                    session_start,
-                    sr,
-                    ch,
-                ));
-            } else if matches!(source, CaptureSource::Mixed) {
-                warn!("mixed mode: system buffer unavailable, running mic-only");
-            }
-        }
-
-        // Extract backfill audio and reset cursors to current positions
-        if has_backfill {
-            info!(
-                "live transcription: extracted backfill audio ({:.1}s) for concurrent processing",
-                ctx.config.backfill_seconds
-            );
-            for s in sources.iter_mut() {
-                let (audio, current) = extract_source_audio(&manager, &s.label, s.cursor);
-                if let Some((samples, sr)) = audio {
-                    info!(
-                        "backfill extract: source={:?} cursor={} write_pos={} samples={} sr={} duration={:.2}s",
-                        s.label, s.cursor, current, samples.len(), sr, samples.len() as f32 / sr as f32
-                    );
-                    backfill.push((samples, sr, s.label));
-                } else {
-                    warn!(
-                        "backfill: no audio available for source={:?} (cursor={}, write_pos={})",
-                        s.label, s.cursor, current
-                    );
-                }
-                // Reset the full per-source live VAD state to `current`
-                // so the live loop starts from the post-backfill write
-                // position. Without this, Silero would replay every
-                // backfill sample through the *live* detector on the
-                // first few polls, duplicating or delaying speech that
-                // backfill already emitted. We also reset the recurrent
-                // stream state (LSTM memory was initialized at session
-                // start against pre-backfill audio context) and clear the
-                // sticky last_probability.
-                s.cursor = current;
-                s.speech_start_pos = current;
-                s.earliest_next_chunk_pos = current;
-                s.silero.read_pos = current;
-                s.silero.last_probability = None;
-                s.silero.stream.reset();
-            }
-        }
-
-        (sources, backfill)
-    };
+    let (mut sources, backfill_audio) = build_initial_sources_and_backfill(
+        &audio_state,
+        &ctx.config,
+        check_mic,
+        check_system,
+        source,
+    )
+    .await;
 
     // Spawn concurrent backfill processing.
     // `backfill_cancel` is a cooperative cancel flag. On stop we set it true
@@ -1971,12 +1907,14 @@ async fn live_transcription_loop(
         let backfill_ctx = ctx.clone();
         let backfill_done_clone = backfill_done.clone();
         let backfill_cancel_clone = backfill_cancel.clone();
+        let backfill_counters = counters.clone();
         let handle = tokio::spawn(process_backfill(
             backfill_ctx,
             backfill_audio,
             backfill_done_clone,
             backfill_cancel_clone,
             tuning,
+            backfill_counters,
         ));
         let abort_handle = handle.abort_handle();
         Some((handle, abort_handle))
@@ -1985,12 +1923,6 @@ async fn live_transcription_loop(
         None
     };
 
-    let session = Arc::new(StdMutex::new(SessionAccumulators {
-        shared_prompt: String::new(),
-        total_chunks: 0,
-        total_audio_seconds: 0.0,
-        last_transcription_at: None,
-    }));
     let mut wav_flush_none_count: u32 = 0;
     let mut prompt_seeded_from_backfill = false;
 
@@ -2029,8 +1961,6 @@ async fn live_transcription_loop(
     // invariant "every spawned task → exactly one outcome observed",
     // which keeps `has_in_flight_task` from leaking on panic/cancel and
     // would otherwise silently kill dispatch for that source forever.
-    type ChunkTaskFuture =
-        std::pin::Pin<Box<dyn std::future::Future<Output = ChunkTaskOutcome> + Send>>;
     let mut chunk_tasks: futures_util::stream::FuturesUnordered<ChunkTaskFuture> =
         futures_util::stream::FuturesUnordered::new();
     // Parallel handles so stop can `.abort()` slow tasks immediately —
@@ -2119,116 +2049,25 @@ async fn live_transcription_loop(
             }
         }
 
-        // Write WAV data outside the lock
         if let Some((samples, sr, new_pos)) = wav_flush_data {
             wav_flush_none_count = 0;
             if let Some(ref mut ws) = session_wav_state {
-                // If a mid-session buffer rebind left the extraction at a
-                // different sample rate than the WAV header, resample before
-                // appending so the archived file plays at a single consistent
-                // speed. `yapstack_common::audio::resample` zero-copies when
-                // `sr == ws.wav_sample_rate`.
-                let to_write: std::borrow::Cow<[f32]> = if sr == ws.wav_sample_rate {
-                    std::borrow::Cow::Borrowed(&samples)
-                } else {
-                    match yapstack_common::audio::resample(&samples, sr, ws.wav_sample_rate) {
-                        Ok(cow) => std::borrow::Cow::Owned(cow.into_owned()),
-                        Err(e) => {
-                            error!(
-                                "WAV resample {}Hz → {}Hz failed, dropping {} samples: {}",
-                                sr,
-                                ws.wav_sample_rate,
-                                samples.len(),
-                                e
-                            );
-                            // Advance positions regardless — retrying would
-                            // re-extract the same samples next tick.
-                            ws.flush_positions = new_pos;
-                            continue;
-                        }
-                    }
-                };
-                if let Err(e) = ws.writer.write_samples(&to_write) {
-                    error!(
-                        "session WAV write error ({} samples may be lost): {}",
-                        to_write.len(),
-                        e
-                    );
-                }
-                // Always advance — retrying partial writes would duplicate samples
-                ws.flush_positions = new_pos;
-                // Periodic diagnostic (~every 30s at 300ms intervals)
-                ws.flush_count += 1;
-                if ws.flush_count % WAV_FLUSH_DIAGNOSTIC_INTERVAL == 0 {
-                    debug!(
-                        "session WAV progress: flushes={}, samples_written={}, duration={:.1}s",
-                        ws.flush_count,
-                        ws.writer.samples_written(),
-                        ws.writer.duration_seconds()
-                    );
+                if matches!(
+                    write_session_wav_samples(ws, &samples, sr, new_pos),
+                    WavWriteOutcome::ResampleFailed
+                ) {
+                    continue;
                 }
             }
         } else if session_wav_state.is_some() {
-            wav_flush_none_count += 1;
-            debug!(
-                "session WAV flush: no data (consecutive: {})",
-                wav_flush_none_count
-            );
-            // Only count toward the error threshold after backfill completes.
-            // During backfill, empty flushes are expected because backfill is
-            // consuming ring buffer reads for the first few seconds.
-            if wav_flush_none_count == WAV_FLUSH_ERROR_THRESHOLD {
-                if backfill_done.load(Ordering::Acquire) {
-                    if let Some(ref ws) = session_wav_state {
-                        let has_stream_error = {
-                            let mgr = audio_state.lock().await;
-                            mgr.system_has_stream_error()
-                        };
-                        match classify_empty_flush(ws.source, has_stream_error) {
-                            EmptyFlushClassification::WindowsSilence => {
-                                info!(
-                                    "session WAV: empty extractions for SystemOnly session {} on Windows — emitting warning (no stream error)",
-                                    ws.session_id
-                                );
-                                let _ = ctx.app_handle.emit(
-                                    "session-wav-warning",
-                                    SessionWavWarningEvent {
-                                        session_id: ws.session_id.clone(),
-                                        message:
-                                            "No system audio detected — recording will resume when audio plays"
-                                                .to_string(),
-                                    },
-                                );
-                            }
-                            EmptyFlushClassification::Error => {
-                                warn!(
-                                    "session WAV: 10 consecutive empty extractions for session {} — emitting error event",
-                                    ws.session_id
-                                );
-                                let _ = ctx.app_handle.emit(
-                                    "session-wav-error",
-                                    SessionWavErrorEvent {
-                                        session_id: ws.session_id.clone(),
-                                        message:
-                                            "No audio data available for recording — audio may not be saved"
-                                                .to_string(),
-                                    },
-                                );
-                            }
-                        }
-                    }
-                } else {
-                    debug!("session WAV flush: resetting empty count (backfill still running)");
-                    wav_flush_none_count = 0;
-                }
-            }
-            if wav_flush_none_count.is_multiple_of(WAV_FLUSH_WARNING_INTERVAL) {
-                let silence_secs = wav_flush_none_count as f32 * POLL_INTERVAL_MS as f32 / 1000.0;
-                warn!(
-                    "session WAV flush: {} consecutive empty extractions ({:.1}s) — possible sample rate mismatch or no audio data",
-                    wav_flush_none_count, silence_secs
-                );
-            }
+            handle_empty_wav_flush(
+                &mut wav_flush_none_count,
+                session_wav_state.as_ref(),
+                &audio_state,
+                &ctx,
+                &backfill_done,
+            )
+            .await;
         }
 
         // Stream health watchdog: check for cpal error flags and write_pos stalls.
@@ -2243,30 +2082,10 @@ async fn live_transcription_loop(
         )
         .await;
 
-        // Seed live prompt from backfill context once available.
-        // Must seed both shared_prompt AND each source's accumulated_text,
-        // since transcribe_chunk() uses accumulated_text as the Whisper prompt.
-        if !prompt_seeded_from_backfill {
-            let bridged = ctx.bridged_prompt.lock().await;
-            if !bridged.is_empty() {
-                {
-                    let mut s = session.lock().expect("session mutex poisoned");
-                    if s.shared_prompt.is_empty() {
-                        s.shared_prompt = bridged.clone();
-                    }
-                    s.last_transcription_at = Some(Instant::now());
-                }
-                for source in &mut sources {
-                    if source.accumulated_text.is_empty() {
-                        source.accumulated_text = bridged.clone();
-                    }
-                }
-                prompt_seeded_from_backfill = true;
-                debug!(
-                    "live loop: seeded prompt from backfill ({} chars)",
-                    bridged.len()
-                );
-            }
+        if !prompt_seeded_from_backfill
+            && seed_prompt_from_backfill(&ctx, &prompt, &mut sources).await
+        {
+            prompt_seeded_from_backfill = true;
         }
 
         // First: drain any completed chunk tasks (both the ones collected
@@ -2383,15 +2202,17 @@ async fn live_transcription_loop(
                         is_force,
                         false,
                         ctx.session_offset_base_seconds,
+                        tuning.max_chunk_duration,
                     )
                     .await;
                     if let Some(prepared) = prepared {
                         let task_ctx = ctx.clone();
-                        let task_session = session.clone();
+                        let task_counters = counters.clone();
+                        let task_prompt = prompt.clone();
                         let source_label = prepared.source_label;
                         let fallback_text = prepared.accumulated_text.clone();
                         let handle = tokio::spawn(async move {
-                            run_chunk_task(prepared, task_ctx, task_session).await
+                            run_chunk_task(prepared, task_ctx, task_counters, task_prompt).await
                         });
                         chunk_aborts.push(handle.abort_handle());
                         chunk_tasks.push(Box::pin(async move {
@@ -2428,281 +2249,31 @@ async fn live_transcription_loop(
         }
 
         if fatal {
-            error!("live transcription: sidecar died and could not be restarted — stopping");
-            let (chunks, audio_secs) = {
-                let s = session.lock().expect("session mutex poisoned");
-                (s.total_chunks, s.total_audio_seconds)
-            };
-            let _ = ctx.app_handle.emit(
-                "live-transcription-status",
-                LiveTranscriptionStatus {
-                    phase: LiveTranscriptionPhase::Error,
-                    chunks_processed: chunks,
-                    total_audio_seconds: audio_secs,
-                    error_message: Some(
-                        "Transcription engine stopped unexpectedly and could not be restarted"
-                            .to_string(),
-                    ),
-                    session_id: ctx.config.session_id.clone(),
-                    effective_start_epoch_ms: None,
-                },
-            );
+            emit_fatal_sidecar_error(&ctx, &counters);
             exited_fatal = true;
             break;
         }
 
-        // Prompt decay: clear shared_prompt + accumulated_text when no transcription
-        // has occurred for prompt_decay_silence_seconds (default 5s)
-        let prompt_decay_secs = ctx.config.prompt_decay_silence_seconds.unwrap_or(5.0);
-        let last_at = {
-            let s = session.lock().expect("session mutex poisoned");
-            s.last_transcription_at
-        };
-        let decayed = {
-            let mut s = session.lock().expect("session mutex poisoned");
-            check_prompt_decay(
-                &mut sources,
-                &mut s.shared_prompt,
-                prompt_decay_secs,
-                last_at,
-            )
-        };
-        if decayed {
-            info!(
-                "prompt decay: cleared shared_prompt ({:.1}s since last transcription)",
-                last_at.map(|t| t.elapsed().as_secs_f32()).unwrap_or(0.0)
-            );
-            session
-                .lock()
-                .expect("session mutex poisoned")
-                .last_transcription_at = None;
-        }
+        run_prompt_decay(&ctx, &prompt, &mut sources);
 
         if should_stop {
             break;
         }
     }
 
-    // Drain any still-running chunk tasks so their segments land before we
-    // finalize the session. The `setLivePhase("Stopped")` finalizer on the
-    // frontend awaits `segmentQueueTail`, but for that to help we first
-    // need to actually *dispatch* the segment events — which only happens
-    // when each task's transcribe await completes.
-    if !chunk_tasks.is_empty() {
-        debug!(
-            "live transcription stop: draining {} in-flight chunk tasks",
-            chunk_tasks.len()
-        );
-        use futures_util::stream::StreamExt;
+    drain_in_flight_chunks(&mut chunk_tasks, &mut chunk_aborts, &mut sources).await;
+    dispatch_final_pending_chunks(
+        &mut sources,
+        &audio_state,
+        &ctx,
+        &counters,
+        &prompt,
+        tuning.max_chunk_duration,
+    )
+    .await;
 
-        // Phase 1 — graceful drain. `should_stop` already forced a final chunk
-        // for any actively-speaking source earlier in the loop, *unless* that
-        // source already had a task in-flight (the in_flight gate skipped it).
-        // Collect outcomes so source state can be restored and the blocked
-        // source can issue its deferred final chunk in Phase 3.
-        let mut drained_outcomes: Vec<ChunkTaskOutcome> = Vec::new();
-        let graceful_timed_out = {
-            let drain = async {
-                while let Some(outcome) = chunk_tasks.next().await {
-                    if outcome.sidecar_dead {
-                        warn!("drained chunk task reported sidecar dead");
-                    }
-                    drained_outcomes.push(outcome);
-                }
-            };
-            tokio::time::timeout(Duration::from_secs(10), drain)
-                .await
-                .is_err()
-        };
-
-        // Restore source state from completed outcomes so a source whose
-        // final-chunk dispatch was gated by `has_in_flight_task` becomes
-        // eligible to dispatch its pending speech in Phase 3.
-        for outcome in drained_outcomes {
-            for source in sources.iter_mut() {
-                if source.label == outcome.source_label {
-                    source.has_in_flight_task = false;
-                    source.accumulated_text = outcome.accumulated_text;
-                    break;
-                }
-            }
-        }
-
-        // Phase 2 — abort only on timeout. A hanging sidecar can't indefinitely
-        // block the stop path; we also need each task's `Arc<TranscriptionClient>`
-        // clone released so the post-loop try_unwrap succeeds and shared state is
-        // restored. transcribe_with awaits a oneshot internally; abort drops the
-        // receiver cleanly and the sidecar's response is harmlessly orphaned.
-        if graceful_timed_out {
-            warn!(
-                "live transcription stop: chunk task drain exceeded 10s; \
-                 aborting remaining tasks to reclaim shared state"
-            );
-            for ah in chunk_aborts.drain(..) {
-                ah.abort();
-            }
-            let _ = tokio::time::timeout(Duration::from_secs(2), async {
-                while chunk_tasks.next().await.is_some() {}
-            })
-            .await;
-        }
-    }
-
-    // Phase 3 — final pending-speech dispatch. Any source whose stop-time
-    // `VadAction::Chunk` was skipped because a previous task was still
-    // running now has un-transcribed audio between its frozen
-    // `speech_start_pos` and the current write_pos. Dispatch one synchronous
-    // chunk per source so the final segment lands before we finalize.
-    for source in sources.iter_mut() {
-        if source.has_in_flight_task {
-            // Phase 2 timeout path — we aborted without an outcome landing.
-            // Skipping is safe: the source's state is already considered lost.
-            continue;
-        }
-        let has_pending = {
-            let manager = audio_state.lock().await;
-            let write_pos = source_write_pos(&manager, &source.label);
-            write_pos > source.speech_start_pos
-        };
-        if !has_pending {
-            continue;
-        }
-        debug!(
-            "live transcription stop: dispatching final pending chunk for {:?} \
-             (speech_start_pos={}, blocked by prior in-flight task)",
-            source.label, source.speech_start_pos
-        );
-        let prepared = prepare_chunk_dispatch(
-            source,
-            &audio_state,
-            true,
-            false,
-            ctx.session_offset_base_seconds,
-        )
-        .await;
-        if let Some(prepared) = prepared {
-            let task_ctx = ctx.clone();
-            let task_session = session.clone();
-            let source_label = prepared.source_label;
-            let final_task = run_chunk_task(prepared, task_ctx, task_session);
-            if tokio::time::timeout(Duration::from_secs(10), final_task)
-                .await
-                .is_err()
-            {
-                warn!(
-                    "live transcription stop: final pending chunk for {:?} exceeded 10s — \
-                     segment may be lost",
-                    source_label
-                );
-            }
-        }
-    }
-
-    // Final WAV flush: extract any remaining audio and finalize
-    if let Some(mut ws) = session_wav_state {
-        // Extract remaining audio since last flush
-        let final_flush = {
-            let manager = audio_state.lock().await;
-            manager.extract_since(&ws.flush_positions, ws.source, ws.mix_config.as_ref())
-        };
-        if let Some((samples, sr, _new_pos)) = final_flush {
-            let to_write: std::borrow::Cow<[f32]> = if sr == ws.wav_sample_rate {
-                std::borrow::Cow::Borrowed(&samples)
-            } else {
-                match yapstack_common::audio::resample(&samples, sr, ws.wav_sample_rate) {
-                    Ok(cow) => std::borrow::Cow::Owned(cow.into_owned()),
-                    Err(e) => {
-                        error!(
-                            "session WAV final flush resample {}Hz → {}Hz failed, dropping {} samples: {}",
-                            sr, ws.wav_sample_rate, samples.len(), e
-                        );
-                        std::borrow::Cow::Owned(Vec::new())
-                    }
-                }
-            };
-            if !to_write.is_empty() {
-                if let Err(e) = ws.writer.write_samples(&to_write) {
-                    error!("session WAV final flush write failed: {}", e);
-                }
-            }
-        }
-
-        if ws.writer.samples_written() == 0 {
-            // No audio was ever written — delete the empty WAV file
-            warn!(
-                "session WAV had 0 samples written — deleting empty file for session {}",
-                ws.session_id
-            );
-            let wav_path = ws.writer.path().to_path_buf();
-            // Finalize WAV only (no MP3 conversion) to release file handle, then delete
-            let _ = ws.writer.finalize_wav_only();
-            let _ = std::fs::remove_file(&wav_path);
-            let _ = ctx.app_handle.emit(
-                "session-wav-error",
-                SessionWavErrorEvent {
-                    session_id: ws.session_id,
-                    message: "No audio was recorded — WAV file not saved".to_string(),
-                },
-            );
-        } else {
-            let use_mp3 = ctx.config.audio_export_format.as_deref().unwrap_or("mp3") != "wav";
-            let result = if use_mp3 {
-                ws.writer
-                    .finalize_as_mp3(ctx.config.mp3_bitrate.unwrap_or(64))
-            } else {
-                ws.writer.finalize_wav_only()
-            };
-            match result {
-                Ok((path, duration)) => {
-                    info!(
-                        "session part {} finalized: {} ({:.1}s)",
-                        ws.part_index,
-                        path.display(),
-                        duration
-                    );
-                    let format = if use_mp3 { "mp3" } else { "wav" };
-                    let file_path_str = path.to_string_lossy().to_string();
-
-                    // Insert the parts row from Rust *before* emitting so the
-                    // DB is the durable source of truth even if the FE event
-                    // listener is unavailable (crash, force-quit, window
-                    // closed). The FE handler now just refreshes from DB.
-                    if let Some(db_path_state) = ctx.app_handle.try_state::<crate::DbPath>() {
-                        let row = crate::db::AudioPartRow {
-                            session_id: ws.session_id.clone(),
-                            part_index: ws.part_index,
-                            file_path: file_path_str.clone(),
-                            format,
-                            duration_seconds: duration,
-                            sample_rate: ws.wav_sample_rate,
-                        };
-                        if let Err(e) =
-                            crate::db::insert_audio_part_row(db_path_state.as_path(), &row)
-                        {
-                            error!("insert_audio_part_row failed (will rely on FE refresh): {e}");
-                        }
-                        if let Some(parent) = path.parent() {
-                            crate::register_trusted_audio_dir(&ctx.app_handle, parent);
-                        }
-                    }
-
-                    let _ = ctx.app_handle.emit(
-                        "session-part-ready",
-                        SessionPartReadyEvent {
-                            session_id: ws.session_id.clone(),
-                            part_index: ws.part_index,
-                            file_path: file_path_str,
-                            format: format.to_string(),
-                            duration_seconds: duration,
-                            sample_rate: ws.wav_sample_rate,
-                        },
-                    );
-                }
-                Err(e) => {
-                    error!("session WAV finalize failed: {}", e);
-                }
-            }
-        }
+    if let Some(ws) = session_wav_state {
+        finalize_session_wav(ws, &audio_state, &ctx).await;
     }
 
     // Wait for concurrent backfill to finish before emitting Stopped.
@@ -2722,7 +2293,7 @@ async fn live_transcription_loop(
     }
 
     let (final_chunks, final_audio_seconds) = {
-        let s = session.lock().expect("session mutex poisoned");
+        let s = counters.lock().expect("counters mutex poisoned");
         (s.total_chunks, s.total_audio_seconds)
     };
 
@@ -2742,6 +2313,638 @@ async fn live_transcription_loop(
     );
 }
 
+/// Build the per-source VAD state for the live loop and, if `backfill_seconds`
+/// is non-zero, extract the matching pre-session audio and reset each source's
+/// cursors / Silero stream forward to the current write position. Reading
+/// backfill before the live loop starts guarantees a single coherent snapshot
+/// — the loop then begins polling at the post-backfill cursor. Returns the
+/// initialized sources alongside the backfill audio queued for concurrent
+/// processing.
+async fn build_initial_sources_and_backfill(
+    audio_state: &AudioManagerState,
+    config: &LiveTranscriptionConfig,
+    check_mic: bool,
+    check_system: bool,
+    source: CaptureSource,
+) -> (Vec<SourceVadState>, Vec<(Vec<f32>, u32, AudioSourceLabel)>) {
+    let manager = audio_state.lock().await;
+    let positions = manager.buffer_positions();
+
+    let has_backfill = config.backfill_seconds > 0.0;
+    let mut sources: Vec<SourceVadState> = Vec::with_capacity(2);
+    let mut backfill: Vec<(Vec<f32>, u32, AudioSourceLabel)> = Vec::new();
+
+    if check_mic {
+        let (initial_pos, session_start, sr, ch) = if let Some(buf) = manager.mic_buffer() {
+            let sr = buf.sample_rate();
+            let ch = buf.channels();
+            if has_backfill {
+                let raw = (config.backfill_seconds * sr as f32 * ch as f32) as usize;
+                // Round down to frame boundary for correct deinterleaving.
+                let rewind = raw - (raw % ch as usize);
+                let rewound = positions.mic_pos.saturating_sub(rewind);
+                (rewound, rewound, sr, ch)
+            } else {
+                (positions.mic_pos, positions.mic_pos, sr, ch)
+            }
+        } else {
+            (positions.mic_pos, positions.mic_pos, 48000, 1)
+        };
+        sources.push(SourceVadState::new(
+            AudioSourceLabel::Mic,
+            initial_pos,
+            session_start,
+            sr,
+            ch,
+        ));
+    }
+    if check_system {
+        if let Some(buf) = manager.system_buffer() {
+            let sr = buf.sample_rate();
+            let ch = buf.channels();
+            let (initial_pos, session_start) = if has_backfill {
+                let raw = (config.backfill_seconds * sr as f32 * ch as f32) as usize;
+                let rewind = raw - (raw % ch as usize);
+                let rewound = positions.system_pos.saturating_sub(rewind);
+                (rewound, rewound)
+            } else {
+                (positions.system_pos, positions.system_pos)
+            };
+            sources.push(SourceVadState::new(
+                AudioSourceLabel::System,
+                initial_pos,
+                session_start,
+                sr,
+                ch,
+            ));
+        } else if matches!(source, CaptureSource::Mixed) {
+            warn!("mixed mode: system buffer unavailable, running mic-only");
+        }
+    }
+
+    if has_backfill {
+        info!(
+            "live transcription: extracted backfill audio ({:.1}s) for concurrent processing",
+            config.backfill_seconds
+        );
+        for s in sources.iter_mut() {
+            let (audio, current) = extract_source_audio(&manager, &s.label, s.cursor);
+            if let Some((samples, sr)) = audio {
+                info!(
+                    "backfill extract: source={:?} cursor={} write_pos={} samples={} sr={} duration={:.2}s",
+                    s.label, s.cursor, current, samples.len(), sr, samples.len() as f32 / sr as f32
+                );
+                backfill.push((samples, sr, s.label));
+            } else {
+                warn!(
+                    "backfill: no audio available for source={:?} (cursor={}, write_pos={})",
+                    s.label, s.cursor, current
+                );
+            }
+            // Reset the full per-source live VAD state to `current` so the
+            // live loop starts from the post-backfill write position. Without
+            // this, Silero would replay every backfill sample through the
+            // *live* detector on the first few polls, duplicating or delaying
+            // speech that backfill already emitted. We also reset the
+            // recurrent stream state (LSTM memory was initialized at session
+            // start against pre-backfill audio context) and clear the sticky
+            // last_probability.
+            s.cursor = current;
+            s.speech_start_pos = current;
+            s.earliest_next_chunk_pos = current;
+            s.silero.read_pos = current;
+            s.silero.reset();
+        }
+    }
+
+    (sources, backfill)
+}
+
+/// Emit a final `Error`-phase status event after the sidecar has been
+/// declared unrecoverable. Reads the running totals out of the shared
+/// accumulator so the UI sees the same chunk/audio counts it would on a
+/// normal stop.
+fn emit_fatal_sidecar_error(ctx: &TranscriptionContext, counters: &Arc<StdMutex<SessionCounters>>) {
+    error!("live transcription: sidecar died and could not be restarted — stopping");
+    let (chunks, audio_secs) = {
+        let s = counters.lock().expect("counters mutex poisoned");
+        (s.total_chunks, s.total_audio_seconds)
+    };
+    let _ = ctx.app_handle.emit(
+        "live-transcription-status",
+        LiveTranscriptionStatus {
+            phase: LiveTranscriptionPhase::Error,
+            chunks_processed: chunks,
+            total_audio_seconds: audio_secs,
+            error_message: Some(
+                "Transcription engine stopped unexpectedly and could not be restarted".to_string(),
+            ),
+            session_id: ctx.config.session_id.clone(),
+            effective_start_epoch_ms: None,
+        },
+    );
+}
+
+/// Per-tick prompt decay check: clear `shared_prompt` and every source's
+/// `accumulated_text` once `prompt_decay_silence_seconds` have elapsed since
+/// the last successful transcription. Keeps stale context from seeding
+/// hallucinations after a long pause.
+fn run_prompt_decay(
+    ctx: &TranscriptionContext,
+    prompt: &Arc<StdMutex<PromptState>>,
+    sources: &mut [SourceVadState],
+) {
+    let prompt_decay_secs = ctx.config.prompt_decay_silence_seconds.unwrap_or(5.0);
+    // Hold the lock across read/check/clear/timestamp so the decision is
+    // atomic w.r.t. concurrent chunk tasks. Releasing between steps would
+    // let a freshly-completed chunk update `shared_prompt` /
+    // `last_transcription_at` mid-decay, either clearing fresh prompt text
+    // or clobbering a fresh timestamp with `None`.
+    let elapsed = {
+        let mut p = prompt.lock().expect("prompt mutex poisoned");
+        let last_at = p.last_transcription_at;
+        let decayed = check_prompt_decay(sources, &mut p.shared_prompt, prompt_decay_secs, last_at);
+        if decayed {
+            p.last_transcription_at = None;
+            Some(last_at.map(|t| t.elapsed().as_secs_f32()).unwrap_or(0.0))
+        } else {
+            None
+        }
+    };
+    if let Some(secs) = elapsed {
+        info!(
+            "prompt decay: cleared shared_prompt ({:.1}s since last transcription)",
+            secs
+        );
+    }
+}
+
+/// Drain still-running chunk tasks at session stop so their segments dispatch
+/// before finalization. The frontend's stop finalizer waits on
+/// `segmentQueueTail`; that only helps once each task has actually emitted.
+/// Phase 1 grants 10 s of graceful drain (long enough for any in-flight
+/// transcribe to complete) and restores per-source state from each completed
+/// outcome so a source whose final-chunk dispatch was skipped earlier becomes
+/// eligible to issue it. Phase 2 aborts on timeout — needed both to keep stop
+/// bounded and to release each task's `Arc<TranscriptionClient>` clone so the
+/// post-loop `try_unwrap` succeeds.
+async fn drain_in_flight_chunks(
+    chunk_tasks: &mut futures_util::stream::FuturesUnordered<ChunkTaskFuture>,
+    chunk_aborts: &mut Vec<tokio::task::AbortHandle>,
+    sources: &mut [SourceVadState],
+) {
+    if chunk_tasks.is_empty() {
+        return;
+    }
+    debug!(
+        "live transcription stop: draining {} in-flight chunk tasks",
+        chunk_tasks.len()
+    );
+    use futures_util::stream::StreamExt;
+
+    let mut drained_outcomes: Vec<ChunkTaskOutcome> = Vec::new();
+    let graceful_timed_out = {
+        let drain = async {
+            while let Some(outcome) = chunk_tasks.next().await {
+                if outcome.sidecar_dead {
+                    warn!("drained chunk task reported sidecar dead");
+                }
+                drained_outcomes.push(outcome);
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(10), drain)
+            .await
+            .is_err()
+    };
+
+    for outcome in drained_outcomes {
+        for source in sources.iter_mut() {
+            if source.label == outcome.source_label {
+                source.has_in_flight_task = false;
+                source.accumulated_text = outcome.accumulated_text;
+                break;
+            }
+        }
+    }
+
+    if graceful_timed_out {
+        warn!(
+            "live transcription stop: chunk task drain exceeded 10s; \
+             aborting remaining tasks to reclaim shared state"
+        );
+        for ah in chunk_aborts.drain(..) {
+            ah.abort();
+        }
+        let _ = tokio::time::timeout(Duration::from_secs(2), async {
+            while chunk_tasks.next().await.is_some() {}
+        })
+        .await;
+    }
+}
+
+/// Final pending-speech dispatch at session stop. Any source whose stop-time
+/// `VadAction::Chunk` was skipped because a previous task was still running
+/// now has un-transcribed audio between its frozen `speech_start_pos` and the
+/// current write position. Run one synchronous chunk per such source so the
+/// final segment lands before finalization.
+async fn dispatch_final_pending_chunks(
+    sources: &mut [SourceVadState],
+    audio_state: &AudioManagerState,
+    ctx: &TranscriptionContext,
+    counters: &Arc<StdMutex<SessionCounters>>,
+    prompt: &Arc<StdMutex<PromptState>>,
+    max_chunk_duration: Duration,
+) {
+    for source in sources.iter_mut() {
+        if source.has_in_flight_task {
+            // Reached only on the Phase 2 abort path — we aborted before an
+            // outcome landed. Skipping is safe: that source's state is already
+            // considered lost.
+            continue;
+        }
+        let has_pending = {
+            let manager = audio_state.lock().await;
+            let write_pos = source_write_pos(&manager, &source.label);
+            write_pos > source.speech_start_pos
+        };
+        if !has_pending {
+            continue;
+        }
+        debug!(
+            "live transcription stop: dispatching final pending chunk for {:?} \
+             (speech_start_pos={}, blocked by prior in-flight task)",
+            source.label, source.speech_start_pos
+        );
+        let prepared = prepare_chunk_dispatch(
+            source,
+            audio_state,
+            true,
+            false,
+            ctx.session_offset_base_seconds,
+            max_chunk_duration,
+        )
+        .await;
+        if let Some(prepared) = prepared {
+            let task_ctx = ctx.clone();
+            let task_counters = counters.clone();
+            let task_prompt = prompt.clone();
+            let source_label = prepared.source_label;
+            let final_task = run_chunk_task(prepared, task_ctx, task_counters, task_prompt);
+            if tokio::time::timeout(Duration::from_secs(10), final_task)
+                .await
+                .is_err()
+            {
+                warn!(
+                    "live transcription stop: final pending chunk for {:?} exceeded 10s — \
+                     segment may be lost",
+                    source_label
+                );
+            }
+        }
+    }
+}
+
+/// Outcome of a single session-WAV write attempt within the live loop. The
+/// only failure the loop cares about is a resample error: when that happens,
+/// the loop skips the rest of the tick so it doesn't act on a half-flushed
+/// state. Every other path (no `SessionWavState`, write success, write error)
+/// is "carry on" from the loop's perspective.
+enum WavWriteOutcome {
+    Wrote,
+    ResampleFailed,
+}
+
+/// Append the just-extracted ring-buffer samples to the streaming session WAV.
+/// Resamples on the fly when the live extraction sample rate diverges from the
+/// header rate (mid-session device rebind), and bumps the periodic-diagnostic
+/// counter on success. `flush_positions` is always advanced — retrying a
+/// partial write would duplicate samples on the next tick.
+fn write_session_wav_samples(
+    ws: &mut SessionWavState,
+    samples: &[f32],
+    sr: u32,
+    new_pos: BufferPositions,
+) -> WavWriteOutcome {
+    let to_write: std::borrow::Cow<[f32]> = if sr == ws.wav_sample_rate {
+        std::borrow::Cow::Borrowed(samples)
+    } else {
+        match yapstack_common::audio::resample(samples, sr, ws.wav_sample_rate) {
+            Ok(cow) => std::borrow::Cow::Owned(cow.into_owned()),
+            Err(e) => {
+                error!(
+                    "WAV resample {}Hz → {}Hz failed, dropping {} samples: {}",
+                    sr,
+                    ws.wav_sample_rate,
+                    samples.len(),
+                    e
+                );
+                // Advance positions regardless — retrying would re-extract the
+                // same samples next tick.
+                ws.flush_positions = new_pos;
+                return WavWriteOutcome::ResampleFailed;
+            }
+        }
+    };
+    if let Err(e) = ws.writer.write_samples(&to_write) {
+        error!(
+            "session WAV write error ({} samples may be lost): {}",
+            to_write.len(),
+            e
+        );
+    }
+    ws.flush_positions = new_pos;
+    ws.flush_count += 1;
+    if ws.flush_count.is_multiple_of(WAV_FLUSH_DIAGNOSTIC_INTERVAL) {
+        debug!(
+            "session WAV progress: flushes={}, samples_written={}, duration={:.1}s",
+            ws.flush_count,
+            ws.writer.samples_written(),
+            ws.writer.duration_seconds()
+        );
+    }
+    WavWriteOutcome::Wrote
+}
+
+/// Advance the consecutive-empty-flush counter and emit the layered
+/// diagnostics: a one-shot user-facing event the first time the count crosses
+/// `WAV_FLUSH_ERROR_THRESHOLD` (deferred until backfill completes so the
+/// backfill-driven empty window doesn't false-positive), and a periodic warn
+/// log every `WAV_FLUSH_WARNING_INTERVAL` ticks thereafter.
+async fn handle_empty_wav_flush(
+    wav_flush_none_count: &mut u32,
+    session_wav_state: Option<&SessionWavState>,
+    audio_state: &AudioManagerState,
+    ctx: &TranscriptionContext,
+    backfill_done: &Arc<AtomicBool>,
+) {
+    *wav_flush_none_count += 1;
+    debug!(
+        "session WAV flush: no data (consecutive: {})",
+        *wav_flush_none_count
+    );
+    if *wav_flush_none_count == WAV_FLUSH_ERROR_THRESHOLD {
+        if backfill_done.load(Ordering::Acquire) {
+            if let Some(ws) = session_wav_state {
+                let has_stream_error = {
+                    let mgr = audio_state.lock().await;
+                    mgr.system_has_stream_error()
+                };
+                match classify_empty_flush(ws.source, has_stream_error) {
+                    EmptyFlushClassification::WindowsSilence => {
+                        info!(
+                            "session WAV: empty extractions for SystemOnly session {} on Windows — emitting warning (no stream error)",
+                            ws.session_id
+                        );
+                        let _ = ctx.app_handle.emit(
+                            "session-wav-warning",
+                            SessionWavWarningEvent {
+                                session_id: ws.session_id.clone(),
+                                message:
+                                    "No system audio detected — recording will resume when audio plays"
+                                        .to_string(),
+                            },
+                        );
+                    }
+                    EmptyFlushClassification::Error => {
+                        warn!(
+                            "session WAV: 10 consecutive empty extractions for session {} — emitting error event",
+                            ws.session_id
+                        );
+                        let _ = ctx.app_handle.emit(
+                            "session-wav-error",
+                            SessionWavErrorEvent {
+                                session_id: ws.session_id.clone(),
+                                message:
+                                    "No audio data available for recording — audio may not be saved"
+                                        .to_string(),
+                            },
+                        );
+                    }
+                }
+            }
+        } else {
+            debug!("session WAV flush: resetting empty count (backfill still running)");
+            *wav_flush_none_count = 0;
+        }
+    }
+    if wav_flush_none_count.is_multiple_of(WAV_FLUSH_WARNING_INTERVAL) {
+        let silence_secs = *wav_flush_none_count as f32 * POLL_INTERVAL_MS as f32 / 1000.0;
+        warn!(
+            "session WAV flush: {} consecutive empty extractions ({:.1}s) — possible sample rate mismatch or no audio data",
+            *wav_flush_none_count, silence_secs
+        );
+    }
+}
+
+/// Seed the live shared prompt and per-source `accumulated_text` from the
+/// backfill task's bridged prompt the first time it's non-empty. Whisper uses
+/// `accumulated_text` as its initial prompt, so seeding both keeps the live
+/// loop's first chunk aware of what backfill already transcribed. Returns
+/// `true` once the seed lands so the caller can flip the one-shot guard.
+async fn seed_prompt_from_backfill(
+    ctx: &TranscriptionContext,
+    prompt: &Arc<StdMutex<PromptState>>,
+    sources: &mut [SourceVadState],
+) -> bool {
+    let bridged = ctx.bridged_prompt.lock().await;
+    if bridged.is_empty() {
+        return false;
+    }
+    {
+        let mut p = prompt.lock().expect("prompt mutex poisoned");
+        if p.shared_prompt.is_empty() {
+            p.shared_prompt = bridged.clone();
+        }
+        p.last_transcription_at = Some(Instant::now());
+    }
+    for source in sources.iter_mut() {
+        if source.accumulated_text.is_empty() {
+            source.accumulated_text = bridged.clone();
+        }
+    }
+    debug!(
+        "live loop: seeded prompt from backfill ({} chars)",
+        bridged.len()
+    );
+    true
+}
+
+/// Drain the final tail of session audio, finalize the session-WAV writer in
+/// the user's chosen export format, and persist the resulting part row to the
+/// DB before emitting `session-part-ready`. Called once at end-of-loop after
+/// in-flight chunks have drained. Empty recordings get the file deleted and a
+/// `session-wav-error` event instead.
+async fn finalize_session_wav(
+    mut ws: SessionWavState,
+    audio_state: &AudioManagerState,
+    ctx: &TranscriptionContext,
+) {
+    let final_flush = {
+        let manager = audio_state.lock().await;
+        manager.extract_since(&ws.flush_positions, ws.source, ws.mix_config.as_ref())
+    };
+    if let Some((samples, sr, _new_pos)) = final_flush {
+        let to_write: std::borrow::Cow<[f32]> = if sr == ws.wav_sample_rate {
+            std::borrow::Cow::Borrowed(&samples)
+        } else {
+            match yapstack_common::audio::resample(&samples, sr, ws.wav_sample_rate) {
+                Ok(cow) => std::borrow::Cow::Owned(cow.into_owned()),
+                Err(e) => {
+                    error!(
+                        "session WAV final flush resample {}Hz → {}Hz failed, dropping {} samples: {}",
+                        sr, ws.wav_sample_rate, samples.len(), e
+                    );
+                    std::borrow::Cow::Owned(Vec::new())
+                }
+            }
+        };
+        if !to_write.is_empty() {
+            if let Err(e) = ws.writer.write_samples(&to_write) {
+                error!("session WAV final flush write failed: {}", e);
+            }
+        }
+    }
+
+    if ws.writer.samples_written() == 0 {
+        warn!(
+            "session WAV had 0 samples written — deleting empty file for session {}",
+            ws.session_id
+        );
+        let wav_path = ws.writer.path().to_path_buf();
+        // Finalize WAV only (no MP3 conversion) to release the file handle, then delete.
+        let _ = ws.writer.finalize_wav_only();
+        let _ = std::fs::remove_file(&wav_path);
+        let _ = ctx.app_handle.emit(
+            "session-wav-error",
+            SessionWavErrorEvent {
+                session_id: ws.session_id,
+                message: "No audio was recorded — WAV file not saved".to_string(),
+            },
+        );
+        return;
+    }
+
+    let format = ctx
+        .config
+        .audio_export_format
+        .unwrap_or(AudioExportFormatDto::Mp3);
+    let result = if format.is_mp3() {
+        ws.writer
+            .finalize_as_mp3(ctx.config.mp3_bitrate.unwrap_or(64))
+    } else {
+        ws.writer.finalize_wav_only()
+    };
+    let (path, duration) = match result {
+        Ok(out) => out,
+        Err(e) => {
+            error!("session WAV finalize failed: {}", e);
+            return;
+        }
+    };
+
+    info!(
+        "session part {} finalized: {} ({:.1}s)",
+        ws.part_index,
+        path.display(),
+        duration
+    );
+    let file_path_str = path.to_string_lossy().to_string();
+
+    // Always register the parent dir with TrustedAudioDirs so the
+    // audio-stream:// handler can serve the file regardless of who owns
+    // the audio (sessions vs dictations).
+    if let Some(parent) = path.parent() {
+        crate::register_trusted_audio_dir(&ctx.app_handle, parent);
+    }
+
+    // Insert the parts row from Rust *before* emitting so the DB stays the
+    // durable source of truth even if the FE event listener is unavailable
+    // (crash, force-quit, window closed). The FE handler then just
+    // refreshes from DB. Skipped when `persist_audio_part` is false —
+    // dictation owns its own audio path on `dictation_history` and the
+    // synthetic `session_id` has no row in `sessions`, so inserting would
+    // either FK-fail or (with FK enforcement off) leave orphans that
+    // `clearAllSessions` could then sweep.
+    if ws.persist_audio_part {
+        if let Some(db_path_state) = ctx.app_handle.try_state::<crate::DbPath>() {
+            let row = crate::db::AudioPartRow {
+                session_id: ws.session_id.clone(),
+                part_index: ws.part_index,
+                file_path: file_path_str.clone(),
+                format: format.as_str(),
+                duration_seconds: duration,
+                sample_rate: ws.wav_sample_rate,
+            };
+            if let Err(e) = crate::db::insert_audio_part_row(db_path_state.as_path(), &row) {
+                error!("insert_audio_part_row failed (will rely on FE refresh): {e}");
+            }
+        }
+    }
+
+    let _ = ctx.app_handle.emit(
+        "session-part-ready",
+        SessionPartReadyEvent {
+            session_id: ws.session_id,
+            part_index: ws.part_index,
+            file_path: file_path_str,
+            format,
+            duration_seconds: duration,
+            sample_rate: ws.wav_sample_rate,
+        },
+    );
+}
+
+/// Build the `initial_prompt` we'll send to the engine for one chunk:
+/// `"<vocabulary_hints>. <rolling_context>"`. Vocabulary hints (folder/tag
+/// names) prime Whisper for proper nouns and are read fresh per chunk so
+/// mid-recording updates take effect; the hints are snapshotted into an owned
+/// string inside a tight scope so the mutex is dropped before the long
+/// `transcribe_with` await blocks any concurrent `update_vocabulary_hints`
+/// call. Returns `None` only when both vocab and accumulated context are
+/// empty.
+async fn build_effective_prompt(
+    ctx: &TranscriptionContext,
+    accumulated_text: &str,
+) -> Option<String> {
+    let max_prompt = ctx.config.prompt_context_chars.unwrap_or(350) as usize;
+    let vocab_truncated: String = {
+        let vocab_guard = ctx.vocabulary_hints.lock().await;
+        let vocab: &str = vocab_guard.as_str();
+        // Round down to a char boundary — folder/tag names can contain
+        // multibyte codepoints, and a raw byte slice at the 80-byte cap could
+        // land mid-codepoint and panic the live-transcription task.
+        let vocab_budget = vocab.floor_char_boundary(vocab.len().min(80));
+        vocab[..vocab_budget].to_string()
+    };
+    let vocab_budget = vocab_truncated.len();
+    let context_budget = max_prompt.saturating_sub(if vocab_budget > 0 {
+        vocab_budget + 2
+    } else {
+        0
+    });
+
+    if accumulated_text.is_empty() && vocab_budget == 0 {
+        return None;
+    }
+
+    let context_part = if accumulated_text.is_empty() {
+        ""
+    } else if accumulated_text.len() > context_budget {
+        let boundary = accumulated_text.ceil_char_boundary(accumulated_text.len() - context_budget);
+        &accumulated_text[boundary..]
+    } else {
+        accumulated_text
+    };
+
+    if vocab_budget > 0 && !context_part.is_empty() {
+        Some(format!("{}. {}", &vocab_truncated, context_part))
+    } else if vocab_budget > 0 {
+        Some(vocab_truncated)
+    } else {
+        Some(context_part.to_string())
+    }
+}
+
 /// Transcribes a chunk of audio and returns a `TranscribeOutcome`.
 ///
 /// - `Success`: transcription produced segments
@@ -2752,7 +2955,7 @@ async fn transcribe_chunk(
     input: &ChunkInput<'_>,
     chunk_index: &mut u32,
     accumulated_text: &mut String,
-    session: &Arc<StdMutex<SessionAccumulators>>,
+    prompt: &Arc<StdMutex<PromptState>>,
 ) -> TranscribeOutcome {
     let chunk_duration = input.samples.len() as f32 / input.sample_rate as f32;
     if chunk_duration < MIN_CHUNK_DURATION_SECS {
@@ -2773,53 +2976,7 @@ async fn transcribe_chunk(
             }
         };
 
-    // Build effective prompt: [vocabulary_hints]. [rolling_context]
-    // Vocabulary hints (folder names) are prepended to help Whisper recognise proper nouns.
-    // Read fresh each chunk so mid-recording updates take effect. Snapshot the
-    // hints into an owned String inside a short scope so the mutex is dropped
-    // before the long `transcribe_with` await — otherwise the
-    // `update_vocabulary_hints` command can block behind a multi-second
-    // sidecar round trip.
-    let max_prompt = ctx.config.prompt_context_chars.unwrap_or(350) as usize;
-    let vocab_truncated: String = {
-        let vocab_guard = ctx.vocabulary_hints.lock().await;
-        let vocab: &str = vocab_guard.as_str();
-        // Round down to a char boundary — folder/tag names can contain
-        // multibyte codepoints, and a raw byte slice at the 80-byte cap
-        // could land mid-codepoint and panic the live-transcription task.
-        let vocab_budget = vocab.floor_char_boundary(vocab.len().min(80));
-        vocab[..vocab_budget].to_string()
-    };
-    let vocab_budget = vocab_truncated.len();
-    let context_budget = max_prompt.saturating_sub(if vocab_budget > 0 {
-        vocab_budget + 2
-    } else {
-        0
-    });
-
-    let combined_prompt: String;
-    let effective_prompt: Option<&str> = if accumulated_text.is_empty() && vocab_budget == 0 {
-        None
-    } else {
-        let context_part = if accumulated_text.is_empty() {
-            ""
-        } else if accumulated_text.len() > context_budget {
-            let boundary =
-                accumulated_text.ceil_char_boundary(accumulated_text.len() - context_budget);
-            &accumulated_text[boundary..]
-        } else {
-            accumulated_text.as_str()
-        };
-
-        if vocab_budget > 0 && !context_part.is_empty() {
-            combined_prompt = format!("{}. {}", &vocab_truncated, context_part);
-            Some(&combined_prompt)
-        } else if vocab_budget > 0 {
-            Some(&vocab_truncated)
-        } else {
-            Some(context_part)
-        }
-    };
+    let effective_prompt = build_effective_prompt(ctx, accumulated_text).await;
 
     // Briefly lock the outer mutex just to clone the inner Arc<TranscriptionClient>.
     // The actual `transcribe_with` await happens *without* holding any outer lock,
@@ -2851,7 +3008,7 @@ async fn transcribe_chunk(
     // input, so passing it would just be ignored. Drop it explicitly so the IPC
     // payload is honest about what was sent.
     let prompt_for_engine = match engine_kind {
-        yapstack_common::types::EngineKind::Whisper => effective_prompt,
+        yapstack_common::types::EngineKind::Whisper => effective_prompt.as_deref(),
         yapstack_common::types::EngineKind::Parakeet => None,
     };
     let transcription_result = client
@@ -2893,16 +3050,16 @@ async fn transcribe_chunk(
                     *accumulated_text = accumulated_text[boundary..].to_string();
                 }
                 let max_prompt = ctx.config.prompt_context_chars.unwrap_or(350) as usize;
-                let mut s = session.lock().expect("session mutex poisoned");
-                if !s.shared_prompt.is_empty() {
-                    s.shared_prompt.push(' ');
+                let mut p = prompt.lock().expect("prompt mutex poisoned");
+                if !p.shared_prompt.is_empty() {
+                    p.shared_prompt.push(' ');
                 }
-                s.shared_prompt.push_str(&prompt_text);
-                if s.shared_prompt.len() > max_prompt {
-                    let boundary = s
+                p.shared_prompt.push_str(&prompt_text);
+                if p.shared_prompt.len() > max_prompt {
+                    let boundary = p
                         .shared_prompt
-                        .ceil_char_boundary(s.shared_prompt.len() - max_prompt);
-                    s.shared_prompt = s.shared_prompt[boundary..].to_string();
+                        .ceil_char_boundary(p.shared_prompt.len() - max_prompt);
+                    p.shared_prompt = p.shared_prompt[boundary..].to_string();
                 }
             }
 
@@ -2943,68 +3100,62 @@ async fn transcribe_chunk(
         }
         Err(e) => {
             warn!("live transcription: chunk failed: {}, skipping", e);
-
-            // Drop our local Arc clone before attempting restart so the outer
-            // mutex holder can try_unwrap without racing us. `client` (the
-            // Arc we cloned above) went out of scope at the end of the Ok
-            // arm's destructor, but we still hold our `client_arc` binding
-            // from the transcribe section. Drop it explicitly.
+            // Drop our local Arc clone so the restart helper's `try_unwrap`
+            // isn't racing us.
             drop(client);
+            recover_from_chunk_failure(ctx).await
+        }
+    }
+}
 
-            // Check if the sidecar process died — attempt auto-restart.
-            // respawn() needs &mut TranscriptionClient, so we take the Arc
-            // out of the Option, try_unwrap it, respawn, and put it back.
-            // If another task is still holding an Arc clone (e.g. a
-            // concurrent chunk still awaiting a response from the dead
-            // sidecar), try_unwrap fails and we fall through to Skipped —
-            // the other task will hit the same error and one of us will
-            // eventually win the race.
-            let mut client_guard = ctx.transcription_client.lock().await;
-            if let Some(arc_client) = client_guard.take() {
-                if !arc_client.is_running() {
-                    warn!("sidecar process died — attempting restart");
-                    match Arc::try_unwrap(arc_client) {
-                        Ok(mut client) => {
-                            match client.respawn().await {
-                                Ok(()) => {
-                                    info!(
-                                        "sidecar restarted successfully after transcription failure"
-                                    );
-                                    *client_guard = Some(Arc::new(client));
-                                    let _ = ctx.app_handle.emit(
-                                        "live-transcription-warning",
-                                        LiveTranscriptionWarningEvent {
-                                            message: "Transcription engine restarted".into(),
-                                        },
-                                    );
-                                    return TranscribeOutcome::Skipped;
-                                }
-                                Err(restart_err) => {
-                                    error!("sidecar restart failed: {}", restart_err);
-                                    // Put the client back so other tasks can
-                                    // see it as "not running" and try again.
-                                    *client_guard = Some(Arc::new(client));
-                                    return TranscribeOutcome::SidecarDead;
-                                }
-                            }
-                        }
-                        Err(still_shared) => {
-                            // Another task still holds the Arc. Put it back
-                            // untouched; that task will hit the same error
-                            // and we'll try again on the next chunk.
-                            *client_guard = Some(still_shared);
-                            debug!(
-                                "sidecar restart skipped: client still held by another chunk task"
-                            );
-                            return TranscribeOutcome::Skipped;
-                        }
-                    }
-                }
-                // Sidecar still running — just a transient error. Put the
-                // Arc back and let the caller retry.
-                *client_guard = Some(arc_client);
+/// Inspect the transcription client after a chunk error: if the sidecar is
+/// still running the failure was transient and we just retry; if it died,
+/// try to respawn it. respawn needs `&mut TranscriptionClient`, so we
+/// `try_unwrap` the inner `Arc`. When another task still holds a clone (a
+/// concurrent chunk awaiting the dead sidecar's response), the unwrap fails;
+/// we put the `Arc` back untouched and return `Skipped`, letting that other
+/// task hit the same error and retry on the next chunk. Returns the outcome
+/// the caller should propagate.
+async fn recover_from_chunk_failure(ctx: &TranscriptionContext) -> TranscribeOutcome {
+    let mut client_guard = ctx.transcription_client.lock().await;
+    let Some(arc_client) = client_guard.take() else {
+        return TranscribeOutcome::Skipped;
+    };
+    if arc_client.is_running() {
+        // Sidecar still running — just a transient error. Put the Arc back
+        // and let the caller retry.
+        *client_guard = Some(arc_client);
+        return TranscribeOutcome::Skipped;
+    }
+
+    warn!("sidecar process died — attempting restart");
+    match Arc::try_unwrap(arc_client) {
+        Ok(mut client) => match client.respawn().await {
+            Ok(()) => {
+                info!("sidecar restarted successfully after transcription failure");
+                *client_guard = Some(Arc::new(client));
+                let _ = ctx.app_handle.emit(
+                    "live-transcription-warning",
+                    LiveTranscriptionWarningEvent {
+                        message: "Transcription engine restarted".into(),
+                    },
+                );
+                TranscribeOutcome::Skipped
             }
-
+            Err(restart_err) => {
+                error!("sidecar restart failed: {}", restart_err);
+                // Put the client back so other tasks can see it as "not
+                // running" and try again.
+                *client_guard = Some(Arc::new(client));
+                TranscribeOutcome::SidecarDead
+            }
+        },
+        Err(still_shared) => {
+            // Another task still holds the Arc. Put it back untouched; that
+            // task will hit the same error and we'll try again on the next
+            // chunk.
+            *client_guard = Some(still_shared);
+            debug!("sidecar restart skipped: client still held by another chunk task");
             TranscribeOutcome::Skipped
         }
     }
@@ -3021,19 +3172,23 @@ async fn transcribe_and_emit_chunk(
     input: &ChunkInput<'_>,
     chunk_index: &mut u32,
     accumulated_text: &mut String,
-    session: &Arc<StdMutex<SessionAccumulators>>,
+    counters: &Arc<StdMutex<SessionCounters>>,
+    prompt: &Arc<StdMutex<PromptState>>,
 ) -> TranscribeOutcome {
-    let outcome = transcribe_chunk(ctx, input, chunk_index, accumulated_text, session).await;
+    let outcome = transcribe_chunk(ctx, input, chunk_index, accumulated_text, prompt).await;
 
     if let TranscribeOutcome::Success(ref result) = outcome {
         // Short critical section — no await held.
         let (total_chunks, total_audio_seconds) = {
-            let mut s = session.lock().expect("session mutex poisoned");
+            let mut s = counters.lock().expect("counters mutex poisoned");
             s.total_chunks += 1;
             s.total_audio_seconds += result.chunk_duration;
-            s.last_transcription_at = Some(Instant::now());
             (s.total_chunks, s.total_audio_seconds)
         };
+        prompt
+            .lock()
+            .expect("prompt mutex poisoned")
+            .last_transcription_at = Some(Instant::now());
 
         let _ = ctx
             .app_handle
@@ -3074,11 +3229,6 @@ pub async fn start_live_transcription(
     // Validate config values. Use `is_finite` alongside the sign checks
     // because NaN comparisons all return false — raw `<= 0.0` silently
     // admits NaN payloads which would later panic in sample-count math.
-    if !config.silence_threshold.is_finite() || config.silence_threshold <= 0.0 {
-        return Err(CommandError::InvalidInput {
-            message: "silence_threshold must be finite and > 0".into(),
-        });
-    }
     if config.silence_duration_ms == 0 {
         return Err(CommandError::InvalidInput {
             message: "silence_duration_ms must be > 0".into(),
@@ -3103,7 +3253,10 @@ pub async fn start_live_transcription(
     }
     // Validate MP3 bitrate now so a misconfigured session doesn't fail late,
     // after the buffer has been drained into the session WAV with no recovery.
-    let will_write_mp3 = config.audio_export_format.as_deref().unwrap_or("mp3") != "wav";
+    let will_write_mp3 = config
+        .audio_export_format
+        .unwrap_or(AudioExportFormatDto::Mp3)
+        .is_mp3();
     if will_write_mp3 {
         if let Some(kbps) = config.mp3_bitrate {
             yapstack_audio::export::validate_mp3_bitrate(kbps).map_err(|e| {
@@ -3292,6 +3445,7 @@ pub async fn start_live_transcription(
                 part_index,
                 flush_count: 0,
                 wav_sample_rate: sample_rate,
+                persist_audio_part: config.persist_audio_part,
             })
         } else {
             None
@@ -3335,14 +3489,21 @@ pub async fn start_live_transcription(
         session_offset_base_seconds,
     };
 
+    let counters = Arc::new(StdMutex::new(SessionCounters {
+        total_chunks: 0,
+        total_audio_seconds: 0.0,
+    }));
+
     let task_handle = tokio::spawn({
         let ctx_guard = ctx.clone();
+        let counters_for_loop = counters.clone();
         async move {
             let result = AssertUnwindSafe(live_transcription_loop(
                 audio_state_clone,
                 ctx,
                 stop_rx,
                 session_wav_state,
+                counters_for_loop,
             ))
             .catch_unwind()
             .await;
@@ -3384,6 +3545,7 @@ pub async fn start_live_transcription(
             stop_tx: Some(stop_tx),
             session_id: controller_session_id,
             effective_start_epoch_ms,
+            counters,
         },
         vocabulary_hints: vocab_hints,
     });
@@ -3420,34 +3582,23 @@ pub async fn get_live_transcription_status(
 ) -> Result<LiveTranscriptionStatus, CommandError> {
     let guard = live_state.lock().await;
 
-    // TODO: chunks_processed and total_audio_seconds are always 0 because these
-    // counters live inside the async transcription loop (local variables in
-    // `live_transcription_loop`). To report real values, the loop would need to
-    // write to an Arc<AtomicU32> / Arc<AtomicF32> (or a shared struct) that this
-    // command reads. Low priority since the frontend receives accurate per-chunk
-    // values via the "live-transcription-status" event stream.
     match &*guard {
         Some(runtime) => {
             let c = &runtime.controller;
-            if c.is_running() {
-                Ok(LiveTranscriptionStatus {
-                    phase: LiveTranscriptionPhase::Running,
-                    chunks_processed: 0,
-                    total_audio_seconds: 0.0,
-                    error_message: None,
-                    session_id: c.session_id.clone(),
-                    effective_start_epoch_ms: Some(c.effective_start_epoch_ms),
-                })
+            let (chunks_processed, total_audio_seconds) = c.counters();
+            let phase = if c.is_running() {
+                LiveTranscriptionPhase::Running
             } else {
-                Ok(LiveTranscriptionStatus {
-                    phase: LiveTranscriptionPhase::Stopped,
-                    chunks_processed: 0,
-                    total_audio_seconds: 0.0,
-                    error_message: None,
-                    session_id: c.session_id.clone(),
-                    effective_start_epoch_ms: Some(c.effective_start_epoch_ms),
-                })
-            }
+                LiveTranscriptionPhase::Stopped
+            };
+            Ok(LiveTranscriptionStatus {
+                phase,
+                chunks_processed,
+                total_audio_seconds,
+                error_message: None,
+                session_id: c.session_id.clone(),
+                effective_start_epoch_ms: Some(c.effective_start_epoch_ms),
+            })
         }
         None => Ok(LiveTranscriptionStatus {
             phase: LiveTranscriptionPhase::Stopped,
@@ -3480,56 +3631,6 @@ pub async fn update_vocabulary_hints(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_trim_leading_silence_all_loud() {
-        // Signal well above threshold
-        let samples: Vec<f32> = vec![0.5; 1600]; // 0.1s at 16kHz
-        let (trimmed, offset) = trim_leading_silence(&samples, 16000, 0.01, 0.0);
-        assert_eq!(trimmed.len(), 1600);
-        assert!((offset - 0.0).abs() < f32::EPSILON);
-    }
-
-    #[test]
-    fn test_trim_leading_silence_all_silent() {
-        // All zeros — below any threshold
-        let samples: Vec<f32> = vec![0.0; 1600];
-        let (trimmed, offset) = trim_leading_silence(&samples, 16000, 0.01, 0.0);
-        // Returns empty slice when all silent so caller can skip
-        assert!(trimmed.is_empty());
-        assert!((offset - 0.0).abs() < f32::EPSILON);
-    }
-
-    #[test]
-    fn test_trim_leading_silence_with_leading_silence() {
-        // 0.1s silence then 0.1s loud at 16kHz
-        let mut samples = vec![0.0f32; 1600];
-        samples.extend(vec![0.5f32; 1600]);
-        let (trimmed, offset) = trim_leading_silence(&samples, 16000, 0.01, 0.0);
-        // Should trim the leading silence
-        assert!(trimmed.len() < 3200);
-        assert!(offset > 0.0);
-    }
-
-    #[test]
-    fn test_trim_leading_silence_with_pad() {
-        // 0.2s silence then loud at 16kHz
-        let mut samples = vec![0.0f32; 3200];
-        samples.extend(vec![0.5f32; 1600]);
-        // Pad 0.05s before the loud section
-        let (trimmed, offset) = trim_leading_silence(&samples, 16000, 0.01, 0.05);
-        // Offset should be slightly less than the loud section start (due to padding)
-        assert!(offset > 0.0);
-        assert!(trimmed.len() > 1600); // includes some pad
-    }
-
-    #[test]
-    fn test_trim_leading_silence_empty() {
-        let samples: Vec<f32> = vec![];
-        let (trimmed, offset) = trim_leading_silence(&samples, 16000, 0.01, 0.0);
-        assert!(trimmed.is_empty());
-        assert!((offset - 0.0).abs() < f32::EPSILON);
-    }
 
     #[test]
     fn test_capture_source_dto_into() {
@@ -3647,8 +3748,6 @@ mod tests {
         assert!(matches!(action, VadAction::None));
     }
 
-    // --- build_cursor tests ---
-
     // --- Prompt decay tests ---
 
     #[test]
@@ -3743,79 +3842,6 @@ mod tests {
         assert_eq!(sources[0].accumulated_text, "seeded context");
     }
 
-    // --- build_cursor tests ---
-
-    #[test]
-    fn test_build_cursor_mic_only() {
-        let sources = vec![SourceVadState::new(AudioSourceLabel::Mic, 42, 0, 48000, 1)];
-        let cursor = build_cursor(&sources);
-        assert_eq!(cursor.mic_pos, 42);
-        assert_eq!(cursor.system_pos, 0);
-    }
-
-    #[test]
-    fn test_build_cursor_both_sources() {
-        let sources = vec![
-            SourceVadState::new(AudioSourceLabel::Mic, 100, 0, 48000, 1),
-            SourceVadState::new(AudioSourceLabel::System, 200, 0, 48000, 2),
-        ];
-        let cursor = build_cursor(&sources);
-        assert_eq!(cursor.mic_pos, 100);
-        assert_eq!(cursor.system_pos, 200);
-    }
-
-    // --- chunk_at_silence_boundaries tests ---
-
-    #[test]
-    fn test_chunk_at_silence_empty() {
-        let chunks = chunk_at_silence_boundaries(&[], 48000, 48000, 0.01);
-        assert!(chunks.is_empty());
-    }
-
-    #[test]
-    fn test_chunk_at_silence_short_audio() {
-        // Audio shorter than chunk_size → single chunk
-        let samples = vec![0.5f32; 16000]; // 1s at 16kHz
-        let chunks = chunk_at_silence_boundaries(&samples, 48000, 16000, 0.01);
-        assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0].len(), 16000);
-    }
-
-    #[test]
-    fn test_chunk_at_silence_splits_at_silence() {
-        // Build audio: 2s loud, 0.2s silence, 2s loud at 16kHz
-        let sr = 16000;
-        let loud_len = 2 * sr;
-        let silence_len = (0.2 * sr as f32) as usize;
-        let mut samples = vec![0.5f32; loud_len];
-        samples.extend(vec![0.0f32; silence_len]);
-        samples.extend(vec![0.5f32; loud_len]);
-        // Total: ~4.2s. Chunk size: 3s (48000 samples at 16kHz).
-        let chunk_size = 3 * sr;
-        let chunks = chunk_at_silence_boundaries(&samples, chunk_size, sr as u32, 0.01);
-        // Should split near the silence gap rather than at the hard 3s boundary
-        assert!(
-            chunks.len() >= 2,
-            "expected at least 2 chunks, got {}",
-            chunks.len()
-        );
-        // The total samples across all chunks should equal the input
-        let total: usize = chunks.iter().map(|c| c.len()).sum();
-        assert_eq!(total, samples.len());
-    }
-
-    #[test]
-    fn test_chunk_at_silence_no_silence_falls_back() {
-        // Continuous loud audio — should fall back to fixed boundaries
-        let sr = 16000usize;
-        let samples = vec![0.5f32; 5 * sr]; // 5s loud
-        let chunk_size = 2 * sr; // 2s chunks
-        let chunks = chunk_at_silence_boundaries(&samples, chunk_size, sr as u32, 0.01);
-        assert!(chunks.len() >= 2);
-        let total: usize = chunks.iter().map(|c| c.len()).sum();
-        assert_eq!(total, samples.len());
-    }
-
     // --- Stream health decision helper tests ---
 
     #[test]
@@ -3889,7 +3915,6 @@ mod tests {
 
     fn dummy_config() -> LiveTranscriptionConfig {
         LiveTranscriptionConfig {
-            silence_threshold: 0.01,
             silence_duration_ms: 800,
             max_chunk_seconds: 30.0,
             backfill_seconds: 0.0,
@@ -3899,6 +3924,7 @@ mod tests {
             prompt_context_chars: None,
             prompt_decay_silence_seconds: None,
             session_id: None,
+            persist_audio_part: true,
             audio_save_location: None,
             audio_export_format: None,
             mp3_bitrate: None,
@@ -4014,9 +4040,9 @@ mod tests {
         // without the `prev_chunk_end` clamp, the second onset's pre-roll
         // would reach back into the first chunk's tail.
         let mut probs: Vec<f32> = Vec::with_capacity(loud_frames * 2 + gap_frames);
-        probs.extend(std::iter::repeat(0.90).take(loud_frames));
-        probs.extend(std::iter::repeat(0.10).take(gap_frames));
-        probs.extend(std::iter::repeat(0.90).take(loud_frames));
+        probs.extend(std::iter::repeat_n(0.90, loud_frames));
+        probs.extend(std::iter::repeat_n(0.10, gap_frames));
+        probs.extend(std::iter::repeat_n(0.90, loud_frames));
 
         let frame_samples = (super::super::silero_vad::FRAME_DURATION_SECS * sr as f32) as usize;
         let total_samples = probs.len() * frame_samples;
@@ -4068,8 +4094,7 @@ mod tests {
         s.speech_start_pos = current;
         s.earliest_next_chunk_pos = current;
         s.silero.read_pos = current;
-        s.silero.last_probability = None;
-        s.silero.stream.reset();
+        s.silero.reset();
 
         assert_eq!(
             s.silero.read_pos, current,

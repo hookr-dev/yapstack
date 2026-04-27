@@ -6,7 +6,7 @@ import { register as registerGlobalShortcut, unregister as unregisterGlobalShort
 import { useAppStore } from "@/stores/appStore";
 import { commands } from "@/lib/tauri";
 import { EVENTS, WINDOWS, listenEvent, emitEvent, type BubbleState } from "@/lib/events";
-import { createAIClient, getActiveConfig, isAIConfigured } from "@/lib/ai";
+import { createAIClient, getActiveConfig, isAIConfigured, markdownToBasicHtml } from "@/lib/ai";
 import { buildVocabularyHints } from "@/lib/transcription";
 import { createManualSession as dbCreateManualSession, saveNote, insertDictationHistory, listFolders, listTags } from "@/lib/db";
 import { toast } from "sonner";
@@ -17,8 +17,8 @@ type DictationState = "idle" | "recording" | "transcribing" | "processing" | "ca
 // How long the bubble shows "Cancelled" before hiding. Mirrors the existing
 // no-speech / error self-hide window.
 const CANCEL_DISPLAY_MS = 450;
-// How long to wait after stopLiveTranscription for the streamed Session WAV
-// to be finalized (so we can delete it on cancel). Past this we give up.
+// How long to wait after stopLiveTranscription for the part to be finalized
+// (session-part-ready) so we can delete it on cancel. Past this we give up.
 const CANCEL_WAV_GRACE_MS = 1500;
 
 const BUBBLE_WIDTH = 220;
@@ -253,7 +253,6 @@ export function useDictation() {
       // Start live transcription (pass dictation ID for WAV saving)
       const { language } = s.settings;
       const result = await commands.startLiveTranscription({
-        silence_threshold: 0.01,
         silence_duration_ms: 400,
         max_chunk_seconds: 10,
         backfill_seconds: 0,
@@ -263,6 +262,11 @@ export function useDictation() {
         prompt_context_chars: 350,
         prompt_decay_silence_seconds: 0,
         session_id: dictationIdRef.current,
+        // Dictations are not sessions — the synthetic id has no row in
+        // `sessions`, so don't insert into `session_audio_parts`. The
+        // finalized path is recorded against `dictation_history` instead
+        // (see the session-part-ready listener below).
+        persist_audio_part: false,
         audio_save_location: null,
         audio_export_format: s.settings.audioExportFormat,
         mp3_bitrate: s.settings.audioExportFormat === "mp3" ? s.settings.mp3Bitrate : null,
@@ -425,7 +429,7 @@ export function useDictation() {
             const sessionId = noteSessionId;
             const title = text.slice(0, 60);
             await dbCreateManualSession(sessionId, title);
-            await saveNote(sessionId, `<p>${text}</p>`);
+            await saveNote(sessionId, markdownToBasicHtml(text));
             await focusMainWindow();
             const store = useAppStore.getState();
             await store.loadSessions();
@@ -562,12 +566,13 @@ export function useDictation() {
         duration_ms: Date.now() - startTimeRef.current,
       });
 
-      // Stop live transcription — finalizes the streamed Session WAV and emits
-      // "Stopped". Capture itself is app-wide and stays running.
+      // Stop live transcription — finalizes the session part (WAV or MP3 per
+      // audioExportFormat) and emits "Stopped". Capture itself is app-wide
+      // and stays running.
       await commands.stopLiveTranscription().catch(() => {});
 
-      // Wait briefly for the Session WAV to finalize so we can delete it.
-      // wavInfoRef populates from the SESSION_PART_READY listener, which is
+      // Wait briefly for the part to finalize so we can delete it.
+      // wavInfoRef populates from the session-part-ready listener, which is
       // still mounted at this point.
       const wavDeadline = Date.now() + CANCEL_WAV_GRACE_MS;
       while (!wavInfoRef.current && Date.now() < wavDeadline) {
@@ -575,7 +580,16 @@ export function useDictation() {
       }
 
       if (wavInfoRef.current) {
-        await commands.deleteSessionWav(dictationIdRef.current, null).catch(() => {});
+        // Delete by exact path so we hit the per-part trusted-dirs path
+        // (NotFound treated as no-op) rather than the legacy session-glob
+        // that scans the audio dir. Surface unexpected failures to the
+        // console — this is the only diagnostic for cancel cleanup.
+        const path = wavInfoRef.current.path;
+        try {
+          await commands.deleteAudioFiles([path]);
+        } catch (err) {
+          console.warn("dictation cancel: failed to delete part", path, err);
+        }
       }
 
       cleanupListeners();

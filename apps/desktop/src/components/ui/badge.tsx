@@ -45,4 +45,7 @@ function Badge({
   )
 }
 
+// shadcn vendored shape — `badgeVariants` ships alongside `Badge` for
+// consumers that need the cva config; splitting it would diverge from upstream.
+// eslint-disable-next-line react-refresh/only-export-components
 export { Badge, badgeVariants }

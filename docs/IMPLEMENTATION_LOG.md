@@ -1181,17 +1181,102 @@ PRD: `docs/plans/dictation-escape-cancel.md`.
 
 ---
 
+## Phase 29 — AI Tool Extensions: Transcript Editing, Note Modes, Undo Receipts
+
+### What was built
+
+Five expansions to the AI chat tooling layer that turn it from "summarize and tag" into "edit and refine":
+
+1. **`replace_in_transcript`** — surgical edit of transcript text by find-and-replace. Touches the durable `segments` rows, preserves `original_text` so undo restores every touched segment.
+2. **`save_to_notes` modes** — added `prepend` (TL;DR / executive summary above) and `find_replace` (substring swap inside existing notes). Prior `replace` semantics are preserved but the system prompt now nudges the model to prefer `find_replace` for "change", "fix", "edit", "update", "rename" requests instead of overwriting the whole note.
+3. **Undone receipts** — undone tool calls render as grayed receipts in the chat history rather than disappearing entirely. Persisted tool calls are also cleaned up on undo so the next replay sees consistent state.
+4. **Action button intent fix** — action buttons (Summarize / Key Points / etc.) no longer ask "conversation or notes?" — they pick the correct surface based on whether the source is a transcript or note context.
+5. **Citation chip robustness** — citation chips now render reliably across messages even when the chat is reloaded mid-stream. `[[seg:ID]]` tokens land in HTML as `<span data-segment-ref>` elements, then the renderer reattaches click handlers per message on mount.
+
+### Key decisions
+
+- **Editing the transcript via the AI is durable, not a UI overlay.** `replace_in_transcript` mutates `segments.text` and stamps `edited_at`; `original_text` captures the pre-edit value once. Undo restores `original_text` per touched segment. This matches how human edits already work — there's no "AI shadow text" layer.
+- **Notes modes are first-class branches, not free-form.** The schema enum is `replace | append | prepend | find_replace`, with `find` required when `find_replace` is chosen. The system prompt steers the model toward `find_replace` over `replace` whenever the user is asking for a change rather than a wholesale rewrite, because `replace` would silently nuke the user's manual edits.
+- **Undone tool calls stay visible.** Hiding them was confusing — users saw a bot reply with no apparent action. Graying the receipt while keeping the row preserves provenance.
+
+### Files Changed
+
+| File | Change |
+|------|--------|
+| `apps/desktop/src/lib/ai-tools.ts` | New `replace_in_transcript` tool. `save_to_notes` schema gains `prepend` + `find_replace` modes and a `find` parameter. |
+| `apps/desktop/src/lib/ai-prompts.ts` | Notes guidance rewritten to prefer `find_replace` for change requests. |
+| `apps/desktop/src/components/ToolExecutionBlock.tsx` | Grayed-receipt rendering for undone calls; tightened bottom padding. |
+| `apps/desktop/src/hooks/useChatMessages.ts` | Persist undone tool-call state to DB so reloads see consistent receipts; tighten search filters. |
+
+---
+
+## Phase 30 — Resumable Sessions via `session_audio_parts`
+
+### What was built
+
+Each session can now consist of multiple audio parts persisted in a new `session_audio_parts` table (migration v15). Recording into an existing session appends a new part instead of overwriting; the FE concatenates parts at playback time, segments use a cumulative `audio_offset_seconds` base so timestamps stay continuous across resumes. This makes sessions genuinely resumable without losing transcript-to-audio alignment.
+
+### Key decisions
+
+- **DB is the durable source of truth, FE event is just a refresh hint.** The `session_audio_parts` row is inserted from Rust at finalize time *before* `session-part-ready` is emitted, so a missed FE event (window closed, force quit) can't lose the file. The FE handler now just refreshes parts from the DB.
+- **One file per part, no concatenation on disk.** Files are named `{session_id}.{part_index}.{wav|mp3}` per the user's `audioExportFormat` setting. Resuming a session opens a new `SessionWavWriter` at `part_index = N` rather than rewriting `part_index = 0`. Concat happens at playback time, in the FE, via a parts-aware `seekTo`.
+- **`audio_save_locations` table catches orphans.** Every directory the app has written audio into is recorded at recording start, *before* the file exists. If the run dies before the row insert, `scan_missing_audio_parts()` on next startup walks each known dir for files matching `{session_id}.{part_index}.{ext}` and reconciles the missing rows. This covers crash, force-quit, and the migration's runtime backfill.
+- **Migration v15 is idempotent and safe.** Backfills `session_audio_parts` from legacy `wav_file_path` rows but does not drop the legacy columns (SQLite ALTER-DROP-in-same-tx hazard). The legacy columns remain as a duration fallback for sessions whose part rows didn't reconcile.
+- **`delete_audio_files` surfaces failures.** Bulk-delete returns an error listing every path that didn't unlink, so the FE can warn or queue retries; we explicitly removed an earlier "pending deletion retry" loop because the surfaced error already gives the FE everything it needs.
+- **`audio-stream://` allow-list extended at runtime.** `TrustedAudioDirs` is seeded at startup from `session_audio_parts.file_path` parents and `audio_save_locations`, then extended each time a part is finalized. User-chosen export paths (anywhere on disk) now play, while path traversal and untracked paths still 404.
+
+### Files Changed
+
+| File | Change |
+|------|--------|
+| `apps/desktop/src-tauri/src/db.rs` | `session_audio_parts` table + migration v15 + `AudioPartRow` + `insert_audio_part_row` + `register_audio_save_location` + `scan_missing_audio_parts` + `reconcile_audio_parts` + runtime backfill in `ensure_runtime_schema` |
+| `apps/desktop/src-tauri/src/commands/capture.rs` | New `delete_audio_files` command (validates against `TrustedAudioDirs`, surfaces failure list) |
+| `apps/desktop/src-tauri/src/commands/live_transcription.rs` | `LiveTranscriptionConfig.audio_save_location` / `audio_export_format` / `mp3_bitrate` / `resume`; finalize inserts the part row + emits `session-part-ready` |
+| `apps/desktop/src-tauri/src/lib.rs` | `TrustedAudioDirs` allow-list seeded at startup from parts + audio_save_locations |
+| `apps/desktop/src/lib/db.ts` | `listSessionAudioParts`, parts-aware deletion, `listAllAudioPartPaths` for `clearAllSessions` |
+| `apps/desktop/src/stores/appStore.ts` | Resume flow appends a new part; `onSessionPartReady` refreshes from DB |
+
+---
+
+## Phase 31 — Live Transcription Decomposition + Tree-shake
+
+### What was built
+
+A behavior-preserving cleanup pass that removed accumulated dead code, decomposed the largest functions in the live-transcription pipeline, and brought stale documentation back in sync with the code. Tracked at `docs/plans/tree-shake-cleanup.md`.
+
+### Key decisions
+
+- **`live_transcription_loop` was 923 lines, now ~445.** Split into named helpers (each with a specific responsibility): `build_initial_sources_and_backfill`, `seed_prompt_from_backfill`, `write_session_wav_samples`, `handle_empty_wav_flush`, `drain_in_flight_chunks`, `dispatch_final_pending_chunks`, `emit_fatal_sidecar_error`, `run_prompt_decay`, `finalize_session_wav`. Loop body now reads as orchestration over named phases.
+- **`check_stream_health` was 306 lines, now a 25-line orchestrator + four layered helpers**: `evaluate_listener_signal` (Layer 0 OS push notification with settle-and-recheck for cpal#1175), `evaluate_speculative_signals` (Layers 1–3 cooldown-gated symptom detection), `attempt_source_restart` (the actual restart + outcome bookkeeping), `handle_buffer_replacement` (cursor + WAV-flush reset on a fresh buffer). Same restart policy, same per-source `restart_attempts` cap, same emitted events.
+- **`transcribe_chunk` was 261 lines, now 156 lines.** Pulled `build_effective_prompt` (vocab + accumulated_text combination, with mutex-scoped vocab snapshot to keep `update_vocabulary_hints` from blocking on transcribe round trips) and `recover_from_chunk_failure` (post-error sidecar respawn handshake — `try_unwrap`, put-back, retry).
+- **Dead code deleted, not just suppressed.** `BackfillChunk` struct (never instantiated), `chunk_at_silence_boundaries()` and its tests (no production caller — backfill exclusively uses `vad_chunk_historical_audio`), and the `should_stall_restart` if/else simplified to a single negated expression.
+- **Frontend `useDictationEntry()` hook unifies the dictation row UI.** `DictationFeedEntry` and `DictationTrayItem` previously duplicated playing-state, audio play/pause, copy/move-to-note/delete handlers, and store wiring. The hook owns all of it; both components now focus on layout.
+- **Several agent-suggested deletions were reverted under verification.** `prompt_seeded_from_backfill` is a load-bearing one-shot guard against reseeding the shared prompt every poll; `getDayLabel` is internal-and-tested; the three WAV flush thresholds (10/20/100) each serve a distinct purpose (one-shot user error, periodic warn, success-path diagnostic). Plan file documents each skip.
+- **Documentation reconciliation** — CLAUDE.md, `docs/ARCHITECTURE.md`, `docs/API_REFERENCE.md`, and `docs/DEVELOPMENT.md` were updated to drop the `WhisperClient` alias and the `init_whisper_client` legacy shim (both removed long ago), bump the documented Zustand store version (22 → 23) and SQL migration count (v11 → v15), and correct the description of `db::ensure_runtime_schema()` (sweeps stale recording sessions and creates `audio_save_locations`; the `segments.speaker_id` column is added by the frontend's `getDb()` after migrations run).
+
+### Files Changed
+
+| File | Change |
+|------|--------|
+| `apps/desktop/src-tauri/src/commands/live_transcription.rs` | All extractions; `should_stall_restart` simplification; dead code removal |
+| `apps/desktop/src/hooks/useDictationEntry.ts` | New shared hook |
+| `apps/desktop/src/components/DictationFeedEntry.tsx`, `DictationTrayItem.tsx` | Refactor to consume hook |
+| `CLAUDE.md`, `docs/ARCHITECTURE.md`, `docs/API_REFERENCE.md`, `docs/DEVELOPMENT.md` | Stale-content sweep |
+| `docs/plans/tree-shake-cleanup.md` | New plan tracking the refactor |
+
+---
+
 ## What's Not Yet Built
 
 - **End-to-end integration tests** — capture audio, transcribe, verify text (unit + component tests now exist; integration tests still needed)
 - **CI/CD pipeline** — GitHub Actions for cross-platform builds, sidecar compilation
 - **Temp file cleanup** — WAV files from capture accumulate; needs cleanup after transcription
-- **Sidecar auto-restart** — `WhisperClient` detects crashes but doesn't restart automatically
 - **Progress events during sidecar inference** — the sidecar emits `Progress` responses and the client handles them (skipping to wait for final result), but whisper-rs doesn't provide a progress callback during inference itself
 - **Memory system** — Three-layer knowledge model (permanent facts, project context, daily logs) with SQLite storage, tag-based retrieval, and AI tools (`create_memory`, `update_memory`). Planned as Phase 4 of knowledge management.
 - **Daily digest & knowledge gardening** — AI-driven end-of-day summarization with full knowledge gardening (extract, update, merge, promote, archive). Manual trigger with smart nudge.
 - **Memory UI & vault sync** — Memory browser, backlinks panel, action item tracker, optional markdown vault sync for Obsidian interop.
 - **Tag management UI** — Tag CRUD, tag picker, tag filtering in sidebar, tags in search results. Tags infrastructure exists but no dedicated management UI yet.
 - **Sharing** — `shares` table exists but no sharing UI or backend logic
-- **Dictation during active recording** — WhisperClient is exclusively held by live transcription; dictation is unavailable while recording. Requires a second WhisperClient instance or queuing mechanism.
+- **Dictation during active recording** — `TranscriptionClient` is exclusively held by live transcription; dictation is unavailable while recording. Requires a second client instance or queuing mechanism.
 - **Multi-platform dictation testing** — Auto-paste (`osascript`) is macOS-only. Windows implementation needs testing. Linux not yet supported.
+- **Session-stable speaker IDs** — Sortformer's chunk-local speaker IDs cause the same person to flip across speaker numbers across chunk boundaries. Diarization is force-disabled on upgrade (settings v22→23) until session-stable IDs land. The IPC + DB + sidecar plumbing is intact, so re-enabling is a one-line change once stability is solved.

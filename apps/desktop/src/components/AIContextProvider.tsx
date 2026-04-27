@@ -6,6 +6,10 @@ import type { DbSegment } from "@/lib/db";
 
 const AIContext = createContext<AIContextValue | null>(null);
 
+// Hook colocated with the provider intentionally — splitting it across files
+// just to satisfy fast-refresh would force every consumer to bounce through
+// an extra import.
+// eslint-disable-next-line react-refresh/only-export-components
 export function useAIContext(): AIContextValue | null {
   return useContext(AIContext);
 }

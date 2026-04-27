@@ -56,22 +56,6 @@ async checkSystemAudioPermission() : Promise<Result<PermissionStatusDto, Command
     else return { status: "error", error: e  as any };
 }
 },
-async snapshotMicAudio(durationSeconds: number | null) : Promise<Result<AudioSnapshotDto | null, CommandError>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("snapshot_mic_audio", { durationSeconds }) };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-async snapshotSystemAudio(durationSeconds: number | null) : Promise<Result<AudioSnapshotDto | null, CommandError>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("snapshot_system_audio", { durationSeconds }) };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
 async getBufferInfo() : Promise<Result<BufferStatusDto, CommandError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("get_buffer_info") };
@@ -88,46 +72,19 @@ async peekCaptureEnergy(windowSecs: number) : Promise<Result<CaptureEnergyDto, C
     else return { status: "error", error: e  as any };
 }
 },
-async triggerInstantCapture(seconds: number, source: CaptureSourceDto, mixConfig: MixConfigDto | null) : Promise<Result<CaptureResultDto, CommandError>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("trigger_instant_capture", { seconds, source, mixConfig }) };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-async startSession() : Promise<Result<null, CommandError>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("start_session") };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-async endSession(source: CaptureSourceDto, mixConfig: MixConfigDto | null) : Promise<Result<CaptureResultDto, CommandError>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("end_session", { source, mixConfig }) };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-async getSessionStatus() : Promise<Result<SessionStatusDto, CommandError>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("get_session_status") };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-async exportSessionWav(sessionId: string, source: CaptureSourceDto, durationSeconds: number, mixConfig: MixConfigDto | null, audioSaveLocation: string | null, audioExportFormat: string | null, mp3Bitrate: number | null) : Promise<Result<SessionWavResultDto, CommandError>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("export_session_wav", { sessionId, source, durationSeconds, mixConfig, audioSaveLocation, audioExportFormat, mp3Bitrate }) };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
+/**
+ * Glob-deletes every `{session_id}.*.wav` / `.mp3` under `audio_dir`. Used
+ * for sessions that pre-date the v15 `session_audio_parts` migration (where
+ * the FE has no per-part path to delete) and as the fallback path inside
+ * `appStore.deleteSessionAudio` when the parts list is empty.
+ * 
+ * Authorization: the resolved `audio_dir` must already be in
+ * `TrustedAudioDirs` — otherwise the command returns `InvalidInput` and
+ * nothing is touched. This stops a malicious caller from passing an
+ * arbitrary `audio_save_location` and globbing files outside the
+ * audio-store. Per-file `remove_file` errors (other than `NotFound`) are
+ * collected and surfaced so failures don't get swallowed.
+ */
 async deleteSessionWav(sessionId: string, audioSaveLocation: string | null) : Promise<Result<null, CommandError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("delete_session_wav", { sessionId, audioSaveLocation }) };
@@ -174,14 +131,6 @@ async downloadModel(size: ModelSizeDto) : Promise<Result<string, CommandError>> 
 async deleteModel(size: ModelSizeDto) : Promise<Result<null, CommandError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("delete_model", { size }) };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-async transcribeAudio(audioPath: string, language: string | null, initialPrompt: string | null) : Promise<Result<TranscriptionResultDto, CommandError>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("transcribe_audio", { audioPath, language, initialPrompt }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -437,12 +386,17 @@ async revealLogDir() : Promise<Result<null, CommandError>> {
 /** user-defined types **/
 
 export type AudioDeviceInfoDto = { id: string | null; name: string; device_type: DeviceTypeDto; is_default: boolean }
-export type AudioSnapshotDto = { samples: number[]; sample_rate: number; channels: number; duration_seconds: number }
+/**
+ * Typed surface for the audio finalize format. Lowercase serde tags match
+ * the legacy `"wav"` / `"mp3"` strings the FE already passes and the
+ * `format` field on `SessionPartReadyEvent` already emits, so this is a
+ * drop-in tightening of the Tauri boundary — generated TypeScript becomes
+ * a `"wav" | "mp3"` discriminated union instead of `string | null`.
+ */
+export type AudioExportFormatDto = "wav" | "mp3"
 export type BufferStatusDto = { mic: RingBufferInfoDto | null; system: RingBufferInfoDto | null }
 export type CaptureEnergyDto = { mic_rms: number | null; system_rms: number | null }
-export type CaptureResultDto = { file_path: string; duration_seconds: number; sample_rate: number; source: CaptureSourceDtoSerialize }
 export type CaptureSourceDto = "MicOnly" | "SystemOnly" | "Mixed"
-export type CaptureSourceDtoSerialize = "MicOnly" | "SystemOnly" | "Mixed"
 export type CaptureStateDto = "Idle" | "Capturing" | "Error"
 export type CaptureStatusDto = { state: CaptureStateDto; mic_active: boolean; system_audio_active: boolean; error_message: string | null }
 /**
@@ -463,10 +417,6 @@ export type EngineDescriptorDto = { kind: EngineKindDto; display_name: string; l
 export type EngineKindDto = "Whisper" | "Parakeet"
 export type HealthStatus = { status: string; version: string }
 export type LiveTranscriptionConfig = { 
-/**
- * RMS energy threshold below which audio is considered silence. Default: 0.01.
- */
-silence_threshold: number; 
 /**
  * Milliseconds of continuous silence before triggering a chunk. Default: 800.
  */
@@ -501,18 +451,40 @@ prompt_context_chars: number | null;
  */
 prompt_decay_silence_seconds: number | null; 
 /**
- * Session ID for streaming WAV recording. If set, audio is incrementally
- * written to `$APP_DATA_DIR/audio/{session_id}.wav` during the session.
+ * Session ID for streaming session-audio recording. If set, the loop
+ * streams a new audio part to disk during the session and emits
+ * `session-part-ready` at finalize time. The on-disk file is
+ * `{audio_save_location || $APP_DATA_DIR/audio/}/{session_id}.{part_index}.{wav|mp3}`,
+ * where `part_index` is 0 for a fresh session and `N` when resuming a
+ * session that already has parts.
  */
 session_id: string | null; 
 /**
- * Custom directory for saving WAV files. If None, uses `$APP_DATA_DIR/audio/`.
+ * When `true`, the finalize path inserts a `session_audio_parts` row
+ * keyed by `session_id` so the DB stays the durable source of truth even
+ * if the FE listener is gone. Set this to `false` for synthetic ids that
+ * are *not* rows in `sessions` — most importantly dictation, where the
+ * id is per-utterance and the finalized file is recorded against
+ * `dictation_history` instead. Defaults to `true` to preserve historical
+ * behavior for actual sessions; the dictation hook flips it off.
+ */
+persist_audio_part?: boolean; 
+/**
+ * Custom directory for saving session audio parts. If None, uses
+ * `$APP_DATA_DIR/audio/`. The directory is registered with
+ * `audio_save_locations` at recording start so reconciliation can
+ * recover orphan parts on the next startup.
  */
 audio_save_location: string | null; 
 /**
- * Audio export format: "wav" or "mp3". Default: "mp3".
+ * Audio export format applied at part finalization. Default: `Mp3`
+ * (matches the legacy "no value provided" behaviour). Choosing `Mp3`
+ * re-encodes the streamed WAV at `mp3_bitrate` and deletes the source
+ * WAV; `Wav` keeps the streamed file as-is. Typed end-to-end so a stale
+ * or typo'd caller fails at deserialization rather than silently
+ * rerouting through the MP3 branch.
  */
-audio_export_format: string | null; 
+audio_export_format: AudioExportFormatDto | null; 
 /**
  * MP3 bitrate in kbps (e.g. 64, 128, 192). Only used when format is "mp3".
  */
@@ -567,17 +539,8 @@ part_index: number;
 offset_base_seconds: number }
 export type RingBufferInfoDto = { capacity_samples: number; samples_written: number; available_samples: number; capacity_seconds: number; available_seconds: number; sample_rate: number; channels: number }
 export type ScreenCapturePermissionDto = "Granted" | "NotDetermined" | "Unavailable"
-export type SessionStatusDto = { active: boolean; elapsed_seconds: number | null }
-export type SessionWavResultDto = { file_path: string; duration_seconds: number }
 export type SortformerModelInfoDto = { variant: SortformerVariantDto; downloaded: boolean; display_name: string; approximate_size_bytes: number }
 export type SortformerVariantDto = "V2_1"
-export type TranscriptSegmentDto = { start_ms: number; end_ms: number; text: string; confidence: number; 
-/**
- * Populated when the active engine is Parakeet *and* diarization
- * was requested for the originating transcribe call. `None` for Whisper.
- */
-speaker_id: number | null }
-export type TranscriptionResultDto = { text: string; segments: TranscriptSegmentDto[]; duration_ms: number }
 export type TranscriptionStatusDto = { initialized: boolean }
 
 /** tauri-specta globals **/

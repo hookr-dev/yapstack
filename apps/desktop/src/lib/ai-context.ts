@@ -1,6 +1,6 @@
 import type { LucideIcon } from "lucide-react";
 import { FileText, StickyNote, Layers, Mic } from "lucide-react";
-import type { DbSegment, DbSession, DbFolder, DbDictationHistory } from "./db";
+import type { DbSegment, DbSession, DbFolder, DbDictationHistory, SessionType } from "./db";
 import {
   getSessionSegments,
   getNote,
@@ -79,7 +79,7 @@ export interface AIContextValue {
 export function createSessionSources(
   sessionId: string,
   segmentCount: number,
-  sessionType: string,
+  sessionType: SessionType,
 ): ContextSource[] {
   const sources: ContextSource[] = [];
 
@@ -149,6 +149,7 @@ export function createSessionTools(sessionId: string): AIContextTools {
         .map((tid) => allTags.find((t) => t.id === tid)?.name)
         .filter((n): n is string => !!n);
       return {
+        scope: "session",
         sessionId,
         currentTitle: session?.title ?? "Untitled",
         currentNote: note,
@@ -257,16 +258,37 @@ export function createMultiSessionTools(
       "search_dictations",
     ],
     contextType: "multi-session",
-    // Retrieval tools don't read from session-scoped ToolContext; they hit
-    // the DB directly. The session-meta fields go unused; allowedSessionIds
-    // is the load-bearing field — it pins retrieval to the Chat's filter
-    // (folder/pinned/all) so the model can't reach outside the user's view.
+    // Retrieval tools don't read session-scoped ToolContext; they hit the DB
+    // directly with `allowedSessionIds` pinning retrieval to the chat's
+    // filter (folder/pinned/all) so the model can't reach outside the
+    // user's view. The discriminated `RetrievalToolContext` keeps the type
+    // honest — no fabricated empty `sessionId`/`currentTitle`/etc.
     getToolContext: async () => ({
-      sessionId: "",
-      currentTitle: "",
-      currentNote: null,
-      isPinned: false,
+      scope: "retrieval",
       allowedSessionIds,
+    }),
+  };
+}
+
+/**
+ * Tool surface for the dictation list view. Exposes only `search_dictations`
+ * — folder/session retrieval tools are intentionally absent because the
+ * dictation chat is scoped to `dictation_history`, not any sessions or
+ * folders. Reusing `createMultiSessionTools([])` here would have surfaced
+ * `search_sessions`, `get_session_context`, and `search_folders`, all of
+ * which return empty (or worse, leak unrelated sessions if the
+ * `allowedSessionIds` guard ever drifted).
+ */
+export function createDictationTools(): AIContextTools {
+  return {
+    availableToolIds: ["search_dictations"],
+    contextType: "multi-session",
+    getToolContext: async () => ({
+      scope: "retrieval",
+      // Empty allow-list — `search_dictations` doesn't honor it (dictation
+      // history is its own table) but a stray future tool that *does*
+      // consult `allowedSessionIds` will fail closed.
+      allowedSessionIds: [],
     }),
   };
 }
@@ -332,9 +354,7 @@ export function resolveListContext(
       return {
         contextKey: key,
         sources: createDictationSources(count),
-        // Dictation chats don't expose session retrieval, but pass an empty
-        // scope to be explicit that no sessions are reachable from here.
-        tools: createMultiSessionTools([]),
+        tools: createDictationTools(),
         buildSystemPrompt: createDictationSystemPromptBuilder(),
         placeholder: `Ask about ${count} dictation${count !== 1 ? "s" : ""}...`,
       };

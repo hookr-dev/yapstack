@@ -1,6 +1,6 @@
 # AI Context & Tooling
 
-How the AI chat learns what's on screen, what tools it can call, and how the system prompt is assembled. Also covers folder-based organizational context and the pending tags schema on `feature/knowledge-management`.
+How the AI chat learns what's on screen, what tools it can call, and how the system prompt is assembled. Also covers folder-based organizational context and the tags primitive (live since v11).
 
 For the streaming + tool-call plumbing and undo machinery, see [`ARCHITECTURE.md`](./ARCHITECTURE.md) § AI Chat & Tool Calling.
 
@@ -12,10 +12,10 @@ YapStack has four chat contexts, each built by a dedicated factory in [`apps/des
 
 | Context | Factory (sources) | System prompt | Tools |
 | --- | --- | --- | --- |
-| Session | `createSessionSources(sessionId, segmentCount, sessionType)` | `createSessionSystemPromptBuilder(sessionId)` → `getSystemPromptWithToolContext` | `update_title`, `save_to_notes`, `pin_session` |
-| Multi-session (All / Pinned) | `createMultiSessionSources(sessionIds, count)` | `createMultiSessionSystemPromptBuilder()` → `getMultiSessionSystemPrompt` | none |
-| Folder | `createMultiSessionSources(...)` + folder-description layers | `createMultiSessionSystemPromptBuilder(layers)` | none |
-| Dictation | `createDictationSources(count)` | `createDictationSystemPromptBuilder()` → `getDictationSystemPrompt` | none |
+| Session | `createSessionSources(sessionId, segmentCount, sessionType)` | `createSessionSystemPromptBuilder(sessionId)` → `getSystemPromptWithToolContext` | All 10 (mutating + retrieval): `update_title`, `save_to_notes`, `pin_session`, `tag_session`, `search_folders`, `add_session_to_folder`, `search_sessions`, `search_dictations`, `get_session_context`, `replace_in_transcript` |
+| Multi-session (All / Pinned) | `createMultiSessionSources(sessionIds, count)` | `createMultiSessionSystemPromptBuilder()` → `getMultiSessionSystemPrompt` | Retrieval-only: `search_sessions`, `get_session_context`, `search_folders`, `search_dictations`. The `allowedSessionIds` array on the tool context pins retrieval to the chat's filter (all / pinned) so the model can't reach outside the user's view. |
+| Folder | `createMultiSessionSources(...)` + folder-description layers | `createMultiSessionSystemPromptBuilder(layers)` | Retrieval-only (same set as multi-session), pinned to the folder's session ids. |
+| Dictation | `createDictationSources(count)` | `createDictationSystemPromptBuilder()` → `getDictationSystemPrompt` | `search_dictations` only (deliberately scoped — folder/session retrieval is not surfaced here). |
 
 `resolveListContext(chatContext, deps)` picks the right factory for non-session views. For sessions, the `AIContextProvider` composes the session factories directly.
 
@@ -96,26 +96,49 @@ Registry: [`apps/desktop/src/lib/ai-tools.ts`](../apps/desktop/src/lib/ai-tools.
 ### `ToolDefinition` shape
 
 ```ts
+type ToolKind = "read" | "mutate";
+
+type ToolEffect = "session-meta" | "notes" | "organization" | "transcript";
+
 interface ToolDefinition {
+  kind: ToolKind;                                                    // gates Undo + "Session updated" toast
   schema: ChatCompletionTool;                                        // OpenAI function-call schema
   execute: (args, ctx: ToolContext) => Promise<ExecutedTool | null>; // returns null to skip (no-op)
-  undo:    (undoData, ctx: { sessionId: string }) => Promise<void>;
-  affects?: ToolEffect[];                                            // "session-meta" | "notes"
+  undo:    (undoData, ctx: { sessionId: string }) => Promise<void>;  // no-op for "read" tools
+  affects?: ToolEffect[];                                            // drives content-refresh callbacks
 }
 
-interface ToolContext {
+// ToolContext is a discriminated union — multi-session chats no longer
+// fabricate empty session-meta values. Mutating tools narrow via
+// `requireSessionContext(ctx)` and operate on `SessionToolContext`;
+// retrieval tools that work in both scopes (e.g. `search_sessions`) read
+// `allowedSessionIds` directly off the union.
+type ToolContext = SessionToolContext | RetrievalToolContext;
+
+interface SessionToolContext {
+  scope: "session";
   sessionId: string;
   currentTitle: string;
   currentNote: DbNote | null;
   isPinned: boolean;
   segments?: DbSegment[];
+  tags?: string[];
+  folderNames?: string[];
+  folderIds?: string[];
+  allowedSessionIds?: string[]; // reserved for future filtered single-session views
+}
+
+interface RetrievalToolContext {
+  scope: "retrieval";
+  allowedSessionIds: string[];  // pins retrieval tools to the chat's filter (folder/pinned/all)
 }
 
 interface ExecutedTool {
   name: string;
-  label: string;       // short badge label ("Title", "Notes", "Pinned")
-  detail: string;      // one-line description shown in the toast
-  undoData?: unknown;  // opaque blob passed back to undo()
+  label: string;            // short badge label ("Title", "Notes", "Pinned")
+  detail: string;           // one-line description shown in the toast
+  observation?: string;     // text the LLM sees as the tool result for multi-turn chains
+  undoData?: unknown;       // opaque blob passed back to undo() — required for kind: "mutate"
 }
 ```
 
@@ -124,10 +147,17 @@ interface ExecutedTool {
 | Name | Affects | Params | Behavior | Undo |
 | --- | --- | --- | --- | --- |
 | `update_title` | `session-meta` | `title: string` (clamped to 80 chars) | Calls `updateSessionTitle`. No-op if unchanged. | Restores previous title. |
-| `save_to_notes` | `notes` | `content: string` (markdown), `mode: "append" \| "replace"` | Converts markdown → HTML, runs `convertCitationsToSegmentRefs`, then either overwrites or joins with `<hr>` to existing content. | Restores previous note content (or `<p></p>` if there was none). |
+| `save_to_notes` | `notes` | `content: string` (markdown), `mode: "replace" \| "append" \| "prepend" \| "find_replace"`, `find?: string` (required for `find_replace`) | Converts markdown → HTML, runs `convertCitationsToSegmentRefs`. `replace` overwrites; `append` joins with `<hr>` below; `prepend` joins above; `find_replace` does a surgical substring swap inside the existing notes (plain-text replacement — markdown won't render). | Restores previous note content (or `<p></p>` if there was none). |
 | `pin_session` | `session-meta` | `pinned: boolean` | Toggles pin if different from current state. | Restores previous pin state via `togglePin`. |
+| `tag_session` | `organization` | `add: string[]`, `remove?: string[]` | Adds/removes tags. Creates new tags on-the-fly via `getTagByName` + `createTag`. `source = "ai"` so the UI can distinguish AI-applied tags. | Removes added tags + restores removed tags. |
+| `search_folders` | (read-only) | `query?: string` | Returns the folder tree (or query-filtered subset) with `folder_id`, `name`, parent chain, and `description`. Used by Phase 1 of folder-aware actions before `add_session_to_folder`. | n/a |
+| `add_session_to_folder` | `organization` | `folder_id: string` | Classifies session into a folder by id. Resolves branch conflicts, then returns the hierarchical description chain in `result` so Phase 2 of two-phase actions sees the parent context. | Removes the session from that folder. |
+| `search_sessions` | (read-only) | `query: string`, `filters: { folder_id: string \| null, pinned: boolean \| null } \| null`, `limit?: number` | FTS5 search across session titles, notes, and segment text. `filters` is `null` for an unfiltered search, or an object whose two fields are individually nullable (each `null` skips that filter). Used when the user references a different session by name. | n/a |
+| `search_dictations` | (read-only) | `query: string`, `limit?: number` | FTS5 search across `dictation_history`. | n/a |
+| `get_session_context` | (read-only) | `session_ids: string[]`, `scope: "segments" \| "notes" \| "summary" \| "all"` | Expands the listed `session_ids` (max 5/call) into the requested artifact: transcript chunks (with `[seg:ID]` for citation), notes, summary (currently always null pending a future summarization step), or all. Out-of-scope ids are rejected when the chat carries `allowedSessionIds`. | n/a |
+| `replace_in_transcript` | `transcript` (refresh) | `find: string`, `replace: string`, `case_sensitive: boolean` | Edits segment text in the durable DB rows — surgical fix for typos / mis-transcriptions. Default case-insensitive. Capped at 50 affected segments per call (call fails over the cap; narrow `find`). Preserves the per-segment `original_text` snapshot. | Restores each touched segment's pre-call text. |
 
-`getToolsForContext(isSessionContext)` returns the full schema list for session contexts and `[]` for multi-session/dictation contexts. Multi-session context intentionally exposes no tools — a pin / title change at the folder scope is ambiguous (which session?).
+Multi-session and folder contexts expose only the **retrieval** tools — `search_sessions`, `get_session_context`, `search_folders`, `search_dictations` — so the LLM can search and expand sessions on demand instead of having all candidates dumped into the prompt. Mutating tools are intentionally omitted there; they need a single `sessionId` in `ToolContext`, and applying them at folder scope is ambiguous ("pin which session?"). The dictation context narrows further to **`search_dictations` only** — folder/session retrieval tools are not surfaced because dictation lives in its own table and the surrounding session/folder lookups would just return empty (or worse, leak unrelated state).
 
 ### How to add a new tool
 
@@ -136,7 +166,7 @@ interface ExecutedTool {
 3. **Implement `undo`.** Must be idempotent — it runs only if `undoData !== undefined` and the user hits the undo toast within the window.
 4. **Register at module bottom:** `registerTool({ schema, execute, undo, affects });`
 5. **Citation handling.** If your tool writes markdown that will be saved as HTML (notes, docs), run the output through `convertCitationsToSegmentRefs(html, segments)` so `[[seg:ID]]` becomes a clickable pill.
-6. **Expose it.** Add the tool's name to the relevant context's `availableToolIds` in `ai-context.ts` (session contexts currently get all three — extend the array, don't create a new registry).
+6. **Expose it.** Add the tool's name to the relevant context's `availableToolIds` in `ai-context.ts`. Session context already lists all 10 tools — append yours. If the tool is retrieval-only and meaningful at folder/multi-session scope, also add it to `createMultiSessionTools` (the retrieval set is intentionally narrow there, so add carefully). Do not create a new registry.
 7. **Declare effects.** Set `affects` so the UI can invalidate the right data after a run: `"session-meta"` invalidates the header, `"notes"` refreshes the note editor.
 
 Undo window is 10 s; the user sees a toast. Your `undo` must work even if the user has navigated away — treat it as a DB mutation, not a UI revert.
@@ -217,13 +247,11 @@ These become the **Organizational context** bullet list in the multi-session sys
 
 ---
 
-## Tags (pending — `feature/knowledge-management`)
+## Tags
 
-**Not on `main`.** The `feature/knowledge-management` branch adds a tags primitive, vocabulary hints, multi-turn tool chaining, and auto-folder suggestions. The branch is currently behind main; expect conflicts when bringing it forward. Apply the "merge-before-cleanup" posture from [`PRINCIPLES.md`](./PRINCIPLES.md).
+Tags are a flat, lightweight metadata primitive applied by the AI during summarization (via `tag_session`) or by the user. **Folders remain the primary organizational primitive** — hierarchical, with descriptions that flow into the AI system prompt. Tags are deliberately *not* hierarchical and don't carry descriptions.
 
-### Proposed schema (migration v11)
-
-Source: `origin/feature/knowledge-management:apps/desktop/src-tauri/src/db.rs` lines 213–236.
+### Schema (migration v11)
 
 ```sql
 CREATE TABLE tags (
@@ -237,8 +265,8 @@ CREATE INDEX idx_tags_name ON tags(name);
 CREATE TABLE session_tags (
   session_id  TEXT NOT NULL,
   tag_id      TEXT NOT NULL,
-  source      TEXT NOT NULL DEFAULT 'manual',   -- 'manual' | 'auto'
-  confidence  REAL,                             -- populated for auto tags
+  source      TEXT NOT NULL DEFAULT 'manual',   -- 'manual' | 'ai'
+  confidence  REAL,                             -- populated for AI-applied tags
   created_at  TEXT NOT NULL DEFAULT (datetime('now')),
   PRIMARY KEY (session_id, tag_id),
   FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE,
@@ -248,16 +276,14 @@ CREATE INDEX idx_session_tags_tag     ON session_tags(tag_id);
 CREATE INDEX idx_session_tags_session ON session_tags(session_id);
 ```
 
-Design notes worth preserving on merge:
+Design notes:
 
-- Unique tag names are case-insensitive (`COLLATE NOCASE`).
-- `session_tags.source` distinguishes user-applied tags from auto-assigned ones so the UI can show confidence or let the user confirm suggestions.
+- Unique tag names are case-insensitive (`COLLATE NOCASE`). `tag_session` matches against existing tags by lowercased name and creates new tags on miss.
+- `session_tags.source` distinguishes user-applied (`manual`) from AI-applied (`ai`) tags so the UI can render an AI badge or let the user confirm suggestions.
 - `ON DELETE CASCADE` on both FKs: deleting a session removes its tag links; deleting a tag removes it from all sessions.
 
-### Auto-tagging (folder-name matching)
+### Auto-folder suggestions during recording
 
-`origin/feature/knowledge-management:apps/desktop/src/lib/auto-tag.ts` builds a keyword map from folder names (length ≥ 4) and scans transcript text for whole-word matches. `FolderSuggestionTracker` requires ≥ 2 matches before surfacing a suggestion — this prevents noisy single-mention false positives.
+[`apps/desktop/src/lib/auto-tag.ts`](../apps/desktop/src/lib/auto-tag.ts) builds a keyword map from folder names (length ≥ 4) and scans transcript text for whole-word matches. `FolderSuggestionTracker` requires ≥ 2 matches before surfacing a suggestion chip — this prevents noisy single-mention false positives. Suggestions land as folder chips below the live recording header; on accept, the session gains the folder via `dbAddSessionToFolder` and the folder name is pushed to the live transcription as a vocabulary hint via `update_vocabulary_hints` (Whisper-only — Parakeet's TDT decoder ignores `initial_prompt`).
 
-The interesting reuse: folder names double as the vocabulary for auto-categorization. If we ever introduce tags as a separate axis, we should decide whether auto-tag suggests *folders* (current branch) or *tags* (new). Picking folders keeps the organizational hierarchy coherent; picking tags creates a second vocabulary to maintain.
-
-Once the branch lands, this section becomes authoritative and the "pending" framing drops. Until then it is a planning reference — do not rely on these tables existing on `main`.
+Suggestions are **folder-only**, not tag-only. Folder names double as the vocabulary for auto-categorization, which keeps the organizational hierarchy coherent. Tags are applied *after* recording, by the AI during summarization, against the (now-classified) session.

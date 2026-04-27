@@ -151,9 +151,9 @@ impl SileroSource {
         }
     }
 
-    /// Reset the recurrent state (e.g. after a long silence that invalidates
-    /// the LSTM's context).
-    #[allow(dead_code)] // kept for future prompt-decay-style resets
+    /// Reset the recurrent state. Called when the live loop jumps the read
+    /// cursor (e.g. after backfill extraction) so the next poll starts with a
+    /// clean LSTM context and no stale `last_probability`.
     pub(super) fn reset(&mut self) {
         self.stream.reset();
         self.last_probability = None;

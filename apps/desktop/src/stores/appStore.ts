@@ -912,7 +912,6 @@ function createAppStore() {
         const vocabHints = buildVocabularyHints(freshFolders, freshTags);
 
         const config: LiveTranscriptionConfig = {
-          silence_threshold: 0.01,
           silence_duration_ms: settings.silenceDurationMs,
           max_chunk_seconds: settings.maxChunkSeconds,
           backfill_seconds: backfillSeconds ?? 0,
@@ -1021,7 +1020,6 @@ function createAppStore() {
         const vocabHints = buildVocabularyHints(freshFolders, freshTags);
 
         const config: LiveTranscriptionConfig = {
-          silence_threshold: 0.01,
           silence_duration_ms: settings.silenceDurationMs,
           max_chunk_seconds: settings.maxChunkSeconds,
           backfill_seconds: 0,
@@ -2013,7 +2011,25 @@ function createAppStore() {
         try {
           const entry = await getDictationHistoryEntry(id);
           if (entry?.wav_file_path) {
-            commands.deleteSessionWav(id, null).catch(() => {});
+            // Delete by exact path so this matches the per-part trusted-dirs
+            // model (handles WAV or MP3, treats NotFound as no-op). The
+            // legacy session-glob deleter scanned the audio dir and could
+            // miss parts that lived under a custom audio_save_location.
+            // Awaited so a failure (file held by player, perms) is surfaced
+            // before the DB row goes away — otherwise the path is gone and
+            // we have no recovery handle.
+            try {
+              await commands.deleteAudioFiles([entry.wav_file_path]);
+            } catch (cleanupErr) {
+              console.error(
+                `Failed to delete dictation audio for ${id}:`,
+                cleanupErr,
+                entry.wav_file_path,
+              );
+              toast.error("Audio file was not deleted", {
+                id: `dictation-audio-cleanup-${id}`,
+              });
+            }
           }
           await dbDeleteDictationHistoryEntry(id);
           set({ dictationHistory: get().dictationHistory.filter((h) => h.id !== id) });
@@ -2025,10 +2041,22 @@ function createAppStore() {
 
       clearDictationHistory: async () => {
         try {
-          // Clean up WAV files for all entries — dictation WAVs always use default directory
-          for (const entry of get().dictationHistory) {
-            if (entry.wav_file_path) {
-              commands.deleteSessionWav(entry.id, null).catch(() => {});
+          // Batch every entry's stored part path into one deleteAudioFiles
+          // call — same per-part trusted-dirs path as the single-entry
+          // delete above; one Tauri call for the whole sweep. Awaited so a
+          // failure surfaces before the DB rows are dropped (otherwise the
+          // paths are gone and any orphans are silent).
+          const paths = get()
+            .dictationHistory.map((e) => e.wav_file_path)
+            .filter((p): p is string => !!p);
+          if (paths.length > 0) {
+            try {
+              await commands.deleteAudioFiles(paths);
+            } catch (cleanupErr) {
+              console.error("Failed to delete dictation audio batch:", cleanupErr, paths);
+              toast.error("Some dictation audio files were not deleted", {
+                id: "dictation-audio-cleanup-batch",
+              });
             }
           }
           await dbClearDictationHistory();

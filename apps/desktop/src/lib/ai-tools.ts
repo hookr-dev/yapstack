@@ -116,7 +116,13 @@ export interface ExecutedTool {
   undoData?: unknown;
 }
 
-export interface ToolContext {
+/**
+ * Context for tools that mutate a single session's state. Carries the
+ * pre-image fields (`currentTitle`, `currentNote`, `isPinned`, `tags`,
+ * `folderIds`) that mutating tools snapshot into `undoData`.
+ */
+export interface SessionToolContext {
+  scope: "session";
   sessionId: string;
   currentTitle: string;
   currentNote: DbNote | null;
@@ -126,13 +132,43 @@ export interface ToolContext {
   folderNames?: string[];
   folderIds?: string[];
   /**
-   * When defined, retrieval Tools (`search_sessions`, `get_session_context`)
-   * must restrict their results to these session IDs. Set by multi-session
-   * Chats (folder/pinned/all) so the model can't reach outside the user's
-   * current scope. Single-session Chats leave this undefined so the user
-   * can still ask cross-session questions from a session view.
+   * When defined, retrieval tools dispatched from this session-scoped chat
+   * must still restrict their results to these session IDs. Currently
+   * unused for single-session chats but reserved for future filtered views.
    */
   allowedSessionIds?: string[];
+}
+
+/**
+ * Context for retrieval-only chats (folder / pinned / all). Carries no
+ * single-session pre-image — only the allow-list that pins retrieval tools
+ * to the chat's filter so the model can't reach outside the user's view.
+ */
+export interface RetrievalToolContext {
+  scope: "retrieval";
+  allowedSessionIds: string[];
+}
+
+/**
+ * Discriminated by `scope`. Mutating tools must narrow via
+ * `requireSessionContext(ctx)`; retrieval tools that work in both scopes
+ * (e.g. `search_sessions`) can read the optional fields directly.
+ */
+export type ToolContext = SessionToolContext | RetrievalToolContext;
+
+/**
+ * Narrow a `ToolContext` to its session-scoped variant. Mutating tools call
+ * this at the top of `execute` instead of fabricating values when the chat
+ * is multi-session — a session-scoped tool dispatched in retrieval scope is
+ * a wiring bug and should fail loudly.
+ */
+export function requireSessionContext(ctx: ToolContext): SessionToolContext {
+  if (ctx.scope !== "session") {
+    throw new Error(
+      `Tool requires a session-scoped context (got scope='${ctx.scope}')`,
+    );
+  }
+  return ctx;
 }
 
 // --- Modular tool definition ---
@@ -285,10 +321,11 @@ registerTool({
     },
   },
   execute: async (args, ctx) => {
+    const sctx = requireSessionContext(ctx);
     const title = String(args.title).slice(0, 80);
-    if (title === ctx.currentTitle) return null;
-    const previousTitle = await captureUndoSnapshot(() => ctx.currentTitle);
-    await updateSessionTitle(ctx.sessionId, title);
+    if (title === sctx.currentTitle) return null;
+    const previousTitle = await captureUndoSnapshot(() => sctx.currentTitle);
+    await updateSessionTitle(sctx.sessionId, title);
     return {
       name: "update_title",
       label: "Title",
@@ -399,6 +436,7 @@ If you're unsure between append and replace, choose append. The user's manual no
     },
   },
   execute: async (args, ctx) => {
+    const sctx = requireSessionContext(ctx);
     const mode = String(args.mode) as
       | "replace"
       | "append"
@@ -408,15 +446,15 @@ If you're unsure between append and replace, choose append. The user's manual no
     const find = args.find != null ? String(args.find) : "";
 
     const previousContent = await captureUndoSnapshot(
-      () => ctx.currentNote?.content ?? null,
+      () => sctx.currentNote?.content ?? null,
     );
 
     // Snapshot to note_versions before every save, regardless of mode.
     // The Undo window is short-lived (10s); note_versions is the durable
     // recovery path. createNoteVersion is a no-op when the user has no
     // current note (nothing to snapshot).
-    if (ctx.currentNote?.id && previousContent) {
-      await createNoteVersion(ctx.currentNote.id, previousContent);
+    if (sctx.currentNote?.id && previousContent) {
+      await createNoteVersion(sctx.currentNote.id, previousContent);
     }
 
     let mergedHtml: string;
@@ -459,8 +497,8 @@ If you're unsure between append and replace, choose append. The user's manual no
       resultText = `Replaced ${replacedCount} occurrence${replacedCount === 1 ? "" : "s"} of "${find}" with "${content}".`;
     } else {
       let html = markdownToBasicHtml(content);
-      if (ctx.segments?.length) {
-        html = convertCitationsToSegmentRefs(html, ctx.segments);
+      if (sctx.segments?.length) {
+        html = convertCitationsToSegmentRefs(html, sctx.segments);
       }
       const hasExisting =
         !!previousContent && previousContent !== "<p></p>";
@@ -483,7 +521,7 @@ If you're unsure between append and replace, choose append. The user's manual no
       }
     }
 
-    await saveNote(ctx.sessionId, mergedHtml);
+    await saveNote(sctx.sessionId, mergedHtml);
 
     const wordCount = content.split(/\s+/).filter(Boolean).length;
     return {
@@ -532,12 +570,13 @@ registerTool({
     },
   },
   execute: async (args, ctx) => {
+    const sctx = requireSessionContext(ctx);
     const wantPinned = Boolean(args.pinned);
-    const wasPinned = await captureUndoSnapshot(() => ctx.isPinned);
+    const wasPinned = await captureUndoSnapshot(() => sctx.isPinned);
     const changed = wantPinned !== wasPinned;
 
     if (changed) {
-      await togglePin(ctx.sessionId);
+      await togglePin(sctx.sessionId);
     }
 
     return {
@@ -593,6 +632,7 @@ registerTool({
     },
   },
   execute: async (args, ctx) => {
+    const sctx = requireSessionContext(ctx);
     const toAdd = (args.add as string[]) ?? [];
     const toRemove = (args.remove as string[]) ?? [];
 
@@ -601,7 +641,7 @@ registerTool({
     // deltas that, on undo, drop pre-existing manual tags or re-add tags
     // that were never on the session.
     const beforeRows = await captureUndoSnapshot(() =>
-      getSessionTagRows(ctx.sessionId),
+      getSessionTagRows(sctx.sessionId),
     );
     const beforeSourceById = new Map(
       beforeRows.map((r) => [r.tag_id, r.source]),
@@ -622,7 +662,7 @@ registerTool({
         tag = { id, name: trimmed, color: null, created_at: new Date().toISOString() };
       }
       if (beforeSourceById.has(tag.id)) continue; // already on the session
-      await addSessionTag(ctx.sessionId, tag.id, "ai");
+      await addSessionTag(sctx.sessionId, tag.id, "ai");
       addedTagIds.push(tag.id);
       addedNames.push(trimmed);
     }
@@ -634,7 +674,7 @@ registerTool({
       if (!tag) continue;
       const previousSource = beforeSourceById.get(tag.id);
       if (previousSource === undefined) continue; // wasn't on the session
-      await removeSessionTag(ctx.sessionId, tag.id);
+      await removeSessionTag(sctx.sessionId, tag.id);
       removedTags.push({ tagId: tag.id, source: previousSource });
       removedNames.push(trimmed);
     }
@@ -815,6 +855,7 @@ registerTool({
     },
   },
   execute: async (args, ctx) => {
+    const sctx = requireSessionContext(ctx);
     const folderId = String(args.folder_id).trim();
     const folders = await listFolders();
     const target = folders.find((f) => f.id === folderId);
@@ -828,7 +869,7 @@ registerTool({
     }
 
     const currentFolderIds = await captureUndoSnapshot(
-      () => ctx.folderIds ?? [],
+      () => sctx.folderIds ?? [],
     );
     if (currentFolderIds.includes(target.id)) {
       const contextChain = formatFolderContextChain(folders, target.id);
@@ -842,9 +883,9 @@ registerTool({
 
     const conflicts = findBranchConflicts(folders, currentFolderIds, target.id);
     for (const cId of conflicts) {
-      await dbRemoveSessionFromFolder(ctx.sessionId, cId);
+      await dbRemoveSessionFromFolder(sctx.sessionId, cId);
     }
-    await dbAddSessionToFolder(ctx.sessionId, target.id);
+    await dbAddSessionToFolder(sctx.sessionId, target.id);
 
     const contextChain = formatFolderContextChain(folders, target.id);
     return {
@@ -901,9 +942,9 @@ registerTool({
             description: "Free-form keywords to search for.",
           },
           filters: {
-            type: "object",
+            type: ["object", "null"],
             description:
-              "Filters to narrow the search. Pass null on individual fields to skip that filter.",
+              "Filters to narrow the search. Pass null for an unfiltered search, or an object with both keys (each may be null individually).",
             properties: {
               folder_id: {
                 type: ["string", "null"],
@@ -1292,6 +1333,7 @@ registerTool({
     },
   },
   execute: async (args, ctx) => {
+    const sctx = requireSessionContext(ctx);
     const find = String(args.find ?? "");
     const replace = String(args.replace ?? "");
     const caseSensitive = args.case_sensitive === true;
@@ -1312,7 +1354,7 @@ registerTool({
         result: `No change — \`find\` and \`replace\` are identical ("${find}").`,
       };
     }
-    if (!ctx.segments || ctx.segments.length === 0) {
+    if (!sctx.segments || sctx.segments.length === 0) {
       return {
         name: "replace_in_transcript",
         label: "Transcript",
@@ -1326,7 +1368,7 @@ registerTool({
 
     type EditPlan = { segmentId: string; previousText: string; newText: string };
     const plans: EditPlan[] = [];
-    for (const seg of ctx.segments) {
+    for (const seg of sctx.segments) {
       if (seg.deleted_at || seg.hidden) continue;
       pattern.lastIndex = 0;
       if (!pattern.test(seg.text)) continue;
