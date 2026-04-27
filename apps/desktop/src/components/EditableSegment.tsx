@@ -45,6 +45,7 @@ export const EditableSegment = memo(forwardRef<
   const toggleSegmentHidden = useAppStore((s) => s.toggleSegmentHidden);
   const toggleSegmentSelected = useAppStore((s) => s.toggleSegmentSelected);
   const clearSegmentSelection = useAppStore((s) => s.clearSegmentSelection);
+  const setSegmentAnchor = useAppStore((s) => s.setSegmentAnchor);
 
   const [isEditing, setIsEditing] = useState(false);
   const bubbleRef = useRef<HTMLDivElement | null>(null);
@@ -116,8 +117,15 @@ export const EditableSegment = memo(forwardRef<
       // mode on a segment the user might have been trying to deselect away
       // from. Second click enters edit mode.
       clearSegmentSelection();
+      // Record this segment as the anchor so the next shift-click ranges
+      // from here — clearSegmentSelection nulled the anchor we just set.
+      setSegmentAnchor(segment.id);
       return;
     }
+    // Bare click with no active selection: anchor here so a subsequent
+    // shift-click on another bubble extends a range from this segment.
+    // Then enter edit mode (when editable).
+    setSegmentAnchor(segment.id);
     if (!readOnly) handleStartEdit();
   };
 
