@@ -42,7 +42,7 @@ import type { DbSession, DbFolder, DbDictationHistory } from "./db";
 
 describe("createSessionSources", () => {
   it("returns transcript and notes sources for recording type", () => {
-    const sources = createSessionSources("session-1", 5, "recording");
+    const sources = createSessionSources("session-1", 5, "transcription");
     expect(sources.length).toBe(2);
     expect(sources[0].type).toBe("transcript");
     expect(sources[1].type).toBe("notes");
@@ -55,27 +55,27 @@ describe("createSessionSources", () => {
   });
 
   it("transcript source is enabled by default", () => {
-    const sources = createSessionSources("session-1", 0, "recording");
+    const sources = createSessionSources("session-1", 0, "transcription");
     expect(sources[0].enabled).toBe(true);
   });
 
   it("transcript source is toggleable", () => {
-    const sources = createSessionSources("session-1", 0, "recording");
+    const sources = createSessionSources("session-1", 0, "transcription");
     expect(sources[0].toggleable).toBe(true);
   });
 
   it("notes source is toggleable", () => {
-    const sources = createSessionSources("session-1", 0, "recording");
+    const sources = createSessionSources("session-1", 0, "transcription");
     expect(sources[1].toggleable).toBe(true);
   });
 
   it("transcript summary includes segment count", () => {
-    const sources = createSessionSources("session-1", 12, "recording");
+    const sources = createSessionSources("session-1", 12, "transcription");
     expect(sources[0].summary).toBe("12 segments");
   });
 
   it("transcript assembler calls DB and returns formatted text", async () => {
-    const sources = createSessionSources("session-1", 1, "recording");
+    const sources = createSessionSources("session-1", 1, "transcription");
     const result = await sources[0].assembler();
     expect(result).toContain("[seg:s1 0:00] (You) Hello");
   });

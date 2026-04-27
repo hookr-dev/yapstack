@@ -4,6 +4,17 @@ use tauri::Manager;
 use super::error::{validate_session_id, CommandError};
 use crate::audio_dir_trusted;
 
+/// Glob-deletes every `{session_id}.*.wav` / `.mp3` under `audio_dir`. Used
+/// for sessions that pre-date the v15 `session_audio_parts` migration (where
+/// the FE has no per-part path to delete) and as the fallback path inside
+/// `appStore.deleteSessionAudio` when the parts list is empty.
+///
+/// Authorization: the resolved `audio_dir` must already be in
+/// `TrustedAudioDirs` — otherwise the command returns `InvalidInput` and
+/// nothing is touched. This stops a malicious caller from passing an
+/// arbitrary `audio_save_location` and globbing files outside the
+/// audio-store. Per-file `remove_file` errors (other than `NotFound`) are
+/// collected and surfaced so failures don't get swallowed.
 #[tauri::command]
 #[specta::specta]
 pub async fn delete_session_wav(
@@ -24,6 +35,15 @@ pub async fn delete_session_wav(
         app_data_dir.join("audio")
     };
 
+    if !audio_dir_trusted(&app_handle, &audio_dir) {
+        return Err(CommandError::InvalidInput {
+            message: format!(
+                "audio dir {} is not in the trusted set",
+                audio_dir.display()
+            ),
+        });
+    }
+
     // Match both the legacy single-file pattern (`{session_id}.wav` —
     // dictations and pre-parts sessions) and the parts pattern
     // (`{session_id}.{part_index}.wav`/`.mp3`).
@@ -32,6 +52,7 @@ pub async fn delete_session_wav(
         Err(_) => return Ok(()), // Audio dir doesn't exist; nothing to delete.
     };
     let prefix = format!("{session_id}.");
+    let mut failures: Vec<String> = Vec::new();
     for entry in entries.flatten() {
         let Some(name) = entry.file_name().to_str().map(|s| s.to_string()) else {
             continue;
@@ -43,9 +64,25 @@ pub async fn delete_session_wav(
         if !(lower.ends_with(".wav") || lower.ends_with(".mp3")) {
             continue;
         }
-        let _ = std::fs::remove_file(entry.path());
+        let path = entry.path();
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => failures.push(format!("{}: {}", path.display(), e)),
+        }
     }
-    Ok(())
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(CommandError::Internal {
+            message: format!(
+                "failed to delete {} legacy audio file(s) for session {}: {}",
+                failures.len(),
+                session_id,
+                failures.join("; ")
+            ),
+        })
+    }
 }
 
 /// Deletes the listed absolute audio file paths after verifying each lives

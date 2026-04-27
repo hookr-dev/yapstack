@@ -113,7 +113,7 @@ Whisper exposes 99 ISO-639 codes; Parakeet TDT v3 exposes 25 European codes.
 ### Re-exports (`lib.rs`)
 
 ```rust
-pub use capture::{BufferPositions, CaptureResult, SeparateExtraction};
+pub use capture::{BufferPositions, SeparateExtraction};
 pub use error::AudioError;
 pub use export::SessionWavWriter;
 pub use manager::AudioManager;
@@ -208,26 +208,14 @@ impl AudioManager {
     pub fn mic_buffer(&self) -> Option<&SharedAudioRingBuffer>;
     pub fn system_buffer(&self) -> Option<&SharedAudioRingBuffer>;
 
-    // Capture extraction (all output is mono — multi-channel data is deinterleaved per buffer).
-    // `trigger_instant_capture` is library-only API (no Tauri command exposes it anymore);
-    // production capture goes through the live-transcription pipeline.
-    pub fn extract_captured_audio(&self, duration_seconds: f32) -> CapturedAudio;  // channels always 1
-    pub fn trigger_instant_capture(&self, seconds: f32, source: CaptureSource, mix_config: Option<&MixConfig>) -> Result<CaptureResult>;
-
-    // Position tracking (used by live transcription)
+    // Position-based extraction (the only capture API; production capture goes
+    // through `start_live_transcription`'s ring-buffer-driven loop).
     pub fn buffer_positions(&self) -> BufferPositions;  // current write positions for both buffers
     pub fn mic_write_pos(&self) -> usize;   // current mic buffer write position (0 if no buffer)
     pub fn system_write_pos(&self) -> usize; // current system buffer write position (0 if no buffer)
     pub fn extract_since(&self, positions: &BufferPositions, source: CaptureSource, mix_config: Option<&MixConfig>) -> Option<(Vec<f32>, u32, BufferPositions)>;
     pub fn extract_sources_since(&self, positions: &BufferPositions) -> Option<SeparateExtraction>;  // per-source extraction (no mixing)
     pub fn peek_energy_rms(&self, positions: &BufferPositions, duration_secs: f32) -> (Option<f32>, Option<f32>);  // zero-alloc RMS via ring_buffer.rms_energy_since()
-
-    // Session API (library-only; no Tauri command surface — live transcription owns
-    // session lifecycle in production, these are kept for the audio crate's tests).
-    pub fn start_session(&mut self) -> Result<()>;       // records write_pos
-    pub fn end_session(&mut self, source: CaptureSource, mix_config: Option<&MixConfig>) -> Result<CaptureResult>;
-    pub fn is_session_active(&self) -> bool;
-    pub fn session_elapsed_seconds(&self) -> Option<f32>;
 
     // Stream health
     pub fn mic_has_stream_error(&self) -> bool;      // delegates to MicrophoneCapture
@@ -325,22 +313,8 @@ impl SessionWavWriter {
 ### Capture Types (`capture.rs`)
 
 ```rust
-pub struct CapturedAudio {
-    pub mic_samples: Vec<f32>,      // always mono (deinterleaved)
-    pub system_samples: Vec<f32>,   // always mono (deinterleaved)
-    pub sample_rate: u32,
-    pub channels: u16,              // always 1
-    pub duration_seconds: f32,
-}
-
-pub struct SessionMark {
-    pub mic_write_pos: usize,
-    pub system_write_pos: usize,
-    pub started_at: std::time::Instant,
-}
-
-/// Lightweight cursor tracking for both ring buffers.
-/// Used by live transcription to track read positions independently of the session API.
+/// Lightweight cursor tracking for both ring buffers. Used by live
+/// transcription to track read positions across polls.
 pub struct BufferPositions {  // Default
     pub mic_pos: usize,
     pub system_pos: usize,
@@ -351,13 +325,6 @@ pub struct SeparateExtraction {
     pub mic: Option<(Vec<f32>, u32)>,      // (mono_samples, sample_rate)
     pub system: Option<(Vec<f32>, u32)>,   // (mono_samples, sample_rate)
     pub new_positions: BufferPositions,
-}
-
-pub struct CaptureResult {  // Serialize
-    pub file_path: PathBuf,
-    pub duration_seconds: f32,
-    pub sample_rate: u32,
-    pub source: CaptureSource,
 }
 ```
 
@@ -377,9 +344,9 @@ pub enum AudioError {
     NotRunning,
     InvalidBufferConfig(String),
     WavExport(String),
-    NoActiveSession,
-    SessionAlreadyActive,
     NoBufferAvailable,
+    Mp3Encode(String),
+    InvalidBitrate(u16),
 }
 // From impls: cpal errors, hound::Error, std::io::Error
 ```
@@ -1113,7 +1080,7 @@ Popover-based model selector. Groups models by provider, shows recommended model
 | Type | Definition |
 |------|-----------|
 | `SessionStatus` | `"recording" \| "completed"` |
-| `SessionType` | `"manual" \| "recording"` |
+| `SessionType` | `"manual" \| "transcription"` (matches the `sessions.session_type` DB column) |
 
 These replace raw strings in `DbSession.status` and `DbSession.session_type` respectively.
 

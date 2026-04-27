@@ -1,5 +1,6 @@
 import type { LucideIcon } from "lucide-react";
 import { Sparkles, List, ListChecks, ClipboardList } from "lucide-react";
+import type { SessionType } from "./db";
 
 export interface ActionDefinition {
   id: string;
@@ -156,7 +157,7 @@ export function getActionIcon(id: string): LucideIcon | undefined {
   return ACTIONS.find((a) => a.id === id)?.icon;
 }
 
-export function getActionsForSession(sessionType: string): ActionDefinition[] {
+export function getActionsForSession(sessionType: SessionType): ActionDefinition[] {
   if (sessionType === "manual") {
     return ACTIONS.filter((a) => !a.requiresTranscript);
   }

@@ -1,6 +1,6 @@
 import type { LucideIcon } from "lucide-react";
 import { FileText, StickyNote, Layers, Mic } from "lucide-react";
-import type { DbSegment, DbSession, DbFolder, DbDictationHistory } from "./db";
+import type { DbSegment, DbSession, DbFolder, DbDictationHistory, SessionType } from "./db";
 import {
   getSessionSegments,
   getNote,
@@ -79,7 +79,7 @@ export interface AIContextValue {
 export function createSessionSources(
   sessionId: string,
   segmentCount: number,
-  sessionType: string,
+  sessionType: SessionType,
 ): ContextSource[] {
   const sources: ContextSource[] = [];
 

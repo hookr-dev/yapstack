@@ -27,6 +27,7 @@ import {
 } from "@/components/ui/tooltip";
 import { toast } from "sonner";
 import type { ChatContext } from "@/lib/ai";
+import type { SessionType } from "@/lib/db";
 
 export function AppLayout() {
   useAutoSetup();
@@ -60,7 +61,7 @@ export function AppLayout() {
   const [activeSession, setActiveSession] = useState<{
     id: string;
     title: string;
-    sessionType: string;
+    sessionType: SessionType;
     isPinned: boolean;
     totalSegments: number;
     createdAt: string;
