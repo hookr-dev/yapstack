@@ -717,13 +717,14 @@ async fn prepare_chunk_dispatch(
     is_force_chunk: bool,
     is_backfill: bool,
     session_offset_base_seconds: f32,
+    max_chunk_duration: Duration,
 ) -> Option<PreparedChunk> {
     let (extraction, new_pos) = {
         let manager = audio_state.lock().await;
         extract_source_audio(&manager, &vad.label, vad.speech_start_pos)
     };
 
-    let Some((samples, sample_rate)) = extraction else {
+    let Some((mut samples, sample_rate)) = extraction else {
         // Nothing new in the buffer since last read — advance the cursor to
         // the latest write_pos but leave speech_start_pos so we'll pick up
         // the ongoing utterance on the next poll.
@@ -731,20 +732,51 @@ async fn prepare_chunk_dispatch(
         return None;
     };
 
-    let chunk_duration = samples.len() as f32 / sample_rate as f32;
-    if chunk_duration < MIN_CHUNK_DURATION_SECS {
+    let extracted_duration = samples.len() as f32 / sample_rate as f32;
+    if extracted_duration < MIN_CHUNK_DURATION_SECS {
         // Too short — don't dispatch yet and don't advance speech_start_pos.
         // Next poll re-extracts this region together with whatever arrives.
         vad.cursor = new_pos;
         return None;
     }
 
+    // Cap the dispatched chunk at `max_chunk_duration`. When a prior chunk
+    // sits in flight longer than its own audio duration (e.g. Parakeet's
+    // RTFx degrades on long inputs), the next dispatch otherwise covers the
+    // entire wait window plus 10 s — and the chunk after that grows again,
+    // ad infinitum. Latency-first policy: keep the *tail* (most recent
+    // audio) and drop the head, so the live transcript catches up to "now"
+    // instead of replaying a stale backlog. `speech_start_pos` is still
+    // advanced to `new_pos` below, so the dropped head is permanently gone
+    // — the alternative (rewind speech_start_pos to mid-extraction) would
+    // re-queue the dropped head on the next poll and reintroduce the
+    // unbounded queue we're fixing.
+    let max_samples = (max_chunk_duration.as_secs_f32() * sample_rate as f32) as usize;
+    let dropped_head_samples = samples.len().saturating_sub(max_samples);
+    let dropped_head_seconds = dropped_head_samples as f32 / sample_rate as f32;
+    if dropped_head_samples > 0 {
+        warn!(
+            "live chunk: source={:?} extracted {:.2}s exceeds max_chunk_duration {:.2}s — \
+             dropping {:.2}s head to keep latency bounded \
+             (likely sidecar wall time exceeded chunk duration)",
+            vad.label,
+            extracted_duration,
+            max_chunk_duration.as_secs_f32(),
+            dropped_head_seconds,
+        );
+        samples.drain(..dropped_head_samples);
+    }
+    let chunk_duration = samples.len() as f32 / sample_rate as f32;
+
     // Deterministic offset from buffer position delta. On a resumed Session,
     // `session_offset_base_seconds` shifts every live offset past the prior
-    // parts' cumulative duration so persisted Segments stay continuous.
+    // parts' cumulative duration so persisted Segments stay continuous. When
+    // we drop the head, the offset shifts forward by the dropped duration so
+    // segment timestamps still match the audio we actually sent.
     let samples_since_start = vad.speech_start_pos.saturating_sub(vad.session_start_pos);
     let audio_offset = session_offset_base_seconds
-        + samples_since_start as f32 / (vad.source_sample_rate as f32 * vad.source_channels as f32);
+        + samples_since_start as f32 / (vad.source_sample_rate as f32 * vad.source_channels as f32)
+        + dropped_head_seconds;
 
     debug!(
         "live chunk: source={:?} offset={:.2}s duration={:.2}s samples={} (pos: speech={} session_start={}, in-flight dispatch)",
@@ -2170,6 +2202,7 @@ async fn live_transcription_loop(
                         is_force,
                         false,
                         ctx.session_offset_base_seconds,
+                        tuning.max_chunk_duration,
                     )
                     .await;
                     if let Some(prepared) = prepared {
@@ -2229,7 +2262,15 @@ async fn live_transcription_loop(
     }
 
     drain_in_flight_chunks(&mut chunk_tasks, &mut chunk_aborts, &mut sources).await;
-    dispatch_final_pending_chunks(&mut sources, &audio_state, &ctx, &counters, &prompt).await;
+    dispatch_final_pending_chunks(
+        &mut sources,
+        &audio_state,
+        &ctx,
+        &counters,
+        &prompt,
+        tuning.max_chunk_duration,
+    )
+    .await;
 
     if let Some(ws) = session_wav_state {
         finalize_session_wav(ws, &audio_state, &ctx).await;
@@ -2512,6 +2553,7 @@ async fn dispatch_final_pending_chunks(
     ctx: &TranscriptionContext,
     counters: &Arc<StdMutex<SessionCounters>>,
     prompt: &Arc<StdMutex<PromptState>>,
+    max_chunk_duration: Duration,
 ) {
     for source in sources.iter_mut() {
         if source.has_in_flight_task {
@@ -2539,6 +2581,7 @@ async fn dispatch_final_pending_chunks(
             true,
             false,
             ctx.session_offset_base_seconds,
+            max_chunk_duration,
         )
         .await;
         if let Some(prepared) = prepared {
