@@ -47,13 +47,21 @@ pub struct LiveTranscriptionConfig {
     /// hallucination from stale context. Default: 5.0. Set to 0 to disable.
     pub prompt_decay_silence_seconds: Option<f32>,
     /// Session ID for streaming session-audio recording. If set, the loop
-    /// streams a new **session audio part** to disk during the session and
-    /// inserts a `session_audio_parts` row at finalize time before emitting
-    /// `session-part-ready`. The on-disk file is
+    /// streams a new audio part to disk during the session and emits
+    /// `session-part-ready` at finalize time. The on-disk file is
     /// `{audio_save_location || $APP_DATA_DIR/audio/}/{session_id}.{part_index}.{wav|mp3}`,
     /// where `part_index` is 0 for a fresh session and `N` when resuming a
     /// session that already has parts.
     pub session_id: Option<String>,
+    /// When `true`, the finalize path inserts a `session_audio_parts` row
+    /// keyed by `session_id` so the DB stays the durable source of truth even
+    /// if the FE listener is gone. Set this to `false` for synthetic ids that
+    /// are *not* rows in `sessions` — most importantly dictation, where the
+    /// id is per-utterance and the finalized file is recorded against
+    /// `dictation_history` instead. Defaults to `true` to preserve historical
+    /// behavior for actual sessions; the dictation hook flips it off.
+    #[serde(default = "default_persist_audio_part")]
+    pub persist_audio_part: bool,
     /// Custom directory for saving session audio parts. If None, uses
     /// `$APP_DATA_DIR/audio/`. The directory is registered with
     /// `audio_save_locations` at recording start so reconciliation can
@@ -80,6 +88,10 @@ pub struct LiveTranscriptionConfig {
     /// no prior file is read or modified. Backfill is forced to 0.
     #[serde(default)]
     pub resume: Option<ResumeConfig>,
+}
+
+fn default_persist_audio_part() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
@@ -187,6 +199,10 @@ struct SessionWavState {
     /// to this rate before `write_samples` so the archived file plays at
     /// a single consistent speed.
     wav_sample_rate: u32,
+    /// When `true`, finalize inserts a `session_audio_parts` row keyed by
+    /// `session_id`. Set to `false` for dictation, whose `session_id` is a
+    /// synthetic per-utterance value with no `sessions` row backing it.
+    persist_audio_part: bool,
 }
 
 // --- Shared context ---
@@ -2760,24 +2776,34 @@ async fn finalize_session_wav(
     let format = if use_mp3 { "mp3" } else { "wav" };
     let file_path_str = path.to_string_lossy().to_string();
 
-    // Insert the parts row from Rust *before* emitting so the DB is the
+    // Always register the parent dir with TrustedAudioDirs so the
+    // audio-stream:// handler can serve the file regardless of who owns
+    // the audio (sessions vs dictations).
+    if let Some(parent) = path.parent() {
+        crate::register_trusted_audio_dir(&ctx.app_handle, parent);
+    }
+
+    // Insert the parts row from Rust *before* emitting so the DB stays the
     // durable source of truth even if the FE event listener is unavailable
-    // (crash, force-quit, window closed). The FE handler now just refreshes
-    // from DB.
-    if let Some(db_path_state) = ctx.app_handle.try_state::<crate::DbPath>() {
-        let row = crate::db::AudioPartRow {
-            session_id: ws.session_id.clone(),
-            part_index: ws.part_index,
-            file_path: file_path_str.clone(),
-            format,
-            duration_seconds: duration,
-            sample_rate: ws.wav_sample_rate,
-        };
-        if let Err(e) = crate::db::insert_audio_part_row(db_path_state.as_path(), &row) {
-            error!("insert_audio_part_row failed (will rely on FE refresh): {e}");
-        }
-        if let Some(parent) = path.parent() {
-            crate::register_trusted_audio_dir(&ctx.app_handle, parent);
+    // (crash, force-quit, window closed). The FE handler then just
+    // refreshes from DB. Skipped when `persist_audio_part` is false —
+    // dictation owns its own audio path on `dictation_history` and the
+    // synthetic `session_id` has no row in `sessions`, so inserting would
+    // either FK-fail or (with FK enforcement off) leave orphans that
+    // `clearAllSessions` could then sweep.
+    if ws.persist_audio_part {
+        if let Some(db_path_state) = ctx.app_handle.try_state::<crate::DbPath>() {
+            let row = crate::db::AudioPartRow {
+                session_id: ws.session_id.clone(),
+                part_index: ws.part_index,
+                file_path: file_path_str.clone(),
+                format,
+                duration_seconds: duration,
+                sample_rate: ws.wav_sample_rate,
+            };
+            if let Err(e) = crate::db::insert_audio_part_row(db_path_state.as_path(), &row) {
+                error!("insert_audio_part_row failed (will rely on FE refresh): {e}");
+            }
         }
     }
 
@@ -3342,6 +3368,7 @@ pub async fn start_live_transcription(
                 part_index,
                 flush_count: 0,
                 wav_sample_rate: sample_rate,
+                persist_audio_part: config.persist_audio_part,
             })
         } else {
             None
@@ -3820,6 +3847,7 @@ mod tests {
             prompt_context_chars: None,
             prompt_decay_silence_seconds: None,
             session_id: None,
+            persist_audio_part: true,
             audio_save_location: None,
             audio_export_format: None,
             mp3_bitrate: None,

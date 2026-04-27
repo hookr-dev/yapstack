@@ -270,6 +270,29 @@ export function createMultiSessionTools(
   };
 }
 
+/**
+ * Tool surface for the dictation list view. Exposes only `search_dictations`
+ * — folder/session retrieval tools are intentionally absent because the
+ * dictation chat is scoped to `dictation_history`, not any sessions or
+ * folders. Reusing `createMultiSessionTools([])` here would have surfaced
+ * `search_sessions`, `get_session_context`, and `search_folders`, all of
+ * which return empty (or worse, leak unrelated sessions if the
+ * `allowedSessionIds` guard ever drifted).
+ */
+export function createDictationTools(): AIContextTools {
+  return {
+    availableToolIds: ["search_dictations"],
+    contextType: "multi-session",
+    getToolContext: async () => ({
+      scope: "retrieval",
+      // Empty allow-list — `search_dictations` doesn't honor it (dictation
+      // history is its own table) but a stray future tool that *does*
+      // consult `allowedSessionIds` will fail closed.
+      allowedSessionIds: [],
+    }),
+  };
+}
+
 export function createMultiSessionSystemPromptBuilder(
   folderContext?: FolderContextLayer[],
 ): SystemPromptBuilder {
@@ -331,9 +354,7 @@ export function resolveListContext(
       return {
         contextKey: key,
         sources: createDictationSources(count),
-        // Dictation chats don't expose session retrieval, but pass an empty
-        // scope to be explicit that no sessions are reachable from here.
-        tools: createMultiSessionTools([]),
+        tools: createDictationTools(),
         buildSystemPrompt: createDictationSystemPromptBuilder(),
         placeholder: `Ask about ${count} dictation${count !== 1 ? "s" : ""}...`,
       };

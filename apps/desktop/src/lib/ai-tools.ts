@@ -942,9 +942,9 @@ registerTool({
             description: "Free-form keywords to search for.",
           },
           filters: {
-            type: "object",
+            type: ["object", "null"],
             description:
-              "Filters to narrow the search. Pass null on individual fields to skip that filter.",
+              "Filters to narrow the search. Pass null for an unfiltered search, or an object with both keys (each may be null individually).",
             properties: {
               folder_id: {
                 type: ["string", "null"],

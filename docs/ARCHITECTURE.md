@@ -54,7 +54,7 @@ All audio capture and processing. Core of the application.
 - `device.rs` — Device enumeration via `cpal`
 - `mic.rs` — Microphone capture stream management. `stream_error: Arc<AtomicBool>` for cpal error propagation.
 - `system/` — System audio capture (macOS via cpal loopback on default output device, Windows stub, fallback `Unavailable`)
-- `manager.rs` — `AudioManager` orchestrates mic + system capture, session tracking, instant capture. Stream restart (`restart_mic`, `restart_system_audio`) preserving ring buffers.
+- `manager.rs` — `AudioManager` orchestrates mic + system capture and exposes the position-based extraction API (`buffer_positions`, `extract_since`, `extract_sources_since`, `peek_energy_rms`) consumed by the live-transcription loop. Stream restart (`restart_mic`, `restart_system_audio`) preserves ring buffers across device rebinds.
 - `mixer.rs` — Pure functions for mixing mic + system audio with gain/normalization
 - `export.rs` — WAV file export via `hound` (16-bit PCM, f32 clamping). `SessionWavWriter` for incremental streaming WAV during live sessions.
 - `capture.rs` — Data types: `BufferPositions`, `SeparateExtraction` (the position-based extraction shapes consumed by the live-transcription loop)
@@ -89,7 +89,8 @@ Standalone binary. Reads JSON-line requests from stdin, writes responses to stdo
 ### yapstack-desktop (Tauri app)
 Tauri commands layer. Thin wrappers that convert between domain types and DTOs (with `specta::Type` for TypeScript generation).
 - `commands/error.rs` — `CommandError` tagged union with 6 error kinds (`Audio`, `Transcription`, `NotInitialized`, `InvalidInput`, `NotFound`, `Internal`). All Tauri commands return `Result<_, CommandError>`. `From` impls for `AudioError`, `TranscriptionError`, `std::io::Error`.
-- `commands/audio.rs` — Device listing, capture start/stop, buffer snapshots, instant capture, session start/end. `MixConfigDto::sanitized()` validates gain values at the command boundary.
+- `commands/audio.rs` — Device listing, capture start/stop, capture status, buffer info, `peek_capture_energy` (RMS readout used by the recording beacon). `MixConfigDto::sanitized()` validates gain values at the command boundary.
+- `commands/capture.rs` — Audio cleanup commands only (`delete_audio_files` for per-part cleanup, `delete_session_wav` for legacy session-glob cleanup). Session lifecycle and audio finalization are owned by `commands/live_transcription.rs`.
 - `commands/transcription.rs` — Model management, transcription, sidecar lifecycle. Locks released before async I/O.
 - `commands/live_transcription.rs` — Real-time transcription controller with per-source VAD (`SourceVadState`), concurrent backfill processing (Silero-driven `vad_chunk_historical_audio` shares boundary choices with the live loop), prompt context windowing, prompt decay, stream health monitoring with auto-restart. Shared `TranscriptionContext` struct for immutable config passing. Extracts the `TranscriptionClient` from shared state for zero-contention private use during the loop. Streams session WAV incrementally via `SessionWavWriter`.
 - `commands/dictation.rs` — `clipboard_paste` command for voice dictation output. Writes text to system clipboard via `pbcopy` (macOS) or `clip` (Windows), optionally triggers auto-paste via `osascript` keystroke simulation.
@@ -118,8 +119,11 @@ start_live_transcription(config with session_id, audio_save_location?, audio_exp
         1. Final flush, then finalize per audioExportFormat:
            • format = "wav" → keep the WAV
            • format = "mp3" → re-encode at mp3Bitrate (lame) and DELETE the source WAV
-        2. Insert session_audio_parts row from Rust (durable source of truth)
-        3. Register parent dir with TrustedAudioDirs so the audio-stream:// handler can serve it
+        2. Register parent dir with TrustedAudioDirs so the audio-stream:// handler can serve it
+        3. If config.persist_audio_part is true (default for real sessions),
+           insert a session_audio_parts row from Rust (durable source of truth).
+           Dictation passes false here because its synthetic session_id has no
+           sessions row — the path is recorded against dictation_history instead.
         4. Emit "session-part-ready" with { session_id, part_index, file_path, format,
            duration_seconds, sample_rate }
         5. Empty recordings (0 samples written) emit "session-wav-error" instead and the
@@ -430,7 +434,7 @@ Built-in tools (registered in `ai-tools.ts`):
 | `tag_session` | `{ add: string[], remove?: string[] }` | `organization` | Adds/removes tags. Creates new tags on-the-fly if they don't exist. Source tracked as `"ai"`. |
 | `search_folders` | `{ query?: string }` | (none) | Read-only. Returns folder tree (or matches against `query`) with descriptions and `folder_id`s for the LLM to choose from. Phase 1 of folder-aware actions. |
 | `add_session_to_folder` | `{ folder_id: string }` | `organization` | Classifies session into a folder by id (chosen from `search_folders` results). Handles branch conflicts. Returns the folder's hierarchical description chain in `result` so Phase 2 of two-phase actions sees the parent context. |
-| `search_sessions` | `{ query: string, limit?: number }` | (none) | Read-only. FTS5 search across session titles, segment text, and notes. |
+| `search_sessions` | `{ query: string, filters: { folder_id: string \| null, pinned: boolean \| null } \| null, limit?: number }` | (none) | Read-only. FTS5 search across session titles, segment text, and notes. `filters` is `null` for an unfiltered search or an object with both keys (each may be null individually). |
 | `search_dictations` | `{ query: string, limit?: number }` | (none) | Read-only. FTS5 search across `dictation_history`. |
 | `get_session_context` | `{ session_ids: string[], scope: "segments" \| "notes" \| "summary" \| "all" }` | (none) | Read-only. Expands a list of `session_ids` returned by `search_sessions` into the requested artifact (transcript chunks, notes, both, or a future summary). Hard-capped at 5 ids per call. When the chat context carries `allowedSessionIds`, out-of-scope ids are rejected. |
 | `replace_in_transcript` | `{ find: string, replace: string, case_sensitive: boolean }` | `transcript` (refresh segments) | Edits segment text in the durable DB rows — fixes typos / mis-transcriptions surgically. Capped at 50 affected segments per call. Undo restores the pre-call text on every touched segment. |
@@ -538,9 +542,9 @@ These persist in `chat_messages` DB. On load, `AIChatMessage.parseToolBadges()` 
 
 `AIContextProvider` wraps `FloatingChatBar` and provides `AIContextValue` via React context. Factory functions in `ai-context.ts` create sources, tools, actions, and system prompt builders for different contexts:
 
-- **Session context** (`createSessionSources`, `createSessionTools`, `createSessionSystemPromptBuilder`) — Single session with toggleable transcript and notes sources. All ten tools available. Actions filtered by `getActionsForSession(sessionType)`.
-- **Multi-session context** (`createMultiSessionSources`, `createMultiSessionTools`, `createMultiSessionSystemPromptBuilder`) — Folder-level AI chat aggregating sessions. No tools available (read-only analysis). Folder context hierarchy passed as `FolderContextLayer[]`.
-- **Dictation context** (`createDictationSources`, `createDictationSystemPromptBuilder`) — Dictation history AI chat. Read-only analysis of dictation entries. No tools available.
+- **Session context** (`createSessionSources`, `createSessionTools`, `createSessionSystemPromptBuilder`) — Single session with toggleable transcript and notes sources. All ten tools available. Actions filtered by `getActionsForSession(sessionType)`. `ToolContext.scope = "session"`.
+- **Multi-session context** (`createMultiSessionSources`, `createMultiSessionTools`, `createMultiSessionSystemPromptBuilder`) — Folder / pinned / all chat. Exposes the four retrieval tools (`search_sessions`, `get_session_context`, `search_folders`, `search_dictations`); mutating tools are intentionally absent because they need a single `sessionId`. `allowedSessionIds` pins retrieval to the chat's filter. `ToolContext.scope = "retrieval"`.
+- **Dictation context** (`createDictationSources`, `createDictationTools`, `createDictationSystemPromptBuilder`) — Dictation history chat. Exposes `search_dictations` only — folder/session retrieval tools are deliberately *not* surfaced because dictation lives in its own table and reusing the multi-session toolset would have leaked unrelated session search into a dictation-scoped chat.
 - **List context** — `resolveListContext(filter, sessions, folders)` returns a `ListChatContext` (contextKey, sources, tools, systemPromptBuilder, placeholder) for any `ListFilter` type. `ListContextBar` renders the `AIContextProvider` + `FloatingChatBar` for non-session views.
 
 Sources are toggleable via `toggleSource()` — users can enable/disable transcript and notes context independently. The `contextKey` (from `chatContextKey()`) determines chat message identity — switching sessions or folders resets the chat history. `AIContextValue` includes a `placeholder` string for context-specific input hints.
