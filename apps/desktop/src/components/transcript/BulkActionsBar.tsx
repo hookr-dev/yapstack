@@ -49,11 +49,10 @@ export function BulkActionsBar({
 
   return (
     <div className="pointer-events-none absolute inset-x-0 bottom-3 z-20 flex justify-center">
-      <div className="pointer-events-auto flex items-center gap-1 rounded-full border bg-background/95 px-2 py-1 shadow-lg backdrop-blur">
-        <span className="px-2 text-xs font-medium tabular-nums">
-          {selected.length}
-        </span>
-        <div className="mx-1 h-4 w-px bg-border" />
+      <div
+        className="pointer-events-auto flex items-center gap-1 rounded-full border bg-background/95 px-2 py-1 shadow-lg backdrop-blur"
+        title="AI chat is scoped to the selected segments"
+      >
         <Button
           size="sm"
           variant="ghost"

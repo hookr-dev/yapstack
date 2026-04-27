@@ -6,14 +6,31 @@ interface ContextPillProps {
   onToggle?: () => void;
   icon: ReactNode;
   label: string;
+  /** Muted suffix appended after the label, e.g. "• 6 selected". */
+  suffix?: string;
 }
 
-export function ContextPill({ enabled, onToggle, icon, label }: ContextPillProps) {
+export function ContextPill({
+  enabled,
+  onToggle,
+  icon,
+  label,
+  suffix,
+}: ContextPillProps) {
+  const content = (
+    <>
+      {icon}
+      {label}
+      {suffix && (
+        <span className="text-muted-foreground/70">{suffix}</span>
+      )}
+    </>
+  );
+
   if (!onToggle) {
     return (
       <span className="inline-flex items-center gap-1 rounded-md border border-primary/30 bg-primary/5 px-2 py-0.5 text-[9px] text-foreground">
-        {icon}
-        {label}
+        {content}
       </span>
     );
   }
@@ -28,8 +45,7 @@ export function ContextPill({ enabled, onToggle, icon, label }: ContextPillProps
           : "border-muted-foreground/20 bg-transparent text-muted-foreground/50",
       )}
     >
-      {icon}
-      {label}
+      {content}
     </button>
   );
 }

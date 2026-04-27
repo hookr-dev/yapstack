@@ -94,9 +94,18 @@ export function createSessionSources(
       summary: segmentCount > 0 ? `${segmentCount} segments` : undefined,
       assembler: async () => {
         const segments = await getSessionSegments(sessionId);
-        const speakerNames =
-          useAppStore.getState().settings.speakerNames[sessionId];
-        return assembleTranscriptContext(segments, speakerNames);
+        const state = useAppStore.getState();
+        const speakerNames = state.settings.speakerNames[sessionId];
+        // When the user has an active segment selection, scope the
+        // transcript context to just those segments. Selection is global
+        // in the store but is reset on session change, so any non-empty
+        // set here belongs to the current session.
+        const selected = state.selectedSegmentIds;
+        const scoped =
+          selected.size > 0
+            ? segments.filter((s) => selected.has(s.id))
+            : segments;
+        return assembleTranscriptContext(scoped, speakerNames);
       },
     });
   }
