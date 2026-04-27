@@ -2013,8 +2013,14 @@ function createAppStore() {
         set((state) => ({ noteRefreshCounter: state.noteRefreshCounter + 1 })),
 
       // Audio playback
-      setPlaybackTime: (time: number) => set({ playbackTime: time }),
-      setIsPlaying: (playing: boolean) => set({ isPlaying: playing }),
+      setPlaybackTime: (time: number) => {
+        if (get().playbackTime === time) return;
+        set({ playbackTime: time });
+      },
+      setIsPlaying: (playing: boolean) => {
+        if (get().isPlaying === playing) return;
+        set({ isPlaying: playing });
+      },
 
       // Dictation history
       loadDictationHistory: async () => {
