@@ -23,12 +23,15 @@ The shared vocabulary for YapStack. Use these terms verbatim in code, docs, PRDs
 | **Session**           | A bounded recording with its captured audio and ordered list of segments, persisted in SQLite.                        | Recording, take           |
 | **Segment**           | A single transcribed utterance with start/end timestamps, text, confidence, and optional speaker ID.                  | Chunk, transcript line    |
 | **Backfill**          | Re-transcription of audio captured *before* live transcription started, emitted as `is_backfill: true` segments.      | History, replay, prefill  |
-| **Session audio**       | The persisted on-disk audio artifact for a session, served via the `audio-stream://` protocol. Encoded as either WAV *or* MP3 — never both — per the user's audio export format. | Audio file, recording file |
-| **Session WAV**         | The 16-bit PCM mono WAV form of a session's audio. Always streamed to `$APP_DATA_DIR/audio/{session_id}.wav` during recording; survives finalization only when audio export format is `wav`. | Wav file                   |
-| **Session MP3**         | The MP3 form of a session's audio, produced at finalization by encoding the streamed WAV and **deleting** the WAV. The session keeps only the `.mp3`. | Compressed audio           |
-| **Audio export format** | The user's choice of persisted session-audio encoding: `wav` or `mp3`. Applied at session finalization (and to user-triggered re-saves).             | Output format, save format |
+| **Session audio**       | The umbrella term for a session's persisted audio. A session's audio is composed of one or more **Session audio parts**; each part is one file in the user's chosen format. | Audio file, recording file |
+| **Session audio part**  | One ordered slice of a session's audio (`part_index = 0, 1, 2…`), persisted as one file at `{audio_dir}/{session_id}.{part_index}.{wav\|mp3}` and recorded as one row in `session_audio_parts`. A fresh session has `part_index = 0`; resuming appends `part_index = N`. The DB row is the durable source of truth — written from Rust at finalize time before any FE event. | Audio chunk, segment audio |
+| **Resume**              | Continuing a paused/stopped session by appending a new **Session audio part** rather than overwriting. Segments and parts both continue numbering from where the prior run left off. | Re-open, re-record         |
+| **Session WAV**         | The WAV form of a single **Session audio part** (16-bit PCM mono). Always streamed to disk during recording; survives finalization only when **Audio export format** is `wav`. | Wav file                   |
+| **Session MP3**         | The MP3 form of a single **Session audio part**, produced at finalization by encoding the streamed WAV and **deleting** the WAV. The part row keeps only the `.mp3`. | Compressed audio           |
+| **Audio export format** | The user's choice of persisted session-audio encoding: `wav` or `mp3`. Applied at part finalization (and to user-triggered re-saves).             | Output format, save format |
 | **MP3 bitrate**         | The user-configurable encode quality for the MP3 form (8–320 kbps).                                                                                  | Quality, kbps              |
-| **Audio save location** | The filesystem path used when the user saves a copy of session audio outside the app data directory.                                                | Export path                |
+| **Audio save location** | The user-overridden filesystem path where session audio parts are written (default `$APP_DATA_DIR/audio/`). Tracked in `audio_save_locations` so reconciliation can recover orphans on next startup. | Export path                |
+| **Trusted audio dir**   | A directory in the runtime allow-list that the `audio-stream://` handler is willing to serve files from. Seeded at startup from `session_audio_parts.file_path` parents and `audio_save_locations`, then extended at finalize time. | Audio root                 |
 
 ## Transcription engines
 
@@ -68,7 +71,7 @@ The shared vocabulary for YapStack. Use these terms verbatim in code, docs, PRDs
 
 | Term                       | Definition                                                                                                              | Aliases to avoid          |
 | -------------------------- | ----------------------------------------------------------------------------------------------------------------------- | ------------------------- |
-| **Dictation**              | A short, sessionless voice-to-text capture optimized for dropping text into the active app or clipboard.                | Quick note, voice command |
+| **Dictation**              | A short voice-to-text capture optimized for dropping text into the active app or clipboard. Runs through the same live-transcription pipeline as a session, under a synthetic dictation id (not a real `sessions.id`), and finalizes one **Session audio part** at `{dictation_id}.0.{wav\|mp3}`. The audio is kept on the `dictation_history` row regardless of **Output action**; only cancel deletes it.                | Quick note, voice command |
 | **Dictation slot**         | A named, reusable dictation preset. Carries id, name, enabled flag, AI-enabled flag, prompt, output action, and default binding. The slots array is unlimited; one slot ("Raw Dictation") ships by default. | Preset, profile           |
 | **Dictation activation mode** | How a slot's hotkey behaves: `hold` (push-to-talk, recording while held) or `toggle` (press to start/stop).          | Trigger mode              |
 | **Output action**          | What to do with a finished dictation: `paste` into the focused field, `clipboard`, or `new-note` (create a session).    | Insertion mode, sink      |
@@ -103,7 +106,7 @@ The shared vocabulary for YapStack. Use these terms verbatim in code, docs, PRDs
 | **Chat**          | A conversation with an LLM scoped to a context (a session, a folder, the pinned set, dictation history, or global), exposed via the floating chat bar. | Assistant, copilot     |
 | **Context key**   | The string that scopes a chat: `global`, `pinned`, `dictation`, `folder:{id}`, or a session id. Determines what content the LLM sees and where messages are filed. | Scope, channel         |
 | **Chat message**  | One turn (user or assistant) in a chat, persisted in SQLite with its context key.                                                   | Reply, exchange        |
-| **Tool**          | A typed function the LLM can invoke (`update_title`, `save_to_notes`, `pin_session`) via OpenAI tool calling.                       | Action, function call  |
+| **Tool**          | A typed function the LLM can invoke via OpenAI tool calling. Each tool declares a `kind` (`"read"` or `"mutate"`) and an optional `affects` effect set; only `mutate` tools enter the Undo window. The current registry has ten: `update_title`, `save_to_notes`, `pin_session`, `tag_session`, `add_session_to_folder`, `replace_in_transcript` (mutating); `search_folders`, `search_sessions`, `search_dictations`, `get_session_context` (retrieval). | Action, function call  |
 | **Citation**      | An inline `[[seg:ID]]` reference in chat output that resolves to a clickable timestamp chip on a segment.                           | Reference, link        |
 | **Undo window**   | The 10-second period after a tool mutation during which the user can revert it.                                                     | Grace period, rollback |
 | **AI provider**   | An external LLM backend the chat can target: `openai`, `openrouter`, or `custom` (any OpenAI-compatible endpoint).                  | LLM provider, vendor   |
@@ -131,14 +134,14 @@ The shared vocabulary for YapStack. Use these terms verbatim in code, docs, PRDs
 
 ## Relationships
 
-- A **Session** owns one **Session audio** artifact (a **Session WAV** *or* a **Session MP3**, never both) and many **Segments**. The format is decided at finalization by the **Audio export format** setting; choosing `mp3` re-encodes the streamed WAV and deletes it.
+- A **Session** owns zero or more **Session audio parts** (one row per resume, ordered by `part_index` in `session_audio_parts`) and many **Segments**. Each part is exactly one file — a **Session WAV** *or* a **Session MP3**, never both — at the user's chosen **Audio export format** at finalize time. Choosing `mp3` re-encodes the streamed WAV and deletes it. Parts are concatenated at playback time, never on disk.
 - A **Session** has zero or one **Note** (enforced by `UNIQUE` on `notes.session_id`); a **Note** has zero or many **Note versions**.
 - A **Session** can belong to zero or many **Folders**, and a **Folder** can hold zero or many **Sessions** — many-to-many via the `session_folders` join table. **Folders do not contain Notes directly**; a note is reachable through its session.
 - A **Capture** writes into one **Ring buffer** per **Source**; **Live transcription** reads from those buffers.
 - An **Engine** runs inside the **Sidecar**; the **Transcription client** is its in-process handle. The engine's readiness is tracked as the **Engine phase**.
 - **Diarization** assigns a **Speaker ID** to a **Segment**; the user maps it to a **Speaker label** per-session (Zustand-persisted, not in SQL).
 - A **Chat** is scoped by a **Context key** (a session id, a folder id, `pinned`, `dictation`, or `global`) and uses one **AI provider** + **API key** + selected model from the **Model catalog**. Session-scoped chats may emit **Citations** that resolve to that session's **Segments**.
-- **Dictation** produces transcribed text without creating a **Session** unless the active **Dictation slot**'s **Output action** is `new-note`. Either way it is logged in **Dictation history** (with an optional session FK).
+- **Dictation** produces transcribed text without creating a **Session** unless the active **Dictation slot**'s **Output action** is `new-note`. Either way it is logged in **Dictation history** (with the finalized **Session audio part**'s path on `wav_file_path`; the `session_id` FK is set only on `new-note`).
 - A **Dictation slot** owns one **Binding** (a **Global hotkey**) and one **Dictation activation mode**.
 - **Capture source** = `Mixed` is the only mode that consults **Mix config** (mic gain, system gain, normalize).
 
@@ -162,11 +165,11 @@ The shared vocabulary for YapStack. Use these terms verbatim in code, docs, PRDs
 
 > **Dev:** "When a **Session** finalizes, what determines whether we end up with a WAV or an MP3?"
 
-> **Domain expert:** "The **Audio export format** setting. We always stream a **Session WAV** to disk during recording — that's the working buffer. At finalization, if the format is `wav`, we keep it. If it's `mp3`, we encode at the configured **MP3 bitrate** to produce a **Session MP3** and delete the WAV. The session ends up with exactly one **Session audio** artifact."
+> **Domain expert:** "The **Audio export format** setting. We always stream a **Session WAV** to disk during recording — that's the working buffer. At finalization, if the format is `wav`, we keep it. If it's `mp3`, we encode at the configured **MP3 bitrate** to produce a **Session MP3** and delete the WAV. Each recording run produces one such audio artifact — the **Session audio part** for that run. A session that's resumed N times ends up with N+1 parts; the **Audio player** stitches them in `part_index` order at playback time."
 
-> **Dev:** "And **Dictation** — does that produce a session audio artifact too?"
+> **Dev:** "And **Dictation** — does it write to `session_audio_parts`?"
 
-> **Domain expert:** "Only if the slot's **Output action** is `new-note`. Otherwise the audio just feeds transcription, the text goes to **Output action** `paste` or `clipboard`, and the transcript lands in **Dictation history** — no session, no audio kept."
+> **Domain expert:** "It uses the same live-transcription pipeline so the chunking, VAD, and streaming-WAV machinery are reused, but it sets `persist_audio_part: false` so finalize *skips* the `session_audio_parts` insert — that table is keyed on `sessions.id` and the dictation id is synthetic. Capture finalizes the file at `{dictation_id}.0.{wav|mp3}` regardless of **Output action**, and the path lands on the `dictation_history` row (`wav_file_path`, `wav_duration_seconds`) so the user can replay it. The difference between actions is what happens to the *text* — `paste` and `clipboard` route it out of the app, `new-note` also creates a real **Session** and links it via `dictation_history.session_id`. The audio is only deleted on cancel."
 
 > **Dev:** "If I drag a **Session** into a **Folder**, does it leave its current folder?"
 
@@ -178,14 +181,14 @@ The shared vocabulary for YapStack. Use these terms verbatim in code, docs, PRDs
 
 ## Flagged ambiguities
 
-- **"Whisper client"** (legacy) vs **Transcription client** (current). The Tauri state name `WhisperClientState` and the type alias `WhisperClient` still exist for one-release back-compat, but they hold an engine-agnostic `TranscriptionClient`. Prefer **Transcription client** in all new prose, comments, and PR titles.
+- **"Whisper client"** (legacy, no longer in code) vs **Transcription client** (current). The engine-agnostic Rust type is `TranscriptionClient` and the Tauri managed-state alias is `TranscriptionClientState`. The legacy `WhisperClient` / `WhisperClientState` aliases have been removed; "Whisper client" is dead terminology — always say **Transcription client**.
 - **"Segment"** is overloaded: it means both a transcribed unit (the domain segment, persisted in SQLite) and, internally, a `WhisperSegment` from the whisper-rs API. In domain language, **Segment** always means the persisted transcribed unit. Use "whisper-rs segment" or "raw segment" when referring to the library type.
 - **"Chunk"** vs **Segment**: a **chunk** is the *audio slice* sent to the sidecar between VAD start/end; a **segment** is what comes back transcribed. Don't use "chunk" to mean transcribed text.
 - **"Source"** has two distinct meanings: (1) a **Capture source** enum (`MicOnly`/`SystemOnly`/`Mixed`) chosen at session start, and (2) a single audio origin (`mic` or `system`) within the live loop. The first is a *configuration*, the second is a *runtime entity* with its own VAD and cursor. Prefer **Capture source** for the enum and **Source** alone only inside the live-transcription context.
 - **"Model"** vs **Variant** vs **Engine**: an **Engine** is the algorithm family (Whisper/Parakeet); a **Variant** is a specific weights bundle for that engine; a **Model** is the on-disk artifact. "Switching models" is ambiguous — say "switching engine" or "switching variant" depending on intent.
 - **"Speaker name"** vs **Speaker label**: code uses `speakerNames` (the persisted Zustand map). In domain prose prefer **Speaker label** to make clear it's a user-facing display string mapped from a numeric **Speaker ID**.
 - **"Recording"** is used loosely in UI copy. In domain language a **Session** is the persisted record and a **Capture** is the live act. Avoid "recording" as a noun unless quoting UI text.
-- **"Session WAV"** vs **"Session audio"** vs **"Session MP3"**: **Session audio** is the umbrella term for a session's persisted audio artifact, and a session has **exactly one** — either a **Session WAV** *or* a **Session MP3**, never both. The streamed WAV is always the working form *during* recording; at finalization the **Audio export format** setting decides which encoding survives, and choosing `mp3` deletes the WAV. Don't say "the session's audio file" generically when the format matters — say **Session WAV** or **Session MP3**.
+- **"Session WAV"** vs **"Session audio"** vs **"Session MP3"** vs **"Session audio part"**: **Session audio** is the umbrella term for a session's persisted audio. A session is composed of one or more **Session audio parts** (one row per resume in `session_audio_parts`); each part is exactly one file — a **Session WAV** *or* a **Session MP3**, never both — at the user's chosen **Audio export format** at the time that part finalized. Different parts can have different formats if the user changed `audioExportFormat` between resumes. Don't say "the session's audio file" generically — say **Session audio part** when you mean one file, **Session audio** when you mean the whole concatenated thing, and **Session WAV** / **Session MP3** when the format matters.
 - **"Hotkey"** vs **Shortcut** vs **Global hotkey** vs **Binding**: a **Shortcut** is a named in-app action; a **Binding** is the key combination assigned to it; a **Global hotkey** is a binding registered with the OS so it fires while YapStack is unfocused (used for **Dictation slots**). Don't use "hotkey" alone — qualify it.
 - **"Output"** in dictation context means **Output action** (`paste`/`clipboard`/`new-note`), not the audio output device. Audio output as a *capture target* is **System audio**.
 - **"Provider"** has two senses we keep distinct: the **AI provider** (OpenAI/OpenRouter/custom) for chat, and the ORT **Execution provider** (cpu/coreml/webgpu) for the Parakeet engine. Always qualify which one you mean.

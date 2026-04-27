@@ -217,6 +217,24 @@ pub(crate) fn audio_path_trusted(app: &AppHandle, abs_path: &Path) -> bool {
     guard.iter().any(|dir| is_allowed_audio_path(dir, abs_path))
 }
 
+/// True if `dir` (canonicalized) is registered in `TrustedAudioDirs`. Useful
+/// when authorizing operations on a path whose target file may not exist —
+/// e.g. an idempotent delete where the row points at an already-removed file
+/// — because canonicalizing a missing file fails closed in
+/// `is_allowed_audio_path`.
+pub(crate) fn audio_dir_trusted(app: &AppHandle, dir: &Path) -> bool {
+    let Some(state) = app.try_state::<TrustedAudioDirs>() else {
+        return false;
+    };
+    let Ok(guard) = state.lock() else {
+        return false;
+    };
+    let Ok(canonical) = std::fs::canonicalize(dir) else {
+        return false;
+    };
+    guard.iter().any(|trusted| canonical.starts_with(trusted))
+}
+
 /// Adds `dir`'s canonical form to the trusted set. Called from the
 /// finalize path each time Rust writes a new part to a directory.
 pub(crate) fn register_trusted_audio_dir(app: &AppHandle, dir: &Path) {
@@ -253,21 +271,13 @@ pub fn run() {
             commands::audio::stop_capture,
             commands::audio::get_capture_status,
             commands::audio::check_system_audio_permission,
-            commands::audio::snapshot_mic_audio,
-            commands::audio::snapshot_system_audio,
             commands::audio::get_buffer_info,
             commands::audio::peek_capture_energy,
-            commands::capture::trigger_instant_capture,
-            commands::capture::start_session,
-            commands::capture::end_session,
-            commands::capture::get_session_status,
-            commands::capture::export_session_wav,
             commands::capture::delete_session_wav,
             commands::capture::delete_audio_files,
             commands::transcription::get_available_models,
             commands::transcription::download_model,
             commands::transcription::delete_model,
-            commands::transcription::transcribe_audio,
             commands::transcription::init_transcription_client,
             commands::transcription::shutdown_transcription_client,
             commands::transcription::get_transcription_status,

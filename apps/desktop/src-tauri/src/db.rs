@@ -881,8 +881,10 @@ pub fn migrations() -> Vec<Migration> {
         "#,
             kind: MigrationKind::Up,
         },
-        // segments.speaker_id is added by `ensure_runtime_schema()` instead —
-        // see that function for why.
+        // segments.speaker_id is added by the frontend's `getDb()` after
+        // migrations run — kept out of the migration list because some
+        // local dev DBs picked up a "ghost" v11 entry from another branch
+        // that makes sqlx silently refuse later migrations.
     ]
 }
 
@@ -972,7 +974,7 @@ mod tests {
         assert_eq!(
             migrations().len(),
             15,
-            "v1-v15; segments.speaker_id handled at runtime via ensure_runtime_schema"
+            "v1-v15; segments.speaker_id is patched at runtime by the frontend's getDb()"
         );
     }
 
@@ -1045,7 +1047,7 @@ mod tests {
         writer.finalize().unwrap();
 
         // No row yet — reconciliation should insert one.
-        reconcile_audio_parts(&db_path, &[audio_dir.clone()]);
+        reconcile_audio_parts(&db_path, std::slice::from_ref(&audio_dir));
         let conn = rusqlite::Connection::open(&db_path).unwrap();
         let (count, dur, sr): (i64, f64, i64) = conn
             .query_row(
@@ -1060,7 +1062,7 @@ mod tests {
         assert!((dur - 1.0).abs() < 0.01, "expected ~1s, got {dur}");
 
         // Running reconciliation again must be a no-op (INSERT OR IGNORE).
-        reconcile_audio_parts(&db_path, &[audio_dir.clone()]);
+        reconcile_audio_parts(&db_path, std::slice::from_ref(&audio_dir));
         let count2: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM session_audio_parts WHERE session_id = 'sess-x'",

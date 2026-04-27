@@ -86,4 +86,6 @@ function TabsContent({
   )
 }
 
+// shadcn vendored shape — `tabsListVariants` ships alongside the components.
+// eslint-disable-next-line react-refresh/only-export-components
 export { Tabs, TabsList, TabsTrigger, TabsContent, tabsListVariants }

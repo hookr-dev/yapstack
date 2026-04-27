@@ -157,7 +157,7 @@ The DTO pattern keeps `specta::Type` out of library crates:
 ## Frontend Dependencies
 
 Key frontend dependencies beyond React 19 + Vite:
-- **Zustand** — State management with `persist` middleware for settings (version 16, with migrations)
+- **Zustand** — State management with `persist` middleware for settings (version 23, with migrations — see `docs/API_REFERENCE.md` for the full v0→v23 history)
 - **tauri-plugin-sql** — SQLite via Tauri plugin. Session, segment, note, folder persistence in `src/lib/db.ts`
 - **sonner** — Toast notifications for user feedback
 - **shadcn/ui** — Component library (button, card, tabs, select, popover, alert-dialog, dialog, dropdown-menu, context-menu, tooltip, slider, input, textarea, command, sheet, etc.)
@@ -196,19 +196,20 @@ App (routes by ?window= param: main → MainApp, dictation → DictationBubble, 
 │               │   ├── NoteCardList (grid of session/note cards)
 │               │   │   ├── NoteCard (draggable, with pin/folder badges)
 │               │   │   └── DictationHistoryList (when filter = dictation)
-│               │   │       └── DictationHistoryCard
+│               │   │       └── DictationFeedEntry (per-row, uses useDictationEntry hook)
+│               │   ├── DictationTrayItem (sidebar tray; also uses useDictationEntry)
 │               │   ├── NoteDetailView (session detail)
-│               │   │   ├── SessionHeaderV2 (title, badges, actions dropdown)
-│               │   │   ├── AudioPlayer (play/pause, seek, speed control)
+│               │   │   ├── SessionHeader (title, badges, actions dropdown)
+│               │   │   ├── AudioPlayer (play/pause, seek, speed control — parts-aware seeking)
+│               │   │   ├── AutoTagSuggestions (folder suggestion chips during recording)
 │               │   │   ├── ResizablePanelGroup (split pane)
-│               │   │   │   ├── ChatView (transcript bubbles)
+│               │   │   │   ├── ChatView (transcript bubbles, supports diarized speaker grouping)
 │               │   │   │   │   └── EditableSegment (context menu: edit, copy, hide, delete; also used as read-only bubble)
 │               │   │   │   └── NoteEditor (Tiptap rich text with toolbar)
 │               │   │   │       └── NoteHistoryPanel (version snapshots)
-│               │   │   ├── AIContextProvider (context-dependent AI setup)
-│               │   │   │   └── FloatingChatBar (AI chat overlay in notes pane)
-│               │   │   │       └── AIChatMessage (tool badges, citations, markdown)
-│               │   │   └── RecordingControls (during active session)
+│               │   │   └── AIContextProvider (context-dependent AI setup)
+│               │   │       └── FloatingChatBar (AI chat overlay in notes pane)
+│               │   │           └── AIChatMessage (tool badges, citations, markdown)
 │               │   └── SettingsPanel (tabbed settings)
 │               │       ├── AudioTab
 │               │       ├── TranscriptionTab
@@ -227,7 +228,7 @@ App (routes by ?window= param: main → MainApp, dictation → DictationBubble, 
 |------|---------|
 | `useAutoSetup` | One-time engine initialization on mount |
 | `useCaptureEvents` | Listens to backend `capture-status` and `buffer-info` events |
-| `useLiveTranscriptionEvents` | Handles `live-transcription-segment`, `live-transcription-status`, `backfill-complete`, `session-wav-ready` events |
+| `useLiveTranscriptionEvents` | Handles `live-transcription-segment`, `live-transcription-status`, `backfill-complete`, `session-part-ready`, `session-wav-error`, `live-transcription-warning`, `stream-health` events |
 | `useCreateSession` | Derives `canCreate` from engine + capture state, provides `handleNew(useBackfill)` |
 | `useDownloadProgress` | Listens to `model-download-progress` events |
 | `useKeyboardShortcuts` | In-app keyboard shortcuts via capture-phase keydown (mounted in AppLayout). 11 actions. |
@@ -238,23 +239,7 @@ App (routes by ?window= param: main → MainApp, dictation → DictationBubble, 
 | `useClickOutside` | Detects clicks outside a ref element. Used by FloatingChatBar for collapse-on-click-outside. |
 
 ### Settings Persistence
-Settings are stored via Zustand's `persist` middleware with `localStorage`. Schema versioned (currently v16) with migrations:
-- v0→v1: `graceSeconds` → `backfillSeconds`
-- v1→v2: Added `silenceDurationMs`, `maxChunkSeconds`, `overlapSeconds`
-- v2→v3: Reset aggressive defaults (500ms→800ms, 15s→30s, 0.5s→1.0s)
-- v3→v4: Added `promptContextChars`
-- v4→v5: Added `theme` (light/dark/system)
-- v5→v6: Added `sidebarCollapsed`
-- v6→v7: Added `bufferMaxSeconds` (300), removed `backfillSeconds`
-- v7→v8: Added `ai` settings (provider config, API keys, model selection)
-- v8→v9: Added `shortcutBindings` (Record<string, string> override map)
-- v9→v10: Added `audioSaveLocation: string | null`
-- v10→v11: Added `dictation: DictationSettings` with defaults
-- v11→v12: Added `outputAction` to existing `DictationSlot`s (default `"paste"`)
-- v12→v13: Added `showRecordingIndicator: boolean` (default `true`)
-- v13→v14: Changed default model `Base` → `Small`, default capture `MicOnly` → `Mixed` (migrates existing users)
-- v14→v15: Added `promptDecaySilenceSeconds` (default 5) — seconds of all-source silence before clearing prompt context
-- v15→v16: Added `activationMode` to dictation settings (default `"hold"`)
+Settings are stored via Zustand's `persist` middleware with `localStorage`. Schema versioned (currently **v23**). See `docs/API_REFERENCE.md` § "Settings Persistence (Zustand)" for the full migration history (v0→v23).
 
 ## Project Structure Conventions
 
@@ -267,11 +252,11 @@ Settings are stored via Zustand's `persist` middleware with `localStorage`. Sche
 
 **Rust tests**: Unit tests in `#[cfg(test)] mod tests` within each source file. Hardware-dependent tests (device enumeration, mic capture) are `#[ignore]`d. Tests use `tempfile` for temporary directories/files.
 
-**Frontend tests** (294 tests across ~23 files): vitest + `@testing-library/react` + `@testing-library/user-event` + jsdom.
+**Frontend tests** (338 tests across 23 files): vitest + `@testing-library/react` + `@testing-library/user-event` + jsdom.
 
 Test infrastructure files:
 - `src/test/setup.ts` — Global setup: `@testing-library/jest-dom` matchers + `ResizeObserver` polyfill (needed by `react-resizable-panels` in jsdom)
-- `src/test/tauri-mocks.ts` — Factory functions for Tauri API mocks (`tauriCoreMock`, `tauriEventMock`, `tauriWindowMock`, `tauriDpiMock`, `tauriWebviewWindowMock`, `tauriSqlMock`, `tauriCommandsMock`). Factories return fresh mock objects — `vi.mock()` calls must be in the test file itself (vitest hoisting requirement).
+- `src/test/tauri-mocks.ts` — Factory functions for Tauri API mocks. The full set: `tauriCoreMock`, `tauriEventMock`, `tauriWindowMock`, `tauriDpiMock`, `tauriWebviewWindowMock`, `tauriSqlMock`, `tauriDialogMock`, `tauriFsMock`, `tauriOpenerMock`, `tauriGlobalShortcutMock`, `tauriPathMock`, `tauriCommandsMock`. Factories return fresh mock objects — `vi.mock()` calls must be in the test file itself (vitest hoisting requirement).
 - `src/test/match-media.ts` — `setupMatchMedia()` polyfill for `window.matchMedia` (jsdom doesn't implement it)
 - `vitest.config.ts` — jsdom environment, `@/` path alias, setup file
 
@@ -279,8 +264,6 @@ Testing patterns:
 - **Store injection**: Component tests use `useAppStore.setState()` to set store state before rendering
 - **Module-level mocks**: AI library tests (`ai.test.ts`, `ai-tools.test.ts`) use `vi.mock()` at module level for OpenAI SDK and store imports
 - **Factory mocks**: Tauri mocks use factory functions (not side-effect imports) because `vi.mock()` is hoisted above imports — factories ensure each test file gets fresh mocks
-
-Test coverage: 10 lib files (`utils`, `shortcuts`, `folder-tree`, `ai`, `ai-prompts`, `ai-actions`, `ai-tools`, `ai-context`, `analytics`, `DictationTab`, `ShortcutsTab`), 9 component files (`AudioPlayer`, `EditableSegment`, `AIChatMessage`, `NoteCard`, `FolderDialog`, `RecordingBeacon`, `RecordingControls`, `SetupBanner`, `TrialExpiredOverlay`), 1 hook file (`useClickOutside`), 1 app-level file (`App.test.tsx`). Shared test factories in `test/helpers.ts`.
 
 ### File Organization
 - One module per file (no nested modules except `system/`)
@@ -304,16 +287,25 @@ cargo test -p yapstack-audio -- --ignored
 Whisper models are stored in the app's data directory under `models/`:
 - macOS: `~/Library/Application Support/dev.yapstack.app/models/`
 - Whisper models: `ggml-tiny.bin`, `ggml-base.bin`, `ggml-small.bin`, `ggml-medium.bin` — downloaded from `huggingface.co/ggerganov/whisper.cpp`
-- VAD model: `ggml-silero-v6.2.0.bin` (~885KB) — auto-downloaded on first `init_whisper_client` call from `huggingface.co/ggml-org/whisper-vad`. Used by whisper.cpp for voice activity detection preprocessing.
+- VAD model: `ggml-silero-v6.2.0.bin` (~885KB) — auto-downloaded on the first `init_transcription_client` call (Whisper engine path) from `huggingface.co/ggml-org/whisper-vad`. Used by whisper.cpp for voice activity detection preprocessing.
 
 ## Temp File Cleanup
 
 `export::write_wav_to_temp()` creates temp files with prefix `yapstack_capture_` that persist after creation. The caller (transcription pipeline) is responsible for cleanup. These files accumulate in the system temp directory if not cleaned up.
 
-## WAV File Storage
+## Session Audio Storage
 
-Session WAV files are stored persistently at `$APP_DATA_DIR/audio/{session_id}.wav`. For live transcription sessions, the WAV is streamed incrementally during recording via `SessionWavWriter` (every 300ms the loop extracts new audio from the ring buffer and appends it to the file). This ensures no audio is lost for sessions longer than the ring buffer capacity (180s). When the session stops, the WAV header is finalized and a `"session-wav-ready"` event is emitted to the frontend.
+Session audio is persisted as one file per part in each session's tracked audio directory: `{session_id}.{part_index}.{wav|mp3}`. The default directory is `$APP_DATA_DIR/audio/`; users can override it per-session via the `audioSaveLocation` setting. `session_audio_parts` (migration v15) is the durable source of truth for which files belong to a session — its rows are inserted from Rust at finalize time *before* the `session-part-ready` event fires.
 
-For short sessions or re-export, `export_session_wav` can still extract audio from the ring buffer after the fact. `delete_session_wav` removes the WAV file from disk.
+For live transcription sessions, the file is streamed incrementally during recording via `SessionWavWriter` (every 300 ms the loop extracts new audio from the ring buffer and appends to the file). This ensures no audio is lost for sessions longer than the ring buffer capacity (180s). When the session stops:
 
-The `audio-stream://` custom URI scheme protocol (registered in `lib.rs`) serves these files to the frontend `<audio>` element with range request support for seeking.
+1. The streamed WAV is finalized in the user's `audioExportFormat` — kept as WAV, or re-encoded at `mp3Bitrate` and the source WAV is deleted (MP3 path).
+2. The `session_audio_parts` row is inserted from Rust.
+3. The parent dir is registered with `TrustedAudioDirs` so playback can serve from it.
+4. `session-part-ready` is emitted with `{ session_id, part_index, file_path, format, duration_seconds, sample_rate }`. Empty recordings emit `session-wav-error` instead and the empty file is deleted.
+
+Resuming a session opens a new `SessionWavWriter` at `part_index = N` (cumulative duration of prior parts becomes the segment offset base), so timestamps stay continuous across resumes. Files are not concatenated on disk; the FE concatenates parts at playback time via a parts-aware `seekTo`.
+
+`delete_session_wav` is the legacy session-glob cleanup path used by `clearAllSessions` and for sessions that pre-date `session_audio_parts`; per-part cleanup is `delete_audio_files(paths)`, which validates each path against `TrustedAudioDirs` and surfaces failures (the FE can warn or queue retries).
+
+The `audio-stream://` custom URI scheme protocol (registered in `lib.rs`) serves these files to the frontend `<audio>` element with range request support for seeking. Allow-list is seeded at startup from `session_audio_parts.file_path` parents and `audio_save_locations`, then extended at finalize time.

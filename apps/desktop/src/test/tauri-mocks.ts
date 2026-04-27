@@ -108,33 +108,15 @@ export const tauriCommandsMock = () => ({
     checkSystemAudioPermission: vi
       .fn()
       .mockResolvedValue({ status: "ok", data: "Granted" }),
-    snapshotMicAudio: vi
-      .fn()
-      .mockResolvedValue({ status: "ok", data: null }),
-    snapshotSystemAudio: vi
-      .fn()
-      .mockResolvedValue({ status: "ok", data: null }),
     getBufferInfo: vi.fn().mockResolvedValue({
       status: "ok",
       data: { mic: null, system: null },
-    }),
-    triggerInstantCapture: vi
-      .fn()
-      .mockResolvedValue({ status: "ok", data: null }),
-    startSession: vi.fn().mockResolvedValue({ status: "ok", data: null }),
-    endSession: vi.fn().mockResolvedValue({ status: "ok", data: null }),
-    getSessionStatus: vi.fn().mockResolvedValue({
-      status: "ok",
-      data: { active: false, elapsed_seconds: null },
     }),
     getAvailableModels: vi
       .fn()
       .mockResolvedValue({ status: "ok", data: [] }),
     downloadModel: vi.fn().mockResolvedValue({ status: "ok", data: "" }),
     deleteModel: vi.fn().mockResolvedValue({ status: "ok", data: null }),
-    transcribeAudio: vi
-      .fn()
-      .mockResolvedValue({ status: "ok", data: null }),
     initTranscriptionClient: vi
       .fn()
       .mockResolvedValue({ status: "ok", data: null }),
@@ -145,22 +127,81 @@ export const tauriCommandsMock = () => ({
       status: "ok",
       data: { initialized: false },
     }),
-    startLiveTranscription: vi
+    getEngineCatalogue: vi
+      .fn()
+      .mockResolvedValue({ status: "ok", data: [] }),
+    getParakeetModels: vi
+      .fn()
+      .mockResolvedValue({ status: "ok", data: [] }),
+    downloadParakeetModel: vi
+      .fn()
+      .mockResolvedValue({ status: "ok", data: "" }),
+    deleteParakeetModel: vi
       .fn()
       .mockResolvedValue({ status: "ok", data: null }),
+    getSortformerStatus: vi.fn().mockResolvedValue({
+      status: "ok",
+      data: { downloaded: false, sample_rate: 16000 },
+    }),
+    downloadSortformerModel: vi
+      .fn()
+      .mockResolvedValue({ status: "ok", data: "" }),
+    deleteSortformerModel: vi
+      .fn()
+      .mockResolvedValue({ status: "ok", data: null }),
+    startLiveTranscription: vi.fn().mockResolvedValue({
+      status: "ok",
+      data: { effective_start_epoch_ms: 0 },
+    }),
     stopLiveTranscription: vi
       .fn()
       .mockResolvedValue({ status: "ok", data: null }),
     getLiveTranscriptionStatus: vi.fn().mockResolvedValue({
       status: "ok",
-      data: { phase: "Stopped" },
+      data: {
+        phase: "Stopped",
+        chunks_processed: 0,
+        total_audio_seconds: 0,
+        error_message: null,
+        session_id: null,
+        effective_start_epoch_ms: null,
+      },
     }),
     clipboardPaste: vi.fn().mockResolvedValue({ status: "ok", data: null }),
+    checkScreenCapturePermission: vi
+      .fn()
+      .mockResolvedValue({ status: "ok", data: "Granted" }),
     requestScreenCapturePermission: vi
       .fn()
       .mockResolvedValue({ status: "ok", data: "Granted" }),
     updateVocabularyHints: vi
       .fn()
       .mockResolvedValue({ status: "ok", data: null }),
+    deleteAudioFiles: vi
+      .fn()
+      .mockResolvedValue({ status: "ok", data: null }),
+    deleteSessionWav: vi
+      .fn()
+      .mockResolvedValue({ status: "ok", data: null }),
+    peekCaptureEnergy: vi.fn().mockResolvedValue({
+      status: "ok",
+      data: { mic_rms: 0, system_rms: 0 },
+    }),
+    getAutostartEnabled: vi
+      .fn()
+      .mockResolvedValue({ status: "ok", data: false }),
+    setAutostartEnabled: vi
+      .fn()
+      .mockResolvedValue({ status: "ok", data: null }),
+    showOverlayPanel: vi
+      .fn()
+      .mockResolvedValue({ status: "ok", data: null }),
+    hideOverlayPanel: vi
+      .fn()
+      .mockResolvedValue({ status: "ok", data: null }),
+    getRecentLogs: vi.fn().mockResolvedValue({ status: "ok", data: [] }),
+    clearLogs: vi.fn().mockResolvedValue({ status: "ok", data: null }),
+    getLogDir: vi.fn().mockResolvedValue({ status: "ok", data: "/mock/logs" }),
+    revealLogDir: vi.fn().mockResolvedValue({ status: "ok", data: null }),
   },
 });

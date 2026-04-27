@@ -15,7 +15,7 @@
         "folder_id": null,
         "is_pinned": 1,
         "pinned_at": "2026-04-10T10:00:00",
-        "session_type": "recording",
+        "session_type": "transcription",
         "wav_file_path": null,
         "wav_duration_seconds": null,
         "sort_order": 0

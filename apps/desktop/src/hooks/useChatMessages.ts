@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, useCallback } from "react";
+import { useState, useRef, useEffect, useCallback, useMemo } from "react";
 import type { AIContextValue } from "@/lib/ai-context";
 import { assembleFolderTreeForActions } from "@/lib/ai-context";
 import type { ChatMessage, FileAttachment, ToolExecution } from "@/lib/ai";
@@ -169,7 +169,9 @@ export function useChatMessages(
   const activeConfig = getActiveConfig(aiSettings);
 
   const contextKey = ctx?.contextKey ?? "";
-  const sources = ctx?.sources ?? [];
+  // Memoize the empty fallback so identity is stable across renders — without
+  // this `[] !== []` makes every render bust the useCallback deps below.
+  const sources = useMemo(() => ctx?.sources ?? [], [ctx?.sources]);
   const ctxTools = ctx?.tools;
   const buildSystemPrompt = ctx?.buildSystemPrompt;
   const isSessionContext = ctx?.isSessionContext ?? false;
