@@ -305,6 +305,12 @@ struct TranscriptionContext {
     /// `session_offset_base_seconds` this gives "session-time now" for lag
     /// calculations: lag = (offset_base + start.elapsed()) - latest_completed_audio_offset.
     session_start_instant: Instant,
+    /// Engine-conditional configuration resolved once when the session
+    /// starts. Live loop, `transcribe_chunk`, and `run_prompt_decay`
+    /// consult this instead of branching on `EngineKind` at every site.
+    /// `Arc` so the cheap `Clone` on `TranscriptionContext` doesn't
+    /// re-allocate the underlying tuning struct.
+    engine_profile: Arc<EngineProfile>,
 }
 
 /// Result of transcribing a single chunk.
@@ -601,34 +607,66 @@ struct VadTuning {
     pre_roll: Duration,
 }
 
-fn vad_tuning_for(
+/// Engine-conditional configuration consolidated into a single value
+/// resolved once at session start. The live loop and `transcribe_chunk`
+/// consult this instead of re-deriving from `EngineKind` at every site —
+/// keeps the path clean of `match engine_kind` sprawl as the upcoming
+/// queue / watchdog / repair stages add more engine-aware behavior.
+#[derive(Debug, Clone)]
+struct EngineProfile {
+    /// Underlying engine identity. Kept here so call sites that need the
+    /// raw enum (hallucination filtering, IPC requests) don't have to pass
+    /// it separately alongside the profile.
+    engine_kind: yapstack_common::types::EngineKind,
+    /// Display name for telemetry surfaces — `"Whisper"` / `"Parakeet"`.
+    engine_name: &'static str,
+    /// Per-source VAD timing + thresholds.
+    vad_tuning: VadTuning,
+    /// Whisper's whisper-rs decoder consumes `initial_prompt` (vocabulary
+    /// hints + rolling accumulated_text); Parakeet TDT's decoder ignores
+    /// any text prompt. Drives prompt-context build / decay sites so
+    /// neither engine has to be matched on directly.
+    uses_initial_prompt: bool,
+}
+
+fn profile_for(
     engine: yapstack_common::types::EngineKind,
     config: &LiveTranscriptionConfig,
-) -> VadTuning {
+) -> EngineProfile {
     use yapstack_common::types::EngineKind;
     match engine {
         // Whisper: preserve existing dictation-proven *timing* exactly.
         // Silence window honors the user's `silence_duration_ms` (frontend
         // default 800 ms); 300 ms poll cadence; no pre-roll. Only the
         // detector swaps RMS → Silero — all timing constants stay put.
-        EngineKind::Whisper => VadTuning {
-            speech_threshold: SPEECH_THRESHOLD,
-            offset_threshold_ratio: SILENCE_THRESHOLD / SPEECH_THRESHOLD,
-            silence_duration: Duration::from_millis(config.silence_duration_ms as u64),
-            max_chunk_duration: Duration::from_secs_f32(config.max_chunk_seconds),
-            poll_interval: Duration::from_millis(POLL_INTERVAL_MS),
-            pre_roll: Duration::ZERO,
+        EngineKind::Whisper => EngineProfile {
+            engine_kind: engine,
+            engine_name: "Whisper",
+            vad_tuning: VadTuning {
+                speech_threshold: SPEECH_THRESHOLD,
+                offset_threshold_ratio: SILENCE_THRESHOLD / SPEECH_THRESHOLD,
+                silence_duration: Duration::from_millis(config.silence_duration_ms as u64),
+                max_chunk_duration: Duration::from_secs_f32(config.max_chunk_seconds),
+                poll_interval: Duration::from_millis(POLL_INTERVAL_MS),
+                pre_roll: Duration::ZERO,
+            },
+            uses_initial_prompt: true,
         },
         // Parakeet: dialogue-aggressive. Ignores frontend silence / chunk /
         // poll knobs — those are engine-specific best practice, not
         // user-facing tuning. See live_transcription docs for rationale.
-        EngineKind::Parakeet => VadTuning {
-            speech_threshold: SPEECH_THRESHOLD,
-            offset_threshold_ratio: SILENCE_THRESHOLD / SPEECH_THRESHOLD,
-            silence_duration: Duration::from_millis(200),
-            max_chunk_duration: Duration::from_secs(10),
-            poll_interval: Duration::from_millis(100),
-            pre_roll: Duration::from_millis(250),
+        EngineKind::Parakeet => EngineProfile {
+            engine_kind: engine,
+            engine_name: "Parakeet",
+            vad_tuning: VadTuning {
+                speech_threshold: SPEECH_THRESHOLD,
+                offset_threshold_ratio: SILENCE_THRESHOLD / SPEECH_THRESHOLD,
+                silence_duration: Duration::from_millis(200),
+                max_chunk_duration: Duration::from_secs(10),
+                poll_interval: Duration::from_millis(100),
+                pre_roll: Duration::from_millis(250),
+            },
+            uses_initial_prompt: false,
         },
     }
 }
@@ -1941,26 +1979,10 @@ async fn live_transcription_loop(
     let check_mic = matches!(source, CaptureSource::MicOnly | CaptureSource::Mixed);
     let check_system = matches!(source, CaptureSource::SystemOnly | CaptureSource::Mixed);
 
-    // Resolve engine-keyed VAD tuning once at loop entry. Whisper uses the
-    // frontend-supplied silence_duration_ms / poll cadence; Parakeet uses its
-    // dialogue-tuned defaults (200 ms silence, 100 ms poll, 250 ms pre-roll,
-    // 10 s max chunk).
-    let engine_kind = {
-        let client_guard = ctx.transcription_client.lock().await;
-        client_guard
-            .as_ref()
-            .map(|c| c.as_ref().engine())
-            .unwrap_or(yapstack_common::types::EngineKind::Whisper)
-    };
-    let tuning = vad_tuning_for(engine_kind, &ctx.config);
-    debug!(
-        engine = engine_kind.as_str(),
-        silence_ms = tuning.silence_duration.as_millis() as u64,
-        poll_ms = tuning.poll_interval.as_millis() as u64,
-        pre_roll_ms = tuning.pre_roll.as_millis() as u64,
-        offset_ratio = tuning.offset_threshold_ratio,
-        "live transcription VAD tuning resolved"
-    );
+    // VAD tuning resolved at session start (see start_live_transcription)
+    // and shared via `ctx.engine_profile`. Re-bind locally so the rest of
+    // the loop body can keep its existing `tuning.*` field accesses.
+    let tuning = ctx.engine_profile.vad_tuning;
 
     let (mut sources, backfill_audio) = build_initial_sources_and_backfill(
         &audio_state,
@@ -3131,13 +3153,17 @@ async fn transcribe_chunk(
             return TranscribeOutcome::SidecarDead;
         }
     };
-    let engine_kind = client.engine();
     // initial_prompt is Whisper-only — Parakeet's TDT decoder has no text-prompt
     // input, so passing it would just be ignored. Drop it explicitly so the IPC
-    // payload is honest about what was sent.
-    let prompt_for_engine = match engine_kind {
-        yapstack_common::types::EngineKind::Whisper => effective_prompt.as_deref(),
-        yapstack_common::types::EngineKind::Parakeet => None,
+    // payload is honest about what was sent. Engine identity comes from the
+    // session-resolved profile so we don't have to re-read `client.engine()`
+    // and so future engines can opt in via a single boolean.
+    let profile = ctx.engine_profile.as_ref();
+    let engine_kind = profile.engine_kind;
+    let prompt_for_engine = if profile.uses_initial_prompt {
+        effective_prompt.as_deref()
+    } else {
+        None
     };
     let wall_start = Instant::now();
     let transcription_result = client
@@ -3173,10 +3199,7 @@ async fn transcribe_chunk(
             chunk_audio_seconds: chunk_duration,
             wall_ms,
             rtfx,
-            engine: match engine_kind {
-                yapstack_common::types::EngineKind::Whisper => "Whisper".to_string(),
-                yapstack_common::types::EngineKind::Parakeet => "Parakeet".to_string(),
-            },
+            engine: profile.engine_name.to_string(),
             is_backfill: input.is_backfill,
             lag_seconds,
         },
@@ -3660,6 +3683,20 @@ pub async fn start_live_transcription(
     ));
 
     let session_start_instant = Instant::now();
+    // Resolve the engine profile once at session start using the live
+    // client. After this point, neither the live loop nor `transcribe_chunk`
+    // need to re-read `client.engine()` to discover engine-specific
+    // behavior — they consult `ctx.engine_profile` instead.
+    let engine_profile = Arc::new(profile_for(extracted_client.engine(), &config));
+    debug!(
+        engine = engine_profile.engine_name,
+        silence_ms = engine_profile.vad_tuning.silence_duration.as_millis() as u64,
+        poll_ms = engine_profile.vad_tuning.poll_interval.as_millis() as u64,
+        pre_roll_ms = engine_profile.vad_tuning.pre_roll.as_millis() as u64,
+        max_chunk_secs = engine_profile.vad_tuning.max_chunk_duration.as_secs_f32(),
+        uses_initial_prompt = engine_profile.uses_initial_prompt,
+        "live transcription engine profile resolved"
+    );
     let ctx = TranscriptionContext {
         transcription_client: Arc::new(Mutex::new(Some(extracted_client))),
         shared_transcription_state: transcription_state_clone,
@@ -3669,6 +3706,7 @@ pub async fn start_live_transcription(
         vocabulary_hints: vocab_hints.clone(),
         session_offset_base_seconds,
         session_start_instant,
+        engine_profile,
     };
 
     let counters = Arc::new(StdMutex::new(SessionCounters {
@@ -4138,7 +4176,7 @@ mod tests {
         let mut cfg = dummy_config();
         cfg.silence_duration_ms = 600;
         cfg.max_chunk_seconds = 25.0;
-        let t = vad_tuning_for(EngineKind::Whisper, &cfg);
+        let t = profile_for(EngineKind::Whisper, &cfg).vad_tuning;
         assert_eq!(t.silence_duration, Duration::from_millis(600));
         assert_eq!(t.max_chunk_duration, Duration::from_secs_f32(25.0));
         assert!((t.speech_threshold - 0.5).abs() < 1e-6);
@@ -4154,7 +4192,7 @@ mod tests {
         // frontend, Parakeet uses its dialogue-aggressive defaults.
         use yapstack_common::types::EngineKind;
         let cfg = dummy_config();
-        let t = vad_tuning_for(EngineKind::Parakeet, &cfg);
+        let t = profile_for(EngineKind::Parakeet, &cfg).vad_tuning;
         assert_eq!(
             t.silence_duration,
             Duration::from_millis(200),
@@ -4183,7 +4221,7 @@ mod tests {
     fn poll_vad_enters_speaking_within_a_single_poll_batch() {
         use yapstack_common::types::EngineKind;
         let cfg = dummy_config();
-        let tuning = vad_tuning_for(EngineKind::Parakeet, &cfg);
+        let tuning = profile_for(EngineKind::Parakeet, &cfg).vad_tuning;
         let mut state = SourceVadState::new(AudioSourceLabel::Mic, 0, 0, 48000, 1);
 
         // Simulate one 100 ms Parakeet poll containing: silence → loud →
@@ -4220,7 +4258,7 @@ mod tests {
     fn backfill_chunks_do_not_overlap_when_gap_shorter_than_pre_roll() {
         use yapstack_common::types::EngineKind;
         let cfg = dummy_config();
-        let tuning = vad_tuning_for(EngineKind::Parakeet, &cfg);
+        let tuning = profile_for(EngineKind::Parakeet, &cfg).vad_tuning;
         assert_eq!(tuning.pre_roll, Duration::from_millis(250));
         assert_eq!(tuning.silence_duration, Duration::from_millis(200));
 
