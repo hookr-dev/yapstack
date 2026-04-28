@@ -8,6 +8,13 @@
   Real-time audio capture & transcription for your desktop. On-device. Open source.
 </p>
 
+<p align="center">
+  <a href="https://github.com/hookr-dev/YapStack/actions/workflows/ci.yml"><img src="https://github.com/hookr-dev/YapStack/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/hookr-dev/YapStack/releases"><img src="https://img.shields.io/github/v/release/hookr-dev/YapStack?include_prereleases&sort=semver" alt="Latest release"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-AGPL_v3-blue.svg" alt="License: AGPL v3"></a>
+  <a href="CONTRIBUTING.md"><img src="https://img.shields.io/badge/PRs-welcome-brightgreen.svg" alt="PRs welcome"></a>
+</p>
+
 ---
 
 > [!WARNING]
@@ -157,9 +164,9 @@ Detailed docs under [`docs/`](docs/):
 
 ## Contributing
 
-PRs welcome. Run `pnpm check` before submitting (Rust fmt + clippy + tests, frontend typecheck + lint + vitest). See [`docs/PRINCIPLES.md`](docs/PRINCIPLES.md) for the design and testing posture, and [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md) for build details (including local Windows builds for the curious).
+PRs welcome. See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the full workflow, [`docs/PRINCIPLES.md`](docs/PRINCIPLES.md) for design and testing posture, and [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md) for build details (including local Windows builds for the curious).
 
-User-visible changes should include a corresponding entry in [`CHANGELOG.md`](CHANGELOG.md) under `## [Unreleased]`.
+This project follows the [Contributor Covenant Code of Conduct](CODE_OF_CONDUCT.md). Security issues should be reported per [`SECURITY.md`](SECURITY.md), not as public issues.
 
 ## License
 
