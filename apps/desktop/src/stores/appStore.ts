@@ -1265,42 +1265,97 @@ function createAppStore() {
           if (settings.selectedEngine === "Parakeet") {
             // Parakeet path
             //
-            // Coerce the persisted variant to whatever the host can run.
-            // The backend resolves TdtV3 vs TdtV3Int8 from `cfg!` flags so
-            // the FE never duplicates that logic. Running every launch
-            // (cheap no-op when already correct) is more reliable than a
-            // one-shot persist migration — backend probes don't fit into
-            // the sync `migrate` callback. If the command fails (rare race
-            // during hydration) we keep the existing variant; the flow
-            // below downloads/inits whatever's selected and the next
-            // autoSetup pass corrects it.
-            const recommendedRes = await commands.getRecommendedParakeetVariant();
-            if (
-              recommendedRes.status === "ok" &&
-              recommendedRes.data !== settings.selectedParakeetVariant
-            ) {
-              get().updateSettings({ selectedParakeetVariant: recommendedRes.data });
-            }
+            // Variant resolution is driven by the backend's
+            // `recommended_for_host()` (cfg-driven, deterministic per
+            // machine). For the post-update upgrade case — Apple Silicon
+            // users sitting on `TdtV3` because that was the only variant
+            // pre-int8 — we want to download `TdtV3Int8` AND keep the old
+            // bundle as a safety net so an offline launch / dropped
+            // download doesn't strand the user with a working model on
+            // disk that we ignored.
+            //
+            // Order: refresh state first, then decide which variant to
+            // load this launch.
             await get().refreshParakeetModels();
             await get().refreshSortformerStatus();
-            const variant = get().settings.selectedParakeetVariant;
-            const ready = get().parakeetModels.find(
-              (m) => m.variant === variant && m.downloaded,
+
+            const recommendedRes =
+              await commands.getRecommendedParakeetVariant();
+            const recommended =
+              recommendedRes.status === "ok" ? recommendedRes.data : null;
+
+            const downloadedVariants = get().parakeetModels.filter(
+              (m) => m.downloaded,
             );
-            if (!ready) {
-              set({ enginePhase: "downloading", modelDownloadProgress: 0 });
-              const dl = await commands.downloadParakeetModel(variant);
-              if (dl.status === "error") {
-                trackEngineError({ error: dl.error.message, phase: "downloading" });
-                set({
-                  enginePhase: "error",
-                  engineError: dl.error.message,
-                  modelDownloadProgress: null,
-                });
-                return;
+            const recommendedDownloaded =
+              recommended &&
+              downloadedVariants.some((m) => m.variant === recommended);
+            // Any non-recommended variant that's already on disk — the
+            // user's "previous bundle" if we're mid-upgrade. Used as the
+            // fallback target when a recommended-variant download fails.
+            const legacyFallback =
+              downloadedVariants.find((m) => m.variant !== recommended)
+                ?.variant ?? null;
+
+            let variant = settings.selectedParakeetVariant;
+
+            if (recommendedDownloaded) {
+              // Recommended is already on disk. Use it directly.
+              variant = recommended!;
+            } else if (recommended) {
+              // Need to download the recommended variant. If the user
+              // already has another variant downloaded (the upgrade
+              // case), surface a one-time toast so they know why a
+              // fresh download is happening right after the app update.
+              if (legacyFallback) {
+                toast.info(
+                  "Upgrading Parakeet to the optimized model for your Mac. Downloading…",
+                  {
+                    id: "parakeet-variant-upgrade",
+                    duration: 10000,
+                  },
+                );
               }
+              set({ enginePhase: "downloading", modelDownloadProgress: 0 });
+              const dl = await commands.downloadParakeetModel(recommended);
               set({ modelDownloadProgress: null });
-              await get().refreshParakeetModels();
+
+              if (dl.status === "error") {
+                if (legacyFallback) {
+                  // Keep the user working on the bundle they already
+                  // have. Surface a warning so they know the upgrade
+                  // didn't take and can retry next launch.
+                  toast.warning(
+                    "Couldn't download the optimized Parakeet model. Continuing with the existing bundle.",
+                    {
+                      id: "parakeet-variant-upgrade",
+                      duration: 8000,
+                    },
+                  );
+                  variant = legacyFallback;
+                } else {
+                  // No fallback on disk → first-install error path.
+                  trackEngineError({
+                    error: dl.error.message,
+                    phase: "downloading",
+                  });
+                  set({
+                    enginePhase: "error",
+                    engineError: dl.error.message,
+                  });
+                  return;
+                }
+              } else {
+                await get().refreshParakeetModels();
+                variant = recommended;
+              }
+            }
+
+            // Persist whichever variant we ended up using so StatusPopover,
+            // pressure-event tagging, and the next autoSetup pass all see
+            // a coherent view.
+            if (variant !== settings.selectedParakeetVariant) {
+              get().updateSettings({ selectedParakeetVariant: variant });
             }
 
             // Sortformer download is lazy — only when diarization is on.
