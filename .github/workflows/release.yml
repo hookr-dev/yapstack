@@ -97,7 +97,7 @@ jobs:
           cat checksums-macos.txt
 
       - name: Upload artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: macos-dmg
           path: |
@@ -105,7 +105,7 @@ jobs:
             target/aarch64-apple-darwin/release/bundle/dmg/checksums-macos.txt
 
       - name: Upload updater artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: macos-updater
           path: |
