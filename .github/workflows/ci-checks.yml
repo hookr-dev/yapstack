@@ -27,6 +27,18 @@ jobs:
   rust:
     name: Rust (macos-latest)
     runs-on: macos-latest
+    # whisper-rs-sys bundles whisper.cpp; on Apple Silicon (macos-latest)
+    # ggml-cpu's ARM quants.c uses `vmmlaq_s32`, which requires the i8mm
+    # target feature. The bundled cmake build doesn't auto-enable it on
+    # plain `cargo build`, so the C compiler errors with:
+    #   error: always_inline function 'vmmlaq_s32' requires target feature 'i8mm'
+    # Setting CFLAGS / CXXFLAGS to `-march=native` lets clang detect and
+    # enable i8mm (and dotprod, etc.) on the runner. release.yml dodges
+    # this by building with `--target aarch64-apple-darwin --features
+    # whisper,parakeet,metal,...`, which routes through different paths.
+    env:
+      CFLAGS: "-march=native"
+      CXXFLAGS: "-march=native"
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
