@@ -5,59 +5,76 @@
 <h1 align="center">YapStack</h1>
 
 <p align="center">
-  Real-time audio capture & transcription for your desktop.
+  Real-time audio capture & transcription for your desktop. On-device. Open source.
 </p>
 
 ---
 
-YapStack is a privacy-first desktop app that captures mic and system audio, transcribes it locally using [Whisper](https://github.com/ggerganov/whisper.cpp), and organizes everything into searchable, editable notes. All processing happens on-device — nothing leaves your machine.
+> [!WARNING]
+> **YapStack v1.0.0-alpha.5 — first public alpha release (2026-04-28).** Officially supported on macOS (Apple Silicon recommended). Builds on Intel Macs and Windows are experimental — see [Platform Support](#platform-support) below. Schema and APIs may evolve; pin a tag for any serious use.
 
-<!-- TODO: Add screenshot/demo GIF here -->
+> [!NOTE]
+> **Vibe-coded with AI assistance.** YapStack is built using AI pair-programming as a first-class part of the workflow, and we plan to keep iterating that way. Contributions are welcome — your prompts, enhancements, modifications, and PRs back into the project. Bring whatever tools you want; we care about correctness, design clarity, and tests, not provenance.
 
-## Features
+YapStack is a privacy-first desktop app that captures mic and system audio, transcribes it locally using [Whisper](https://github.com/ggerganov/whisper.cpp) or [Parakeet TDT](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3), and organizes everything into searchable, editable notes. All processing happens on-device — nothing leaves your machine.
 
-### Never Miss a Word
+## Highlights
+
+### Never miss a word
 
 Always-on ring buffer (up to 5 min) captures audio before you hit record. Start a session and rewind to grab what you missed. Backfill transcribes retroactively while live transcription continues in parallel.
 
-### Real-Time Transcription
+### Real-time transcription
 
-Local Whisper inference with per-source VAD, hallucination filtering, and prompt context for continuity. All on-device.
+Choose between **Whisper** (Metal-accelerated, broad language support) and **Parakeet TDT v3** (NVIDIA, faster on Apple Silicon via WebGPU + int8). Per-source VAD, hallucination filtering, two-tier prompt context for continuity. All on-device.
 
-### Full Audio Capture
+### Speaker diarization
+
+Optional multi-speaker labeling via Sortformer (Parakeet only). Rename `Speaker 1` / `Speaker 2` to whatever fits the meeting.
+
+### Full audio capture
 
 Sessions stream to WAV incrementally. Play back at 6 speeds (0.5×–2×) with seeking. Click any transcript timestamp to jump to that moment.
 
-### Voice Dictation
+### Voice dictation
 
 Global shortcut-driven dictation with deep customization:
 
-- **Multiple slots** — Named slots with custom global keybinds
-- **Activation modes** — Hold-to-talk or toggle
-- **AI processing** — Per-slot system prompts to transform speech (e.g. "Clean & Focus", "Create Spec")
-- **Output actions** — Paste into active app, copy to clipboard, or create a new note
-- **Status bubble** — Floating overlay (listening → transcribing → processing → done)
-- **History** — Past dictations grouped by day with audio replay
+- **Multiple slots** — Named slots with custom global keybinds.
+- **Activation modes** — Hold-to-talk or toggle.
+- **AI processing** — Per-slot system prompts to transform speech (e.g. "Clean & Focus", "Create Spec").
+- **Output actions** — Paste into active app, copy to clipboard, or create a new note.
+- **Status bubble** — Floating overlay (listening → transcribing → processing → done).
+- **History** — Past dictations grouped by day with audio replay.
 
-### AI Session Chat
+### AI session chat
 
-Per-session chat with tool calling: rename, pin, save to notes — each with 10s undo. AI cites transcript segments as clickable timestamp chips.
+Per-session chat with tool calling: rename, pin, save to notes, tag, organize into folders — each with 10s undo. AI cites transcript segments as clickable timestamp chips.
 
-### Rich Notes Editor
+### Rich notes editor
 
 Tiptap split-pane editor alongside the transcript. Version history with restore.
 
-### Mic + System Audio
+### Mic + system audio
 
 Capture mic, system audio, or both. Independent per-source VAD. Stream health monitoring with auto-restart (up to 3 attempts).
 
-### Organization & Search
+### Organization & search
 
 Folders with icons and colors, pinning, drag-and-drop sorting, Cmd+K search across sessions, notes, and segments.
 
-### Desktop Integration
+### Desktop integration
 
-System tray with quick actions. Fully customizable global shortcuts. Recording indicator overlay. Close-to-minimize. macOS + Windows.
+System tray with quick actions. Fully customizable global shortcuts. Recording indicator overlay. Close-to-minimize.
+
+## Platform Support
+
+| Platform              | Status                  | Notes |
+|-----------------------|-------------------------|-------|
+| macOS (Apple Silicon) | ✅ Officially supported | Primary target. Metal acceleration for Whisper, WebGPU + int8 Parakeet. |
+| macOS (Intel)         | ⚠️ Best-effort           | Builds, but reduced performance and limited testing. |
+| Windows               | 🧪 Experimental          | **Not officially supported.** CI/CD does not produce Windows builds. CUDA support exists in code; you may build and run locally at your own discretion. Official Windows support is planned for a future release. |
+| Linux                 | ❌ Not yet               | No current build target. |
 
 ## Getting Started
 
@@ -113,7 +130,7 @@ Tauri v2 app with a Rust backend and React frontend. Five crates handle distinct
 | `yapstack-common` | Shared types, config, audio utilities |
 | `yapstack-audio` | Lock-free ring buffers, mic/system capture, WAV export |
 | `yapstack-transcription` | Model management, sidecar IPC |
-| `yapstack-sidecar` | Standalone Whisper inference binary |
+| `yapstack-sidecar` | Standalone Whisper / Parakeet inference binary |
 | `yapstack-desktop` | Tauri command layer, live transcription controller |
 
 Detailed docs under [`docs/`](docs/):
@@ -122,7 +139,7 @@ Detailed docs under [`docs/`](docs/):
 - [`API_REFERENCE.md`](docs/API_REFERENCE.md) — Rust library + Tauri command signatures.
 - [`DEVELOPMENT.md`](docs/DEVELOPMENT.md) — build, feature flags, test setup.
 - [`FRONTEND.md`](docs/FRONTEND.md) — Tailwind tokens, shadcn inventory, framework stack, shortcuts, UX patterns.
-- [`AI_CONTEXT.md`](docs/AI_CONTEXT.md) — AI chat context, tool registry + how to add a tool, folders, pending tags schema.
+- [`AI_CONTEXT.md`](docs/AI_CONTEXT.md) — AI chat context, tool registry + how to add a tool.
 - [`PRINCIPLES.md`](docs/PRINCIPLES.md) — design, testing, and coding posture.
 - [`LOCAL_LLM.md`](docs/LOCAL_LLM.md) — llama.cpp, LM Studio, Ollama integration.
 - [`IMPLEMENTATION_LOG.md`](docs/IMPLEMENTATION_LOG.md) — phase-by-phase build history.
@@ -134,4 +151,16 @@ Detailed docs under [`docs/`](docs/):
 - [React 19](https://react.dev) + TypeScript — frontend UI
 - [SQLite](https://sqlite.org) — session, note, and folder persistence
 - [Whisper.cpp](https://github.com/ggerganov/whisper.cpp) — on-device speech recognition
+- [Parakeet TDT v3](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3) — NVIDIA TDT speech recognition (alternative engine)
+- [ONNX Runtime](https://onnxruntime.ai) — Parakeet inference + WebGPU/CoreML execution
 - [Tiptap](https://tiptap.dev) — rich text editor
+
+## Contributing
+
+PRs welcome. Run `pnpm check` before submitting (Rust fmt + clippy + tests, frontend typecheck + lint + vitest). See [`docs/PRINCIPLES.md`](docs/PRINCIPLES.md) for the design and testing posture, and [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md) for build details (including local Windows builds for the curious).
+
+User-visible changes should include a corresponding entry in [`CHANGELOG.md`](CHANGELOG.md) under `## [Unreleased]`.
+
+## License
+
+YapStack is licensed under the [GNU Affero General Public License v3.0](LICENSE). You can use, modify, and redistribute it under those terms; if you run YapStack as a network service, you must make your modifications available under the same license.

@@ -1,6 +1,11 @@
 {
   "name": "yapstack",
   "private": true,
+  "license": "AGPL-3.0-only",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hookr-dev/YapStack.git"
+  },
   "scripts": {
     "dev": "pnpm --filter @yapstack/desktop build:sidecar:dev && pnpm --filter @yapstack/desktop dev:tauri",
     "dev:frontend": "pnpm --filter @yapstack/desktop dev",
