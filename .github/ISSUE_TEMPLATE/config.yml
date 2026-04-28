@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/hookr-dev/YapStack/security/advisories/new
+    about: Report security issues privately. Do not file them as public issues.
+  - name: Question or discussion
+    url: https://github.com/hookr-dev/YapStack/discussions
+    about: For questions, ideas, and general discussion — please use Discussions instead of opening an issue.

@@ -1,0 +1,102 @@
+name: Bug report
+description: Report a bug or unexpected behavior in YapStack.
+title: "[Bug]: "
+labels: ["bug", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug report. The more detail you can provide, the faster we can fix it.
+
+        **Before opening:**
+        - Please search [existing issues](https://github.com/hookr-dev/YapStack/issues?q=is%3Aissue) to avoid duplicates.
+        - For security vulnerabilities, see [SECURITY.md](https://github.com/hookr-dev/YapStack/blob/main/SECURITY.md) — do **not** report them here.
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: A clear, concise description of what the bug is.
+      placeholder: When I do X, Y happens instead of Z.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description: Numbered steps that reliably trigger the bug.
+      placeholder: |
+        1. Open YapStack
+        2. Click ...
+        3. Observe ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options:
+        - macOS (Apple Silicon)
+        - macOS (Intel)
+        - Windows (experimental local build)
+        - Linux (unsupported)
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: YapStack version
+      description: Find this in Settings → General, or the app's About menu.
+      placeholder: "1.0.0-alpha.5"
+    validations:
+      required: true
+
+  - type: input
+    id: os-version
+    attributes:
+      label: OS version
+      placeholder: "macOS 14.4"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: engine
+    attributes:
+      label: Transcription engine in use
+      options:
+        - Whisper
+        - Parakeet TDT v3
+        - Both / N/A
+        - Not sure
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs / error output
+      description: |
+        Copy any relevant log lines from Settings → General → Logs, or paste console output.
+        Redact anything sensitive.
+      render: shell
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Additional context
+      description: Screenshots, recordings, hardware notes, anything else that helps.
