@@ -237,10 +237,14 @@ export function StatusPopover() {
     : null;
   const sourceLabel = SOURCE_LABELS_FULL[captureSource];
 
+  // Parakeet variants intentionally collapse to one user-facing label —
+  // int8 vs fp32 is an implementation detail driven by host capability,
+  // not a user-visible choice.
   const modelLabel =
     selectedEngine === "Whisper"
       ? selectedModelSize
-      : selectedParakeetVariant === "TdtV3"
+      : selectedParakeetVariant === "TdtV3" ||
+          selectedParakeetVariant === "TdtV3Int8"
         ? "TDT v3"
         : selectedParakeetVariant;
 

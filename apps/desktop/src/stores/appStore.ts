@@ -1252,9 +1252,26 @@ function createAppStore() {
 
           if (settings.selectedEngine === "Parakeet") {
             // Parakeet path
+            //
+            // Coerce the persisted variant to whatever the host can run.
+            // The backend resolves TdtV3 vs TdtV3Int8 from `cfg!` flags so
+            // the FE never duplicates that logic. Running every launch
+            // (cheap no-op when already correct) is more reliable than a
+            // one-shot persist migration — backend probes don't fit into
+            // the sync `migrate` callback. If the command fails (rare race
+            // during hydration) we keep the existing variant; the flow
+            // below downloads/inits whatever's selected and the next
+            // autoSetup pass corrects it.
+            const recommendedRes = await commands.getRecommendedParakeetVariant();
+            if (
+              recommendedRes.status === "ok" &&
+              recommendedRes.data !== settings.selectedParakeetVariant
+            ) {
+              get().updateSettings({ selectedParakeetVariant: recommendedRes.data });
+            }
             await get().refreshParakeetModels();
             await get().refreshSortformerStatus();
-            const variant = settings.selectedParakeetVariant;
+            const variant = get().settings.selectedParakeetVariant;
             const ready = get().parakeetModels.find(
               (m) => m.variant === variant && m.downloaded,
             );
