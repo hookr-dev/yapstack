@@ -54,6 +54,11 @@ pub enum EngineKindDto {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
 pub enum ParakeetVariantDto {
     TdtV3,
+    /// int8-quantized variant — same model, smaller footprint, no
+    /// external `.onnx.data` so accelerators can load it. Used on
+    /// Apple Silicon by default; the FE migration coerces existing
+    /// `TdtV3` users on Apple Silicon to this variant on next launch.
+    TdtV3Int8,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
@@ -133,6 +138,7 @@ impl From<ParakeetVariantDto> for ParakeetVariant {
     fn from(v: ParakeetVariantDto) -> Self {
         match v {
             ParakeetVariantDto::TdtV3 => ParakeetVariant::TdtV3,
+            ParakeetVariantDto::TdtV3Int8 => ParakeetVariant::TdtV3Int8,
         }
     }
 }
@@ -141,6 +147,7 @@ impl From<ParakeetVariant> for ParakeetVariantDto {
     fn from(v: ParakeetVariant) -> Self {
         match v {
             ParakeetVariant::TdtV3 => ParakeetVariantDto::TdtV3,
+            ParakeetVariant::TdtV3Int8 => ParakeetVariantDto::TdtV3Int8,
         }
     }
 }

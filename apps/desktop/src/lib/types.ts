@@ -537,7 +537,14 @@ export type MixConfigDto = { mic_gain: number; system_gain: number; normalize: b
 export type ModelInfoDto = { size: ModelSizeDto; downloaded: boolean; path: string | null; display_name: string; approximate_size_bytes: number }
 export type ModelSizeDto = "Tiny" | "Base" | "Small" | "Medium"
 export type ParakeetModelInfoDto = { variant: ParakeetVariantDto; downloaded: boolean; display_name: string; approximate_size_bytes: number }
-export type ParakeetVariantDto = "TdtV3"
+export type ParakeetVariantDto = "TdtV3" | 
+/**
+ * int8-quantized variant — same model, smaller footprint, no
+ * external `.onnx.data` so accelerators can load it. Used on
+ * Apple Silicon by default; the FE migration coerces existing
+ * `TdtV3` users on Apple Silicon to this variant on next launch.
+ */
+"TdtV3Int8"
 export type PermissionStatusDto = "Granted" | "Denied" | "NotDetermined" | "Unavailable"
 export type ResumeConfig = { 
 /**

@@ -87,15 +87,41 @@ const VAD_MODEL_SIZE_BYTES: u64 = 885_000;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ParakeetVariant {
     /// nvidia/parakeet-tdt-0.6b-v3 (multilingual, 25 European languages),
-    /// repackaged to ONNX by `istupakov` on HuggingFace.
+    /// repackaged to ONNX by `istupakov` on HuggingFace. fp32 weights — the
+    /// encoder ships a 2.4 GB external `.onnx.data` blob which prevents
+    /// CoreML EP from loading the model. Default outside Apple Silicon;
+    /// on Windows we keep this variant pending CUDA EP support.
     TdtV3,
+    /// int8-quantized variant of the same `nvidia/parakeet-tdt-0.6b-v3`
+    /// model, also from `istupakov`. Single-file inlined ONNX bundles —
+    /// no `.onnx.data` external initializer, so accelerators can load
+    /// the encoder. Published GPU benchmarks show INT8/FP16/FP32 hit
+    /// identical accuracy on LibriSpeech (97.84%) and indistinguishable
+    /// WER on the leaderboard (15.72–15.77%); RNN-T joint decisions are
+    /// driven by relative logit magnitudes so quantization doesn't change
+    /// argmax decoding. Default on Apple Silicon.
+    TdtV3Int8,
 }
 
 impl ParakeetVariant {
+    /// The variant we should pick at install time for the current host.
+    /// Apple Silicon runs the int8 bundle so accelerators (WebGPU today,
+    /// CoreML if upstream lands static-shape conversion) can load it; all
+    /// other targets stay on the fp32 bundle until their own GPU path
+    /// arrives (Windows CUDA in a follow-up).
+    pub fn recommended_for_host() -> Self {
+        if cfg!(target_os = "macos") && cfg!(target_arch = "aarch64") {
+            ParakeetVariant::TdtV3Int8
+        } else {
+            ParakeetVariant::TdtV3
+        }
+    }
+
     /// Subdirectory under `$APP_DATA_DIR/models/` where this variant's files live.
     pub fn dir_name(&self) -> &'static str {
         match self {
             ParakeetVariant::TdtV3 => "parakeet-tdt-v3",
+            ParakeetVariant::TdtV3Int8 => "parakeet-tdt-v3-int8",
         }
     }
 
@@ -126,6 +152,32 @@ impl ParakeetVariant {
                     32_000,
                 ),
             ],
+            // Sizes verified against the HF tree (Apr 2026): encoder ~652 MB,
+            // decoder ~18 MB, preprocessor ~140 KB, vocab ~94 KB. The
+            // sub-MB values double as Content-Length fallbacks; HF returns
+            // accurate Content-Length so they're rarely consulted.
+            ParakeetVariant::TdtV3Int8 => &[
+                (
+                    "encoder-model.int8.onnx",
+                    "https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/resolve/main/encoder-model.int8.onnx",
+                    683_700_000,
+                ),
+                (
+                    "decoder_joint-model.int8.onnx",
+                    "https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/resolve/main/decoder_joint-model.int8.onnx",
+                    19_100_000,
+                ),
+                (
+                    "nemo128.onnx",
+                    "https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/resolve/main/nemo128.onnx",
+                    150_000,
+                ),
+                (
+                    "vocab.txt",
+                    "https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/resolve/main/vocab.txt",
+                    96_000,
+                ),
+            ],
         }
     }
 
@@ -133,14 +185,20 @@ impl ParakeetVariant {
         self.files().iter().map(|(_, _, s)| s).sum()
     }
 
+    /// User-facing label. Both variants intentionally report the same
+    /// model identity (`Parakeet TDT v3`) — the int8 vs fp32 split is an
+    /// implementation detail driven by what the host can accelerate, not
+    /// something the user picks. Size ranges are the only honest hint
+    /// that they differ on disk.
     pub fn display_name(&self) -> &'static str {
         match self {
             ParakeetVariant::TdtV3 => "Parakeet TDT v3 (~600 MB)",
+            ParakeetVariant::TdtV3Int8 => "Parakeet TDT v3 (~700 MB)",
         }
     }
 
     pub fn all() -> &'static [ParakeetVariant] {
-        &[ParakeetVariant::TdtV3]
+        &[ParakeetVariant::TdtV3, ParakeetVariant::TdtV3Int8]
     }
 }
 
@@ -540,6 +598,69 @@ mod tests {
     #[test]
     fn test_model_size_all() {
         assert_eq!(ModelSize::all().len(), 4);
+    }
+
+    #[test]
+    fn parakeet_variant_dir_names_distinct() {
+        let mut names: Vec<&str> = ParakeetVariant::all()
+            .iter()
+            .map(|v| v.dir_name())
+            .collect();
+        names.sort();
+        names.dedup();
+        assert_eq!(
+            names.len(),
+            ParakeetVariant::all().len(),
+            "every Parakeet variant must have a unique dir_name so download/delete don't collide"
+        );
+    }
+
+    #[test]
+    fn parakeet_variant_int8_has_no_external_data_file() {
+        // The whole reason int8 exists in this catalogue is so the encoder
+        // bundle has no `.onnx.data` external initializer (which blocks
+        // parakeet-rs accelerator EPs from loading the model). If a future
+        // refactor accidentally re-adds an external-data file to the int8
+        // variant's `files()` list this test fires.
+        let int8_files = ParakeetVariant::TdtV3Int8.files();
+        let has_external = int8_files
+            .iter()
+            .any(|(name, _, _)| name.ends_with(".onnx.data") || name.ends_with(".onnx_data"));
+        assert!(
+            !has_external,
+            "int8 variant must not include any `.onnx.data` external initializer"
+        );
+    }
+
+    #[test]
+    fn parakeet_variant_int8_includes_preprocessor() {
+        // The int8 bundle on HuggingFace ships a separate `nemo128.onnx`
+        // preprocessor file that the fp32 bundle does not have (fp32's
+        // preprocessor is baked into the encoder graph). Loading int8
+        // without this file would surface as a missing-input error at
+        // session-build time. Lock it in so a future trim doesn't drop it.
+        let int8_files = ParakeetVariant::TdtV3Int8.files();
+        let has_preprocessor = int8_files
+            .iter()
+            .any(|(name, _, _)| *name == "nemo128.onnx");
+        assert!(
+            has_preprocessor,
+            "int8 variant must include nemo128.onnx preprocessor"
+        );
+    }
+
+    #[test]
+    fn parakeet_recommended_for_host_matches_target() {
+        // `recommended_for_host` is `cfg!`-driven, so the test runner sees
+        // exactly one branch on each CI runner. We assert against the same
+        // cfg flags here so the test is meaningful on every target without
+        // having to mock the host detection.
+        let expected = if cfg!(target_os = "macos") && cfg!(target_arch = "aarch64") {
+            ParakeetVariant::TdtV3Int8
+        } else {
+            ParakeetVariant::TdtV3
+        };
+        assert_eq!(ParakeetVariant::recommended_for_host(), expected);
     }
 
     #[test]
