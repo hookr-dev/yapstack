@@ -133,6 +133,11 @@ export const tauriCommandsMock = () => ({
     getParakeetModels: vi
       .fn()
       .mockResolvedValue({ status: "ok", data: [] }),
+    // Test environment defaults to the fp32 variant — matches non-Apple-Silicon
+    // CI runners. Tests that exercise the int8 path can override this mock.
+    getRecommendedParakeetVariant: vi
+      .fn()
+      .mockResolvedValue({ status: "ok", data: "TdtV3" }),
     downloadParakeetModel: vi
       .fn()
       .mockResolvedValue({ status: "ok", data: "" }),
