@@ -333,6 +333,21 @@ pub async fn get_parakeet_models(
         .collect())
 }
 
+/// Returns the Parakeet variant the current host should run. Apple Silicon
+/// gets the int8 bundle (smaller, no external `.onnx.data`, accelerator-
+/// compatible); other targets keep the fp32 bundle.
+///
+/// The frontend uses this in two places:
+///   1. As the source of truth for the v24 store migration that coerces
+///      pre-existing `selectedParakeetVariant` values.
+///   2. To render a single-variant Parakeet UI keyed to whatever the host
+///      is meant to run, so users never have to pick int8 vs fp32.
+#[tauri::command]
+#[specta::specta]
+pub async fn get_recommended_parakeet_variant() -> Result<ParakeetVariantDto, CommandError> {
+    Ok(ParakeetVariant::recommended_for_host().into())
+}
+
 #[tauri::command]
 #[specta::specta]
 pub async fn download_parakeet_model(

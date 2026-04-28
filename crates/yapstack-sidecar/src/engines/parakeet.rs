@@ -73,18 +73,35 @@ impl TranscriptionBackend for ParakeetBackend {
 
         let cache_dir = self.coreml_cache_dir.as_deref();
         let choice = AccelChoice::from_env();
-        // Auto: skip CoreML when external `.onnx.data` is present (known ORT bug
-        // `model_path must not be empty`). User-forced choices are honored.
+        // Auto: skip CoreML when external `.onnx.data` is present (known ORT
+        // bug `model_path must not be empty`). The skip ONLY applies when
+        // CoreML is the auto-selected EP — WebGPU runs through a different
+        // ORT codepath that doesn't try to serialize the partitioned subgraph
+        // back through the model path, so it's safe with external data.
+        // User-forced choices are honored regardless (so a hand-set
+        // `YAPSTACK_PARAKEET_ACCEL=coreml` will still try CoreML even on a
+        // fp32 bundle, fail, and hit the fallback chain below).
         let exec_config = match choice {
-            AccelChoice::Auto if has_external_data_file(model_path) => None,
+            AccelChoice::Auto if auto_skip_due_to_external_data(model_path) => None,
             _ => build_exec_config(choice, cache_dir),
         };
         let accel_attempted = exec_config.is_some();
+        info!(
+            marker = "live_accel_choice",
+            engine = "parakeet",
+            requested = ?choice,
+            attempted = accel_attempted,
+            model_dir = %model_path.display(),
+            "parakeet acceleration resolved"
+        );
         let model = match ParakeetTDT::from_pretrained(model_path, exec_config) {
             Ok(m) => m,
             Err(e) if accel_attempted => {
                 warn!(
-                    "accelerator load failed ({e}); falling back to CPU \
+                    marker = "live_accel_fallback",
+                    engine = "parakeet",
+                    error = %e,
+                    "accelerator load failed; falling back to CPU \
                      (set YAPSTACK_PARAKEET_ACCEL=cpu to suppress this attempt)"
                 );
                 ParakeetTDT::from_pretrained(model_path, None)
@@ -283,28 +300,76 @@ impl AccelChoice {
     }
 }
 
+/// Returns true when the model dir contains an external `.onnx.data` file
+/// AND the auto-selected accelerator would be a CoreML-style EP that
+/// stumbles on the "model_path must not be empty" partitioning bug. With
+/// the new Apple Silicon default of WebGPU, this only fires when CoreML
+/// is the only EP compiled in (legacy/fallback build) — which means the
+/// fp32 bundle on those builds keeps its CPU-only behavior.
+fn auto_skip_due_to_external_data(model_path: &Path) -> bool {
+    if !has_external_data_file(model_path) {
+        return false;
+    }
+    // If WebGPU is compiled in, Auto will pick WebGPU over CoreML on Apple
+    // Silicon — and WebGPU is safe with external data, so don't skip.
+    #[cfg(all(target_os = "macos", feature = "webgpu"))]
+    {
+        return false;
+    }
+    #[cfg(not(all(target_os = "macos", feature = "webgpu")))]
+    {
+        // Auto would pick CoreML on Apple Silicon (legacy / no-webgpu build)
+        // OR fall through to CPU on other platforms. Keep the skip on
+        // CoreML-only Apple builds; harmless no-op elsewhere.
+        true
+    }
+}
+
 fn build_exec_config(
     choice: AccelChoice,
     cache_dir: Option<&Path>,
 ) -> Option<parakeet_rs::ExecutionConfig> {
     info!("parakeet accelerator choice: {:?}", choice);
     match choice {
-        AccelChoice::Cpu => None,
-        AccelChoice::Auto => {
-            #[cfg(feature = "coreml")]
-            {
-                build_coreml_config(cache_dir)
-            }
-            #[cfg(not(feature = "coreml"))]
-            {
-                _ = cache_dir;
-                None
-            }
+        AccelChoice::Cpu => {
+            _ = cache_dir;
+            None
         }
+        AccelChoice::Auto => auto_exec_config(cache_dir),
         #[cfg(feature = "coreml")]
         AccelChoice::CoreMl => build_coreml_config(cache_dir),
         #[cfg(feature = "webgpu")]
         AccelChoice::WebGpu => build_webgpu_config(),
+    }
+}
+
+/// Apple Silicon defaults to WebGPU (Dawn → Metal). parakeet-rs's source
+/// notes that CoreML EP currently runs slower than CPU on Parakeet because
+/// the ONNX graphs have dynamic input shapes (CoreML claims the nodes but
+/// runs them on CPU with overhead), and parakeet-rs hardcodes
+/// `ComputeUnits::CPUAndGPU` rather than `CPUAndNeuralEngine` — so CoreML
+/// is not the path to ANE acceleration today. WebGPU bypasses that issue
+/// at the cost of going through Metal instead of Apple's CoreML compiler.
+/// Other targets fall through to CPU; Windows CUDA arrives in a follow-up.
+fn auto_exec_config(cache_dir: Option<&Path>) -> Option<parakeet_rs::ExecutionConfig> {
+    #[cfg(all(target_os = "macos", feature = "webgpu"))]
+    {
+        _ = cache_dir;
+        return build_webgpu_config();
+    }
+    #[cfg(all(target_os = "macos", not(feature = "webgpu"), feature = "coreml"))]
+    {
+        return build_coreml_config(cache_dir);
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        _ = cache_dir;
+        None
+    }
+    #[cfg(all(target_os = "macos", not(feature = "webgpu"), not(feature = "coreml")))]
+    {
+        _ = cache_dir;
+        None
     }
 }
 

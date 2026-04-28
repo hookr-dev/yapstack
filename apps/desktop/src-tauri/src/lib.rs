@@ -283,6 +283,7 @@ pub fn run() {
             commands::transcription::get_transcription_status,
             commands::transcription::get_engine_catalogue,
             commands::transcription::get_parakeet_models,
+            commands::transcription::get_recommended_parakeet_variant,
             commands::transcription::download_parakeet_model,
             commands::transcription::delete_parakeet_model,
             commands::transcription::get_sortformer_status,
