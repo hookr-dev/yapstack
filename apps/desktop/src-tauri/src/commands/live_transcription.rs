@@ -578,7 +578,7 @@ enum VadAction {
 ///   frontend `silence_duration_ms`, 300 ms poll, no pre-roll). Values
 ///   preserve the proven Whisper dictation feel — Silero only changes
 ///   *what* we detect as speech, not *how long* we wait before chunking.
-/// - Parakeet: dialogue-aggressive cadence (200 ms silence, 10 s max
+/// - Parakeet: meeting-tuned cadence (500 ms silence, 10 s max
 ///   chunk, 100 ms poll, 250 ms pre-roll). Parakeet's low RTFx and
 ///   non-autoregressive decoder make short chunks free; we bias for
 ///   responsive on-screen updates.
@@ -652,16 +652,36 @@ fn profile_for(
             },
             uses_initial_prompt: true,
         },
-        // Parakeet: dialogue-aggressive. Ignores frontend silence / chunk /
-        // poll knobs — those are engine-specific best practice, not
-        // user-facing tuning. See live_transcription docs for rationale.
+        // Parakeet: meeting-tuned. Ignores frontend silence / chunk / poll
+        // knobs — these are engine-specific best practice, not user-facing
+        // tuning.
+        //
+        // `silence_duration` was 200 ms originally, which mirrors a
+        // dictation-style "fire as soon as the speaker pauses" cadence.
+        // For multi-speaker meeting transcription that produces ~3× more
+        // dispatches than necessary — every comma-breath triggers a chunk —
+        // and the IPC + inference pressure of those extra dispatches is the
+        // proximate cause of the stall the cap commit (e6b05ea) was trying
+        // to bound. Comparable production stacks use 500 ms (Vad+Whisper
+        // dictation), 750 ms (FluidAudio meeting mode), or higher (Muesli
+        // aims for 3 s minimum chunks). Bumped to 500 ms — the conservative
+        // half of that range — to cut dispatch rate by ~2-3× on fast
+        // multi-speaker dialogue while keeping live-caption feel.
+        //
+        // `max_chunk_duration` stays at 10 s for now: the cap commit
+        // documented chunks ≥12 s degrading to RTFx < 1 on our CPU path.
+        // FluidAudio's 14.4 s window is feasible because they run on the
+        // ANE; we don't have that path until we either (a) get TDT v3
+        // working on ORT-CoreML or (b) switch to streaming Nemotron.
+        // Stage 6 of the pipeline overhaul plan revisits once we have
+        // real per-chunk wall-time data to validate.
         EngineKind::Parakeet => EngineProfile {
             engine_kind: engine,
             engine_name: "Parakeet",
             vad_tuning: VadTuning {
                 speech_threshold: SPEECH_THRESHOLD,
                 offset_threshold_ratio: SILENCE_THRESHOLD / SPEECH_THRESHOLD,
-                silence_duration: Duration::from_millis(200),
+                silence_duration: Duration::from_millis(500),
                 max_chunk_duration: Duration::from_secs(10),
                 poll_interval: Duration::from_millis(100),
                 pre_roll: Duration::from_millis(250),
@@ -4238,8 +4258,10 @@ mod tests {
         let t = profile_for(EngineKind::Parakeet, &cfg).vad_tuning;
         assert_eq!(
             t.silence_duration,
-            Duration::from_millis(200),
-            "Parakeet silence window should be 200ms for responsive splitting"
+            Duration::from_millis(500),
+            "Parakeet silence window should be 500ms for meeting-style chunking \
+             (FluidAudio uses 750ms; 200ms over-dispatched on fast dialogue and \
+             contributed to the stall the cap commit was bounding)"
         );
         assert_eq!(
             t.max_chunk_duration,
@@ -4302,18 +4324,27 @@ mod tests {
         use yapstack_common::types::EngineKind;
         let cfg = dummy_config();
         let tuning = profile_for(EngineKind::Parakeet, &cfg).vad_tuning;
-        assert_eq!(tuning.pre_roll, Duration::from_millis(250));
-        assert_eq!(tuning.silence_duration, Duration::from_millis(200));
 
         let sr: u32 = 48_000;
-        // At 32 ms per frame: 1.0 s = ~31 frames, 0.3 s = ~9 frames.
-        let loud_frames = 31;
-        let gap_frames = 9;
-        // Shape: [loud × 31][silence × 9][loud × 31]. The silence stretch
-        // (288 ms) crosses the 200 ms silence_duration so the first chunk
-        // fires; the gap (288 ms < 250 ms pre-roll + ~32 ms frame) means
-        // without the `prev_chunk_end` clamp, the second onset's pre-roll
-        // would reach back into the first chunk's tail.
+        // Frame counts derived from the active tuning so this regression
+        // doesn't have to be retuned every time the silence/pre-roll
+        // defaults shift. We need:
+        //   - loud region long enough to be a real chunk (≥ 1 s),
+        //   - gap longer than `silence_duration` so the first chunk fires,
+        //   - gap shorter than `silence_duration + pre_roll + small slack`
+        //     so the second onset's pre-roll could (without the clamp)
+        //     reach back into the first chunk's tail.
+        let frame_secs = super::super::silero_vad::FRAME_DURATION_SECS;
+        let frames_for = |ms: u64| -> usize {
+            ((Duration::from_millis(ms).as_secs_f32() / frame_secs).ceil() as usize).max(1)
+        };
+        let loud_frames = frames_for(1_000); // 1.0 s of speech
+                                             // One frame past the silence threshold — guarantees the silence
+                                             // break fires while keeping the gap short enough that pre-roll
+                                             // would overlap without the clamp.
+        let silence_frames = frames_for(tuning.silence_duration.as_millis() as u64);
+        let gap_frames = silence_frames + 1;
+
         let mut probs: Vec<f32> = Vec::with_capacity(loud_frames * 2 + gap_frames);
         probs.extend(std::iter::repeat_n(0.90, loud_frames));
         probs.extend(std::iter::repeat_n(0.10, gap_frames));
