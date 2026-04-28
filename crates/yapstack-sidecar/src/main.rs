@@ -241,6 +241,31 @@ async fn main() {
                 break;
             }
 
+            SidecarRequest::QueryEngineInfo { id } => {
+                #[cfg(any(feature = "whisper", feature = "parakeet"))]
+                {
+                    let info = backend.as_ref().and_then(|b| b.engine_info());
+                    let response = SidecarResponse::EngineInfo {
+                        id,
+                        accel: info.as_ref().map(|i| i.accel.clone()),
+                        model_dir: info.as_ref().map(|i| i.model_dir.clone()),
+                    };
+                    if let Err(e) = send_response(&response).await {
+                        error!("failed to send engine_info response: {}", e);
+                    }
+                }
+
+                #[cfg(not(any(feature = "whisper", feature = "parakeet")))]
+                {
+                    let response = SidecarResponse::EngineInfo {
+                        id,
+                        accel: None,
+                        model_dir: None,
+                    };
+                    let _ = send_response(&response).await;
+                }
+            }
+
             SidecarRequest::LoadModel { id, model_path } => {
                 info!("loading model: {}", model_path.display());
 
@@ -249,7 +274,12 @@ async fn main() {
                     match backend.as_mut() {
                         Some(b) => match b.load_model(&model_path) {
                             Ok(()) => {
-                                let response = SidecarResponse::ModelLoaded { id };
+                                let info = b.engine_info();
+                                let response = SidecarResponse::ModelLoaded {
+                                    id,
+                                    accel: info.as_ref().map(|i| i.accel.clone()),
+                                    model_dir: info.as_ref().map(|i| i.model_dir.clone()),
+                                };
                                 if let Err(e) = send_response(&response).await {
                                     error!("failed to send response: {}", e);
                                 }

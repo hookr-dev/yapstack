@@ -70,9 +70,26 @@ fn log_sidecar_response(response: &SidecarResponse) {
             duration_ms = duration_ms,
             "sidecar response: transcription"
         ),
-        SidecarResponse::ModelLoaded { id } => {
-            debug!(id = id, "sidecar response: model_loaded")
-        }
+        SidecarResponse::ModelLoaded {
+            id,
+            accel,
+            model_dir,
+        } => debug!(
+            id = id,
+            accel = accel.as_deref(),
+            model_dir = model_dir.as_deref(),
+            "sidecar response: model_loaded"
+        ),
+        SidecarResponse::EngineInfo {
+            id,
+            accel,
+            model_dir,
+        } => debug!(
+            id = id,
+            accel = accel.as_deref(),
+            model_dir = model_dir.as_deref(),
+            "sidecar response: engine_info"
+        ),
         SidecarResponse::Error { id, message } => debug!(
             id = id,
             message = message.as_str(),
@@ -112,6 +129,17 @@ pub struct TranscriptionResult {
     pub duration_ms: u64,
 }
 
+/// What the sidecar reported about the model it actually loaded —
+/// resolved execution provider (after any runtime fallback) and the
+/// directory or file the model was loaded from. Both fields are
+/// optional because older sidecars don't emit them; a current build
+/// always populates them on a successful load.
+#[derive(Debug, Clone)]
+pub struct EngineInfo {
+    pub accel: Option<String>,
+    pub model_dir: Option<String>,
+}
+
 /// Transcription client that supports **concurrent in-flight requests** to the
 /// sidecar. Multiple callers can hold `&TranscriptionClient` and call
 /// `transcribe_with(...)` simultaneously — they race on a brief `stdin` lock
@@ -133,6 +161,12 @@ pub struct TranscriptionClient {
     /// yet. The old mpsc-based design could check `response_rx.is_closed()`;
     /// with per-id oneshot routing we need an explicit liveness flag.
     reader_alive: Arc<AtomicBool>,
+    /// Most recent engine info from the sidecar's last successful
+    /// `model_loaded` response. `Mutex` (not RwLock) because reads are
+    /// rare (status surface, telemetry tagging) and writes are even
+    /// rarer (once per `load_model`/`spawn`). Cleared on respawn until
+    /// the next load completes.
+    last_engine_info: Arc<StdMutex<Option<EngineInfo>>>,
     // Stored for auto-restart (respawn)
     sidecar_path: PathBuf,
     engine: EngineKind,
@@ -183,6 +217,7 @@ impl TranscriptionClient {
             next_id: AtomicU64::new(1),
             child: StdMutex::new(parts.child),
             reader_alive: parts.reader_alive,
+            last_engine_info: Arc::new(StdMutex::new(None)),
             sidecar_path: sidecar_path.to_path_buf(),
             engine,
             model_path: model_path.to_path_buf(),
@@ -513,8 +548,10 @@ impl TranscriptionClient {
     }
 
     /// Loads a model into the sidecar process. Safe to call concurrently, but
-    /// typically called once at startup.
-    pub async fn load_model(&self, model_path: &Path) -> Result<()> {
+    /// typically called once at startup. On success caches the resolved
+    /// `EngineInfo` (accel + model_dir) for later retrieval via
+    /// [`Self::engine_info`].
+    pub async fn load_model(&self, model_path: &Path) -> Result<EngineInfo> {
         let model_path = model_path.to_path_buf();
         let (id, rx) = self
             .dispatch_request(|id| SidecarRequest::LoadModel { id, model_path })
@@ -524,7 +561,16 @@ impl TranscriptionClient {
         let response = self.await_response(id, rx, 60).await?;
 
         match response {
-            SidecarResponse::ModelLoaded { .. } => Ok(()),
+            SidecarResponse::ModelLoaded {
+                accel, model_dir, ..
+            } => {
+                let info = EngineInfo { accel, model_dir };
+                *self
+                    .last_engine_info
+                    .lock()
+                    .expect("engine_info mutex poisoned") = Some(info.clone());
+                Ok(info)
+            }
             SidecarResponse::Error { message, .. } => {
                 Err(TranscriptionError::SidecarError(message))
             }
@@ -532,6 +578,46 @@ impl TranscriptionClient {
                 "unexpected response type".to_string(),
             )),
         }
+    }
+
+    /// Asks the sidecar what model it currently has loaded — used at
+    /// initial spawn time when the model was loaded from the `--model`
+    /// CLI arg before the IPC loop started, so no `model_loaded` was
+    /// ever emitted. Cheap on the sidecar side (cached state read).
+    /// Caches the result for later retrieval via [`Self::engine_info`].
+    pub async fn query_engine_info(&self) -> Result<EngineInfo> {
+        let (id, rx) = self
+            .dispatch_request(|id| SidecarRequest::QueryEngineInfo { id })
+            .await?;
+        let response = self.await_response(id, rx, 10).await?;
+        match response {
+            SidecarResponse::EngineInfo {
+                accel, model_dir, ..
+            } => {
+                let info = EngineInfo { accel, model_dir };
+                *self
+                    .last_engine_info
+                    .lock()
+                    .expect("engine_info mutex poisoned") = Some(info.clone());
+                Ok(info)
+            }
+            SidecarResponse::Error { message, .. } => {
+                Err(TranscriptionError::SidecarError(message))
+            }
+            _ => Err(TranscriptionError::SidecarError(
+                "unexpected response type for query_engine_info".to_string(),
+            )),
+        }
+    }
+
+    /// Cached engine info from the most recent successful
+    /// `load_model` or `query_engine_info`. `None` until either has
+    /// been called and succeeded.
+    pub fn engine_info(&self) -> Option<EngineInfo> {
+        self.last_engine_info
+            .lock()
+            .expect("engine_info mutex poisoned")
+            .clone()
     }
 
     /// Sends a shutdown request. Does not wait for the process to exit.
@@ -619,6 +705,12 @@ impl TranscriptionClient {
         self.pending = parts.pending;
         self.reader_alive = parts.reader_alive;
         *self.child.lock().expect("child mutex poisoned") = parts.child;
+        // Reset cached engine info — the new sidecar hasn't loaded yet,
+        // so the previous values would be stale.
+        *self
+            .last_engine_info
+            .lock()
+            .expect("engine_info mutex poisoned") = None;
         // Don't reset next_id — keep incrementing for unique request IDs
         info!(
             "sidecar respawned successfully (next request id: {})",
@@ -633,7 +725,8 @@ impl TranscriptionClient {
 fn response_id(response: &SidecarResponse) -> Option<u64> {
     match response {
         SidecarResponse::Transcription { id, .. } => Some(*id),
-        SidecarResponse::ModelLoaded { id } => Some(*id),
+        SidecarResponse::ModelLoaded { id, .. } => Some(*id),
+        SidecarResponse::EngineInfo { id, .. } => Some(*id),
         SidecarResponse::Error { id, .. } => Some(*id),
         SidecarResponse::Progress { id, .. } => Some(*id),
     }

@@ -56,6 +56,14 @@ pub enum SidecarRequest {
     },
     #[serde(rename = "load_model")]
     LoadModel { id: u64, model_path: PathBuf },
+    /// Query the backend for info about the currently loaded model
+    /// (resolved accel + model_dir). Used at desktop spawn time to
+    /// surface "what's running" — the initial model is loaded from the
+    /// `--model` CLI arg before the IPC loop starts, so its
+    /// `model_loaded` message is never sent over the wire. This request
+    /// is cheap (cached state read on the sidecar side).
+    #[serde(rename = "query_engine_info")]
+    QueryEngineInfo { id: u64 },
     #[serde(rename = "shutdown")]
     Shutdown,
 }
@@ -71,7 +79,32 @@ pub enum SidecarResponse {
         duration_ms: u64,
     },
     #[serde(rename = "model_loaded")]
-    ModelLoaded { id: u64 },
+    ModelLoaded {
+        id: u64,
+        /// Identifier of the execution provider that actually loaded the
+        /// model — `"webgpu"`, `"coreml"`, `"cuda"`, or `"cpu"`. Reflects
+        /// the *resolved* path including any fallback (e.g. WebGPU → CPU
+        /// when EP init fails). None for engines that don't expose this
+        /// (e.g. older sidecars — backward compat).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        accel: Option<String>,
+        /// Resolved model directory or file path the backend actually
+        /// loaded from. Combined with `accel`, lets the desktop layer
+        /// surface "what's running" without re-deriving from FE state.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model_dir: Option<String>,
+    },
+    /// Response to `QueryEngineInfo` — same shape as `ModelLoaded` but
+    /// fired in response to an explicit query, not a load. `accel`/
+    /// `model_dir` are `None` when no model has been loaded yet.
+    #[serde(rename = "engine_info")]
+    EngineInfo {
+        id: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        accel: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model_dir: Option<String>,
+    },
     #[serde(rename = "error")]
     Error { id: u64, message: String },
     #[serde(rename = "progress")]

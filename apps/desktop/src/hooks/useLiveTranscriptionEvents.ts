@@ -26,6 +26,18 @@ export function useLiveTranscriptionEvents() {
           toast.error(payload.error_message);
         }
       }),
+      listenEvent(EVENTS.TRANSCRIPTION_ENGINE_LOADED, (payload) => {
+        // Source of truth for "what's actually running" — emitted right
+        // after the sidecar's first model_loaded probe and on every
+        // subsequent engine/variant switch. StatusPopover renders this.
+        useAppStore.setState({
+          loadedEngineInfo: {
+            engine: payload.engine,
+            accel: payload.accel,
+            modelDir: payload.model_dir,
+          },
+        });
+      }),
       listenEvent(EVENTS.LIVE_TRANSCRIPTION_WARNING, (payload) => {
         toast.warning(payload.message, { id: "transcription-warning" });
       }),

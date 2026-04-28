@@ -84,6 +84,21 @@ pub struct ParakeetModelInfoDto {
     pub approximate_size_bytes: u64,
 }
 
+/// Emitted as a Tauri event (`transcription-engine-loaded`) after a
+/// transcription client successfully initializes — both on initial
+/// app launch and on any subsequent engine/variant switch. Lets the
+/// frontend show a "Parakeet · WebGPU" badge keyed to ground truth
+/// from the sidecar instead of inferring from FE state. The
+/// `model_dir` ends in the variant directory (e.g.
+/// `…/parakeet-tdt-v3-int8`) so the FE can derive whether int8 or
+/// fp32 is active without a separate field.
+#[derive(Debug, Clone, Serialize, Type)]
+pub struct TranscriptionEngineLoadedEvent {
+    pub engine: EngineKindDto,
+    pub accel: Option<String>,
+    pub model_dir: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Type)]
 pub struct SortformerModelInfoDto {
     pub variant: SortformerVariantDto,
@@ -564,12 +579,44 @@ pub async fn init_transcription_client(
         CommandError::from(e)
     })?;
 
+    // Probe the sidecar for the model it just loaded (CLI-arg path
+    // doesn't emit `model_loaded` over IPC) so we can surface accel +
+    // variant to the FE. Best-effort: if the query fails, log and
+    // continue — the client is still usable.
+    let engine_info = match client.query_engine_info().await {
+        Ok(info) => Some(info),
+        Err(e) => {
+            tracing::warn!(
+                "query_engine_info failed after spawn ({e}); continuing without engine_loaded event"
+            );
+            None
+        }
+    };
+
     let mut guard = transcription_state.lock().await;
     *guard = Some(Arc::new(client));
     info!(
         "transcription client initialized: engine={}",
         engine_kind.as_str()
     );
+
+    if let Some(info) = engine_info {
+        info!(
+            marker = "live_engine_loaded",
+            engine = engine_kind.as_str(),
+            accel = info.accel.as_deref(),
+            model_dir = info.model_dir.as_deref(),
+            "transcription engine loaded"
+        );
+        let _ = app_handle.emit(
+            "transcription-engine-loaded",
+            TranscriptionEngineLoadedEvent {
+                engine: engine_kind.into(),
+                accel: info.accel,
+                model_dir: info.model_dir,
+            },
+        );
+    }
     Ok(())
 }
 
