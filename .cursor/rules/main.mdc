@@ -1,0 +1,8 @@
+---
+description: Pointer to canonical agent instructions
+alwaysApply: true
+---
+
+See **[`AGENTS.md`](../../AGENTS.md)** at the repo root for all agent guidance. This is the canonical instruction file for every coding tool that supports the [agents.md](https://agents.md/) spec — including Cursor.
+
+Edit `AGENTS.md` to update agent behaviour; this rule will follow automatically.

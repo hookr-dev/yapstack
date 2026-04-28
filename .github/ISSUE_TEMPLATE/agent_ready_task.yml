@@ -1,0 +1,92 @@
+name: Agent-ready task
+description: A task structured for AI agent (or human) autonomous execution. All fields required.
+title: "[Task]: "
+labels: ["agent-ready", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this template when you want a ticket that an AI coding agent (Claude Code, Codex, Copilot coding agent) can pick up and execute autonomously.
+
+        Reference: [`docs/LINEAR_TICKETS.md`](https://github.com/hookr-dev/YapStack/blob/main/docs/LINEAR_TICKETS.md) explains every field in detail.
+
+        **Sloppy or missing fields block agent pickup.** A human reviewer will downgrade the issue to a regular bug/feature template if the structure isn't followed.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem (1-3 sentences, no solution)
+      description: |
+        What user-facing or developer-facing problem? Who hits it, how often, what's the symptom?
+        Lead with the *problem*, not the proposed fix.
+      placeholder: "Pressing the dictation hotkey twice in quick succession occasionally creates two overlapping sessions, leaving a stranded recording in the DB. Reproducible ~1 in 10 attempts on macOS."
+    validations:
+      required: true
+
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria (testable checklist)
+      description: Bulleted, each item independently verifiable. Tests, log lines, UI states.
+      value: |
+        - [ ]
+        - [ ]
+        - [ ] `pnpm check` passes
+    validations:
+      required: true
+
+  - type: textarea
+    id: files
+    attributes:
+      label: Files likely involved
+      description: Concrete paths, not vague areas. Starting points, not limits.
+      placeholder: |
+        - apps/desktop/src/hooks/useDictation.ts
+        - apps/desktop/src-tauri/src/commands/dictation.rs
+    validations:
+      required: true
+
+  - type: textarea
+    id: out-of-scope
+    attributes:
+      label: Out of scope (explicit non-goals)
+      description: The single biggest agent-failure mode is scope creep. List what is **not** part of this ticket.
+      value: |
+        -
+        -
+    validations:
+      required: true
+
+  - type: input
+    id: verification
+    attributes:
+      label: Verification command
+      description: Exact shell command(s) to confirm done. Most often `pnpm check`.
+      placeholder: "pnpm check"
+      value: "pnpm check"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: risk
+    attributes:
+      label: Risk level
+      description: Anything in [`AGENTS.md`](https://github.com/hookr-dev/YapStack/blob/main/AGENTS.md#permission-boundaries) "Ask first" / "Never" lists?
+      options:
+        - "Low — none of the AGENTS.md Ask-first categories apply"
+        - "Medium — touches an Ask-first area (schema, IPC, deps); requires human approval before implementation"
+        - "High — touches a Never area; do not implement, surface to maintainer"
+    validations:
+      required: true
+
+  - type: textarea
+    id: hypotheses
+    attributes:
+      label: Hypotheses / suspects (optional)
+      description: For bugs you've debugged but not fixed. Current theories with evidence.
+
+  - type: textarea
+    id: related
+    attributes:
+      label: Related tickets / context (optional)
+      description: "Use `Closes #123`, `Relates to #456`, `Blocks #789` syntax."
