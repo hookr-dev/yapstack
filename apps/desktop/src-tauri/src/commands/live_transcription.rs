@@ -867,14 +867,17 @@ async fn prepare_chunk_dispatch(
     let dropped_head_samples = samples.len().saturating_sub(max_samples);
     let dropped_head_seconds = dropped_head_samples as f32 / sample_rate as f32;
     if dropped_head_samples > 0 {
+        // Structured marker for grep-friendly capture in long sessions.
+        // Stage 3 deletes this entire branch — until then, every firing
+        // means audio was permanently lost.
         warn!(
-            "live chunk: source={:?} extracted {:.2}s exceeds max_chunk_duration {:.2}s — \
-             dropping {:.2}s head to keep latency bounded \
-             (likely sidecar wall time exceeded chunk duration)",
-            vad.label,
-            extracted_duration,
-            max_chunk_duration.as_secs_f32(),
-            dropped_head_seconds,
+            marker = "live_cap_fired",
+            source = ?vad.label,
+            extracted_secs = extracted_duration,
+            max_chunk_secs = max_chunk_duration.as_secs_f32(),
+            dropped_secs = dropped_head_seconds,
+            "live chunk: extracted audio exceeds max_chunk_duration — dropping head \
+             (likely sidecar wall time exceeded chunk duration)"
         );
         samples.drain(..dropped_head_samples);
     }
@@ -2412,7 +2415,7 @@ async fn live_transcription_loop(
         }
     }
 
-    let (final_chunks, final_audio_seconds, final_cap_fired, final_lag) = {
+    let (final_chunks, final_audio_seconds, final_cap_fired, final_lag, final_total_wall_ms) = {
         let s = counters.lock().expect("counters mutex poisoned");
         let lag = s.latest_completed_audio_offset_seconds.map(|chunk_end| {
             let session_time_now =
@@ -2424,6 +2427,7 @@ async fn live_transcription_loop(
             s.total_audio_seconds,
             s.cap_fired_total,
             lag,
+            s.total_wall_ms,
         )
     };
 
@@ -2439,9 +2443,26 @@ async fn live_transcription_loop(
         );
     }
 
+    // Session pressure summary — one structured line per session so log
+    // captures from a stalled run carry the aggregate signal even when the
+    // per-chunk lines are too verbose to scan.
+    let mean_rtfx = if final_total_wall_ms > 0 && final_audio_seconds > 0.0 {
+        Some(final_audio_seconds / (final_total_wall_ms as f32 / 1000.0))
+    } else {
+        None
+    };
     info!(
-        "live transcription stopped: {} chunks, {:.1}s total audio",
-        final_chunks, final_audio_seconds
+        marker = "live_session_summary",
+        engine = ctx.engine_profile.engine_name,
+        session_id = ?ctx.config.session_id,
+        chunks = final_chunks,
+        audio_secs = final_audio_seconds,
+        wall_ms = final_total_wall_ms,
+        mean_rtfx = ?mean_rtfx,
+        cap_fired_total = final_cap_fired,
+        final_lag_secs = ?final_lag,
+        exited_fatal = exited_fatal,
+        "live transcription session ended"
     );
 }
 
@@ -3204,6 +3225,24 @@ async fn transcribe_chunk(
             lag_seconds,
         },
     );
+    // Structured `info!` mirror of the pressure event so the data lands in
+    // the in-app log buffer even when no JS listener is mounted. Every
+    // field is grep-friendly and survives across days of usage if log
+    // retention does. The "live_pressure" marker makes it easy to filter:
+    //   grep 'live_pressure' app.log | jq -s ...
+    info!(
+        marker = "live_pressure",
+        source = ?input.source_label,
+        chunk_index = *chunk_index,
+        chunk_audio_secs = chunk_duration,
+        wall_ms = wall_ms,
+        rtfx = ?rtfx,
+        lag_seconds = ?lag_seconds,
+        engine = profile.engine_name,
+        is_backfill = input.is_backfill,
+        ok = transcription_result.is_ok(),
+        "transcribe chunk pressure"
+    );
 
     // _wav_guard handles cleanup via Drop
 
@@ -3688,13 +3727,17 @@ pub async fn start_live_transcription(
     // need to re-read `client.engine()` to discover engine-specific
     // behavior — they consult `ctx.engine_profile` instead.
     let engine_profile = Arc::new(profile_for(extracted_client.engine(), &config));
-    debug!(
+    // Logged at INFO so a default-level log capture pinned to a stalled
+    // session always shows which engine + tuning were active.
+    info!(
         engine = engine_profile.engine_name,
         silence_ms = engine_profile.vad_tuning.silence_duration.as_millis() as u64,
         poll_ms = engine_profile.vad_tuning.poll_interval.as_millis() as u64,
         pre_roll_ms = engine_profile.vad_tuning.pre_roll.as_millis() as u64,
         max_chunk_secs = engine_profile.vad_tuning.max_chunk_duration.as_secs_f32(),
         uses_initial_prompt = engine_profile.uses_initial_prompt,
+        session_id = ?config.session_id,
+        offset_base_secs = session_offset_base_seconds,
         "live transcription engine profile resolved"
     );
     let ctx = TranscriptionContext {
