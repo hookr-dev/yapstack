@@ -2,6 +2,7 @@ import { listen, emit } from "@tauri-apps/api/event";
 import type {
   CaptureStatusDto,
   BufferStatusDto,
+  EngineKindDto,
   LiveTranscriptionStatus,
 } from "@/lib/tauri";
 import type { LiveSegmentEvent } from "@/lib/tauri";
@@ -43,6 +44,21 @@ export type StreamHealthEvent = {
 };
 
 /**
+ * Emitted right after a transcription client successfully initializes,
+ * carrying the resolved acceleration provider and model directory the
+ * sidecar actually loaded. Lets the FE display "Parakeet · WebGPU"
+ * keyed to ground truth instead of FE-side state. Defined manually
+ * because specta only generates types reachable from a registered
+ * command's args/return — event-only payloads have to be declared
+ * here.
+ */
+export type TranscriptionEngineLoadedEvent = {
+  engine: EngineKindDto;
+  accel: string | null;
+  model_dir: string | null;
+};
+
+/**
  * Per-chunk transcription pressure telemetry. Fires after every transcribe
  * attempt (success or failure). RTFx < 1 means the pipeline is slower than
  * real time; sustained low RTFx + rising lag is the failure mode that Stage 1
@@ -59,6 +75,12 @@ export type LiveTranscriptionPressureEvent = {
   is_backfill: boolean;
   /** Null when the chunk did not produce a successful transcription. */
   lag_seconds: number | null;
+  /** Resolved accelerator (e.g. "webgpu", "coreml", "cpu", "metal", "cuda")
+   *  captured at session start. Null if the sidecar didn't report one. */
+  accel: string | null;
+  /** Variant directory name (e.g. "parakeet-tdt-v3-int8"). Null for Whisper
+   *  or when the sidecar didn't report a model_dir. */
+  variant: string | null;
 };
 
 export type BubbleState =
@@ -91,6 +113,7 @@ export const EVENTS = {
   LIVE_TRANSCRIPTION_STATUS: "live-transcription-status",
   LIVE_TRANSCRIPTION_WARNING: "live-transcription-warning",
   LIVE_TRANSCRIPTION_PRESSURE: "live-transcription-pressure",
+  TRANSCRIPTION_ENGINE_LOADED: "transcription-engine-loaded",
   BACKFILL_COMPLETE: "backfill-complete",
   SESSION_PART_READY: "session-part-ready",
   SESSION_WAV_ERROR: "session-wav-error",
@@ -122,6 +145,7 @@ type EventPayloadMap = {
   [EVENTS.LIVE_TRANSCRIPTION_STATUS]: LiveTranscriptionStatus;
   [EVENTS.LIVE_TRANSCRIPTION_WARNING]: LiveTranscriptionWarningEvent;
   [EVENTS.LIVE_TRANSCRIPTION_PRESSURE]: LiveTranscriptionPressureEvent;
+  [EVENTS.TRANSCRIPTION_ENGINE_LOADED]: TranscriptionEngineLoadedEvent;
   [EVENTS.BACKFILL_COMPLETE]: void;
   [EVENTS.SESSION_PART_READY]: SessionPartReadyEvent;
   [EVENTS.SESSION_WAV_ERROR]: SessionWavErrorEvent;

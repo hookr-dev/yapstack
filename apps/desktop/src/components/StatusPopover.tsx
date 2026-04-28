@@ -184,6 +184,7 @@ export function StatusPopover() {
   const diarizationEnabled = useAppStore(
     (s) => s.settings.diarizationEnabled,
   );
+  const loadedEngineInfo = useAppStore((s) => s.loadedEngineInfo);
   const liveActive = useAppStore((s) => s.liveTranscriptionActive);
   const livePhase = useAppStore((s) => s.livePhase);
   const backfillActive = useAppStore((s) => s.backfillActive);
@@ -303,6 +304,17 @@ export function StatusPopover() {
         selectedEngine === "Parakeet" && diarizationEnabled
           ? " + Diarization"
           : ""
+      }${
+        loadedEngineInfo?.accel
+          ? `   Accel: ${loadedEngineInfo.accel}${
+              loadedEngineInfo.modelDir
+                ? ` (${loadedEngineInfo.modelDir
+                    .split(/[/\\]/)
+                    .filter(Boolean)
+                    .pop()})`
+                : ""
+            }`
+          : ""
       }`,
       `Capture source: ${sourceLabel}`,
       `Mic device: ${deviceName ?? "(default)"}`,
@@ -404,6 +416,24 @@ export function StatusPopover() {
                   <span className="text-amber-600 dark:text-amber-400">+ Diarization</span>
                 )}
               </div>
+              {loadedEngineInfo?.accel && (
+                <p className="mt-0.5 text-[10px] text-muted-foreground/80">
+                  <span className="text-muted-foreground/50">Accelerator:</span>{" "}
+                  <span className="font-mono uppercase">
+                    {loadedEngineInfo.accel}
+                  </span>
+                  {loadedEngineInfo.modelDir && (
+                    <span className="ml-2 text-muted-foreground/50">
+                      ({/* show only the trailing dir name (e.g. parakeet-tdt-v3-int8) */}
+                      {loadedEngineInfo.modelDir
+                        .split(/[/\\]/)
+                        .filter(Boolean)
+                        .pop()}
+                      )
+                    </span>
+                  )}
+                </p>
+              )}
             </Section>
 
             {/* Capture + levels */}

@@ -9,8 +9,8 @@ use whisper_rs::{
 use yapstack_common::types::TranscriptSegment;
 
 use crate::engines::{
-    normalize_spacing, read_wav_as_mono_16k, sanitize_text, should_include_segment, TranscribeOpts,
-    TranscriptionBackend, TranscriptionOutput,
+    normalize_spacing, read_wav_as_mono_16k, sanitize_text, should_include_segment, EngineInfo,
+    TranscribeOpts, TranscriptionBackend, TranscriptionOutput,
 };
 
 pub struct WhisperBackend {
@@ -18,6 +18,10 @@ pub struct WhisperBackend {
     /// Optional Silero VAD model path (passed to whisper.cpp at transcribe time).
     /// Set once at sidecar startup via `--vad-model` and reused for every request.
     vad_model_path: Option<PathBuf>,
+    /// Set after each successful `load_model`. Whisper has a single
+    /// EP path (Metal when compiled in, CPU otherwise) so `accel`
+    /// reports the cfg-determined label.
+    last_engine_info: Option<EngineInfo>,
 }
 
 impl WhisperBackend {
@@ -25,6 +29,7 @@ impl WhisperBackend {
         Self {
             ctx: None,
             vad_model_path,
+            last_engine_info: None,
         }
     }
 }
@@ -45,7 +50,23 @@ impl TranscriptionBackend for WhisperBackend {
         )
         .map_err(|e| format!("failed to load model: {e}"))?;
         self.ctx = Some(ctx);
+        // Whisper EP is fixed at compile time — Metal on Apple builds,
+        // CPU everywhere else. Report it so the desktop layer can
+        // surface a "Whisper · Metal" badge symmetrically with Parakeet.
+        let accel = if cfg!(feature = "metal") {
+            "metal".to_string()
+        } else {
+            "cpu".to_string()
+        };
+        self.last_engine_info = Some(EngineInfo {
+            accel,
+            model_dir: model_path.display().to_string(),
+        });
         Ok(())
+    }
+
+    fn engine_info(&self) -> Option<EngineInfo> {
+        self.last_engine_info.clone()
     }
 
     fn transcribe(

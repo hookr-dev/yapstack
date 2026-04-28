@@ -63,6 +63,19 @@ pub(crate) fn read_wav_as_mono_16k(audio_path: &Path) -> Result<Vec<f32>, String
     Ok(resampled.into_owned())
 }
 
+/// Information about the model that a backend has loaded, exposed back
+/// to the desktop layer through `SidecarResponse::ModelLoaded` so the
+/// frontend can surface "Parakeet · WebGPU" badges without re-deriving
+/// from frontend state. `accel` reflects the *resolved* execution
+/// provider including any runtime fallback (e.g. `"cpu"` when WebGPU
+/// init fails and the load chain falls back).
+#[cfg(any(feature = "whisper", feature = "parakeet"))]
+#[derive(Debug, Clone)]
+pub struct EngineInfo {
+    pub accel: String,
+    pub model_dir: String,
+}
+
 /// What every transcription backend must implement. Engine-specific
 /// configuration (Whisper VAD model, Parakeet decoder cache, etc.) is
 /// passed to the backend's constructor — not through this trait.
@@ -71,6 +84,15 @@ pub trait TranscriptionBackend: Send {
     /// (Re)load the primary transcription model from disk. May be called
     /// more than once per process if the user switches models.
     fn load_model(&mut self, model_path: &Path) -> Result<(), String>;
+
+    /// Engine info from the most recent successful `load_model` call.
+    /// `None` when no model is loaded yet, or when the backend doesn't
+    /// expose this (default impl). Backends that select between EPs
+    /// (currently just Parakeet) override to report which EP actually
+    /// took the model — useful for telemetry / UI badges.
+    fn engine_info(&self) -> Option<EngineInfo> {
+        None
+    }
 
     /// Transcribe the WAV file at `audio_path`. The backend is responsible
     /// for any required resampling/channel conversion. Takes `&mut self`

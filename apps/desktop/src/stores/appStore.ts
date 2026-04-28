@@ -258,6 +258,17 @@ interface AppState {
   engineCatalogue: EngineDescriptorDto[];
   parakeetModels: ParakeetModelInfoDto[];
   sortformerStatus: SortformerModelInfoDto | null;
+  /// What the sidecar reported about the live model right after the
+  /// transcription client initialized — resolved acceleration provider
+  /// and the variant directory it loaded from. Populated by the
+  /// `transcription-engine-loaded` event listener; cleared when the
+  /// engine is shut down. Lets `StatusPopover` show "Parakeet · WebGPU"
+  /// (or "· CPU" after fallback) keyed to ground truth.
+  loadedEngineInfo: {
+    engine: EngineKindDto;
+    accel: string | null;
+    modelDir: string | null;
+  } | null;
 
   // Setters (called by event listeners)
   setCaptureStatus: (status: CaptureStatusDto) => void;
@@ -536,6 +547,7 @@ function createAppStore() {
       engineCatalogue: [],
       parakeetModels: [],
       sortformerStatus: null,
+      loadedEngineInfo: null,
       showHiddenSegments: false,
       selectedSegmentIds: new Set<string>(),
       lastSelectedSegmentId: null,
@@ -1413,6 +1425,7 @@ function createAppStore() {
 
           // Shutdown current engine
           set({ enginePhase: "initializing" });
+          set({ loadedEngineInfo: null });
           await commands.shutdownTranscriptionClient();
 
           // Init with new model
@@ -1528,6 +1541,7 @@ function createAppStore() {
           }
 
           set({ enginePhase: "initializing" });
+          set({ loadedEngineInfo: null });
           await commands.shutdownTranscriptionClient();
 
           const initResult = await commands.initTranscriptionClient(
@@ -1621,6 +1635,7 @@ function createAppStore() {
 
         if (settings.selectedEngine === "Parakeet") {
           set({ enginePhase: "initializing" });
+          set({ loadedEngineInfo: null });
           await commands.shutdownTranscriptionClient();
           const r = await commands.initTranscriptionClient(
             "Parakeet",

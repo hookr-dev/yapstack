@@ -8,8 +8,8 @@ use tracing::{debug, info, warn};
 use yapstack_common::types::TranscriptSegment;
 
 use crate::engines::{
-    normalize_spacing, read_wav_as_mono_16k, sanitize_text, should_include_segment, TranscribeOpts,
-    TranscriptionBackend, TranscriptionOutput,
+    normalize_spacing, read_wav_as_mono_16k, sanitize_text, should_include_segment, EngineInfo,
+    TranscribeOpts, TranscriptionBackend, TranscriptionOutput,
 };
 
 const SORTFORMER_SAMPLE_RATE: u32 = 16000;
@@ -25,6 +25,9 @@ pub struct ParakeetBackend {
     sortformer_model_path: Option<PathBuf>,
     sortformer: Option<Sortformer>,
     coreml_cache_dir: Option<PathBuf>,
+    /// Set after each successful `load_model` so `engine_info()` can
+    /// report what's actually running. Cleared if reload fails.
+    last_engine_info: Option<EngineInfo>,
 }
 
 impl ParakeetBackend {
@@ -34,6 +37,7 @@ impl ParakeetBackend {
             sortformer_model_path,
             sortformer: None,
             coreml_cache_dir,
+            last_engine_info: None,
         }
     }
 
@@ -86,35 +90,52 @@ impl TranscriptionBackend for ParakeetBackend {
             _ => build_exec_config(choice, cache_dir),
         };
         let accel_attempted = exec_config.is_some();
+        let attempted_label = if accel_attempted {
+            resolved_accel_label(choice)
+        } else {
+            "cpu"
+        };
         info!(
             marker = "live_accel_choice",
             engine = "parakeet",
             requested = ?choice,
-            attempted = accel_attempted,
+            attempted = attempted_label,
             model_dir = %model_path.display(),
             "parakeet acceleration resolved"
         );
-        let model = match ParakeetTDT::from_pretrained(model_path, exec_config) {
-            Ok(m) => m,
+        // `actual_label` records which EP actually took the model — it
+        // diverges from `attempted_label` only on the fallback path below.
+        let (model, actual_label) = match ParakeetTDT::from_pretrained(model_path, exec_config) {
+            Ok(m) => (m, attempted_label.to_string()),
             Err(e) if accel_attempted => {
                 warn!(
                     marker = "live_accel_fallback",
                     engine = "parakeet",
+                    requested = attempted_label,
                     error = %e,
                     "accelerator load failed; falling back to CPU \
                      (set YAPSTACK_PARAKEET_ACCEL=cpu to suppress this attempt)"
                 );
-                ParakeetTDT::from_pretrained(model_path, None)
-                    .map_err(|e2| format!("failed to load parakeet model (CPU fallback): {e2}"))?
+                let m = ParakeetTDT::from_pretrained(model_path, None)
+                    .map_err(|e2| format!("failed to load parakeet model (CPU fallback): {e2}"))?;
+                (m, "cpu".to_string())
             }
             Err(e) => return Err(format!("failed to load parakeet model: {e}")),
         };
         self.model = Some(model);
+        self.last_engine_info = Some(EngineInfo {
+            accel: actual_label,
+            model_dir: model_path.display().to_string(),
+        });
         info!(
             "parakeet TDT model loaded in {} ms",
             load_start.elapsed().as_millis()
         );
         Ok(())
+    }
+
+    fn engine_info(&self) -> Option<EngineInfo> {
+        self.last_engine_info.clone()
     }
 
     fn transcribe(
@@ -297,6 +318,38 @@ impl AccelChoice {
                 Self::Auto
             }
         }
+    }
+}
+
+/// Stable string label for the accelerator that an `AccelChoice` resolves
+/// to under the current cfg. Matches what `auto_exec_config` actually
+/// builds for `AccelChoice::Auto`. Used for the `ModelLoaded.accel`
+/// telemetry payload — kept lowercase + ASCII for grep-friendliness.
+fn resolved_accel_label(choice: AccelChoice) -> &'static str {
+    match choice {
+        AccelChoice::Cpu => "cpu",
+        AccelChoice::Auto => {
+            #[cfg(all(target_os = "macos", feature = "webgpu"))]
+            {
+                "webgpu"
+            }
+            #[cfg(all(target_os = "macos", not(feature = "webgpu"), feature = "coreml"))]
+            {
+                "coreml"
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                "cpu"
+            }
+            #[cfg(all(target_os = "macos", not(feature = "webgpu"), not(feature = "coreml")))]
+            {
+                "cpu"
+            }
+        }
+        #[cfg(feature = "coreml")]
+        AccelChoice::CoreMl => "coreml",
+        #[cfg(feature = "webgpu")]
+        AccelChoice::WebGpu => "webgpu",
     }
 }
 

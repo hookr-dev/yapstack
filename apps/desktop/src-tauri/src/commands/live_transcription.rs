@@ -243,6 +243,18 @@ pub struct LiveTranscriptionPressureEvent {
     /// real time at the moment this chunk finished." None when the chunk did
     /// not produce a successful Transcription response.
     pub lag_seconds: Option<f32>,
+    /// Resolved accelerator (`"webgpu"`, `"coreml"`, `"cuda"`, `"cpu"`,
+    /// `"metal"`) for the active sidecar. Captured once at session start
+    /// from the client's cached engine info — rises with the rest of the
+    /// pressure payload so a single grep'd `live_pressure` line tells us
+    /// whether a slow chunk happened on GPU or CPU.
+    pub accel: Option<String>,
+    /// For Parakeet, the variant directory name (e.g.
+    /// `"parakeet-tdt-v3-int8"` or `"parakeet-tdt-v3"`) so we can tell
+    /// int8 vs fp32 sessions apart in logs without joining against
+    /// `live_engine_loaded`. None for Whisper (single bundle) or when
+    /// the sidecar didn't report a model_dir.
+    pub variant: Option<String>,
 }
 
 /// Internal state for streaming WAV recording during a live session.
@@ -627,6 +639,16 @@ struct EngineProfile {
     /// any text prompt. Drives prompt-context build / decay sites so
     /// neither engine has to be matched on directly.
     uses_initial_prompt: bool,
+    /// Resolved acceleration label captured from the live
+    /// `TranscriptionClient`'s engine_info at session start. Populated
+    /// when the FE knows what's running; `None` for older sidecars or
+    /// when the spawn-time query failed (`init_transcription_client`
+    /// already logs that case).
+    accel: Option<String>,
+    /// For Parakeet, the variant directory name (e.g.
+    /// `"parakeet-tdt-v3-int8"`). Lets the pressure-event log tell
+    /// int8 from fp32 sessions without external joins.
+    variant: Option<String>,
 }
 
 fn profile_for(
@@ -651,6 +673,8 @@ fn profile_for(
                 pre_roll: Duration::ZERO,
             },
             uses_initial_prompt: true,
+            accel: None,
+            variant: None,
         },
         // Parakeet: meeting-tuned. Ignores frontend silence / chunk / poll
         // knobs — these are engine-specific best practice, not user-facing
@@ -687,6 +711,8 @@ fn profile_for(
                 pre_roll: Duration::from_millis(250),
             },
             uses_initial_prompt: false,
+            accel: None,
+            variant: None,
         },
     }
 }
@@ -3243,6 +3269,8 @@ async fn transcribe_chunk(
             engine: profile.engine_name.to_string(),
             is_backfill: input.is_backfill,
             lag_seconds,
+            accel: profile.accel.clone(),
+            variant: profile.variant.clone(),
         },
     );
     // Structured `info!` mirror of the pressure event so the data lands in
@@ -3259,6 +3287,8 @@ async fn transcribe_chunk(
         rtfx = ?rtfx,
         lag_seconds = ?lag_seconds,
         engine = profile.engine_name,
+        accel = profile.accel.as_deref(),
+        variant = profile.variant.as_deref(),
         is_backfill = input.is_backfill,
         ok = transcription_result.is_ok(),
         "transcribe chunk pressure"
@@ -3746,9 +3776,22 @@ pub async fn start_live_transcription(
     // client. After this point, neither the live loop nor `transcribe_chunk`
     // need to re-read `client.engine()` to discover engine-specific
     // behavior — they consult `ctx.engine_profile` instead.
-    let engine_profile = Arc::new(profile_for(extracted_client.engine(), &config));
+    let mut profile = profile_for(extracted_client.engine(), &config);
+    // Fold the resolved sidecar engine info into the profile so per-chunk
+    // pressure events can report which accel and variant the session ran
+    // on without crossing back through Tauri state. `engine_info()` was
+    // populated by `init_transcription_client` at spawn time.
+    if let Some(info) = extracted_client.engine_info() {
+        profile.accel = info.accel;
+        profile.variant = info.model_dir.as_deref().and_then(|p| {
+            std::path::Path::new(p)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+        });
+    }
+    let engine_profile = Arc::new(profile);
     // Logged at INFO so a default-level log capture pinned to a stalled
-    // session always shows which engine + tuning were active.
+    // session always shows which engine + tuning + accel were active.
     info!(
         engine = engine_profile.engine_name,
         silence_ms = engine_profile.vad_tuning.silence_duration.as_millis() as u64,
@@ -3756,6 +3799,8 @@ pub async fn start_live_transcription(
         pre_roll_ms = engine_profile.vad_tuning.pre_roll.as_millis() as u64,
         max_chunk_secs = engine_profile.vad_tuning.max_chunk_duration.as_secs_f32(),
         uses_initial_prompt = engine_profile.uses_initial_prompt,
+        accel = engine_profile.accel.as_deref(),
+        variant = engine_profile.variant.as_deref(),
         session_id = ?config.session_id,
         offset_base_secs = session_offset_base_seconds,
         "live transcription engine profile resolved"
