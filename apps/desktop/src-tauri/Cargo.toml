@@ -1,7 +1,9 @@
 [package]
 name = "yapstack-desktop"
-version = "0.1.0-alpha.3"
+version = "1.0.0-alpha.5"
 edition = "2021"
+license.workspace = true
+repository.workspace = true
 
 [lib]
 name = "yapstack_desktop_lib"

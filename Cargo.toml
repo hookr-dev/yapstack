@@ -8,6 +8,10 @@ members = [
     "apps/desktop/src-tauri",
 ]
 
+[workspace.package]
+license = "AGPL-3.0-only"
+repository = "https://github.com/hookr-dev/YapStack"
+
 [profile.release]
 strip = "symbols"
 lto = "thin"

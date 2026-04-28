@@ -2,6 +2,25 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Changelog discipline
+
+`CHANGELOG.md` is a first-class artifact and must be updated **in the same PR/commit** that makes a user-visible change. "User-visible" means anything a downstream consumer would notice: new commands/features, removed or renamed APIs, schema migrations, behaviour changes, perf wins they can feel, bug fixes worth calling out, dependency upgrades that affect compatibility.
+
+Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) under `## [Unreleased]`:
+
+- **Added** — new features.
+- **Changed** — behaviour changes to existing features.
+- **Deprecated** — soon-to-be-removed features.
+- **Removed** — deletions.
+- **Fixed** — bug fixes worth surfacing.
+- **Security** — vulnerability fixes.
+
+When cutting a release, rename `[Unreleased]` to the new version with the date (`## [1.0.0-alpha.6] - YYYY-MM-DD`) and start a fresh empty `[Unreleased]` block above it.
+
+**Skip the changelog** for: pure refactors, internal test changes, formatting, doc-only edits that don't affect the API, dependency bumps that don't change behaviour. When in doubt, add an entry — it's cheap.
+
+Treat a missing changelog entry on a user-visible PR as a review-blocking gap, the same way a missing test would be.
+
 ## Build & Test Commands
 
 ```bash

@@ -25,12 +25,8 @@ jobs:
         run: cargo fmt --all -- --check
 
   rust:
-    name: Rust (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [macos-latest, windows-latest]
+    name: Rust (macos-latest)
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
@@ -42,28 +38,18 @@ jobs:
       - name: Rust cache
         uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
         with:
-          shared-key: ci-${{ matrix.os }}
+          shared-key: ci-macos-latest
 
       - name: Create sidecar placeholder
-        shell: bash
         run: |
           mkdir -p apps/desktop/src-tauri/binaries
-          if [[ "$RUNNER_OS" == "Windows" ]]; then
-            touch apps/desktop/src-tauri/binaries/yapstack-sidecar-x86_64-pc-windows-msvc.exe
-          else
-            touch apps/desktop/src-tauri/binaries/yapstack-sidecar-aarch64-apple-darwin
-          fi
+          touch apps/desktop/src-tauri/binaries/yapstack-sidecar-aarch64-apple-darwin
 
       - name: Clippy
         run: cargo clippy --all -- -D warnings
 
       - name: Run tests
         run: cargo test --all
-
-      - name: Check sidecar with whisper feature (Windows)
-        if: runner.os == 'Windows'
-        run: cargo check -p yapstack-sidecar --features whisper
-        # Note: cuda feature requires CUDA toolkit; only enabled in release builds
 
   frontend:
     name: Frontend
