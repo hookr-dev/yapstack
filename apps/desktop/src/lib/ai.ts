@@ -199,6 +199,30 @@ export function getAllModelsGrouped(
 
 // ----- Client -----
 
+// The OpenAI SDK passes a `Headers` instance to its custom `fetch`. Tauri's
+// `plugin-http` then runs `new Request(input, init)` against that same init,
+// and on macOS WKWebView this loses the `Authorization` header on cross-origin
+// requests — OpenRouter then responds 401 "Missing Authentication header".
+// Converting headers to a plain object before invoking `tauriFetch` sidesteps
+// the Request-constructor path entirely.
+async function tauriFetchAdapter(
+  input: RequestInfo | URL,
+  init?: RequestInit,
+): Promise<Response> {
+  if (!init?.headers) return tauriFetch(input as string, init);
+  const plain: Record<string, string> = {};
+  if (init.headers instanceof Headers) {
+    init.headers.forEach((value, key) => {
+      plain[key] = value;
+    });
+  } else if (Array.isArray(init.headers)) {
+    for (const [key, value] of init.headers) plain[key] = value;
+  } else {
+    Object.assign(plain, init.headers);
+  }
+  return tauriFetch(input as string, { ...init, headers: plain });
+}
+
 export function createAIClient(settings: AISettings): OpenAI {
   const config = settings.providers[settings.activeProvider];
 
@@ -208,19 +232,24 @@ export function createAIClient(settings: AISettings): OpenAI {
     headers["X-Title"] = "YapStack";
   }
 
+  // Trim whitespace — pasted keys frequently carry a trailing newline, which
+  // produces an empty Bearer token after the SDK's `Bearer ${apiKey}` template
+  // is split on the first space by some servers.
+  const trimmedKey = config.apiKey.trim();
+
   // Local OpenAI-compatible servers (llama.cpp, LM Studio, Ollama) don't require a key,
   // but the OpenAI SDK refuses to construct without one. Substitute a placeholder.
   const apiKey =
-    settings.activeProvider === "custom" && !config.apiKey
+    settings.activeProvider === "custom" && !trimmedKey
       ? "sk-no-key-required"
-      : config.apiKey;
+      : trimmedKey;
 
   return new OpenAI({
     apiKey,
     baseURL: config.baseUrl,
     dangerouslyAllowBrowser: true,
     defaultHeaders: Object.keys(headers).length > 0 ? headers : undefined,
-    fetch: tauriFetch,
+    fetch: tauriFetchAdapter,
   });
 }
 
