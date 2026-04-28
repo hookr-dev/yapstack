@@ -42,6 +42,25 @@ export type StreamHealthEvent = {
   message: string;
 };
 
+/**
+ * Per-chunk transcription pressure telemetry. Fires after every transcribe
+ * attempt (success or failure). RTFx < 1 means the pipeline is slower than
+ * real time; sustained low RTFx + rising lag is the failure mode that Stage 1
+ * exists to surface.
+ */
+export type LiveTranscriptionPressureEvent = {
+  source: "Mic" | "System";
+  chunk_index: number;
+  chunk_audio_seconds: number;
+  wall_ms: number;
+  /** Null when the transcribe call failed or wall_ms was 0. */
+  rtfx: number | null;
+  engine: "Whisper" | "Parakeet";
+  is_backfill: boolean;
+  /** Null when the chunk did not produce a successful transcription. */
+  lag_seconds: number | null;
+};
+
 export type BubbleState =
   | "recording" | "transcribing" | "processing"
   | "pasted" | "copied" | "note-created"
@@ -71,6 +90,7 @@ export const EVENTS = {
   LIVE_TRANSCRIPTION_SEGMENT: "live-transcription-segment",
   LIVE_TRANSCRIPTION_STATUS: "live-transcription-status",
   LIVE_TRANSCRIPTION_WARNING: "live-transcription-warning",
+  LIVE_TRANSCRIPTION_PRESSURE: "live-transcription-pressure",
   BACKFILL_COMPLETE: "backfill-complete",
   SESSION_PART_READY: "session-part-ready",
   SESSION_WAV_ERROR: "session-wav-error",
@@ -101,6 +121,7 @@ type EventPayloadMap = {
   [EVENTS.LIVE_TRANSCRIPTION_SEGMENT]: LiveSegmentEvent;
   [EVENTS.LIVE_TRANSCRIPTION_STATUS]: LiveTranscriptionStatus;
   [EVENTS.LIVE_TRANSCRIPTION_WARNING]: LiveTranscriptionWarningEvent;
+  [EVENTS.LIVE_TRANSCRIPTION_PRESSURE]: LiveTranscriptionPressureEvent;
   [EVENTS.BACKFILL_COMPLETE]: void;
   [EVENTS.SESSION_PART_READY]: SessionPartReadyEvent;
   [EVENTS.SESSION_WAV_ERROR]: SessionWavErrorEvent;

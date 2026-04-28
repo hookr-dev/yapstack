@@ -147,6 +147,16 @@ pub struct LiveTranscriptionStatus {
     pub error_message: Option<String>,
     pub session_id: Option<String>,
     pub effective_start_epoch_ms: Option<f64>,
+    /// Session-time elapsed since session start minus the latest completed
+    /// chunk's end offset. Rising values mean transcription is falling behind
+    /// real time; falling values mean the consumer is catching up. None until
+    /// the first successful chunk lands.
+    pub lag_seconds: Option<f32>,
+    /// Cumulative count of times the Stage-3 head-drop cap fired this
+    /// session. Stays 0 in normal operation — any non-zero value indicates
+    /// audio was discarded to keep the inference queue bounded. Removed in
+    /// Stage 3 when cap-and-drop is replaced with queue-and-drain.
+    pub cap_fired_total: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Type)]
@@ -212,6 +222,29 @@ pub struct StreamHealthEvent {
     pub message: String,
 }
 
+/// Per-chunk timing telemetry. Emitted after every transcribe attempt (success
+/// OR failure) so the frontend and logs can see when the pipeline is falling
+/// behind real time. `wall_ms / (chunk_audio_seconds * 1000) = RTFx`; values
+/// below 1.0 mean the consumer is slower than real time and lag will grow.
+#[derive(Debug, Clone, Serialize, Type)]
+pub struct LiveTranscriptionPressureEvent {
+    pub source: AudioSourceLabel,
+    pub chunk_index: u32,
+    pub chunk_audio_seconds: f32,
+    pub wall_ms: u64,
+    /// `chunk_audio_seconds / (wall_ms / 1000)`. None when transcribe failed
+    /// or wall_ms is 0.
+    pub rtfx: Option<f32>,
+    /// Engine that produced this chunk — `"Whisper"` or `"Parakeet"`.
+    pub engine: String,
+    pub is_backfill: bool,
+    /// Session-time elapsed since session start minus the just-completed
+    /// chunk's end offset. Positive means "transcription is N seconds behind
+    /// real time at the moment this chunk finished." None when the chunk did
+    /// not produce a successful Transcription response.
+    pub lag_seconds: Option<f32>,
+}
+
 /// Internal state for streaming WAV recording during a live session.
 struct SessionWavState {
     writer: yapstack_audio::SessionWavWriter,
@@ -268,12 +301,20 @@ struct TranscriptionContext {
     /// runs produce offsets continuous with prior parts. Zero on a fresh
     /// Session, equals SUM of prior part durations on a resumed Session.
     session_offset_base_seconds: f32,
+    /// Wall-clock instant the live loop started. Combined with
+    /// `session_offset_base_seconds` this gives "session-time now" for lag
+    /// calculations: lag = (offset_base + start.elapsed()) - latest_completed_audio_offset.
+    session_start_instant: Instant,
 }
 
 /// Result of transcribing a single chunk.
 struct ChunkResult {
     event: LiveSegmentEvent,
     chunk_duration: f32,
+    /// Wall-time the sidecar took to process this chunk (round-trip
+    /// `transcribe_with` duration). Tracked here so the success path can
+    /// fold it into `SessionCounters::total_wall_ms` without re-measuring.
+    wall_ms: u64,
 }
 
 /// Outcome of a transcription attempt — determines cursor management and
@@ -315,6 +356,16 @@ struct ChunkInput<'a> {
 struct SessionCounters {
     total_chunks: u32,
     total_audio_seconds: f32,
+    /// Cumulative count of head-drop cap firings (Stage 3 will remove the
+    /// cap; for now this counts how often we silently discarded audio).
+    cap_fired_total: u32,
+    /// Cumulative wall-time across every successful transcribe — for an
+    /// aggregate "session RTFx" view if we want one later.
+    total_wall_ms: u64,
+    /// Session-time of the latest completed chunk's end (audio_offset +
+    /// chunk_duration). Used by `get_live_transcription_status` to compute
+    /// lag against the current wall clock. None until the first chunk lands.
+    latest_completed_audio_offset_seconds: Option<f32>,
 }
 
 /// Per-loop prompt accumulator. The live loop and `process_backfill` each own
@@ -353,6 +404,13 @@ pub(crate) struct LiveTranscriptionController {
     /// mutate in place when a chunk lands; `get_live_transcription_status`
     /// reads them via a brief lock to surface real values to the UI.
     counters: Arc<StdMutex<SessionCounters>>,
+    /// Mirrors `TranscriptionContext::session_start_instant` so the polled
+    /// status command can compute `lag_seconds` without having to reach into
+    /// the running loop's private state.
+    session_start_instant: Instant,
+    /// Mirrors `TranscriptionContext::session_offset_base_seconds` for the
+    /// same reason — needed to convert wall-clock elapsed into session-time.
+    session_offset_base_seconds: f32,
 }
 
 impl LiveTranscriptionController {
@@ -360,10 +418,22 @@ impl LiveTranscriptionController {
         !self.task_handle.is_finished()
     }
 
-    /// Snapshot the live counters under a short lock.
-    fn counters(&self) -> (u32, f32) {
+    /// Snapshot the live counters and derive `lag_seconds` against the wall
+    /// clock under a single short lock. `lag_seconds` is `None` until the
+    /// first successful chunk has landed.
+    fn snapshot(&self) -> (u32, f32, Option<f32>, u32) {
         let s = self.counters.lock().expect("counters mutex poisoned");
-        (s.total_chunks, s.total_audio_seconds)
+        let lag = s.latest_completed_audio_offset_seconds.map(|chunk_end| {
+            let session_time_now = self.session_offset_base_seconds
+                + self.session_start_instant.elapsed().as_secs_f32();
+            (session_time_now - chunk_end).max(0.0)
+        });
+        (
+            s.total_chunks,
+            s.total_audio_seconds,
+            lag,
+            s.cap_fired_total,
+        )
     }
 }
 
@@ -634,6 +704,8 @@ fn emit_status(
     phase: LiveTranscriptionPhase,
     chunks: u32,
     audio_secs: f32,
+    lag_seconds: Option<f32>,
+    cap_fired_total: u32,
 ) {
     let _ = app_handle.emit(
         "live-transcription-status",
@@ -644,6 +716,8 @@ fn emit_status(
             error_message: None,
             session_id: None,
             effective_start_epoch_ms: None,
+            lag_seconds,
+            cap_fired_total,
         },
     );
 }
@@ -826,6 +900,7 @@ async fn prepare_chunk_dispatch(
         chunk_index,
         accumulated_text,
         is_backfill,
+        dropped_head_seconds,
     })
 }
 
@@ -839,6 +914,11 @@ struct PreparedChunk {
     chunk_index: u32,
     accumulated_text: String,
     is_backfill: bool,
+    /// How many seconds of audio the head-drop cap discarded before
+    /// dispatching this chunk. Zero on the normal path. Reported via
+    /// `SessionCounters::cap_fired_total` so the UI can surface that audio
+    /// was lost. Stage 3 removes the cap and this field with it.
+    dropped_head_seconds: f32,
 }
 
 /// Run a single chunk's transcription in a background task. Emits the
@@ -1926,7 +2006,14 @@ async fn live_transcription_loop(
     let mut wav_flush_none_count: u32 = 0;
     let mut prompt_seeded_from_backfill = false;
 
-    emit_status(&ctx.app_handle, LiveTranscriptionPhase::Running, 0, 0.0);
+    emit_status(
+        &ctx.app_handle,
+        LiveTranscriptionPhase::Running,
+        0,
+        0.0,
+        None,
+        0,
+    );
 
     let poll_interval = tuning.poll_interval;
     let mut exited_fatal = false;
@@ -1942,7 +2029,14 @@ async fn live_transcription_loop(
                 "live transcription: failed to initialize Silero VAD — bailing out: {}",
                 e
             );
-            emit_status(&ctx.app_handle, LiveTranscriptionPhase::Error, 0, 0.0);
+            emit_status(
+                &ctx.app_handle,
+                LiveTranscriptionPhase::Error,
+                0,
+                0.0,
+                None,
+                0,
+            );
             return;
         }
     };
@@ -2206,6 +2300,10 @@ async fn live_transcription_loop(
                     )
                     .await;
                     if let Some(prepared) = prepared {
+                        if prepared.dropped_head_seconds > 0.0 {
+                            let mut s = counters.lock().expect("counters mutex poisoned");
+                            s.cap_fired_total = s.cap_fired_total.saturating_add(1);
+                        }
                         let task_ctx = ctx.clone();
                         let task_counters = counters.clone();
                         let task_prompt = prompt.clone();
@@ -2292,9 +2390,19 @@ async fn live_transcription_loop(
         }
     }
 
-    let (final_chunks, final_audio_seconds) = {
+    let (final_chunks, final_audio_seconds, final_cap_fired, final_lag) = {
         let s = counters.lock().expect("counters mutex poisoned");
-        (s.total_chunks, s.total_audio_seconds)
+        let lag = s.latest_completed_audio_offset_seconds.map(|chunk_end| {
+            let session_time_now =
+                ctx.session_offset_base_seconds + ctx.session_start_instant.elapsed().as_secs_f32();
+            (session_time_now - chunk_end).max(0.0)
+        });
+        (
+            s.total_chunks,
+            s.total_audio_seconds,
+            s.cap_fired_total,
+            lag,
+        )
     };
 
     // Only emit Stopped if we didn't already emit Error (avoids duplicate finalization)
@@ -2304,6 +2412,8 @@ async fn live_transcription_loop(
             LiveTranscriptionPhase::Stopped,
             final_chunks,
             final_audio_seconds,
+            final_lag,
+            final_cap_fired,
         );
     }
 
@@ -2426,9 +2536,19 @@ async fn build_initial_sources_and_backfill(
 /// normal stop.
 fn emit_fatal_sidecar_error(ctx: &TranscriptionContext, counters: &Arc<StdMutex<SessionCounters>>) {
     error!("live transcription: sidecar died and could not be restarted — stopping");
-    let (chunks, audio_secs) = {
+    let (chunks, audio_secs, cap_fired_total, lag_seconds) = {
         let s = counters.lock().expect("counters mutex poisoned");
-        (s.total_chunks, s.total_audio_seconds)
+        let lag = s.latest_completed_audio_offset_seconds.map(|chunk_end| {
+            let session_time_now =
+                ctx.session_offset_base_seconds + ctx.session_start_instant.elapsed().as_secs_f32();
+            (session_time_now - chunk_end).max(0.0)
+        });
+        (
+            s.total_chunks,
+            s.total_audio_seconds,
+            s.cap_fired_total,
+            lag,
+        )
     };
     let _ = ctx.app_handle.emit(
         "live-transcription-status",
@@ -2441,6 +2561,8 @@ fn emit_fatal_sidecar_error(ctx: &TranscriptionContext, counters: &Arc<StdMutex<
             ),
             session_id: ctx.config.session_id.clone(),
             effective_start_epoch_ms: None,
+            lag_seconds,
+            cap_fired_total,
         },
     );
 }
@@ -2585,6 +2707,10 @@ async fn dispatch_final_pending_chunks(
         )
         .await;
         if let Some(prepared) = prepared {
+            if prepared.dropped_head_seconds > 0.0 {
+                let mut s = counters.lock().expect("counters mutex poisoned");
+                s.cap_fired_total = s.cap_fired_total.saturating_add(1);
+            }
             let task_ctx = ctx.clone();
             let task_counters = counters.clone();
             let task_prompt = prompt.clone();
@@ -2998,6 +3124,8 @@ async fn transcribe_chunk(
                     error_message: Some("transcription client not initialized".to_string()),
                     session_id: ctx.config.session_id.clone(),
                     effective_start_epoch_ms: None,
+                    lag_seconds: None,
+                    cap_fired_total: 0,
                 },
             );
             return TranscribeOutcome::SidecarDead;
@@ -3011,6 +3139,7 @@ async fn transcribe_chunk(
         yapstack_common::types::EngineKind::Whisper => effective_prompt.as_deref(),
         yapstack_common::types::EngineKind::Parakeet => None,
     };
+    let wall_start = Instant::now();
     let transcription_result = client
         .transcribe_with(
             &wav_path,
@@ -3019,6 +3148,39 @@ async fn transcribe_chunk(
             ctx.config.diarization,
         )
         .await;
+    let wall_ms = wall_start.elapsed().as_millis() as u64;
+
+    // Emit pressure telemetry regardless of outcome — a chunk that took 8s
+    // to fail is just as much "the pipeline is unhealthy" as one that took 8s
+    // to succeed. RTFx is only meaningful on success and when wall_ms > 0.
+    let rtfx = match (&transcription_result, wall_ms) {
+        (Ok(_), w) if w > 0 => Some(chunk_duration / (w as f32 / 1000.0)),
+        _ => None,
+    };
+    let lag_seconds = if transcription_result.is_ok() {
+        let session_time_now =
+            ctx.session_offset_base_seconds + ctx.session_start_instant.elapsed().as_secs_f32();
+        let chunk_end_session_time = input.audio_offset_seconds + chunk_duration;
+        Some((session_time_now - chunk_end_session_time).max(0.0))
+    } else {
+        None
+    };
+    let _ = ctx.app_handle.emit(
+        "live-transcription-pressure",
+        LiveTranscriptionPressureEvent {
+            source: input.source_label,
+            chunk_index: *chunk_index,
+            chunk_audio_seconds: chunk_duration,
+            wall_ms,
+            rtfx,
+            engine: match engine_kind {
+                yapstack_common::types::EngineKind::Whisper => "Whisper".to_string(),
+                yapstack_common::types::EngineKind::Parakeet => "Parakeet".to_string(),
+            },
+            is_backfill: input.is_backfill,
+            lag_seconds,
+        },
+    );
 
     // _wav_guard handles cleanup via Drop
 
@@ -3096,6 +3258,7 @@ async fn transcribe_chunk(
                     session_id: ctx.config.session_id.clone(),
                 },
                 chunk_duration,
+                wall_ms,
             })
         }
         Err(e) => {
@@ -3179,16 +3342,31 @@ async fn transcribe_and_emit_chunk(
 
     if let TranscribeOutcome::Success(ref result) = outcome {
         // Short critical section — no await held.
-        let (total_chunks, total_audio_seconds) = {
+        let (total_chunks, total_audio_seconds, cap_fired_total) = {
             let mut s = counters.lock().expect("counters mutex poisoned");
             s.total_chunks += 1;
             s.total_audio_seconds += result.chunk_duration;
-            (s.total_chunks, s.total_audio_seconds)
+            s.total_wall_ms = s.total_wall_ms.saturating_add(result.wall_ms);
+            // Track the latest emitted chunk's session-time end so the
+            // status command can compute live lag against the wall clock.
+            // Pressure event already reported per-chunk lag; this is for the
+            // polled-status surface used by StatusPopover.
+            let chunk_end = result.event.audio_offset_seconds + result.chunk_duration;
+            s.latest_completed_audio_offset_seconds = Some(chunk_end);
+            (s.total_chunks, s.total_audio_seconds, s.cap_fired_total)
         };
         prompt
             .lock()
             .expect("prompt mutex poisoned")
             .last_transcription_at = Some(Instant::now());
+
+        // Compute lag for the status broadcast below — same formula as the
+        // pressure event but read from ctx so emit_status can stay engine-
+        // and chunk-agnostic.
+        let session_time_now =
+            ctx.session_offset_base_seconds + ctx.session_start_instant.elapsed().as_secs_f32();
+        let chunk_end_session_time = result.event.audio_offset_seconds + result.chunk_duration;
+        let lag_seconds = Some((session_time_now - chunk_end_session_time).max(0.0));
 
         let _ = ctx
             .app_handle
@@ -3198,6 +3376,8 @@ async fn transcribe_and_emit_chunk(
             LiveTranscriptionPhase::Running,
             total_chunks,
             total_audio_seconds,
+            lag_seconds,
+            cap_fired_total,
         );
     }
 
@@ -3479,6 +3659,7 @@ pub async fn start_live_transcription(
         config.vocabulary_hints.clone().unwrap_or_default(),
     ));
 
+    let session_start_instant = Instant::now();
     let ctx = TranscriptionContext {
         transcription_client: Arc::new(Mutex::new(Some(extracted_client))),
         shared_transcription_state: transcription_state_clone,
@@ -3487,11 +3668,15 @@ pub async fn start_live_transcription(
         bridged_prompt: Arc::new(Mutex::new(String::new())),
         vocabulary_hints: vocab_hints.clone(),
         session_offset_base_seconds,
+        session_start_instant,
     };
 
     let counters = Arc::new(StdMutex::new(SessionCounters {
         total_chunks: 0,
         total_audio_seconds: 0.0,
+        cap_fired_total: 0,
+        total_wall_ms: 0,
+        latest_completed_audio_offset_seconds: None,
     }));
 
     let task_handle = tokio::spawn({
@@ -3533,6 +3718,8 @@ pub async fn start_live_transcription(
                         error_message: Some("live transcription crashed unexpectedly".to_string()),
                         session_id: ctx_guard.config.session_id.clone(),
                         effective_start_epoch_ms: None,
+                        lag_seconds: None,
+                        cap_fired_total: 0,
                     },
                 );
             }
@@ -3546,6 +3733,8 @@ pub async fn start_live_transcription(
             session_id: controller_session_id,
             effective_start_epoch_ms,
             counters,
+            session_start_instant,
+            session_offset_base_seconds,
         },
         vocabulary_hints: vocab_hints,
     });
@@ -3585,7 +3774,8 @@ pub async fn get_live_transcription_status(
     match &*guard {
         Some(runtime) => {
             let c = &runtime.controller;
-            let (chunks_processed, total_audio_seconds) = c.counters();
+            let (chunks_processed, total_audio_seconds, lag_seconds, cap_fired_total) =
+                c.snapshot();
             let phase = if c.is_running() {
                 LiveTranscriptionPhase::Running
             } else {
@@ -3598,6 +3788,8 @@ pub async fn get_live_transcription_status(
                 error_message: None,
                 session_id: c.session_id.clone(),
                 effective_start_epoch_ms: Some(c.effective_start_epoch_ms),
+                lag_seconds,
+                cap_fired_total,
             })
         }
         None => Ok(LiveTranscriptionStatus {
@@ -3607,6 +3799,8 @@ pub async fn get_live_transcription_status(
             error_message: None,
             session_id: None,
             effective_start_epoch_ms: None,
+            lag_seconds: None,
+            cap_fired_total: 0,
         }),
     }
 }

@@ -324,7 +324,11 @@ export function StatusPopover() {
         ? `Session: ${activeSessionId} (${formatElapsed(elapsedMs)}, ${activeSessionSegments.length} segments)`
         : `Session: (none)`,
       liveStatus
-        ? `Chunks: ${liveStatus.chunks_processed}   Audio: ${liveStatus.total_audio_seconds.toFixed(1)}s`
+        ? `Chunks: ${liveStatus.chunks_processed}   Audio: ${liveStatus.total_audio_seconds.toFixed(1)}s   Lag: ${
+            liveStatus.lag_seconds == null
+              ? "—"
+              : `${liveStatus.lag_seconds.toFixed(1)}s`
+          }   Cap fired: ${liveStatus.cap_fired_total}×`
         : `Chunks: n/a`,
       engineError ? `Engine error: ${engineError}` : "",
       captureStatus?.error_message
@@ -485,6 +489,32 @@ export function StatusPopover() {
                         {(liveStatus?.total_audio_seconds ?? 0).toFixed(1)}s
                       </span>
                     </div>
+                    <div className="col-span-2 flex items-center justify-between">
+                      <span className="text-muted-foreground/70">
+                        Lag (live → real time)
+                      </span>
+                      <span
+                        className={`font-mono tabular-nums ${
+                          (liveStatus?.lag_seconds ?? 0) > 5
+                            ? "text-amber-600 dark:text-amber-400"
+                            : ""
+                        }`}
+                      >
+                        {liveStatus?.lag_seconds == null
+                          ? "—"
+                          : `${liveStatus.lag_seconds.toFixed(1)}s`}
+                      </span>
+                    </div>
+                    {(liveStatus?.cap_fired_total ?? 0) > 0 && (
+                      <div className="col-span-2 flex items-center justify-between">
+                        <span className="text-amber-700 dark:text-amber-400">
+                          Audio dropped (cap)
+                        </span>
+                        <span className="font-mono tabular-nums text-amber-700 dark:text-amber-400">
+                          {liveStatus?.cap_fired_total ?? 0}×
+                        </span>
+                      </div>
+                    )}
                     {sessionIdShort && (
                       <div className="col-span-2 flex items-center justify-between">
                         <span className="flex items-center gap-1 text-muted-foreground/70">

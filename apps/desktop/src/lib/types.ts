@@ -509,7 +509,21 @@ vocabulary_hints: string | null;
 resume?: ResumeConfig | null }
 export type LiveTranscriptionPhase = "Running" | "Stopped" | "Error"
 export type LiveTranscriptionStartResult = { effective_start_epoch_ms: number }
-export type LiveTranscriptionStatus = { phase: LiveTranscriptionPhase; chunks_processed: number; total_audio_seconds: number; error_message: string | null; session_id: string | null; effective_start_epoch_ms: number | null }
+export type LiveTranscriptionStatus = { phase: LiveTranscriptionPhase; chunks_processed: number; total_audio_seconds: number; error_message: string | null; session_id: string | null; effective_start_epoch_ms: number | null; 
+/**
+ * Session-time elapsed since session start minus the latest completed
+ * chunk's end offset. Rising values mean transcription is falling behind
+ * real time; falling values mean the consumer is catching up. None until
+ * the first successful chunk lands.
+ */
+lag_seconds: number | null; 
+/**
+ * Cumulative count of times the Stage-3 head-drop cap fired this
+ * session. Stays 0 in normal operation — any non-zero value indicates
+ * audio was discarded to keep the inference queue bounded. Removed in
+ * Stage 3 when cap-and-drop is replaced with queue-and-drain.
+ */
+cap_fired_total: number }
 /**
  * One log line visible to the frontend. `ts_ms` is unix-epoch milliseconds.
  */

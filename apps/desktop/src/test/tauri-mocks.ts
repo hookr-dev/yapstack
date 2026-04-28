@@ -165,6 +165,8 @@ export const tauriCommandsMock = () => ({
         error_message: null,
         session_id: null,
         effective_start_epoch_ms: null,
+        lag_seconds: null,
+        cap_fired_total: 0,
       },
     }),
     clipboardPaste: vi.fn().mockResolvedValue({ status: "ok", data: null }),
