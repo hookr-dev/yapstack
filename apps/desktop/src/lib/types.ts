@@ -194,6 +194,25 @@ async getParakeetModels() : Promise<Result<ParakeetModelInfoDto[], CommandError>
     else return { status: "error", error: e  as any };
 }
 },
+/**
+ * Returns the Parakeet variant the current host should run. Apple Silicon
+ * gets the int8 bundle (smaller, no external `.onnx.data`, accelerator-
+ * compatible); other targets keep the fp32 bundle.
+ * 
+ * The frontend uses this in two places:
+ * 1. As the source of truth for the v24 store migration that coerces
+ * pre-existing `selectedParakeetVariant` values.
+ * 2. To render a single-variant Parakeet UI keyed to whatever the host
+ * is meant to run, so users never have to pick int8 vs fp32.
+ */
+async getRecommendedParakeetVariant() : Promise<Result<ParakeetVariantDto, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("get_recommended_parakeet_variant") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async downloadParakeetModel(variant: ParakeetVariantDto) : Promise<Result<string, CommandError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("download_parakeet_model", { variant }) };
