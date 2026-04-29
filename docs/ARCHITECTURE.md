@@ -92,7 +92,8 @@ Tauri commands layer. Thin wrappers that convert between domain types and DTOs (
 - `commands/audio.rs` — Device listing, capture start/stop, capture status, buffer info, `peek_capture_energy` (RMS readout used by the recording beacon). `MixConfigDto::sanitized()` validates gain values at the command boundary.
 - `commands/capture.rs` — Audio cleanup commands only (`delete_audio_files` for per-part cleanup, `delete_session_wav` for legacy session-glob cleanup). Session lifecycle and audio finalization are owned by `commands/live_transcription.rs`.
 - `commands/transcription.rs` — Model management, transcription, sidecar lifecycle. Locks released before async I/O.
-- `commands/live_transcription.rs` — Real-time transcription controller with per-source VAD (`SourceVadState`), concurrent backfill processing (Silero-driven `vad_chunk_historical_audio` shares boundary choices with the live loop), prompt context windowing, prompt decay, stream health monitoring with auto-restart. Shared `TranscriptionContext` struct for immutable config passing. Extracts the `TranscriptionClient` from shared state for zero-contention private use during the loop. Streams session WAV incrementally via `SessionWavWriter`.
+- `commands/live_transcription.rs` — Real-time transcription controller with per-source VAD (`SourceVadState`), concurrent backfill processing (Silero-driven `vad_chunk_historical_audio` shares boundary choices with the live loop), prompt context windowing, prompt decay, stream health monitoring with auto-restart. Shared `TranscriptionContext` struct for immutable config passing. Extracts the `TranscriptionClient` from shared state at session start and hands it to a `TranscriptionScheduler` that owns it for the duration of the session. Streams session WAV incrementally via `SessionWavWriter`.
+- `commands/transcription_scheduler.rs` — Single-worker priority queue in front of the sidecar lane (`FinalFlush > Live > Backfill`, mic/system round-robin at the live tier). Sole caller of `TranscriptionClient::transcribe_with` during a session, which makes sidecar respawn race-free. See "Transcription Scheduler" below.
 - `commands/dictation.rs` — `clipboard_paste` command for voice dictation output. Writes text to system clipboard via `pbcopy` (macOS) or `clip` (Windows), optionally triggers auto-paste via `osascript` keystroke simulation.
 - `commands/mod.rs` — `show_overlay_panel`, `hide_overlay_panel` commands (cfg-gated: macOS uses NSPanel via `tauri-nspanel`, non-macOS falls back to WebviewWindow show/hide). `get_autostart_enabled`, `set_autostart_enabled` commands via `tauri-plugin-autostart`.
 
@@ -173,27 +174,38 @@ Live transcription loop (one chunk):
 ### Live Transcription
 ```
 Frontend: start_live_transcription(config)
-    → Extracts the TranscriptionClient from shared state → private Arc<Mutex<Option<Arc<TranscriptionClient>>>>
-      (zero contention — other commands get "not available" instead of blocking)
-    → Creates TranscriptionContext (immutable: transcription_client, shared_transcription_state, app_handle, config, start time)
+    → Extracts the TranscriptionClient from shared state and hands it to a
+      fresh TranscriptionScheduler (single-worker priority queue, see
+      "Transcription Scheduler" below). The scheduler is the sole caller of
+      `transcribe_with` for the duration of the session; on shutdown it
+      returns the client to TranscriptionClientState.
+    → Creates TranscriptionContext (immutable: scheduler handle, app_handle, config, start time)
     → If config.session_id set: creates SessionWavWriter at $AUDIO_DIR/{session_id}.{part_index}.wav
       (audioSaveLocation if set, else $APP_DATA_DIR/audio/; part_index resumes from existing parts)
     → Spawns async task with two concurrent tracks:
 
     Track 1 — Backfill (if backfill_seconds > 0):
         1. Rewind cursors by backfill_seconds from current write_pos
-        2. Extract historical audio per source
+        2. Extract historical audio per source into owned Vec<f32> (no longer
+           reads the ring buffer after this snapshot — backfill is durable
+           against ring-buffer churn for the rest of the session)
         3. Run vad_chunk_historical_audio() over each source — same Silero
            state machine the live loop uses, so backfill and live share
            boundary choices and there's no quality gap at the seam
         4. Skip entirely silent windows (no chunk emitted)
-        5. Transcribe interleaved (window 0 all sources, window 1, etc.)
-        6. Emit "live-segment" events with is_backfill=true
-        7. Emit "backfill-complete" event
+        5. Submit each chunk to the scheduler at JobOrigin::Backfill
+           priority, interleaved across sources (chunk 0 all sources,
+           chunk 1, etc.). The scheduler drains backfill whenever it has
+           no FinalFlush or Live work outstanding.
+        6. Emit "live-segment" events with origin="backfill" (is_backfill=true)
+        7. Emit "backfill-complete" event when the submitter finishes
+        8. Stop does *not* cancel the submitter — the scheduler keeps draining
+           backfill after the live loop has exited, capped only by the
+           scheduler's shutdown timeout (default 5 min).
 
     Track 2 — Live VAD loop (runs concurrently; per-call diarization gated on
               ctx.config.diarization, initial_prompt gated on
-              client.engine() == EngineKind::Whisper):
+              ctx.engine_profile.uses_initial_prompt):
         1. Poll every tuning.poll_interval (Whisper 300ms; Parakeet 100ms)
         2. Single lock: per-source extract_source_audio() for Silero +
            extract_since() for WAV flush. Raw mono samples, not RMS.
@@ -209,19 +221,28 @@ Frontend: start_live_transcription(config)
         5. On VadAction::Chunk (silence detected) or ForceChunk (max duration):
             a. extract_sources_since()
             b. write_wav_to_temp() → temp WAV
-            c. TranscriptionClient.transcribe_with() with prompt context (last N chars; Whisper-only)
-            d. Emit "live-segment" event with segments + metadata
+            c. Submit JobRequest to the scheduler at JobOrigin::Live (or
+               JobOrigin::FinalFlush when should_stop is true — these
+               outrank pending Live and Backfill so closing words survive)
+            d. Emit "live-segment" event with segments + metadata + origin
         6. On stop: force-chunk any speaking source, then exit loop
 
     → After loop exits (cleanup):
-        1. Drain in-flight chunk tasks (10 s graceful, then abort)
+        1. Drain in-flight chunk tasks (15 s — they hold no
+           Arc<TranscriptionClient> clones under the scheduler, so no abort
+           phase is needed; FinalFlush priority means closing-words chunks
+           land first)
         2. Final WAV flush + finalize per audioExportFormat (WAV kept / MP3 re-encoded + WAV deleted)
         3. Register the parent dir as trusted; if config.persist_audio_part is true (default),
            insert the session_audio_parts row from Rust. Dictation passes false here and stores
            the path on dictation_history instead. Then emit "session-part-ready" with
            { session_id, part_index, file_path, format, duration_seconds, sample_rate }
            (or "session-wav-error" on empty recordings)
-        4. Returns the TranscriptionClient to shared state (even after panic via AssertUnwindSafe)
+        4. Wait for the backfill submitter task to finish enqueuing chunks
+           (capped at the scheduler's default shutdown timeout — 5 min)
+        5. scheduler.shutdown_and_return(timeout) — drains the queue
+           (FinalFlush, Live, then Backfill) and returns the client to
+           TranscriptionClientState (even after panic via AssertUnwindSafe)
     → Per-source VAD: SourceVadState tracks mic/system independently
     → Prompt context: per-source accumulated_text (up to 1000 chars) truncated to prompt_context_chars (default 350) for Whisper initial_prompt
     → Prompt decay: clears both shared_prompt and per-source accumulated_text after prompt_decay_silence_seconds (default 5s) of
@@ -229,6 +250,43 @@ Frontend: start_live_transcription(config)
       Backfill seeding is one-shot (prompt_seeded_from_backfill guard prevents re-seeding after decay).
     → Stopped via oneshot channel from stop_live_transcription()
 ```
+
+### Transcription Scheduler
+
+`commands/transcription_scheduler.rs` is a single-worker priority queue in
+front of the sidecar lane. The sidecar processes IPC requests serially on the
+model side, so any two `transcribe_with` calls land in stdin FIFO order with
+no way to prefer fresh live speech over historical backfill. The scheduler
+fixes that.
+
+**Priorities** (highest first):
+1. `FinalFlush` — closing-words chunks emitted at session stop.
+2. `Live` — real-time chunks during the session, with strict mic/system
+   round-robin so neither source can starve the other in mixed mode.
+3. `Backfill` — historical audio, drained whenever the higher tiers are idle.
+
+**Single-owner client.** The scheduler owns the sole `Arc<TranscriptionClient>`
+clone for the duration of a session, which makes sidecar respawn race-free:
+when a transcribe call fails and the sidecar is dead, the worker's
+`Arc::try_unwrap` always succeeds because no other task holds a clone. The
+older design had to fall back to "another task still holds the Arc, retry on
+next chunk" branches — that's gone.
+
+**Stop semantics.** Live loop signals stop → in-flight FinalFlush jobs drain
+first → backfill submitter finishes enqueuing → `shutdown_and_return` drains
+remaining Backfill jobs and hands the client back to `TranscriptionClientState`.
+The shutdown timeout (default 5 min) is the only ceiling — generous enough
+for a typical 5-minute backfill window to fully transcribe, bounded so a
+wedged sidecar can't hang the stop path forever. Backfill audio is owned by
+the submitter task as `Vec<f32>`, so ring-buffer churn after extraction
+cannot lose it.
+
+**Job submission API.** `scheduler.submit(JobRequest { origin, source,
+wav_path, language, initial_prompt, diarization })` returns a
+`oneshot::Receiver<JobOutcome>`. `JobOutcome` carries the
+`TranscriptionResult` (or a `SchedulerError`), the worker's `wall_ms` for
+pressure telemetry, and a monotonic `event_sequence` used by frontend
+ordering as a stable tie-breaker for same-offset segments across sources.
 
 ### Stream Health Monitoring
 
@@ -253,7 +311,7 @@ The live transcription loop includes a stream health watchdog (`check_stream_hea
 Four `Arc<Mutex<T>>` states managed by Tauri:
 - `AudioManagerState` — audio capture lifecycle, ring buffers, sessions
 - `ModelManagerState` — model download/delete/list (Whisper + Parakeet + Sortformer)
-- `TranscriptionClientState` — `Arc<Mutex<Option<Arc<TranscriptionClient>>>>`, sidecar process lifecycle. Whichever engine is selected, the value here is the engine-agnostic `TranscriptionClient`.
+- `TranscriptionClientState` — `Arc<Mutex<Option<Arc<TranscriptionClient>>>>`, sidecar process lifecycle. Whichever engine is selected, the value here is the engine-agnostic `TranscriptionClient`. During an active live transcription session the client is held by the `TranscriptionScheduler` (sole `transcribe_with` caller); the scheduler returns it on `shutdown_and_return`.
 - `LiveTranscriptionState` — `Option<LiveTranscriptionController>`, live transcription task + stop signal
 
 Startup also runs `db::ensure_runtime_schema()` *before* tauri-plugin-sql wires up — it opens the SQLite DB directly via `rusqlite`, sweeps stale `recording`-status sessions left by a prior crash, and creates the `audio_save_locations` table used by reconciliation on next startup. The Parakeet+Sortformer `segments.speaker_id INTEGER` column is added separately by the frontend's `getDb()` after migrations run, sidestepping a "ghost" v11 entry that some local dev DBs picked up from another branch.

@@ -986,22 +986,18 @@ For comparison, FluidAudio (Swift + CoreML + ANE) reportedly hits 155-237× real
 
 ---
 
-## Phase 25 — Live Transcription Pipeline Overhaul: Silero VAD + Scheduler + Parakeet Tuning
+## Phase 25 — Silero VAD + Parakeet Tuning
 
-Three tightly related changes, each on its own branch:
-1. `feat/transcription-scheduler` — priority scheduler in front of the sidecar lane.
-2. `feat/silero-vad-parakeet` — replaces RMS energy detector with Silero V5 VAD for both engines; tightens Parakeet chunk cadence.
+Replaces the RMS energy detector with Silero V5 VAD for both engines and tightens Parakeet's chunk cadence to fit its low-RTFx, non-autoregressive decoder. Branch: `feat/silero-vad-parakeet`.
+
+> Note: an earlier draft of this phase also bundled a sidecar priority scheduler from `feat/transcription-scheduler`, but that branch never merged into main. The scheduler eventually landed independently — see Phase 32.
 
 ### What was built
 
 | File | Change |
 |---|---|
-| `apps/desktop/src-tauri/src/commands/transcription_scheduler.rs` | New. `TranscriptionScheduler` wraps the `TranscriptionClient` and serves jobs through three priority queues (`FinalFlush > Live > Backfill`) with mic/system round-robin at the Live tier. Single worker task feeds the sidecar serially so priority ordering isn't defeated by the sidecar's FIFO stdin queue. Retries once after sidecar respawn; drains cleanly on shutdown and hands the raw client back to shared state. |
 | `apps/desktop/src-tauri/src/commands/silero_vad.rs` | New. `SileroVad` (shared `silero::Session`, V5 ONNX bundled in-binary via the `silero` crate, ~2 MB) + `SileroSource` (per-source `StreamState` + VAD-only read cursor + sticky `last_probability` for empty polls). `score_stream` returns every 32 ms frame's probability — not just the last — so intra-poll speech (onset+offset inside one batch) isn't lost. `score_all` for backfill batch-scoring. Resampling delegates to `yapstack_common::audio::resample` (rubato sinc). |
-| `apps/desktop/src-tauri/src/commands/live_transcription.rs` | Replaced RMS (`peek_energy_rms`) with Silero per-source scoring. `VadTuning.silence_threshold` (RMS) renamed → `speech_threshold` (probability). Parakeet tuning: 200 ms silence / 10 s max chunk / 100 ms poll / 250 ms pre-roll. Whisper keeps the user's `silence_duration_ms` (300 ms poll, no pre-roll). `vad_chunk_historical_audio` now batch-scores through Silero and walks a pure state machine (`backfill_chunks_from_probabilities`) over the probability stream; `prev_chunk_end` clamp prevents pre-roll from rewinding into a previous chunk. Backfill-to-live handoff now resets all per-source Silero state (`read_pos`, `stream`, `last_probability`, `earliest_next_chunk_pos`) to the post-backfill write position. Added `LiveSegmentEvent.event_sequence` + `origin` for stable frontend ordering. Removed the stop-time `chunk_aborts.abort()` loop — final chunks are submitted as `FinalFlush` priority and drained with a bounded timeout instead. |
-| `apps/desktop/src/stores/appStore.ts` | `activeSessionBackfillSegments` bucket — backfill chunks live here until `backfill-complete` merges them into `activeSessionSegments`, so a late backfill chunk can't shove already-rendered live rows downward. `stableInsertSegments` replaces the per-event full-array sort; existing segments never reorder. Exports `awaitLiveTranscriptSettled(sessionId)` that drains the in-memory segment write queue before returning the current transcript. |
-| `apps/desktop/src/lib/ai-context.ts` | Session transcript / tool context now use `awaitLiveTranscriptSettled` so AI chat sees the latest spoken sentence instead of a stale SQLite snapshot. |
-| `apps/desktop/src/lib/db.ts` | `getSessionSegments` ORDER BY made deterministic (`audio_offset, chunk_index, source, created_at, id`) to match the in-memory comparator. |
+| `apps/desktop/src-tauri/src/commands/live_transcription.rs` | Replaced RMS (`peek_energy_rms`) with Silero per-source scoring. `VadTuning.silence_threshold` (RMS) renamed → `speech_threshold` (probability). Parakeet tuning: dialogue-aggressive defaults (100 ms poll, 250 ms pre-roll, 0.7 offset-hysteresis ratio); Parakeet's silence window has since been raised to 500 ms (`6d66b24`) to relieve queue pressure. Whisper keeps the user's `silence_duration_ms` (300 ms poll, no pre-roll). `vad_chunk_historical_audio` now batch-scores through Silero and walks a pure state machine (`backfill_chunks_from_probabilities`) over the probability stream; `prev_chunk_end` clamp prevents pre-roll from rewinding into a previous chunk. Backfill-to-live handoff resets all per-source Silero state (`read_pos`, `stream`, `last_probability`, `earliest_next_chunk_pos`) to the post-backfill write position. |
 
 ### Key decisions
 
@@ -1009,22 +1005,19 @@ Three tightly related changes, each on its own branch:
 - **Silero replaces RMS for both engines, but only the detector changes**. Whisper keeps its tuned timing values (`silence_duration_ms`, 300 ms poll, no pre-roll); only the speech signal is different. This was an explicit memory rule: don't retune Whisper when tuning Parakeet.
 - **Thresholds are V5 defaults**. `speech_threshold = 0.5`, `offset_threshold_ratio = 0.7` (→ 0.35 end threshold). Matches the upstream Python silero-vad reference.
 - **Reuse the canonical resampler**. `silero_vad.rs` calls `yapstack_common::audio::resample` (the same rubato-backed sinc path used by `yapstack-sidecar` and `yapstack-audio::mixer`) rather than shipping a hand-rolled decimator. Silero is robust to mild aliasing but consistency with the workspace idiom is worth the line count.
-- **Backfill bucket in the frontend, not just a stripe**. Keeping backfill out of `activeSessionSegments` until `backfill-complete` is the only way to prevent the "live row jumps down" visual churn when a late backfill chunk arrives with a smaller `audio_offset_seconds`.
 - **Pure state-machine helper for tests**. `backfill_chunks_from_probabilities` is extracted from `vad_chunk_historical_audio` so unit tests can feed hand-crafted probability sequences without loading the ONNX model — particularly important for the pre-roll-clamp regression test, since Silero won't classify synthetic tones as speech.
 
 ### What was learned
 
 - **Intra-poll speech events are real**. A 100 ms Parakeet poll can contain an entire short utterance; if `score_stream` returns only the trailing probability (silence), the VAD state machine never sees the onset. The fix is straightforward — return `Vec<f32>` and iterate `poll_vad` per frame — but the bug is easy to miss in review.
-- **The sidecar's stdin queue is FIFO**. Multiple concurrent `transcribe_with` calls don't pipeline on the model side; they queue in order received. That made "parallel" mic/system dispatch useless for prioritization and necessitated the scheduler.
+- **The sidecar's stdin queue is FIFO**. Multiple concurrent `transcribe_with` calls don't pipeline on the model side; they queue in order received. That made "parallel" mic/system dispatch useless for prioritization and motivated the eventual scheduler in Phase 32.
 - **Backfill-to-live handoff is more than just the extraction cursor**. Resetting `cursor` + `speech_start_pos` isn't enough; the Silero read cursor, the LSTM stream state, the sticky last_probability, and `earliest_next_chunk_pos` all have to move with them or the live detector replays the backfill window.
 - **Pre-roll needs the same clamp in backfill as in live**. The live loop already bounded pre-roll by `earliest_next_chunk_pos`; the backfill chunker didn't, so two utterances separated by less than ~250 ms could produce overlapping chunks.
 
 ### Test coverage
 
-- `commands::transcription_scheduler::tests` — priority ordering, mic/system round-robin, single-source drain, final-flush preemption, cancel-all.
 - `commands::silero_vad::tests` — bundled ONNX session loads and returns valid probabilities for silence; 32 ms frame cadence (512 samples × N → N probabilities).
 - `commands::live_transcription::tests` — Silero-era `poll_vad` state-machine tests (thresholds are now probabilities); intra-poll speech onset regression; backfill-reset structural guard; no-overlap regression for the `prev_chunk_end` clamp.
-- Frontend: `stableInsertSegments` tests for stable merge behavior under late-arriving backfill.
 
 ### Not yet done
 
@@ -1263,6 +1256,37 @@ A behavior-preserving cleanup pass that removed accumulated dead code, decompose
 | `apps/desktop/src/components/DictationFeedEntry.tsx`, `DictationTrayItem.tsx` | Refactor to consume hook |
 | `CLAUDE.md`, `docs/ARCHITECTURE.md`, `docs/API_REFERENCE.md`, `docs/DEVELOPMENT.md` | Stale-content sweep |
 | `docs/plans/tree-shake-cleanup.md` | New plan tracking the refactor |
+
+---
+
+## Phase 32 — Transcription Scheduler (Backfill Durability)
+
+### What was built
+
+A single-worker priority queue in front of the sidecar lane that fixes a class of bugs where backfill audio could be silently dropped on session stop, especially under sustained live dictation. New module `commands/transcription_scheduler.rs` (~600 lines including 6 unit tests). Live transcription pipeline rewired to submit jobs through the scheduler instead of calling `TranscriptionClient::transcribe_with` directly.
+
+### The bug being fixed
+
+Before this phase, on session stop the live loop set a `backfill_cancel` flag that broke the backfill submitter loop at the next chunk boundary. Every backfill chunk past the cancel point was dropped without being transcribed — its audio (alive in memory as `Vec<f32>` inside the submitter task) was simply freed. Combined with no priority scheduling between live and backfill at the sidecar, sustained live dictation would starve backfill, and stop would then guarantee whatever hadn't drained got abandoned.
+
+### Key decisions
+
+- **Priorities `FinalFlush > Live > Backfill`, mic/system round-robin at Live.** Live work always preempts backfill at the sidecar; closing-words at stop preempt everything. Round-robin within Live keeps mic and system from starving each other in mixed-source sessions.
+- **Single-owner client.** The scheduler holds the sole `Arc<TranscriptionClient>` clone for the session, and is the only task that calls `transcribe_with`. This makes sidecar respawn race-free: when a transcribe call fails, the worker drops its in-call clone and `Arc::try_unwrap` always succeeds. The previous design had to fall back to "another task still holds the Arc" branches; that's deleted along with `recover_from_chunk_failure`.
+- **Backfill is no longer cancelled on stop.** The submitter walks its in-memory chunk list and submits each at `Backfill` priority. The scheduler drains them as the sidecar has cycles. On stop, the live loop exits, FinalFlush jobs land first, then `shutdown_and_return` drains remaining Backfill within a 5-minute ceiling.
+- **5-minute shutdown timeout.** Generous enough to drain a typical 5-minute backfill window on a slow sidecar; bounded so a wedged sidecar can't hang the stop path forever. If the timeout fires, pending jobs are cancelled (waiters get `SchedulerError::Cancelled`) and the client is taken back forcibly.
+- **`LiveSegmentEvent` schema extended, not replaced.** Added `origin: SegmentOrigin` and `event_sequence: u64`. The legacy `is_backfill: bool` is retained one release cycle for backwards compat. `event_sequence` is a stable tie-breaker for same-offset segments — the frontend can use it later to bucket and sort without churning live rows when a late backfill chunk arrives.
+- **Frontend rendering not changed in this phase.** The new fields are emitted but unconsumed by the UI; the priority change happens entirely at the backend so `pnpm check` is the only verification needed for this branch. Bucketed rendering is a separate UX concern.
+- **Parakeet engine tuning untouched.** An earlier draft of this work (on a feature branch that never merged) bundled a Parakeet retuning pass (200 ms silence / 10 s max chunk). Main has since moved to 500 ms silence (`6d66b24`) and that's deliberately preserved here — engine-specific tuning is its own concern, validated independently.
+
+### Files Changed
+
+| File | Change |
+|------|--------|
+| `apps/desktop/src-tauri/src/commands/transcription_scheduler.rs` | New module — see ARCHITECTURE.md § "Transcription Scheduler" for the design. Includes 6 unit tests for priority ordering, round-robin, cancel, drain. |
+| `apps/desktop/src-tauri/src/commands/live_transcription.rs` | Pipeline rewired around the scheduler. `TranscriptionContext` simplified, `recover_from_chunk_failure` removed (respawn moved into scheduler), backfill cancel flag deleted, stop path waits for backfill submitter then calls `scheduler.shutdown_and_return`. `LiveSegmentEvent` gains `origin` + `event_sequence`. |
+| `apps/desktop/src/lib/tauri.ts` | `LiveSegmentEvent` typing updated for the new fields. |
+| `apps/desktop/src-tauri/src/commands/mod.rs` | Register the new module. |
 
 ---
 

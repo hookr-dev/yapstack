@@ -18,6 +18,10 @@ use super::error::{validate_session_id, CommandError};
 use super::audio::{AudioManagerState, CaptureSourceDto, MixConfigDto};
 use super::silero_vad::{SileroSource, SileroVad, SILENCE_THRESHOLD, SPEECH_THRESHOLD};
 use super::transcription::{TranscriptSegmentDto, TranscriptionClientState};
+use super::transcription_scheduler::{
+    source_from_label, JobOrigin, JobRequest, SchedulerError, TranscriptionScheduler,
+    DEFAULT_SHUTDOWN_TIMEOUT_SECS,
+};
 
 // --- DTOs ---
 
@@ -164,6 +168,28 @@ pub struct LiveTranscriptionStartResult {
     pub effective_start_epoch_ms: f64,
 }
 
+/// Origin class of a live-segment event. Mirrors the scheduler's priority
+/// tier so the frontend can bucket segments (live vs. backfill stripe vs.
+/// final-flush at stop) without re-deriving it from `is_backfill` alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "snake_case")]
+pub enum SegmentOrigin {
+    Live,
+    Backfill,
+    FinalFlush,
+}
+
+impl From<super::transcription_scheduler::JobOrigin> for SegmentOrigin {
+    fn from(o: super::transcription_scheduler::JobOrigin) -> Self {
+        use super::transcription_scheduler::JobOrigin;
+        match o {
+            JobOrigin::Live => SegmentOrigin::Live,
+            JobOrigin::Backfill => SegmentOrigin::Backfill,
+            JobOrigin::FinalFlush => SegmentOrigin::FinalFlush,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Type)]
 pub struct LiveSegmentEvent {
     pub chunk_index: u32,
@@ -178,7 +204,16 @@ pub struct LiveSegmentEvent {
     /// Per-source accumulated text so far.
     pub accumulated_text: String,
     /// Whether this chunk came from backfill processing (true) or live VAD (false).
+    /// Retained for backwards compat; new consumers should prefer `origin`.
     pub is_backfill: bool,
+    /// Origin class: `live`, `backfill`, or `final_flush`. Set by the scheduler
+    /// at emit time. Lets the frontend bucket segments by priority class
+    /// without inferring from `is_backfill` alone.
+    pub origin: SegmentOrigin,
+    /// Monotonic per-session counter assigned by the scheduler when a job is
+    /// picked up. Frontend uses it as a stable tie-breaker for same-offset
+    /// segments so cross-source ordering doesn't churn across renders.
+    pub event_sequence: u64,
     /// Session this chunk belongs to. Carried on the event so late-arriving
     /// segments can still be persisted to the right session even if the
     /// frontend has already cleared `activeSessionId` during finalization.
@@ -291,18 +326,16 @@ struct SessionWavState {
 /// returned to shared state when the live transcription loop ends.
 #[derive(Clone)]
 struct TranscriptionContext {
-    /// Private client for the live transcription loop. Wrapped in an inner
-    /// `Arc` so concurrent chunk tasks (mic + system in the same poll tick)
-    /// can each briefly lock the outer mutex, clone the Arc, and then hold
-    /// the client by reference across their transcribe await without
-    /// contending on the outer mutex. The inner `TranscriptionClient` is
-    /// concurrent-safe by construction (per-id oneshot response routing).
+    /// Priority-queue scheduler in front of the sidecar lane. Owns the sole
+    /// `Arc<TranscriptionClient>` for the duration of the session and is the
+    /// sole caller of `transcribe_with`. On session end, `shutdown_and_return`
+    /// drains the queue and hands the client back to `TranscriptionClientState`
+    /// so subsequent sessions and dictation can pick it up.
     ///
-    /// The `Option` layer remains so we can move the raw client back into
-    /// shared state on session end via `Arc::try_unwrap`.
-    transcription_client: Arc<Mutex<Option<Arc<yapstack_transcription::TranscriptionClient>>>>,
-    /// Reference to the shared state so we can return the client when done.
-    shared_transcription_state: TranscriptionClientState,
+    /// `Arc<TranscriptionScheduler>` so the cheap `Clone` of the context
+    /// shares the same underlying scheduler — every chunk task and the
+    /// backfill submitter all submit jobs through the same priority queue.
+    scheduler: Arc<TranscriptionScheduler>,
     app_handle: AppHandle,
     config: LiveTranscriptionConfig,
     /// Shared prompt context bridging backfill → live transcription.
@@ -363,7 +396,15 @@ struct ChunkInput<'a> {
     sample_rate: u32,
     audio_offset_seconds: f32,
     source_label: AudioSourceLabel,
-    is_backfill: bool,
+    /// Priority class the scheduler uses; also emitted on `LiveSegmentEvent`
+    /// so the frontend can bucket segments.
+    origin: JobOrigin,
+}
+
+impl ChunkInput<'_> {
+    fn is_backfill(&self) -> bool {
+        matches!(self.origin, JobOrigin::Backfill)
+    }
 }
 
 /// Cross-loop chunk counters surfaced to `LiveTranscriptionController` for
@@ -873,7 +914,7 @@ async fn prepare_chunk_dispatch(
     vad: &mut SourceVadState,
     audio_state: &AudioManagerState,
     is_force_chunk: bool,
-    is_backfill: bool,
+    origin: JobOrigin,
     session_offset_base_seconds: f32,
     max_chunk_duration: Duration,
 ) -> Option<PreparedChunk> {
@@ -986,7 +1027,7 @@ async fn prepare_chunk_dispatch(
         source_label: vad.label,
         chunk_index,
         accumulated_text,
-        is_backfill,
+        origin,
         dropped_head_seconds,
     })
 }
@@ -1000,7 +1041,7 @@ struct PreparedChunk {
     source_label: AudioSourceLabel,
     chunk_index: u32,
     accumulated_text: String,
-    is_backfill: bool,
+    origin: JobOrigin,
     /// How many seconds of audio the head-drop cap discarded before
     /// dispatching this chunk. Zero on the normal path. Reported via
     /// `SessionCounters::cap_fired_total` so the UI can surface that audio
@@ -1028,7 +1069,7 @@ async fn run_chunk_task(
         sample_rate: prepared.sample_rate,
         audio_offset_seconds: prepared.audio_offset_seconds,
         source_label,
-        is_backfill: prepared.is_backfill,
+        origin: prepared.origin,
     };
     let mut chunk_index_mut = prepared.chunk_index;
     let mut accumulated_text = prepared.accumulated_text;
@@ -1552,7 +1593,6 @@ async fn process_backfill(
     ctx: TranscriptionContext,
     backfill_audio: Vec<(Vec<f32>, u32, AudioSourceLabel)>,
     backfill_done: Arc<AtomicBool>,
-    cancel: Arc<AtomicBool>,
     tuning: VadTuning,
     counters: Arc<StdMutex<SessionCounters>>,
 ) {
@@ -1603,17 +1643,7 @@ async fn process_backfill(
         .unwrap_or(0);
 
     'outer: for chunk_idx in 0..total_chunks {
-        if cancel.load(Ordering::Acquire) {
-            info!(
-                "backfill: cancel requested at chunk {} — exiting gracefully",
-                chunk_idx
-            );
-            break 'outer;
-        }
         for (source_idx, source) in source_entries.iter().enumerate() {
-            if cancel.load(Ordering::Acquire) {
-                break 'outer;
-            }
             let Some(bounds) = source.chunks.get(chunk_idx) else {
                 continue;
             };
@@ -1632,9 +1662,9 @@ async fn process_backfill(
                 sample_rate: source.sample_rate,
                 audio_offset_seconds: audio_offset,
                 source_label: source.label,
-                is_backfill: true,
+                origin: JobOrigin::Backfill,
             };
-            transcribe_and_emit_chunk(
+            let outcome = transcribe_and_emit_chunk(
                 &ctx,
                 &input,
                 &mut chunk_indices[source_idx],
@@ -1643,6 +1673,15 @@ async fn process_backfill(
                 &backfill_prompt,
             )
             .await;
+            // Surface a dead sidecar early so we don't keep submitting
+            // backfill chunks that will all fail. Skipped/Cancelled outcomes
+            // are non-fatal: a Cancelled chunk only happens if the scheduler
+            // is shutting down (then there's no more useful work to do
+            // anyway), and Skipped is a transient engine error.
+            if matches!(outcome, TranscribeOutcome::SidecarDead) {
+                warn!("backfill: scheduler reports sidecar dead — aborting backfill drain");
+                break 'outer;
+            }
         }
     }
 
@@ -2043,13 +2082,16 @@ async fn live_transcription_loop(
     .await;
 
     // Spawn concurrent backfill processing.
-    // `backfill_cancel` is a cooperative cancel flag. On stop we set it true
-    // and `process_backfill` finishes the in-flight chunk then exits cleanly
-    // instead of being killed mid-transcribe (which would silently drop the
-    // chunk's audio). We still keep an abort handle as a last-resort escape
-    // hatch if the task hangs past our grace period.
+    //
+    // Backfill is no longer cancelled on stop — it submits jobs to the
+    // scheduler at `Backfill` priority and the scheduler keeps draining
+    // them after the live loop has exited. The stop path waits for this
+    // task to finish enqueuing chunks, then calls
+    // `scheduler.shutdown_and_return` which drains any still-queued chunks
+    // up to a generous timeout. The abort handle remains as a last-resort
+    // escape hatch if `shutdown_and_return`'s timeout fires while the
+    // submitter is genuinely stuck (e.g. deadlocked Silero init).
     let backfill_done = Arc::new(AtomicBool::new(false));
-    let backfill_cancel = Arc::new(AtomicBool::new(false));
     let backfill_handle = if !backfill_audio.is_empty() {
         // Namespace live chunk indices to avoid collision with backfill (0..N)
         for s in &mut sources {
@@ -2057,13 +2099,11 @@ async fn live_transcription_loop(
         }
         let backfill_ctx = ctx.clone();
         let backfill_done_clone = backfill_done.clone();
-        let backfill_cancel_clone = backfill_cancel.clone();
         let backfill_counters = counters.clone();
         let handle = tokio::spawn(process_backfill(
             backfill_ctx,
             backfill_audio,
             backfill_done_clone,
-            backfill_cancel_clone,
             tuning,
             backfill_counters,
         ));
@@ -2128,11 +2168,11 @@ async fn live_transcription_loop(
     // would otherwise silently kill dispatch for that source forever.
     let mut chunk_tasks: futures_util::stream::FuturesUnordered<ChunkTaskFuture> =
         futures_util::stream::FuturesUnordered::new();
-    // Parallel handles so stop can `.abort()` slow tasks immediately —
-    // otherwise an in-flight `transcribe_with` past the 10s drain would
-    // hold an `Arc<TranscriptionClient>` clone, blocking try_unwrap and
-    // leaving shared state empty (next session/dictation = NotInitialized).
-    let mut chunk_aborts: Vec<tokio::task::AbortHandle> = Vec::new();
+    // No parallel `AbortHandle` list: under the scheduler the worker is the
+    // sole holder of the `Arc<TranscriptionClient>`, and chunk tasks just
+    // submit jobs and await a oneshot. On stop the scheduler's
+    // `shutdown_and_return` cancels still-pending jobs after its drain
+    // window — no need to force-resolve in-flight chunks here.
     let mut pending_outcomes: Vec<ChunkTaskOutcome> = Vec::new();
 
     loop {
@@ -2262,12 +2302,10 @@ async fn live_transcription_loop(
         // not next tick.
         let mut fatal = false;
         // Drain any additional outcomes that became ready while the tick
-        // waited on other awaits (audio_state lock, WAV flush, etc). Also
-        // prune finished abort handles to keep the vec bounded.
+        // waited on other awaits (audio_state lock, WAV flush, etc).
         while let Some(Some(outcome)) = chunk_tasks.next().now_or_never() {
             pending_outcomes.push(outcome);
         }
-        chunk_aborts.retain(|h| !h.is_finished());
         let drained = std::mem::take(&mut pending_outcomes);
         for outcome in drained {
             for source in sources.iter_mut() {
@@ -2305,7 +2343,7 @@ async fn live_transcription_loop(
         // `has_in_flight_task`: we can't dispatch a second task for the
         // same source, and `advance_idle_cursor` would drop
         // `speech_start_pos` past audio that belongs to the next chunk.
-        let actions: Vec<VadAction> = sources
+        let actions: Vec<(VadAction, JobOrigin)> = sources
             .iter_mut()
             .map(|source| {
                 let probs = per_source_probs
@@ -2336,18 +2374,26 @@ async fn live_transcription_loop(
                     }
                 }
 
+                // On stop, force-flush any in-progress speech to the
+                // scheduler at `FinalFlush` priority so the user's closing
+                // words don't get abandoned at shutdown.
                 if should_stop && source.is_speaking {
                     best_action = VadAction::Chunk;
                 }
-                best_action
+                let origin = if should_stop {
+                    JobOrigin::FinalFlush
+                } else {
+                    JobOrigin::Live
+                };
+                (best_action, origin)
             })
             .collect();
 
         // Dispatch new chunk tasks (fire and forget). Per-source state is
         // advanced optimistically inside prepare_chunk_dispatch; the spawned
-        // task handles transcription, segment emission, and quarantining on
-        // failure. The main loop continues polling other sources next tick.
-        for (i, action) in actions.iter().enumerate() {
+        // task submits to the scheduler and emits segments. The main loop
+        // continues polling other sources next tick.
+        for (i, (action, origin)) in actions.iter().enumerate() {
             let in_flight = sources[i].has_in_flight_task;
             match action {
                 VadAction::Chunk | VadAction::ForceChunk => {
@@ -2365,7 +2411,7 @@ async fn live_transcription_loop(
                         &mut sources[i],
                         &audio_state,
                         is_force,
-                        false,
+                        *origin,
                         ctx.session_offset_base_seconds,
                         tuning.max_chunk_duration,
                     )
@@ -2383,7 +2429,6 @@ async fn live_transcription_loop(
                         let handle = tokio::spawn(async move {
                             run_chunk_task(prepared, task_ctx, task_counters, task_prompt).await
                         });
-                        chunk_aborts.push(handle.abort_handle());
                         chunk_tasks.push(Box::pin(async move {
                             match handle.await {
                                 Ok(outcome) => outcome,
@@ -2430,7 +2475,7 @@ async fn live_transcription_loop(
         }
     }
 
-    drain_in_flight_chunks(&mut chunk_tasks, &mut chunk_aborts, &mut sources).await;
+    drain_in_flight_chunks(&mut chunk_tasks, &mut sources).await;
     dispatch_final_pending_chunks(
         &mut sources,
         &audio_state,
@@ -2446,16 +2491,29 @@ async fn live_transcription_loop(
     }
 
     // Wait for concurrent backfill to finish before emitting Stopped.
-    // Signal the cooperative cancel flag so the task exits at the next window
-    // boundary instead of running to completion when the session is stopping.
-    // The abort handle is a last-resort escape hatch if the in-flight chunk
-    // hangs past the grace period.
+    //
+    // Unlike the previous design, we never cancel the backfill submitter on
+    // stop. The submitter walks its in-memory chunk list and awaits each
+    // scheduler response in turn; the scheduler prioritizes `FinalFlush` and
+    // `Live` work over `Backfill`, so any closing-words chunks queued at stop
+    // outrank remaining backfill and drain quickly. The submitter then
+    // continues working through whatever backfill chunks remain.
+    //
+    // The actual ceiling on "how long can backfill drain after stop" is set
+    // by `scheduler.shutdown_and_return` below — it caps total drain time so
+    // a wedged sidecar can't hang the stop path forever, but it's generous
+    // enough (default 5 min) that a normal backfill window completes. The
+    // abort handle is the last-resort escape hatch.
     if let Some((handle, abort_handle)) = backfill_handle {
-        backfill_cancel.store(true, Ordering::Release);
-        match tokio::time::timeout(Duration::from_secs(30), handle).await {
+        match tokio::time::timeout(Duration::from_secs(DEFAULT_SHUTDOWN_TIMEOUT_SECS), handle).await
+        {
             Ok(_) => {}
             Err(_) => {
-                warn!("backfill task did not exit within 30s after cancel — aborting");
+                warn!(
+                    "backfill submitter did not exit within {}s — aborting; \
+                     scheduler shutdown will cancel any still-pending chunks",
+                    DEFAULT_SHUTDOWN_TIMEOUT_SECS
+                );
                 abort_handle.abort();
             }
         }
@@ -2693,15 +2751,15 @@ fn run_prompt_decay(
 /// Drain still-running chunk tasks at session stop so their segments dispatch
 /// before finalization. The frontend's stop finalizer waits on
 /// `segmentQueueTail`; that only helps once each task has actually emitted.
-/// Phase 1 grants 10 s of graceful drain (long enough for any in-flight
-/// transcribe to complete) and restores per-source state from each completed
-/// outcome so a source whose final-chunk dispatch was skipped earlier becomes
-/// eligible to issue it. Phase 2 aborts on timeout — needed both to keep stop
-/// bounded and to release each task's `Arc<TranscriptionClient>` clone so the
-/// post-loop `try_unwrap` succeeds.
+///
+/// Under the scheduler, chunk tasks just submit a `JobRequest` and await a
+/// oneshot — they don't hold an `Arc<TranscriptionClient>` clone, so we no
+/// longer need an abort phase to reclaim shared state. Tasks at `FinalFlush`
+/// priority complete first; any `Live`/`Backfill` chunks queued at stop are
+/// either drained by the scheduler's worker or cancelled via
+/// `shutdown_and_return` after the bounded shutdown timeout.
 async fn drain_in_flight_chunks(
     chunk_tasks: &mut futures_util::stream::FuturesUnordered<ChunkTaskFuture>,
-    chunk_aborts: &mut Vec<tokio::task::AbortHandle>,
     sources: &mut [SourceVadState],
 ) {
     if chunk_tasks.is_empty() {
@@ -2714,19 +2772,23 @@ async fn drain_in_flight_chunks(
     use futures_util::stream::StreamExt;
 
     let mut drained_outcomes: Vec<ChunkTaskOutcome> = Vec::new();
-    let graceful_timed_out = {
-        let drain = async {
-            while let Some(outcome) = chunk_tasks.next().await {
-                if outcome.sidecar_dead {
-                    warn!("drained chunk task reported sidecar dead");
-                }
-                drained_outcomes.push(outcome);
+    let drain = async {
+        while let Some(outcome) = chunk_tasks.next().await {
+            if outcome.sidecar_dead {
+                warn!("drained chunk task reported sidecar dead");
             }
-        };
-        tokio::time::timeout(Duration::from_secs(10), drain)
-            .await
-            .is_err()
+            drained_outcomes.push(outcome);
+        }
     };
+    if tokio::time::timeout(Duration::from_secs(15), drain)
+        .await
+        .is_err()
+    {
+        warn!(
+            "live transcription stop: chunk task drain exceeded 15s; \
+             scheduler shutdown will cancel any still-pending chunks"
+        );
+    }
 
     for outcome in drained_outcomes {
         for source in sources.iter_mut() {
@@ -2736,20 +2798,6 @@ async fn drain_in_flight_chunks(
                 break;
             }
         }
-    }
-
-    if graceful_timed_out {
-        warn!(
-            "live transcription stop: chunk task drain exceeded 10s; \
-             aborting remaining tasks to reclaim shared state"
-        );
-        for ah in chunk_aborts.drain(..) {
-            ah.abort();
-        }
-        let _ = tokio::time::timeout(Duration::from_secs(2), async {
-            while chunk_tasks.next().await.is_some() {}
-        })
-        .await;
     }
 }
 
@@ -2790,7 +2838,7 @@ async fn dispatch_final_pending_chunks(
             source,
             audio_state,
             true,
-            false,
+            JobOrigin::FinalFlush,
             ctx.session_offset_base_seconds,
             max_chunk_duration,
         )
@@ -3163,8 +3211,9 @@ async fn build_effective_prompt(
 /// Transcribes a chunk of audio and returns a `TranscribeOutcome`.
 ///
 /// - `Success`: transcription produced segments
-/// - `Skipped`: non-fatal failure (temp file error, empty chunk, transient sidecar error)
-/// - `SidecarDead`: sidecar died and could not be restarted — caller should exit the loop
+/// - `Skipped`: non-fatal failure (temp file error, empty chunk, transient engine error,
+///   or a `Cancelled` outcome from the scheduler during shutdown)
+/// - `SidecarDead`: scheduler reports the sidecar died and could not be restarted
 async fn transcribe_chunk(
     ctx: &TranscriptionContext,
     input: &ChunkInput<'_>,
@@ -3193,33 +3242,6 @@ async fn transcribe_chunk(
 
     let effective_prompt = build_effective_prompt(ctx, accumulated_text).await;
 
-    // Briefly lock the outer mutex just to clone the inner Arc<TranscriptionClient>.
-    // The actual `transcribe_with` await happens *without* holding any outer lock,
-    // so a concurrent chunk task (e.g. the other source) can proceed in parallel.
-    let client_arc = {
-        let client_guard = ctx.transcription_client.lock().await;
-        client_guard.as_ref().cloned()
-    };
-    let client = match client_arc {
-        Some(c) => c,
-        None => {
-            error!("live transcription: transcription client not initialized");
-            let _ = ctx.app_handle.emit(
-                "live-transcription-status",
-                LiveTranscriptionStatus {
-                    phase: LiveTranscriptionPhase::Error,
-                    chunks_processed: *chunk_index,
-                    total_audio_seconds: 0.0,
-                    error_message: Some("transcription client not initialized".to_string()),
-                    session_id: ctx.config.session_id.clone(),
-                    effective_start_epoch_ms: None,
-                    lag_seconds: None,
-                    cap_fired_total: 0,
-                },
-            );
-            return TranscribeOutcome::SidecarDead;
-        }
-    };
     // initial_prompt is Whisper-only — Parakeet's TDT decoder has no text-prompt
     // input, so passing it would just be ignored. Drop it explicitly so the IPC
     // payload is honest about what was sent. Engine identity comes from the
@@ -3228,20 +3250,36 @@ async fn transcribe_chunk(
     let profile = ctx.engine_profile.as_ref();
     let engine_kind = profile.engine_kind;
     let prompt_for_engine = if profile.uses_initial_prompt {
-        effective_prompt.as_deref()
+        effective_prompt
     } else {
         None
     };
-    let wall_start = Instant::now();
-    let transcription_result = client
-        .transcribe_with(
-            &wav_path,
-            ctx.config.language.as_deref(),
-            prompt_for_engine,
-            ctx.config.diarization,
-        )
-        .await;
-    let wall_ms = wall_start.elapsed().as_millis() as u64;
+
+    // Submit to the scheduler. The scheduler owns the sole TranscriptionClient
+    // Arc and serializes calls to `transcribe_with`, with priority ordering
+    // (FinalFlush > Live > Backfill) and mic/system round-robin at the live
+    // tier. Respawn on sidecar death is handled inside the scheduler — when it
+    // returns `SchedulerError::SidecarDead`, the respawn already failed.
+    let rx = ctx.scheduler.submit(JobRequest {
+        origin: input.origin,
+        source: source_from_label(input.source_label),
+        wav_path: wav_path.clone(),
+        language: ctx.config.language.clone(),
+        initial_prompt: prompt_for_engine,
+        diarization: ctx.config.diarization,
+    });
+
+    let outcome = match rx.await {
+        Ok(o) => o,
+        Err(_) => {
+            warn!("live transcription: scheduler dropped response — shutting down");
+            return TranscribeOutcome::SidecarDead;
+        }
+    };
+
+    let event_sequence = outcome.event_sequence;
+    let wall_ms = outcome.wall_ms;
+    let transcription_result = outcome.result;
 
     // Emit pressure telemetry regardless of outcome — a chunk that took 8s
     // to fail is just as much "the pipeline is unhealthy" as one that took 8s
@@ -3267,7 +3305,7 @@ async fn transcribe_chunk(
             wall_ms,
             rtfx,
             engine: profile.engine_name.to_string(),
-            is_backfill: input.is_backfill,
+            is_backfill: input.is_backfill(),
             lag_seconds,
             accel: profile.accel.clone(),
             variant: profile.variant.clone(),
@@ -3289,7 +3327,9 @@ async fn transcribe_chunk(
         engine = profile.engine_name,
         accel = profile.accel.as_deref(),
         variant = profile.variant.as_deref(),
-        is_backfill = input.is_backfill,
+        is_backfill = input.is_backfill(),
+        origin = input.origin.as_str(),
+        event_sequence = event_sequence,
         ok = transcription_result.is_ok(),
         "transcribe chunk pressure"
     );
@@ -3350,14 +3390,17 @@ async fn transcribe_chunk(
                 .collect();
 
             info!(
-                "transcribed: {:?} chunk {} offset={:.2}s {:.1}s audio {} chars",
+                "transcribed: {:?} chunk {} origin={} seq={} offset={:.2}s {:.1}s audio {} chars",
                 input.source_label,
                 *chunk_index,
+                input.origin.as_str(),
+                event_sequence,
                 input.audio_offset_seconds,
                 chunk_duration,
                 result.text.len()
             );
 
+            let origin_dto: SegmentOrigin = input.origin.into();
             TranscribeOutcome::Success(ChunkResult {
                 event: LiveSegmentEvent {
                     chunk_index: *chunk_index - 1,
@@ -3366,71 +3409,57 @@ async fn transcribe_chunk(
                     audio_offset_seconds: input.audio_offset_seconds,
                     chunk_duration_seconds: chunk_duration,
                     accumulated_text: accumulated_text.clone(),
-                    is_backfill: input.is_backfill,
+                    is_backfill: input.is_backfill(),
+                    origin: origin_dto,
+                    event_sequence,
                     session_id: ctx.config.session_id.clone(),
                 },
                 chunk_duration,
                 wall_ms,
             })
         }
-        Err(e) => {
-            warn!("live transcription: chunk failed: {}, skipping", e);
-            // Drop our local Arc clone so the restart helper's `try_unwrap`
-            // isn't racing us.
-            drop(client);
-            recover_from_chunk_failure(ctx).await
+        Err(SchedulerError::SidecarDead) | Err(SchedulerError::NotInitialized) => {
+            error!("live transcription: scheduler reports sidecar dead");
+            let _ = ctx.app_handle.emit(
+                "live-transcription-status",
+                LiveTranscriptionStatus {
+                    phase: LiveTranscriptionPhase::Error,
+                    chunks_processed: *chunk_index,
+                    total_audio_seconds: 0.0,
+                    error_message: Some(
+                        "Transcription engine stopped unexpectedly and could not be restarted"
+                            .to_string(),
+                    ),
+                    session_id: ctx.config.session_id.clone(),
+                    effective_start_epoch_ms: None,
+                    lag_seconds: None,
+                    cap_fired_total: 0,
+                },
+            );
+            TranscribeOutcome::SidecarDead
         }
-    }
-}
-
-/// Inspect the transcription client after a chunk error: if the sidecar is
-/// still running the failure was transient and we just retry; if it died,
-/// try to respawn it. respawn needs `&mut TranscriptionClient`, so we
-/// `try_unwrap` the inner `Arc`. When another task still holds a clone (a
-/// concurrent chunk awaiting the dead sidecar's response), the unwrap fails;
-/// we put the `Arc` back untouched and return `Skipped`, letting that other
-/// task hit the same error and retry on the next chunk. Returns the outcome
-/// the caller should propagate.
-async fn recover_from_chunk_failure(ctx: &TranscriptionContext) -> TranscribeOutcome {
-    let mut client_guard = ctx.transcription_client.lock().await;
-    let Some(arc_client) = client_guard.take() else {
-        return TranscribeOutcome::Skipped;
-    };
-    if arc_client.is_running() {
-        // Sidecar still running — just a transient error. Put the Arc back
-        // and let the caller retry.
-        *client_guard = Some(arc_client);
-        return TranscribeOutcome::Skipped;
-    }
-
-    warn!("sidecar process died — attempting restart");
-    match Arc::try_unwrap(arc_client) {
-        Ok(mut client) => match client.respawn().await {
-            Ok(()) => {
-                info!("sidecar restarted successfully after transcription failure");
-                *client_guard = Some(Arc::new(client));
-                let _ = ctx.app_handle.emit(
-                    "live-transcription-warning",
-                    LiveTranscriptionWarningEvent {
-                        message: "Transcription engine restarted".into(),
-                    },
-                );
-                TranscribeOutcome::Skipped
-            }
-            Err(restart_err) => {
-                error!("sidecar restart failed: {}", restart_err);
-                // Put the client back so other tasks can see it as "not
-                // running" and try again.
-                *client_guard = Some(Arc::new(client));
-                TranscribeOutcome::SidecarDead
-            }
-        },
-        Err(still_shared) => {
-            // Another task still holds the Arc. Put it back untouched; that
-            // task will hit the same error and we'll try again on the next
-            // chunk.
-            *client_guard = Some(still_shared);
-            debug!("sidecar restart skipped: client still held by another chunk task");
+        Err(SchedulerError::Cancelled) => {
+            // Only fires if the scheduler was already shutting down when this
+            // chunk reached the front of the queue. Treat as Skipped — the
+            // session is ending; no warning to surface.
+            debug!(
+                "live transcription: scheduler cancelled chunk for {:?} during shutdown",
+                input.source_label
+            );
+            TranscribeOutcome::Skipped
+        }
+        Err(SchedulerError::Transcription(msg)) => {
+            warn!("live transcription: chunk failed: {msg}, skipping");
+            // The scheduler already attempted a single respawn-and-retry on
+            // sidecar death; reaching here means a transient engine error or
+            // a post-respawn retry that still failed. Surface a user-visible
+            // warning and let the caller quarantine the audio.
+            let _ = ctx.app_handle.emit(
+                "live-transcription-warning",
+                LiveTranscriptionWarningEvent {
+                    message: "Transcription engine error — chunk skipped".into(),
+                },
+            );
             TranscribeOutcome::Skipped
         }
     }
@@ -3805,9 +3834,14 @@ pub async fn start_live_transcription(
         offset_base_secs = session_offset_base_seconds,
         "live transcription engine profile resolved"
     );
+    // Hand the client to a fresh scheduler. The scheduler is the sole caller
+    // of `transcribe_with` for this session and returns the client to
+    // `transcription_state_clone` on `shutdown_and_return`.
+    let scheduler =
+        TranscriptionScheduler::new(extracted_client, transcription_state_clone.clone());
+
     let ctx = TranscriptionContext {
-        transcription_client: Arc::new(Mutex::new(Some(extracted_client))),
-        shared_transcription_state: transcription_state_clone,
+        scheduler: scheduler.clone(),
         app_handle,
         config,
         bridged_prompt: Arc::new(Mutex::new(String::new())),
@@ -3840,18 +3874,15 @@ pub async fn start_live_transcription(
             .await;
 
             // Always return the transcription client to shared state, even
-            // after a panic. Both private and shared state hold
-            // `Arc<TranscriptionClient>`, so the Arc moves straight back —
-            // no `try_unwrap` dance, and a chunk task that leaked a clone
-            // won't strand shared state empty.
-            {
-                let mut private_guard = ctx_guard.transcription_client.lock().await;
-                if let Some(arc_client) = private_guard.take() {
-                    let mut shared_guard = ctx_guard.shared_transcription_state.lock().await;
-                    *shared_guard = Some(arc_client);
-                    debug!("returned transcription client to shared state");
-                }
-            }
+            // after a panic. The scheduler owns the sole `Arc` clone; its
+            // shutdown drains the worker, returns the client to the shared
+            // state, and logs loudly if the Arc is somehow still held
+            // elsewhere (which would indicate a bug in the scheduler itself,
+            // not a normal lifecycle event).
+            ctx_guard
+                .scheduler
+                .shutdown_and_return(Duration::from_secs(DEFAULT_SHUTDOWN_TIMEOUT_SECS))
+                .await;
 
             if let Err(panic) = result {
                 error!("live transcription panicked: {:?}", panic);

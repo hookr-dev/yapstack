@@ -625,7 +625,7 @@ All `download_*` commands emit `"model-download-progress"` events to the window 
 | `stop_live_transcription` | — | `()` |
 | `get_live_transcription_status` | — | `LiveTranscriptionStatus` |
 
-Emits `"live-transcription-segment"` events with `LiveSegmentEvent { session_id?: string, chunk_index, source, segments, audio_offset_seconds, chunk_duration_seconds, accumulated_text, is_backfill }`. The `session_id` mirrors `LiveTranscriptionConfig.session_id` so multi-session listeners (dictation hook + main view) can route events without stale-state guards. `LiveTranscriptionConfig` carries an optional `diarization: bool` (default false) — honored only when the active engine is Parakeet *and* the sidecar was spawned with a Sortformer model. Each `TranscriptSegmentDto` in `segments` carries `speaker_id: number | null`.
+Emits `"live-transcription-segment"` events with `LiveSegmentEvent` (full shape: see `commands/live_transcription.rs`). Notable contract points: `session_id` mirrors `LiveTranscriptionConfig.session_id` so multi-session listeners (dictation hook + main view) can route events without stale-state guards; `origin: "live" | "backfill" | "final_flush"` is set by the scheduler at emit time and is the preferred bucket signal (the older `is_backfill: bool` flag is retained for backwards compat); `event_sequence` is a monotonic per-session counter that frontends can use as a stable tie-breaker for same-offset segments across sources. `LiveTranscriptionConfig.diarization` (optional, default false) is honored only when the active engine is Parakeet *and* the sidecar was spawned with a Sortformer model. Each `TranscriptSegmentDto` in `segments` carries `speaker_id: number | null`.
 
 Emits `"backfill-complete"` event (empty payload) when backfill processing finishes.
 
@@ -641,12 +641,15 @@ Emits `"live-transcription-warning"` event with `{ message }` when the sidecar i
 
 **`LiveTranscriptionPhase`**: `Running`, `Stopped`, `Error`.
 
-**Internal types** (not exported via Tauri):
-- `TranscriptionContext` — Immutable shared context: `transcription_client` (private `Arc<Mutex<Option<Arc<TranscriptionClient>>>>`), `shared_transcription_state` (handle for returning the client on exit), `app_handle`, `config`, `bridged_prompt`, `vocabulary_hints`, `session_offset_base_seconds`
-- `SessionWavState` — Streaming WAV state: `writer`, `flush_positions`, `source`, `mix_config`, `session_id`
-- `SourceVadState` — Per-source VAD: `is_speaking`, `speech_start_pos`, `cursor`, `speech_start_time`, `silence_since`, `chunk_index`, `accumulated_text`, `total_audio_seconds`, `last_seen_write_pos`, `last_write_pos_advance`, `restart_attempts`
-- `VadAction` — `None`, `Chunk` (silence detected), `ForceChunk` (max duration exceeded)
-- `ChunkResult` — `event: LiveSegmentEvent`, `chunk_duration: f32`
+**Internal types** (not exported via Tauri): `TranscriptionContext`, `SessionWavState`, `SourceVadState`, `VadAction`, `ChunkResult`, `SegmentOrigin`. Field-level shape lives with the Rust definitions in `commands/live_transcription.rs` — see those rustdoc comments for the source of truth. `TranscriptionContext` now holds `Arc<TranscriptionScheduler>` for the duration of a session (replacing the prior `transcription_client + shared_transcription_state` pair). `SegmentOrigin` is the IPC mirror of the scheduler's `JobOrigin`.
+
+### Transcription Scheduler (`commands/transcription_scheduler.rs`)
+
+Internal module — not exported via Tauri. See ARCHITECTURE.md § "Transcription Scheduler" for the design rationale, and the rustdoc on `TranscriptionScheduler` / `JobRequest` / `JobOutcome` / `SchedulerError` for current type shapes. The behavioural contract is small and worth stating once here:
+
+- One worker, three priority tiers (`FinalFlush > Live > Backfill`), mic/system round-robin at the Live tier.
+- Sole caller of `TranscriptionClient::transcribe_with` during a session, which makes sidecar respawn race-free.
+- `shutdown_and_return(timeout)` drains the queue then returns the client to `TranscriptionClientState`. The timeout caps a wedged-sidecar worst case; default is 5 minutes, generous enough for a typical 5-minute backfill window to finish on a slow sidecar.
 
 ### Dictation Commands (`commands/dictation.rs`)
 | Command | Args | Returns |

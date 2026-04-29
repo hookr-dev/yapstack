@@ -6,7 +6,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+### Fixed
+- Backfill audio is no longer silently dropped when a session is stopped. A new `TranscriptionScheduler` (priority queue: FinalFlush > Live > Backfill, with mic/system round-robin at the live tier) sits in front of the sidecar, so live work preempts backfill at the engine instead of starving it, and the backfill submitter is allowed to drain on stop instead of being cancelled at the next chunk boundary. Closing-words chunks are submitted at FinalFlush priority so they outrank pending backfill and survive the stop path.
+
 ### Added
+- `LiveSegmentEvent` carries `origin: "live" | "backfill" | "final_flush"` and a monotonic `event_sequence` counter; legacy `is_backfill: bool` retained for backwards compat.
 - `AGENTS.md` as canonical AI-agent instruction file (cross-tool standard); `CLAUDE.md`, `.github/copilot-instructions.md`, `.cursor/rules/main.mdc` are stubs that point to it.
 - `docs/INDEX.md` (doc router), `docs/GLOSSARY.md` (domain terms), `docs/AGENT_GUIDE.md` (navigation + task recipes), `docs/LINEAR_TICKETS.md` (agent-pickup ticket structure).
 - `docs/adr/` directory with ADR-0001 (adopt AGENTS.md).
