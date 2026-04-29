@@ -206,10 +206,6 @@ pub struct LiveSegmentEvent {
     /// Origin class: `live`, `backfill`, or `final_flush`. Set by the scheduler
     /// at emit time. Lets the frontend bucket segments by priority class.
     pub origin: SegmentOrigin,
-    /// Monotonic per-session counter assigned by the scheduler when a job is
-    /// picked up. Frontend uses it as a stable tie-breaker for same-offset
-    /// segments so cross-source ordering doesn't churn across renders.
-    pub event_sequence: u64,
     /// Session this chunk belongs to. Carried on the event so late-arriving
     /// segments can still be persisted to the right session even if the
     /// frontend has already cleared `activeSessionId` during finalization.
@@ -3267,7 +3263,6 @@ async fn transcribe_chunk(
         }
     };
 
-    let event_sequence = outcome.event_sequence;
     let wall_ms = outcome.wall_ms;
     let transcription_result = outcome.result;
 
@@ -3318,7 +3313,6 @@ async fn transcribe_chunk(
         accel = profile.accel.as_deref(),
         variant = profile.variant.as_deref(),
         origin = input.origin.as_str(),
-        event_sequence = event_sequence,
         ok = transcription_result.is_ok(),
         "transcribe chunk pressure"
     );
@@ -3379,11 +3373,10 @@ async fn transcribe_chunk(
                 .collect();
 
             info!(
-                "transcribed: {:?} chunk {} origin={} seq={} offset={:.2}s {:.1}s audio {} chars",
+                "transcribed: {:?} chunk {} origin={} offset={:.2}s {:.1}s audio {} chars",
                 input.source_label,
                 *chunk_index,
                 input.origin.as_str(),
-                event_sequence,
                 input.audio_offset_seconds,
                 chunk_duration,
                 result.text.len()
@@ -3398,14 +3391,13 @@ async fn transcribe_chunk(
                     chunk_duration_seconds: chunk_duration,
                     accumulated_text: accumulated_text.clone(),
                     origin: input.origin.into(),
-                    event_sequence,
                     session_id: ctx.config.session_id.clone(),
                 },
                 chunk_duration,
                 wall_ms,
             })
         }
-        Err(SchedulerError::SidecarDead) | Err(SchedulerError::NotInitialized) => {
+        Err(SchedulerError::SidecarDead) => {
             error!("live transcription: scheduler reports sidecar dead");
             let _ = ctx.app_handle.emit(
                 "live-transcription-status",

@@ -33,9 +33,6 @@ export type LiveSegmentEvent = {
   accumulated_text: string;
   /** Origin class set by the scheduler at emit time. */
   origin: SegmentOrigin;
-  /** Monotonic per-session counter assigned when the scheduler picks up a
-   *  job. Stable tie-breaker for same-offset segments across sources. */
-  event_sequence: number;
   /** Session this chunk belongs to. Late-arriving segments still persist to
    * this session even after the frontend has cleared activeSessionId. */
   session_id: string | null;

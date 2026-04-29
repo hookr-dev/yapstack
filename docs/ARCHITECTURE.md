@@ -284,9 +284,8 @@ cannot lose it.
 **Job submission API.** `scheduler.submit(JobRequest { origin, source,
 wav_path, language, initial_prompt, diarization })` returns a
 `oneshot::Receiver<JobOutcome>`. `JobOutcome` carries the
-`TranscriptionResult` (or a `SchedulerError`), the worker's `wall_ms` for
-pressure telemetry, and a monotonic `event_sequence` used by frontend
-ordering as a stable tie-breaker for same-offset segments across sources.
+`TranscriptionResult` (or a `SchedulerError`) and the worker's `wall_ms`
+for pressure telemetry.
 
 ### Stream Health Monitoring
 

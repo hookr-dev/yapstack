@@ -27,7 +27,7 @@
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
@@ -79,7 +79,6 @@ pub struct JobRequest {
 pub enum SchedulerError {
     Cancelled,
     SidecarDead,
-    NotInitialized,
     Transcription(String),
 }
 
@@ -88,7 +87,6 @@ impl std::fmt::Display for SchedulerError {
         match self {
             SchedulerError::Cancelled => write!(f, "scheduler shut down before job completed"),
             SchedulerError::SidecarDead => write!(f, "sidecar died and could not be restarted"),
-            SchedulerError::NotInitialized => write!(f, "transcription engine not initialized"),
             SchedulerError::Transcription(msg) => write!(f, "transcription failed: {msg}"),
         }
     }
@@ -103,10 +101,6 @@ pub struct JobOutcome {
     /// duration). Returned to callers so the existing per-chunk pressure
     /// telemetry keeps its `wall_ms` field honest under the scheduler.
     pub wall_ms: u64,
-    /// Monotonic sequence assigned when the worker picks up the job. Used by
-    /// the live-transcription loop as the `event_sequence` field on
-    /// `LiveSegmentEvent` for stable frontend ordering.
-    pub event_sequence: u64,
 }
 
 struct JobEnvelope {
@@ -176,7 +170,6 @@ impl SchedulerQueues {
                 let _ = env.respond.send(JobOutcome {
                     result: Err(SchedulerError::Cancelled),
                     wall_ms: 0,
-                    event_sequence: 0,
                 });
             }
         };
@@ -197,7 +190,6 @@ struct SchedulerInner {
     /// Shared state we return the client to when the scheduler shuts down.
     shared_state: TranscriptionClientState,
     shutdown: AtomicBool,
-    emit_seq: AtomicU64,
 }
 
 /// Priority-queue scheduler in front of a single sidecar lane.
@@ -228,7 +220,6 @@ impl TranscriptionScheduler {
             client: TokioMutex::new(Some(client)),
             shared_state,
             shutdown: AtomicBool::new(false),
-            emit_seq: AtomicU64::new(0),
         });
 
         let worker_inner = inner.clone();
@@ -322,31 +313,21 @@ async fn scheduler_worker(inner: Arc<SchedulerInner>) {
             continue;
         };
 
-        let event_sequence = inner.emit_seq.fetch_add(1, Ordering::Relaxed);
-        let outcome = process_job(&inner, env.request, event_sequence).await;
+        let outcome = process_job(&inner, env.request).await;
         let _ = env.respond.send(outcome);
     }
 }
 
-async fn process_job(
-    inner: &Arc<SchedulerInner>,
-    request: JobRequest,
-    event_sequence: u64,
-) -> JobOutcome {
+async fn process_job(inner: &Arc<SchedulerInner>, request: JobRequest) -> JobOutcome {
     let client_arc = {
         let guard = inner.client.lock().await;
         guard.as_ref().cloned()
     };
-    let client = match client_arc {
-        Some(c) => c,
-        None => {
-            return JobOutcome {
-                result: Err(SchedulerError::NotInitialized),
-                wall_ms: 0,
-                event_sequence,
-            };
-        }
-    };
+    // `inner.client` is held by the worker for the scheduler's lifetime —
+    // shutdown_and_return only takes it back after the worker has exited, and
+    // respawn_client holds the lock across its take/put-back. Reaching this
+    // arm means the invariant was broken upstream.
+    let client = client_arc.expect("scheduler client present while worker is running");
 
     let wall_start = std::time::Instant::now();
     let result = client
@@ -363,7 +344,6 @@ async fn process_job(
         Ok(r) => JobOutcome {
             result: Ok(r),
             wall_ms,
-            event_sequence,
         },
         Err(e) => {
             warn!(
@@ -396,21 +376,18 @@ async fn process_job(
                         return JobOutcome {
                             result: retry.map_err(|e| SchedulerError::Transcription(e.to_string())),
                             wall_ms: wall_ms + retry_start.elapsed().as_millis() as u64,
-                            event_sequence,
                         };
                     }
                 }
                 return JobOutcome {
                     result: Err(SchedulerError::SidecarDead),
                     wall_ms,
-                    event_sequence,
                 };
             }
 
             JobOutcome {
                 result: Err(SchedulerError::Transcription(e.to_string())),
                 wall_ms,
-                event_sequence,
             }
         }
     }
@@ -425,29 +402,25 @@ async fn client_is_running(inner: &Arc<SchedulerInner>) -> bool {
 }
 
 /// Try to respawn the sidecar. Returns `true` on success. The worker is the
-/// only holder of the `Arc<TranscriptionClient>` at this point, so
-/// `Arc::try_unwrap` always succeeds.
+/// only holder of the `Arc<TranscriptionClient>` at this point — its in-call
+/// clone was dropped before this is reached — so `Arc::try_unwrap` succeeds.
 async fn respawn_client(inner: &Arc<SchedulerInner>) -> bool {
     let mut guard = inner.client.lock().await;
     let Some(arc_client) = guard.take() else {
         return false;
     };
-    match Arc::try_unwrap(arc_client) {
-        Ok(mut client) => match client.respawn().await {
-            Ok(()) => {
-                *guard = Some(Arc::new(client));
-                info!("scheduler: sidecar respawned successfully");
-                true
-            }
-            Err(e) => {
-                error!("scheduler: sidecar respawn failed: {}", e);
-                *guard = Some(Arc::new(client));
-                false
-            }
-        },
-        Err(still_shared) => {
-            error!("scheduler: respawn skipped — Arc still shared (bug, please report)");
-            *guard = Some(still_shared);
+    let Ok(mut client) = Arc::try_unwrap(arc_client) else {
+        panic!("scheduler worker is the sole Arc<TranscriptionClient> holder");
+    };
+    match client.respawn().await {
+        Ok(()) => {
+            *guard = Some(Arc::new(client));
+            info!("scheduler: sidecar respawned successfully");
+            true
+        }
+        Err(e) => {
+            error!("scheduler: sidecar respawn failed: {}", e);
+            *guard = Some(Arc::new(client));
             false
         }
     }
