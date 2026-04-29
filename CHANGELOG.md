@@ -8,6 +8,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ### Fixed
 - Backfill audio is no longer silently dropped when a session is stopped. A new `TranscriptionScheduler` (priority queue: FinalFlush > Live > Backfill, with mic/system round-robin at the live tier) sits in front of the sidecar, so live work preempts backfill at the engine instead of starving it, and the backfill submitter is allowed to drain on stop instead of being cancelled at the next chunk boundary. Closing-words chunks are submitted at FinalFlush priority so they outrank pending backfill and survive the stop path.
+- Live-transcription lag metric in `get_live_transcription_status` and the session-end summary no longer overstates lag when backfill is interleaved with live. The underlying counter now tracks the *max* completed audio offset rather than overwriting on every chunk, so a late backfill chunk for older audio can't clobber the counter backwards and inflate the reported lag by the live/backfill offset gap.
 
 ### Added
 - `LiveSegmentEvent` and `LiveTranscriptionPressureEvent` carry `origin: "live" | "backfill" | "final_flush"` set by the scheduler at emit time.

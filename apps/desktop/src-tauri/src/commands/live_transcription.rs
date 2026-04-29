@@ -407,9 +407,12 @@ struct SessionCounters {
     /// Cumulative wall-time across every successful transcribe — for an
     /// aggregate "session RTFx" view if we want one later.
     total_wall_ms: u64,
-    /// Session-time of the latest completed chunk's end (audio_offset +
-    /// chunk_duration). Used by `get_live_transcription_status` to compute
-    /// lag against the current wall clock. None until the first chunk lands.
+    /// Highest session-time end (`audio_offset + chunk_duration`) we have
+    /// ever successfully transcribed. Monotonic — we take the max rather
+    /// than overwriting on every chunk because backfill and live can land
+    /// out of audio-time order. Used by `get_live_transcription_status` to
+    /// compute lag against the current wall clock. None until the first
+    /// chunk lands.
     latest_completed_audio_offset_seconds: Option<f32>,
 }
 
@@ -3467,12 +3470,20 @@ async fn transcribe_and_emit_chunk(
             s.total_chunks += 1;
             s.total_audio_seconds += result.chunk_duration;
             s.total_wall_ms = s.total_wall_ms.saturating_add(result.wall_ms);
-            // Track the latest emitted chunk's session-time end so the
-            // status command can compute live lag against the wall clock.
-            // Pressure event already reported per-chunk lag; this is for the
-            // polled-status surface used by StatusPopover.
+            // Track the highest session-time end we've ever transcribed so
+            // the status command can compute live lag against the wall clock.
+            // Take the max rather than last-write: backfill chunks land in
+            // arbitrary order against live, so a backfill chunk for older
+            // audio can complete after a live chunk for newer audio. Last-
+            // write would clobber the counter backwards and overstate lag
+            // by the live-vs-backfill offset gap. Pressure event already
+            // reports per-chunk lag; this is for the polled-status surface
+            // used by StatusPopover.
             let chunk_end = result.event.audio_offset_seconds + result.chunk_duration;
-            s.latest_completed_audio_offset_seconds = Some(chunk_end);
+            s.latest_completed_audio_offset_seconds = Some(
+                s.latest_completed_audio_offset_seconds
+                    .map_or(chunk_end, |prev| prev.max(chunk_end)),
+            );
             (s.total_chunks, s.total_audio_seconds, s.cap_fired_total)
         };
         prompt
