@@ -634,7 +634,7 @@ function createAppStore() {
               `offset=${event.audio_offset_seconds.toFixed(2)}s ` +
               `duration=${event.chunk_duration_seconds.toFixed(2)}s ` +
               `segments=${event.segments.length} ` +
-              `backfill=${event.is_backfill}`,
+              `origin=${event.origin}`,
           );
 
           // Prefer the session_id carried on the event so late-arriving

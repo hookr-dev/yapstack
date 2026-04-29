@@ -170,7 +170,7 @@ pub struct LiveTranscriptionStartResult {
 
 /// Origin class of a live-segment event. Mirrors the scheduler's priority
 /// tier so the frontend can bucket segments (live vs. backfill stripe vs.
-/// final-flush at stop) without re-deriving it from `is_backfill` alone.
+/// final-flush at stop).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
 #[serde(rename_all = "snake_case")]
 pub enum SegmentOrigin {
@@ -203,12 +203,8 @@ pub struct LiveSegmentEvent {
     pub chunk_duration_seconds: f32,
     /// Per-source accumulated text so far.
     pub accumulated_text: String,
-    /// Whether this chunk came from backfill processing (true) or live VAD (false).
-    /// Retained for backwards compat; new consumers should prefer `origin`.
-    pub is_backfill: bool,
     /// Origin class: `live`, `backfill`, or `final_flush`. Set by the scheduler
-    /// at emit time. Lets the frontend bucket segments by priority class
-    /// without inferring from `is_backfill` alone.
+    /// at emit time. Lets the frontend bucket segments by priority class.
     pub origin: SegmentOrigin,
     /// Monotonic per-session counter assigned by the scheduler when a job is
     /// picked up. Frontend uses it as a stable tie-breaker for same-offset
@@ -272,7 +268,9 @@ pub struct LiveTranscriptionPressureEvent {
     pub rtfx: Option<f32>,
     /// Engine that produced this chunk — `"Whisper"` or `"Parakeet"`.
     pub engine: String,
-    pub is_backfill: bool,
+    /// Priority tier the scheduler ran this chunk at. Lets pressure
+    /// telemetry distinguish live throughput from backfill drain rate.
+    pub origin: SegmentOrigin,
     /// Session-time elapsed since session start minus the just-completed
     /// chunk's end offset. Positive means "transcription is N seconds behind
     /// real time at the moment this chunk finished." None when the chunk did
@@ -318,12 +316,10 @@ struct SessionWavState {
 
 /// Immutable shared context for transcription operations.
 ///
-/// During live transcription, the TranscriptionClient is extracted from the
-/// shared `TranscriptionClientState` and held privately in
-/// `transcription_client`. This eliminates mutex contention with other
-/// commands that may access `TranscriptionClientState` (e.g.
-/// `transcribe_audio`, `shutdown_transcription_client`). The client is
-/// returned to shared state when the live transcription loop ends.
+/// During live transcription, the `TranscriptionClient` is extracted from the
+/// shared `TranscriptionClientState` and handed to a `TranscriptionScheduler`
+/// that owns it for the duration of the session. The scheduler returns the
+/// client to shared state on `shutdown_and_return`.
 #[derive(Clone)]
 struct TranscriptionContext {
     /// Priority-queue scheduler in front of the sidecar lane. Owns the sole
@@ -399,12 +395,6 @@ struct ChunkInput<'a> {
     /// Priority class the scheduler uses; also emitted on `LiveSegmentEvent`
     /// so the frontend can bucket segments.
     origin: JobOrigin,
-}
-
-impl ChunkInput<'_> {
-    fn is_backfill(&self) -> bool {
-        matches!(self.origin, JobOrigin::Backfill)
-    }
 }
 
 /// Cross-loop chunk counters surfaced to `LiveTranscriptionController` for
@@ -3305,7 +3295,7 @@ async fn transcribe_chunk(
             wall_ms,
             rtfx,
             engine: profile.engine_name.to_string(),
-            is_backfill: input.is_backfill(),
+            origin: input.origin.into(),
             lag_seconds,
             accel: profile.accel.clone(),
             variant: profile.variant.clone(),
@@ -3327,7 +3317,6 @@ async fn transcribe_chunk(
         engine = profile.engine_name,
         accel = profile.accel.as_deref(),
         variant = profile.variant.as_deref(),
-        is_backfill = input.is_backfill(),
         origin = input.origin.as_str(),
         event_sequence = event_sequence,
         ok = transcription_result.is_ok(),
@@ -3400,7 +3389,6 @@ async fn transcribe_chunk(
                 result.text.len()
             );
 
-            let origin_dto: SegmentOrigin = input.origin.into();
             TranscribeOutcome::Success(ChunkResult {
                 event: LiveSegmentEvent {
                     chunk_index: *chunk_index - 1,
@@ -3409,8 +3397,7 @@ async fn transcribe_chunk(
                     audio_offset_seconds: input.audio_offset_seconds,
                     chunk_duration_seconds: chunk_duration,
                     accumulated_text: accumulated_text.clone(),
-                    is_backfill: input.is_backfill(),
-                    origin: origin_dto,
+                    origin: input.origin.into(),
                     event_sequence,
                     session_id: ctx.config.session_id.clone(),
                 },

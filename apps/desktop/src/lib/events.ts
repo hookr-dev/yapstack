@@ -72,7 +72,9 @@ export type LiveTranscriptionPressureEvent = {
   /** Null when the transcribe call failed or wall_ms was 0. */
   rtfx: number | null;
   engine: "Whisper" | "Parakeet";
-  is_backfill: boolean;
+  /** Priority tier the scheduler ran this chunk at. Distinguishes live
+   *  throughput from backfill drain rate in pressure telemetry. */
+  origin: "live" | "backfill" | "final_flush";
   /** Null when the chunk did not produce a successful transcription. */
   lag_seconds: number | null;
   /** Resolved accelerator (e.g. "webgpu", "coreml", "cpu", "metal", "cuda")

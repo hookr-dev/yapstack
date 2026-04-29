@@ -197,7 +197,7 @@ Frontend: start_live_transcription(config)
            priority, interleaved across sources (chunk 0 all sources,
            chunk 1, etc.). The scheduler drains backfill whenever it has
            no FinalFlush or Live work outstanding.
-        6. Emit "live-segment" events with origin="backfill" (is_backfill=true)
+        6. Emit "live-segment" events with origin="backfill"
         7. Emit "backfill-complete" event when the submitter finishes
         8. Stop does *not* cancel the submitter — the scheduler keeps draining
            backfill after the live loop has exited, capped only by the
@@ -343,7 +343,7 @@ Startup also runs `db::ensure_runtime_schema()` *before* tauri-plugin-sql wires 
 The persisted domain model. All writes flow through `tauri-plugin-sql` via `lib/db.ts`; the DB file lives in the app data dir.
 
 - **Sessions** (`sessions`) — capture + transcription root. Owns a title, pinned flag, start/end timestamps, zero-or-more `session_audio_parts` rows (one per recording run; resumed sessions append a new part), and optional note via `notes.session_id` FK. `session_type` distinguishes `"transcription"` (recorded + transcribed) from `"manual"` (no transcript — note-only).
-- **Segments** (`segments`) — transcript rows: `(session_id, audio_offset_seconds, text, speaker_id?, is_backfill)`. Writes serialize through the `segmentQueueTail` promise queue to prevent backfill / live races. `speaker_id` is added by the frontend's `getDb()` after migrations run (outside the migration list — see API_REFERENCE schema note).
+- **Segments** (`segments`) — transcript rows keyed by session, with timestamps, text, and an optional `speaker_id`. Writes serialize through the `segmentQueueTail` promise queue to prevent backfill / live races. `speaker_id` is added by the frontend's `getDb()` after migrations run (outside the migration list — see API_REFERENCE schema note).
 - **Notes** (`notes`) + **note versions** (`note_versions`) — rich-text body (Tiptap HTML). Versions persist the history for restore. One note per session.
 - **Folders** (`folders`) — nested via `parent_id` (root has null). Carry `icon`, `color`, `description`. The `description` feeds the AI multi-session system prompt as an organizational layer (see `AI_CONTEXT.md`).
 - **Session ↔ folder junction** (`session_folders`) — many-to-many. A session can live in multiple folders; branch conflicts detected by `findBranchConflicts()` in `lib/folder-tree.ts`.

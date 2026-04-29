@@ -22,7 +22,7 @@ The shared vocabulary for YapStack. Use these terms verbatim in code, docs, PRDs
 | --------------------- | --------------------------------------------------------------------------------------------------------------------- | ------------------------- |
 | **Session**           | A bounded recording with its captured audio and ordered list of segments, persisted in SQLite.                        | Recording, take           |
 | **Segment**           | A single transcribed utterance with start/end timestamps, text, confidence, and optional speaker ID.                  | Chunk, transcript line    |
-| **Backfill**          | Re-transcription of audio captured *before* live transcription started, emitted as `is_backfill: true` segments.      | History, replay, prefill  |
+| **Backfill**          | Re-transcription of audio captured *before* live transcription started, emitted as `origin: "backfill"` segments.     | History, replay, prefill  |
 | **Session audio**       | The umbrella term for a session's persisted audio. A session's audio is composed of one or more **Session audio parts**; each part is one file in the user's chosen format. | Audio file, recording file |
 | **Session audio part**  | One ordered slice of a session's audio (`part_index = 0, 1, 2…`), persisted as one file at `{audio_dir}/{session_id}.{part_index}.{wav\|mp3}` and recorded as one row in `session_audio_parts`. A fresh session has `part_index = 0`; resuming appends `part_index = N`. The DB row is the durable source of truth — written from Rust at finalize time before any FE event. | Audio chunk, segment audio |
 | **Resume**              | Continuing a paused/stopped session by appending a new **Session audio part** rather than overwriting. Segments and parts both continue numbering from where the prior run left off. | Re-open, re-record         |
@@ -161,7 +161,7 @@ The shared vocabulary for YapStack. Use these terms verbatim in code, docs, PRDs
 
 > **Dev:** "And **backfill** segments — do they go through the same path?"
 
-> **Domain expert:** "Same transcribe call, just flagged `is_backfill: true`. Backfill seeds the prompt context once at start; after that, **prompt decay** can clear it like any other run."
+> **Domain expert:** "Same transcribe call, just submitted to the **scheduler** at `Backfill` priority and emitted with `origin: \"backfill\"`. Backfill seeds the prompt context once at start; after that, **prompt decay** can clear it like any other run."
 
 > **Dev:** "When a **Session** finalizes, what determines whether we end up with a WAV or an MP3?"
 

@@ -73,7 +73,7 @@ When uncertain, `git grep -n <symbol>` from repo root.
 
 1. Read the live transcription section of [`docs/ARCHITECTURE.md`](ARCHITECTURE.md) end-to-end before touching `commands/live_transcription.rs`. There's tight coupling between cursors, VAD state machines, prompt context, and stream health monitoring.
 2. The `live_pressure` and `live_engine_loaded` log markers are how you observe runtime behaviour. Add new markers via `tracing::info!(marker = "...", ...)`.
-3. Backfill must continue to work concurrently with live; don't break the `is_backfill: true` flow.
+3. Backfill must continue to work concurrently with live; don't break the `origin: "backfill"` flow.
 4. Test on a real recording session before declaring done. UI tests don't catch pipeline regressions.
 
 ## Debugging tips

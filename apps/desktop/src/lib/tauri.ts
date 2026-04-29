@@ -21,8 +21,7 @@ export type TranscriptSegmentDto = {
 };
 
 /** Origin class of a live segment event. Mirrors the scheduler's priority
- *  tier (FinalFlush > Live > Backfill). New consumers should prefer this
- *  over `is_backfill`, which is retained for backwards compat. */
+ *  tier (FinalFlush > Live > Backfill). */
 export type SegmentOrigin = "live" | "backfill" | "final_flush";
 
 export type LiveSegmentEvent = {
@@ -32,8 +31,6 @@ export type LiveSegmentEvent = {
   audio_offset_seconds: number;
   chunk_duration_seconds: number;
   accumulated_text: string;
-  /** Retained for backwards compat; new consumers should prefer `origin`. */
-  is_backfill: boolean;
   /** Origin class set by the scheduler at emit time. */
   origin: SegmentOrigin;
   /** Monotonic per-session counter assigned when the scheduler picks up a
