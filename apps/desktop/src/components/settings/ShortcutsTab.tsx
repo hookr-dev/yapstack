@@ -11,34 +11,10 @@ import {
 } from "@/lib/shortcuts";
 import { suspendGlobalShortcuts, resumeGlobalShortcuts } from "@/hooks/useGlobalShortcuts";
 import type { ShortcutDefinition } from "@/lib/shortcuts";
-import { formatShortcutDisplay, isMac } from "@/lib/utils";
+import { formatGlobalShortcutDisplay, formatShortcutDisplay } from "@/lib/utils";
 import { Globe, RotateCcw } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { toast } from "sonner";
-
-/**
- * Format a global binding (CommandOrControl+Shift+N) for display.
- */
-function formatGlobalDisplay(binding: string): string {
-  if (!binding) return "Not set";
-  const parts = binding.split("+");
-  if (isMac) {
-    const symbols: string[] = [];
-    for (const p of parts) {
-      if (p === "CommandOrControl") symbols.push("\u2318");
-      else if (p === "Control") symbols.push("\u2303");
-      else if (p === "Shift") symbols.push("\u21E7");
-      else if (p === "Alt") symbols.push("\u2325");
-      else if (p === "Backspace") symbols.push("\u232B");
-      else if (p === "Escape") symbols.push("\u238B");
-      else symbols.push(p.toUpperCase());
-    }
-    return symbols.join("");
-  }
-  return parts
-    .map((p) => (p === "CommandOrControl" || p === "Control" ? "Ctrl" : p))
-    .join("+");
-}
 
 function ShortcutRow({
   shortcut,
@@ -56,7 +32,7 @@ function ShortcutRow({
   conflict: string | null;
 }) {
   const displayBinding = shortcut.isGlobal
-    ? formatGlobalDisplay(binding)
+    ? formatGlobalShortcutDisplay(binding)
     : formatShortcutDisplay(binding);
 
   return (
@@ -141,7 +117,7 @@ function RecordingRow({
         pendingRef.current = binding;
         setPendingDisplay(
           shortcut.isGlobal
-            ? formatGlobalDisplay(binding)
+            ? formatGlobalShortcutDisplay(binding)
             : formatShortcutDisplay(binding),
         );
       }
@@ -243,7 +219,7 @@ export function ShortcutsTab() {
             ? `dictation slot "${conflict.label}"`
             : `"${conflict.label}"`;
         toast.error(
-          `${formatGlobalDisplay(binding)} is already bound to ${target}. Rebind it first.`,
+          `${formatGlobalShortcutDisplay(binding)} is already bound to ${target}. Rebind it first.`,
         );
         setRecordingId(null);
         return;

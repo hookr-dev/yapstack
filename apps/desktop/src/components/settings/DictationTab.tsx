@@ -21,28 +21,8 @@ import {
 } from "@/lib/shortcuts";
 import { toast } from "sonner";
 import { suspendGlobalShortcuts, resumeGlobalShortcuts } from "@/hooks/useGlobalShortcuts";
-import { isMac } from "@/lib/utils";
+import { formatGlobalShortcutDisplay } from "@/lib/utils";
 import { Plus, Trash2 } from "lucide-react";
-
-function formatGlobalDisplay(binding: string): string {
-  if (!binding) return "Not set";
-  const parts = binding.split("+");
-  if (isMac) {
-    const symbols: string[] = [];
-    for (const p of parts) {
-      if (p === "CommandOrControl") symbols.push("\u2318");
-      else if (p === "Shift") symbols.push("\u21E7");
-      else if (p === "Alt") symbols.push("\u2325");
-      else if (p === "Backspace") symbols.push("\u232B");
-      else if (p === "Escape") symbols.push("\u238B");
-      else symbols.push(p.toUpperCase());
-    }
-    return symbols.join("");
-  }
-  return parts
-    .map((p) => (p === "CommandOrControl" ? "Ctrl" : p))
-    .join("+");
-}
 
 const OUTPUT_ACTION_LABELS: Record<DictationOutputAction, string> = {
   paste: "Paste",
@@ -80,7 +60,7 @@ function KeybindRecorder({
       onClick={() => setRecording(true)}
       className="inline-flex items-center justify-center rounded border px-1.5 py-1 keybind-display text-xs min-w-[56px] transition-colors border-border bg-background text-foreground hover:bg-muted cursor-pointer"
     >
-      {formatGlobalDisplay(binding)}
+      {formatGlobalShortcutDisplay(binding)}
     </button>
   );
 }
@@ -118,7 +98,7 @@ function KeybindCaptureInline({
       const captured = eventToGlobalBinding(e);
       if (captured) {
         pendingRef.current = captured;
-        setPendingDisplay(formatGlobalDisplay(captured));
+        setPendingDisplay(formatGlobalShortcutDisplay(captured));
       }
     }
 
@@ -333,7 +313,7 @@ export function DictationTab() {
             ? `dictation slot "${conflict.label}"`
             : `"${conflict.label}"`;
         toast.error(
-          `${formatGlobalDisplay(binding)} is already bound to ${target}. Rebind it first.`,
+          `${formatGlobalShortcutDisplay(binding)} is already bound to ${target}. Rebind it first.`,
         );
         return;
       }

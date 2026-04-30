@@ -82,7 +82,6 @@ export function useAutoTag(sessionId: string | null, isRecording: boolean) {
       trackerRef.current?.accept(suggestion.id);
       setSuggestions((prev) => prev.filter((s) => s.id !== suggestion.id));
       await addSessionToFolder(sessionId, suggestion.id);
-      trackerRef.current?.addExistingFolder(suggestion.id);
 
       const updatedHints = buildVocabularyHints(await listFolders(), await listTags());
       if (updatedHints) {

@@ -72,6 +72,27 @@ function RecordingBadge() {
   );
 }
 
+function FolderRowContent({
+  folder,
+  isInFolder,
+}: {
+  folder: FolderTreeNode["folder"];
+  isInFolder: boolean;
+}) {
+  const FolderIcon = folder.icon ? ICON_MAP[folder.icon] : null;
+  return (
+    <>
+      {FolderIcon && (
+        <FolderIcon
+          style={folder.color ? { color: folder.color } : undefined}
+        />
+      )}
+      <span className="flex-1">{folder.name}</span>
+      {isInFolder && <Check className="text-muted-foreground" />}
+    </>
+  );
+}
+
 function FolderMenuNode({
   node,
   sessionId,
@@ -85,18 +106,11 @@ function FolderMenuNode({
 }) {
   const { folder, children } = node;
   const isInFolder = sessionFolderIds.includes(folder.id);
-  const FolderIcon = folder.icon ? ICON_MAP[folder.icon] : null;
 
   if (children.length === 0) {
     return (
       <DropdownMenuItem onClick={() => onToggle(sessionId, folder.id)}>
-        {FolderIcon && (
-          <FolderIcon
-            style={folder.color ? { color: folder.color } : undefined}
-          />
-        )}
-        <span className="flex-1">{folder.name}</span>
-        {isInFolder && <Check className="text-muted-foreground" />}
+        <FolderRowContent folder={folder} isInFolder={isInFolder} />
       </DropdownMenuItem>
     );
   }
@@ -104,23 +118,11 @@ function FolderMenuNode({
   return (
     <DropdownMenuSub>
       <DropdownMenuSubTrigger>
-        {FolderIcon && (
-          <FolderIcon
-            style={folder.color ? { color: folder.color } : undefined}
-          />
-        )}
-        <span className="flex-1">{folder.name}</span>
-        {isInFolder && <Check className="text-muted-foreground" />}
+        <FolderRowContent folder={folder} isInFolder={isInFolder} />
       </DropdownMenuSubTrigger>
       <DropdownMenuSubContent>
         <DropdownMenuItem onClick={() => onToggle(sessionId, folder.id)}>
-          {FolderIcon && (
-            <FolderIcon
-              style={folder.color ? { color: folder.color } : undefined}
-            />
-          )}
-          <span className="flex-1">{folder.name}</span>
-          {isInFolder && <Check className="text-muted-foreground" />}
+          <FolderRowContent folder={folder} isInFolder={isInFolder} />
         </DropdownMenuItem>
         <DropdownMenuSeparator />
         {children.map((child) => (

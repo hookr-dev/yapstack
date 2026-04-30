@@ -20,11 +20,13 @@ export function AutoTagSuggestions({
         <Sparkles className="h-3 w-3" />
         Recommended
       </span>
-      {suggestions.map((s) => (
+      {suggestions.map((s) => {
+        const pct = Math.round(s.confidence * 100);
+        return (
         <div
           key={s.id}
           className="flex items-center gap-1 rounded-full border bg-background px-2 py-0.5 text-xs shadow-sm"
-          title={`Confidence: ${Math.round(s.confidence * 100)}%`}
+          title={`Confidence: ${pct}%`}
         >
           <Folder
             className="h-3 w-3 shrink-0"
@@ -38,7 +40,7 @@ export function AutoTagSuggestions({
                 : "text-[10px] font-medium text-muted-foreground"
             }
           >
-            {Math.round(s.confidence * 100)}%
+            {pct}%
           </span>
           <button
             className="rounded-full p-0.5 text-muted-foreground hover:bg-green-500/15 hover:text-green-600 transition-colors"
@@ -55,7 +57,8 @@ export function AutoTagSuggestions({
             <X className="h-3 w-3" />
           </button>
         </div>
-      ))}
+        );
+      })}
     </div>
   );
 }
