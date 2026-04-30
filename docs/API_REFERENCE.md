@@ -113,12 +113,12 @@ Whisper exposes 99 ISO-639 codes; Parakeet TDT v3 exposes 25 European codes.
 ### Re-exports (`lib.rs`)
 
 ```rust
-pub use capture::{BufferPositions, SeparateExtraction};
+pub use capture::{BoundedExtraction, BufferPositions, SeparateExtraction};
 pub use error::AudioError;
 pub use export::SessionWavWriter;
 pub use manager::AudioManager;
 pub use mixer::MixConfig;
-pub use ring_buffer::{AudioRingBuffer, RingBufferInfo, SharedAudioRingBuffer};
+pub use ring_buffer::{AudioRangeSnapshot, AudioRingBuffer, RingBufferInfo, SharedAudioRingBuffer};
 
 /// The actual stream configuration used by a device after negotiation.
 pub struct DeviceStreamConfig {
@@ -156,6 +156,7 @@ impl AudioRingBuffer {
     pub fn snapshot_samples(&self, num_samples: usize) -> Vec<f32>;
     pub fn snapshot_all(&self) -> Vec<f32>;
     pub fn snapshot_since(&self, since_pos: usize) -> Vec<f32>;  // clamped to capacity
+    pub fn snapshot_range(&self, from_pos: usize, until_pos: usize) -> AudioRangeSnapshot;  // bounded, reports overrun
 
     // Energy (zero-allocation RMS computation directly on ring buffer)
     pub fn rms_energy_since(&self, since_pos: usize, max_samples: usize) -> Option<f32>;
@@ -172,6 +173,13 @@ pub struct RingBufferInfo {
     pub available_seconds: f32,
     pub sample_rate: u32,
     pub channels: u16,
+}
+
+pub struct AudioRangeSnapshot {
+    pub samples: Vec<f32>,
+    pub start_pos: usize,
+    pub end_pos: usize,
+    pub overrun: bool,
 }
 ```
 
@@ -213,7 +221,9 @@ impl AudioManager {
     pub fn buffer_positions(&self) -> BufferPositions;  // current write positions for both buffers
     pub fn mic_write_pos(&self) -> usize;   // current mic buffer write position (0 if no buffer)
     pub fn system_write_pos(&self) -> usize; // current system buffer write position (0 if no buffer)
+    pub fn output_sample_rate_for(&self, source: CaptureSource) -> u32;
     pub fn extract_since(&self, positions: &BufferPositions, source: CaptureSource, mix_config: Option<&MixConfig>) -> Option<(Vec<f32>, u32, BufferPositions)>;
+    pub fn extract_since_until(&self, positions: &BufferPositions, limits: &BufferPositions, source: CaptureSource, mix_config: Option<&MixConfig>) -> Option<BoundedExtraction>;  // bounded to stop_positions, reports overrun
     pub fn extract_sources_since(&self, positions: &BufferPositions) -> Option<SeparateExtraction>;  // per-source extraction (no mixing)
     pub fn peek_energy_rms(&self, positions: &BufferPositions, duration_secs: f32) -> (Option<f32>, Option<f32>);  // zero-alloc RMS via ring_buffer.rms_energy_since()
 
@@ -325,6 +335,15 @@ pub struct SeparateExtraction {
     pub mic: Option<(Vec<f32>, u32)>,      // (mono_samples, sample_rate)
     pub system: Option<(Vec<f32>, u32)>,   // (mono_samples, sample_rate)
     pub new_positions: BufferPositions,
+}
+
+/// Stop-safe bounded extraction result. Samples never include audio written
+/// after the supplied limit positions.
+pub struct BoundedExtraction {
+    pub samples: Vec<f32>,
+    pub sample_rate: u32,
+    pub new_positions: BufferPositions,
+    pub overrun: bool,
 }
 ```
 
@@ -627,6 +646,10 @@ All `download_*` commands emit `"model-download-progress"` events to the window 
 
 Emits `"live-transcription-segment"` events with `LiveSegmentEvent` (full shape: see `commands/live_transcription.rs`). Notable contract points: `session_id` mirrors `LiveTranscriptionConfig.session_id` so multi-session listeners (dictation hook + main view) can route events without stale-state guards; `origin: "live" | "backfill" | "final_flush"` is set by the scheduler at emit time and tells the frontend which priority tier produced the chunk. `LiveTranscriptionConfig.diarization` (optional, default false) is honored only when the active engine is Parakeet *and* the sidecar was spawned with a Sortformer model. Each `TranscriptSegmentDto` in `segments` carries `speaker_id: number | null`.
 
+`stop_live_transcription` remains a no-argument frontend command, but internally snapshots `AudioManager::buffer_positions()` plus a short tail grace into a `StopRequest`. After that point, the live loop skips normal VAD polling, idle cursor advancement, stream-health restarts, and unbounded WAV flushing. Final live chunks and the session WAV tail are read only up to that bounded stop position; later samples are ignored for the stopped session.
+
+`LiveTranscriptionStatus` includes `lag_seconds`, `live_drain_backlog_chunks`, and `live_drain_backlog_seconds`. The backlog fields replace the old head-drop cap counter: non-zero values mean live audio is being preserved and drained because inference fell behind real time. `LiveTranscriptionPressureEvent` also carries `drain_backlog_seconds` per chunk.
+
 Emits `"backfill-complete"` event (empty payload) when backfill processing finishes.
 
 Emits `"session-part-ready"` event with `SessionPartReadyEvent { session_id, part_index, file_path, format: AudioExportFormatDto ("wav" \| "mp3"), duration_seconds, sample_rate }` when the streaming part is finalized after the loop exits. When `LiveTranscriptionConfig.persist_audio_part` is true (the default — actual sessions), a `session_audio_parts` row is inserted from Rust *before* this event fires, so the DB stays the durable source of truth even if the listener is gone. When the flag is false (dictation), the row insert is skipped — dictation owns its audio path on `dictation_history` instead, and the synthetic `session_id` has no `sessions.id` to FK against.
@@ -648,6 +671,7 @@ Emits `"live-transcription-warning"` event with `{ message }` when the sidecar i
 Internal module — not exported via Tauri. See ARCHITECTURE.md § "Transcription Scheduler" for the design rationale, and the rustdoc on `TranscriptionScheduler` / `JobRequest` / `JobOutcome` / `SchedulerError` for current type shapes. The behavioural contract is small and worth stating once here:
 
 - One worker, three priority tiers (`FinalFlush > Live > Backfill`), mic/system round-robin at the Live tier.
+- `Backfill` jobs are admitted only when no `FinalFlush`/`Live` job is queued and the live loop's busy gate is clear.
 - Sole caller of `TranscriptionClient::transcribe_with` during a session, which makes sidecar respawn race-free.
 - `shutdown_and_return(timeout)` drains the queue then returns the client to `TranscriptionClientState`. The timeout caps a wedged-sidecar worst case; default is 5 minutes, generous enough for a typical 5-minute backfill window to finish on a slow sidecar.
 

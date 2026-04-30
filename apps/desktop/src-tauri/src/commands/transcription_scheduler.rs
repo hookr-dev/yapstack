@@ -9,7 +9,9 @@
 //! the highest-priority job available, calls `transcribe_with`, and responds
 //! via a per-job oneshot. Within the `Live` priority, mic/system sources
 //! alternate in strict round-robin so neither can starve the other during a
-//! sustained dual-source session.
+//! sustained dual-source session. Backfill is also gated by the live loop's
+//! busy signal so historical work only enters the non-preemptible sidecar lane
+//! while live ingestion is idle.
 //!
 //! Sidecar liveness: because the worker is the *sole* caller of
 //! `transcribe_with`, a transient sidecar error can be resolved cleanly — the
@@ -130,7 +132,7 @@ impl SchedulerQueues {
 
     /// Pick the next job in priority order, applying mic/system round-robin
     /// at the `Live` tier.
-    fn pick_next(&mut self) -> Option<JobEnvelope> {
+    fn pick_next(&mut self, live_busy: bool) -> Option<JobEnvelope> {
         if let Some(job) = self.final_flush.pop_front() {
             return Some(job);
         }
@@ -148,8 +150,10 @@ impl SchedulerQueues {
                 return Some(job);
             }
         }
-        if let Some(job) = self.backfill.pop_front() {
-            return Some(job);
+        if !live_busy {
+            if let Some(job) = self.backfill.pop_front() {
+                return Some(job);
+            }
         }
         None
     }
@@ -190,6 +194,7 @@ struct SchedulerInner {
     /// Shared state we return the client to when the scheduler shuts down.
     shared_state: TranscriptionClientState,
     shutdown: AtomicBool,
+    live_busy: AtomicBool,
 }
 
 /// Priority-queue scheduler in front of a single sidecar lane.
@@ -220,6 +225,7 @@ impl TranscriptionScheduler {
             client: TokioMutex::new(Some(client)),
             shared_state,
             shutdown: AtomicBool::new(false),
+            live_busy: AtomicBool::new(false),
         });
 
         let worker_inner = inner.clone();
@@ -246,6 +252,15 @@ impl TranscriptionScheduler {
         drop(queues);
         self.inner.notify.notify_one();
         rx
+    }
+
+    /// Set whether live ingestion currently needs the sidecar lane protected
+    /// from new backfill work.
+    pub fn set_live_busy(&self, busy: bool) {
+        let previous = self.inner.live_busy.swap(busy, Ordering::AcqRel);
+        if previous != busy {
+            self.inner.notify.notify_one();
+        }
     }
 
     /// Shut down the worker, drain remaining jobs (FinalFlush + Live +
@@ -302,7 +317,9 @@ async fn scheduler_worker(inner: Arc<SchedulerInner>) {
     loop {
         let env = {
             let mut queues = inner.queues.lock().expect("queue mutex poisoned");
-            queues.pick_next()
+            let live_busy =
+                inner.live_busy.load(Ordering::Acquire) && !inner.shutdown.load(Ordering::Acquire);
+            queues.pick_next(live_busy)
         };
 
         let Some(env) = env else {
@@ -469,13 +486,13 @@ mod tests {
         q.push(live);
         q.push(final_flush);
 
-        let first = q.pick_next().unwrap();
+        let first = q.pick_next(false).unwrap();
         assert!(matches!(first.request.origin, JobOrigin::FinalFlush));
-        let second = q.pick_next().unwrap();
+        let second = q.pick_next(false).unwrap();
         assert!(matches!(second.request.origin, JobOrigin::Live));
-        let third = q.pick_next().unwrap();
+        let third = q.pick_next(false).unwrap();
         assert!(matches!(third.request.origin, JobOrigin::Backfill));
-        assert!(q.pick_next().is_none());
+        assert!(q.pick_next(false).is_none());
     }
 
     #[test]
@@ -489,7 +506,7 @@ mod tests {
         }
 
         let mut sequence = Vec::new();
-        while let Some(env) = q.pick_next() {
+        while let Some(env) = q.pick_next(false) {
             sequence.push(env.request.source);
         }
         assert_eq!(sequence.len(), 6);
@@ -514,7 +531,7 @@ mod tests {
             q.push(s);
         }
         let mut count = 0;
-        while let Some(env) = q.pick_next() {
+        while let Some(env) = q.pick_next(false) {
             assert_eq!(env.request.source, JobSource::System);
             count += 1;
         }
@@ -530,7 +547,7 @@ mod tests {
         }
         let (f, _) = fake_env(JobOrigin::FinalFlush, JobSource::System);
         q.push(f);
-        let first = q.pick_next().unwrap();
+        let first = q.pick_next(false).unwrap();
         assert!(matches!(first.request.origin, JobOrigin::FinalFlush));
     }
 
@@ -547,15 +564,53 @@ mod tests {
         q.push(b2);
 
         assert!(matches!(
-            q.pick_next().unwrap().request.origin,
+            q.pick_next(false).unwrap().request.origin,
             JobOrigin::Live
         ));
         assert!(matches!(
-            q.pick_next().unwrap().request.origin,
+            q.pick_next(false).unwrap().request.origin,
             JobOrigin::Backfill
         ));
         assert!(matches!(
-            q.pick_next().unwrap().request.origin,
+            q.pick_next(false).unwrap().request.origin,
+            JobOrigin::Backfill
+        ));
+    }
+
+    #[test]
+    fn backfill_waits_while_live_busy() {
+        let mut q = SchedulerQueues::new();
+        let (backfill, _) = fake_env(JobOrigin::Backfill, JobSource::Mic);
+        q.push(backfill);
+
+        assert!(q.pick_next(true).is_none());
+        assert!(matches!(
+            q.pick_next(false).unwrap().request.origin,
+            JobOrigin::Backfill
+        ));
+    }
+
+    #[test]
+    fn final_flush_and_live_ignore_live_busy_gate() {
+        let mut q = SchedulerQueues::new();
+        let (backfill, _) = fake_env(JobOrigin::Backfill, JobSource::Mic);
+        let (live, _) = fake_env(JobOrigin::Live, JobSource::Mic);
+        let (final_flush, _) = fake_env(JobOrigin::FinalFlush, JobSource::System);
+        q.push(backfill);
+        q.push(live);
+        q.push(final_flush);
+
+        assert!(matches!(
+            q.pick_next(true).unwrap().request.origin,
+            JobOrigin::FinalFlush
+        ));
+        assert!(matches!(
+            q.pick_next(true).unwrap().request.origin,
+            JobOrigin::Live
+        ));
+        assert!(q.pick_next(true).is_none());
+        assert!(matches!(
+            q.pick_next(false).unwrap().request.origin,
             JobOrigin::Backfill
         ));
     }

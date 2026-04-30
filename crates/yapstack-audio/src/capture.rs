@@ -17,3 +17,12 @@ pub struct SeparateExtraction {
     /// Updated buffer positions after extraction.
     pub new_positions: BufferPositions,
 }
+
+/// Bounded extraction result used when callers need a hard upper cursor
+/// limit, such as the exact stop position of a recording session.
+pub struct BoundedExtraction {
+    pub samples: Vec<f32>,
+    pub sample_rate: u32,
+    pub new_positions: BufferPositions,
+    pub overrun: bool,
+}

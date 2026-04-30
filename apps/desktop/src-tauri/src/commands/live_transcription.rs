@@ -156,11 +156,13 @@ pub struct LiveTranscriptionStatus {
     /// real time; falling values mean the consumer is catching up. None until
     /// the first successful chunk lands.
     pub lag_seconds: Option<f32>,
-    /// Cumulative count of times the Stage-3 head-drop cap fired this
-    /// session. Stays 0 in normal operation — any non-zero value indicates
-    /// audio was discarded to keep the inference queue bounded. Removed in
-    /// Stage 3 when cap-and-drop is replaced with queue-and-drain.
-    pub cap_fired_total: u32,
+    /// Count of live chunks that left already-captured audio to drain after
+    /// dispatching one max-duration slice. Non-zero means the sidecar fell
+    /// behind real time, but audio is being preserved rather than dropped.
+    pub live_drain_backlog_chunks: u32,
+    /// Latest backlog depth after a live max-duration slice was dispatched.
+    /// Returns to 0.0 once the live force-drain path catches up.
+    pub live_drain_backlog_seconds: f32,
 }
 
 #[derive(Debug, Clone, Serialize, Type)]
@@ -272,6 +274,10 @@ pub struct LiveTranscriptionPressureEvent {
     /// real time at the moment this chunk finished." None when the chunk did
     /// not produce a successful Transcription response.
     pub lag_seconds: Option<f32>,
+    /// Backlog that remained queued for this source immediately after this
+    /// live chunk was dispatched. Non-zero means live transcription is
+    /// draining preserved audio instead of dropping it.
+    pub drain_backlog_seconds: f32,
     /// Resolved accelerator (`"webgpu"`, `"coreml"`, `"cuda"`, `"cpu"`,
     /// `"metal"`) for the active sidecar. Captured once at session start
     /// from the client's cached engine info — rises with the rest of the
@@ -388,6 +394,7 @@ struct ChunkInput<'a> {
     sample_rate: u32,
     audio_offset_seconds: f32,
     source_label: AudioSourceLabel,
+    drain_backlog_seconds: f32,
     /// Priority class the scheduler uses; also emitted on `LiveSegmentEvent`
     /// so the frontend can bucket segments.
     origin: JobOrigin,
@@ -401,9 +408,12 @@ struct ChunkInput<'a> {
 struct SessionCounters {
     total_chunks: u32,
     total_audio_seconds: f32,
-    /// Cumulative count of head-drop cap firings (Stage 3 will remove the
-    /// cap; for now this counts how often we silently discarded audio).
-    cap_fired_total: u32,
+    /// Count of live dispatches that had more already-captured audio waiting
+    /// after one max-size slice was submitted.
+    live_drain_backlog_chunks: u32,
+    /// Latest source-local live backlog depth after dispatch. This returns to
+    /// zero when a later live chunk catches up.
+    live_drain_backlog_seconds: f32,
     /// Cumulative wall-time across every successful transcribe — for an
     /// aggregate "session RTFx" view if we want one later.
     total_wall_ms: u64,
@@ -445,7 +455,18 @@ struct VadBackfillSource {
 
 pub(crate) struct LiveTranscriptionController {
     task_handle: tokio::task::JoinHandle<()>,
-    stop_tx: Option<oneshot::Sender<()>>,
+    /// Two coupled stop signals. `stop_tx` carries the `StopRequest` payload
+    /// (positions + tail grace) — the loop must consume it exactly when it's
+    /// ready to break, and `oneshot` is single-use, so this is the
+    /// data-bearing channel. `stop_requested` is checked between `await`
+    /// points inside the loop body via `stop_if_requested`; without it, a
+    /// stop arriving mid-body wouldn't be observed until the next
+    /// `tokio::select!` at the top of the loop (one tick late).
+    /// `stop_live_transcription` sets the atomic *first* (so any in-body
+    /// checkpoint sees it) then sends via the channel (so the eventual
+    /// receiver gets the payload).
+    stop_tx: Option<oneshot::Sender<StopRequest>>,
+    stop_requested: Arc<AtomicBool>,
     session_id: Option<String>,
     effective_start_epoch_ms: f64,
     /// Live counters shared with the running loop and backfill task. They
@@ -469,7 +490,7 @@ impl LiveTranscriptionController {
     /// Snapshot the live counters and derive `lag_seconds` against the wall
     /// clock under a single short lock. `lag_seconds` is `None` until the
     /// first successful chunk has landed.
-    fn snapshot(&self) -> (u32, f32, Option<f32>, u32) {
+    fn snapshot(&self) -> (u32, f32, Option<f32>, u32, f32) {
         let s = self.counters.lock().expect("counters mutex poisoned");
         let lag = s.latest_completed_audio_offset_seconds.map(|chunk_end| {
             let session_time_now = self.session_offset_base_seconds
@@ -480,7 +501,8 @@ impl LiveTranscriptionController {
             s.total_chunks,
             s.total_audio_seconds,
             lag,
-            s.cap_fired_total,
+            s.live_drain_backlog_chunks,
+            s.live_drain_backlog_seconds,
         )
     }
 }
@@ -491,6 +513,10 @@ pub struct LiveTranscriptionRuntime {
 }
 
 pub type LiveTranscriptionState = Arc<Mutex<Option<LiveTranscriptionRuntime>>>;
+
+struct StopRequest {
+    positions: BufferPositions,
+}
 
 // --- VAD helpers ---
 
@@ -544,6 +570,9 @@ struct SourceVadState {
     /// Populated regardless of engine — Silero replaces RMS for both
     /// Whisper and Parakeet live sessions.
     silero: SileroSource,
+    /// True when a previous dispatch intentionally sent only the oldest
+    /// max-sized slice and there is more already-captured audio to drain.
+    force_drain: bool,
 }
 
 impl SourceVadState {
@@ -574,6 +603,7 @@ impl SourceVadState {
             last_restart_at: None,
             last_device_check_at: None,
             silero: SileroSource::new(initial_pos),
+            force_drain: false,
         }
     }
 
@@ -596,6 +626,7 @@ impl SourceVadState {
         self.last_write_pos_advance = Instant::now();
         self.earliest_next_chunk_pos = new_pos;
         self.silero = SileroSource::new(new_pos);
+        self.force_drain = false;
     }
 }
 
@@ -819,7 +850,8 @@ fn emit_status(
     chunks: u32,
     audio_secs: f32,
     lag_seconds: Option<f32>,
-    cap_fired_total: u32,
+    live_drain_backlog_chunks: u32,
+    live_drain_backlog_seconds: f32,
 ) {
     let _ = app_handle.emit(
         "live-transcription-status",
@@ -831,9 +863,89 @@ fn emit_status(
             session_id: None,
             effective_start_epoch_ms: None,
             lag_seconds,
-            cap_fired_total,
+            live_drain_backlog_chunks,
+            live_drain_backlog_seconds,
         },
     );
+}
+
+fn update_scheduler_live_busy(
+    ctx: &TranscriptionContext,
+    sources: &[SourceVadState],
+    in_flight_tasks: usize,
+    stopping: bool,
+) {
+    let busy = stopping
+        || in_flight_tasks > 0
+        || sources
+            .iter()
+            .any(|s| s.is_speaking || s.has_in_flight_task || s.force_drain);
+    ctx.scheduler.set_live_busy(busy);
+}
+
+fn record_live_drain_backlog(
+    counters: &Arc<StdMutex<SessionCounters>>,
+    origin: JobOrigin,
+    backlog_seconds: f32,
+) {
+    if !matches!(origin, JobOrigin::Live) {
+        return;
+    }
+    let mut s = counters.lock().expect("counters mutex poisoned");
+    s.live_drain_backlog_seconds = backlog_seconds;
+    if backlog_seconds > 0.0 {
+        s.live_drain_backlog_chunks = s.live_drain_backlog_chunks.saturating_add(1);
+    }
+}
+
+async fn receive_stop_request_or_snapshot(
+    stop_rx: &mut oneshot::Receiver<StopRequest>,
+    audio_state: &AudioManagerState,
+) -> StopRequest {
+    match stop_rx.await {
+        Ok(req) => req,
+        Err(_) => {
+            let manager = audio_state.lock().await;
+            StopRequest {
+                positions: stop_positions_with_tail(&manager),
+            }
+        }
+    }
+}
+
+async fn stop_if_requested(
+    stop_requested: &AtomicBool,
+    stop_rx: &mut oneshot::Receiver<StopRequest>,
+    audio_state: &AudioManagerState,
+    ctx: &TranscriptionContext,
+) -> Option<StopRequest> {
+    if !stop_requested.load(Ordering::Acquire) {
+        return None;
+    }
+    ctx.scheduler.set_live_busy(true);
+    Some(receive_stop_request_or_snapshot(stop_rx, audio_state).await)
+}
+
+fn tail_samples_for(sample_rate: u32, channels: u16) -> usize {
+    let channels = channels.max(1) as usize;
+    let raw = (STOP_TAIL_GRACE_SECS * sample_rate as f32 * channels as f32) as usize;
+    raw - (raw % channels)
+}
+
+fn stop_positions_with_tail(manager: &AudioManager) -> BufferPositions {
+    let positions = manager.buffer_positions();
+    let mic_tail = manager
+        .mic_buffer_info()
+        .map(|info| tail_samples_for(info.sample_rate, info.channels))
+        .unwrap_or(0);
+    let system_tail = manager
+        .system_buffer_info()
+        .map(|info| tail_samples_for(info.sample_rate, info.channels))
+        .unwrap_or(0);
+    BufferPositions {
+        mic_pos: positions.mic_pos.saturating_add(mic_tail),
+        system_pos: positions.system_pos.saturating_add(system_tail),
+    }
 }
 
 /// Get the current write position for a source from the manager.
@@ -868,6 +980,51 @@ fn extract_source_audio(
     }
     let mono = yapstack_common::audio::deinterleave_to_mono(&snap, buf.channels()).into_owned();
     (Some((mono, buf.sample_rate())), new_pos)
+}
+
+struct SourceAudioRange {
+    samples: Vec<f32>,
+    sample_rate: u32,
+    start_pos: usize,
+    end_pos: usize,
+    overrun: bool,
+}
+
+/// Extract mono audio from a source's ring buffer in `[from_pos, until_pos)`.
+/// Used for hard-stop and queue-drain paths that must not read to the live
+/// write head implicitly.
+fn extract_source_audio_until(
+    manager: &AudioManager,
+    label: &AudioSourceLabel,
+    from_pos: usize,
+    until_pos: usize,
+) -> Option<SourceAudioRange> {
+    let buf = match label {
+        AudioSourceLabel::Mic => manager.mic_buffer(),
+        AudioSourceLabel::System => manager.system_buffer(),
+    }?;
+    let snap = buf.snapshot_range(from_pos, until_pos);
+    if snap.samples.is_empty() {
+        return None;
+    }
+    let mono =
+        yapstack_common::audio::deinterleave_to_mono(&snap.samples, buf.channels()).into_owned();
+    if mono.is_empty() {
+        return None;
+    }
+    Some(SourceAudioRange {
+        samples: mono,
+        sample_rate: buf.sample_rate(),
+        start_pos: snap.start_pos,
+        end_pos: snap.end_pos,
+        overrun: snap.overrun,
+    })
+}
+
+fn max_raw_samples_for_duration(duration: Duration, sample_rate: u32, channels: u16) -> usize {
+    let ch = channels.max(1) as usize;
+    let raw = (duration.as_secs_f32() * sample_rate as f32 * ch as f32) as usize;
+    raw.max(ch) - (raw.max(ch) % ch)
 }
 
 /// Boxed future that yields a `ChunkTaskOutcome` once a spawned chunk
@@ -907,76 +1064,70 @@ async fn prepare_chunk_dispatch(
     session_offset_base_seconds: f32,
     max_chunk_duration: Duration,
 ) -> Option<PreparedChunk> {
-    let (extraction, new_pos) = {
+    let max_raw_samples = max_raw_samples_for_duration(
+        max_chunk_duration,
+        vad.source_sample_rate,
+        vad.source_channels,
+    );
+    let current_pos = {
         let manager = audio_state.lock().await;
-        extract_source_audio(&manager, &vad.label, vad.speech_start_pos)
+        source_write_pos(&manager, &vad.label)
+    };
+    let dispatch_until = current_pos.min(vad.speech_start_pos.saturating_add(max_raw_samples));
+
+    let extraction = {
+        let manager = audio_state.lock().await;
+        extract_source_audio_until(&manager, &vad.label, vad.speech_start_pos, dispatch_until)
     };
 
-    let Some((mut samples, sample_rate)) = extraction else {
+    let Some(extraction) = extraction else {
         // Nothing new in the buffer since last read — advance the cursor to
         // the latest write_pos but leave speech_start_pos so we'll pick up
         // the ongoing utterance on the next poll.
-        vad.cursor = new_pos;
+        vad.cursor = dispatch_until;
         return None;
     };
+    if extraction.overrun {
+        warn!(
+            marker = "live_ring_overrun",
+            source = ?vad.label,
+            requested_start = vad.speech_start_pos,
+            actual_start = extraction.start_pos,
+            end = extraction.end_pos,
+            "ring buffer overrun while preparing live chunk; oldest unavailable samples were skipped"
+        );
+    }
 
-    let extracted_duration = samples.len() as f32 / sample_rate as f32;
+    let extracted_duration = extraction.samples.len() as f32 / extraction.sample_rate as f32;
     if extracted_duration < MIN_CHUNK_DURATION_SECS {
         // Too short — don't dispatch yet and don't advance speech_start_pos.
         // Next poll re-extracts this region together with whatever arrives.
-        vad.cursor = new_pos;
+        vad.cursor = extraction.end_pos;
         return None;
     }
 
-    // Cap the dispatched chunk at `max_chunk_duration`. When a prior chunk
-    // sits in flight longer than its own audio duration (e.g. Parakeet's
-    // RTFx degrades on long inputs), the next dispatch otherwise covers the
-    // entire wait window plus 10 s — and the chunk after that grows again,
-    // ad infinitum. Latency-first policy: keep the *tail* (most recent
-    // audio) and drop the head, so the live transcript catches up to "now"
-    // instead of replaying a stale backlog. `speech_start_pos` is still
-    // advanced to `new_pos` below, so the dropped head is permanently gone
-    // — the alternative (rewind speech_start_pos to mid-extraction) would
-    // re-queue the dropped head on the next poll and reintroduce the
-    // unbounded queue we're fixing.
-    let max_samples = (max_chunk_duration.as_secs_f32() * sample_rate as f32) as usize;
-    let dropped_head_samples = samples.len().saturating_sub(max_samples);
-    let dropped_head_seconds = dropped_head_samples as f32 / sample_rate as f32;
-    if dropped_head_samples > 0 {
-        // Structured marker for grep-friendly capture in long sessions.
-        // Stage 3 deletes this entire branch — until then, every firing
-        // means audio was permanently lost.
-        warn!(
-            marker = "live_cap_fired",
-            source = ?vad.label,
-            extracted_secs = extracted_duration,
-            max_chunk_secs = max_chunk_duration.as_secs_f32(),
-            dropped_secs = dropped_head_seconds,
-            "live chunk: extracted audio exceeds max_chunk_duration — dropping head \
-             (likely sidecar wall time exceeded chunk duration)"
-        );
-        samples.drain(..dropped_head_samples);
-    }
-    let chunk_duration = samples.len() as f32 / sample_rate as f32;
+    let chunk_duration = extraction.samples.len() as f32 / extraction.sample_rate as f32;
+    let has_remaining = current_pos > extraction.end_pos;
+    let drain_backlog_seconds = current_pos.saturating_sub(extraction.end_pos) as f32
+        / (vad.source_sample_rate as f32 * vad.source_channels as f32);
 
     // Deterministic offset from buffer position delta. On a resumed Session,
     // `session_offset_base_seconds` shifts every live offset past the prior
-    // parts' cumulative duration so persisted Segments stay continuous. When
-    // we drop the head, the offset shifts forward by the dropped duration so
-    // segment timestamps still match the audio we actually sent.
-    let samples_since_start = vad.speech_start_pos.saturating_sub(vad.session_start_pos);
+    // parts' cumulative duration so persisted Segments stay continuous.
+    let samples_since_start = extraction.start_pos.saturating_sub(vad.session_start_pos);
     let audio_offset = session_offset_base_seconds
-        + samples_since_start as f32 / (vad.source_sample_rate as f32 * vad.source_channels as f32)
-        + dropped_head_seconds;
+        + samples_since_start as f32 / (vad.source_sample_rate as f32 * vad.source_channels as f32);
 
     debug!(
-        "live chunk: source={:?} offset={:.2}s duration={:.2}s samples={} (pos: speech={} session_start={}, in-flight dispatch)",
+        "live chunk: source={:?} offset={:.2}s duration={:.2}s samples={} (pos: start={} end={} session_start={}, remaining={})",
         vad.label,
         audio_offset,
         chunk_duration,
-        samples.len(),
-        vad.speech_start_pos,
+        extraction.samples.len(),
+        extraction.start_pos,
+        extraction.end_pos,
         vad.session_start_pos,
+        has_remaining,
     );
 
     // Snapshot chunk_index for this task, increment our counter so the next
@@ -993,15 +1144,16 @@ async fn prepare_chunk_dispatch(
     // On transient failures we quarantine the audio rather than retry the
     // same region — the main loop continues unblocked, and the user gets a
     // visible warning with a recoverable WAV path.
-    vad.cursor = new_pos;
-    vad.is_speaking = false;
+    vad.cursor = extraction.end_pos;
+    vad.is_speaking = has_remaining || is_force_chunk;
     vad.silence_since = None;
-    vad.speech_start_pos = new_pos;
+    vad.speech_start_pos = extraction.end_pos;
     // Pre-roll for any subsequent onset must not pull speech_start_pos
     // before this point, or the next chunk would redundantly transcribe
     // the tail of the audio this task is about to send.
-    vad.earliest_next_chunk_pos = new_pos;
-    if is_force_chunk {
+    vad.earliest_next_chunk_pos = extraction.end_pos;
+    vad.force_drain = has_remaining;
+    if is_force_chunk || has_remaining {
         vad.speech_start_time = Some(Instant::now());
     } else {
         vad.speech_start_time = None;
@@ -1010,14 +1162,14 @@ async fn prepare_chunk_dispatch(
     vad.has_in_flight_task = true;
 
     Some(PreparedChunk {
-        samples,
-        sample_rate,
+        samples: extraction.samples,
+        sample_rate: extraction.sample_rate,
         audio_offset_seconds: audio_offset,
         source_label: vad.label,
         chunk_index,
         accumulated_text,
         origin,
-        dropped_head_seconds,
+        drain_backlog_seconds,
     })
 }
 
@@ -1031,11 +1183,7 @@ struct PreparedChunk {
     chunk_index: u32,
     accumulated_text: String,
     origin: JobOrigin,
-    /// How many seconds of audio the head-drop cap discarded before
-    /// dispatching this chunk. Zero on the normal path. Reported via
-    /// `SessionCounters::cap_fired_total` so the UI can surface that audio
-    /// was lost. Stage 3 removes the cap and this field with it.
-    dropped_head_seconds: f32,
+    drain_backlog_seconds: f32,
 }
 
 /// Run a single chunk's transcription in a background task. Emits the
@@ -1058,6 +1206,7 @@ async fn run_chunk_task(
         sample_rate: prepared.sample_rate,
         audio_offset_seconds: prepared.audio_offset_seconds,
         source_label,
+        drain_backlog_seconds: prepared.drain_backlog_seconds,
         origin: prepared.origin,
     };
     let mut chunk_index_mut = prepared.chunk_index;
@@ -1234,6 +1383,14 @@ const STREAM_RESTART_COOLDOWN_SECS: f32 = 5.0;
 /// an event. A short throttle caps the cost of the periodic
 /// `cpal::default_host()` lookup.
 const DEVICE_IDENTITY_POLL_INTERVAL_SECS: f32 = 3.0;
+/// Maximum audio duration for one backfill job submitted to the scheduler.
+/// Sidecar work is not preemptible once started, so keeping historical jobs
+/// short bounds how long newly-arrived live speech can wait behind one.
+const BACKFILL_JOB_QUANTUM_SECS: f32 = 5.0;
+/// Small bounded grace period included after the stop command snapshots the
+/// ring-buffer positions. This catches the final syllable already in the
+/// OS/audio callback pipeline without returning to unbounded post-stop reads.
+const STOP_TAIL_GRACE_SECS: f32 = 0.3;
 
 // --- Pure stream health decision helpers ---
 
@@ -1448,10 +1605,13 @@ fn vad_chunk_historical_audio(
         Ok(v) => v,
         Err(e) => {
             warn!("backfill: Silero init failed ({e}) — single-chunk fallback");
-            return vec![VadBackfillChunk {
-                start: 0,
-                end: samples.len(),
-            }];
+            return split_backfill_chunks(
+                vec![VadBackfillChunk {
+                    start: 0,
+                    end: samples.len(),
+                }],
+                sample_rate,
+            );
         }
     };
 
@@ -1460,7 +1620,28 @@ fn vad_chunk_historical_audio(
         return Vec::new();
     }
 
-    backfill_chunks_from_probabilities(&probabilities, samples.len(), sample_rate, tuning)
+    split_backfill_chunks(
+        backfill_chunks_from_probabilities(&probabilities, samples.len(), sample_rate, tuning),
+        sample_rate,
+    )
+}
+
+fn split_backfill_chunks(chunks: Vec<VadBackfillChunk>, sample_rate: u32) -> Vec<VadBackfillChunk> {
+    let max_samples = (BACKFILL_JOB_QUANTUM_SECS * sample_rate as f32) as usize;
+    if max_samples == 0 {
+        return chunks;
+    }
+
+    let mut split = Vec::new();
+    for chunk in chunks {
+        let mut start = chunk.start;
+        while start < chunk.end {
+            let end = start.saturating_add(max_samples).min(chunk.end);
+            split.push(VadBackfillChunk { start, end });
+            start = end;
+        }
+    }
+    split
 }
 
 /// Pure state-machine half of `vad_chunk_historical_audio`: walk a
@@ -1651,6 +1832,7 @@ async fn process_backfill(
                 sample_rate: source.sample_rate,
                 audio_offset_seconds: audio_offset,
                 source_label: source.label,
+                drain_backlog_seconds: 0.0,
                 origin: JobOrigin::Backfill,
             };
             let outcome = transcribe_and_emit_chunk(
@@ -2042,7 +2224,8 @@ async fn handle_buffer_replacement(
 async fn live_transcription_loop(
     audio_state: AudioManagerState,
     ctx: TranscriptionContext,
-    mut stop_rx: oneshot::Receiver<()>,
+    mut stop_rx: oneshot::Receiver<StopRequest>,
+    stop_requested: Arc<AtomicBool>,
     mut session_wav_state: Option<SessionWavState>,
     counters: Arc<StdMutex<SessionCounters>>,
 ) {
@@ -2113,10 +2296,12 @@ async fn live_transcription_loop(
         0.0,
         None,
         0,
+        0.0,
     );
 
     let poll_interval = tuning.poll_interval;
     let mut exited_fatal = false;
+    let mut stop_request: Option<StopRequest> = None;
 
     // Silero VAD runs in-process (bundled V5 ONNX). Single session shared
     // across sources; per-source streaming state lives on each VAD state's
@@ -2136,6 +2321,7 @@ async fn live_transcription_loop(
                 0.0,
                 None,
                 0,
+                0.0,
             );
             return;
         }
@@ -2173,8 +2359,8 @@ async fn live_transcription_loop(
         // now — the tick cadence slides forward after an early wake, which
         // is fine here because the VAD state machine uses wall-clock
         // durations (Instant::now()), not tick count.
-        let should_stop = tokio::select! {
-            _ = sleep(poll_interval) => false,
+        let stop_signal = tokio::select! {
+            _ = sleep(poll_interval) => None,
             Some(outcome) = chunk_tasks.next(), if !chunk_tasks.is_empty() => {
                 pending_outcomes.push(outcome);
                 // Drain any other tasks that happen to be ready in this
@@ -2182,10 +2368,23 @@ async fn live_transcription_loop(
                 while let Some(Some(outcome)) = chunk_tasks.next().now_or_never() {
                     pending_outcomes.push(outcome);
                 }
-                false
+                None
             }
-            _ = &mut stop_rx => true,
+            req = &mut stop_rx => req.ok(),
         };
+
+        if let Some(req) = stop_signal {
+            ctx.scheduler.set_live_busy(true);
+            stop_request = Some(req);
+            break;
+        }
+
+        if let Some(req) =
+            stop_if_requested(&stop_requested, &mut stop_rx, &audio_state, &ctx).await
+        {
+            stop_request = Some(req);
+            break;
+        }
 
         // Single lock: per-source audio extraction for Silero VAD +
         // WAV flush extraction. We pull raw mono samples (not just RMS)
@@ -2215,6 +2414,13 @@ async fn live_transcription_loop(
             (inputs, flush)
         };
 
+        if let Some(req) =
+            stop_if_requested(&stop_requested, &mut stop_rx, &audio_state, &ctx).await
+        {
+            stop_request = Some(req);
+            break;
+        }
+
         // Feed Silero outside the audio lock and collect *every* frame
         // probability per source, in emission order. A single poll batch
         // can span an entire short utterance; the VAD state machine needs
@@ -2243,6 +2449,13 @@ async fn live_transcription_loop(
             }
         }
 
+        if let Some(req) =
+            stop_if_requested(&stop_requested, &mut stop_rx, &audio_state, &ctx).await
+        {
+            stop_request = Some(req);
+            break;
+        }
+
         if let Some((samples, sr, new_pos)) = wav_flush_data {
             wav_flush_none_count = 0;
             if let Some(ref mut ws) = session_wav_state {
@@ -2262,6 +2475,13 @@ async fn live_transcription_loop(
                 &backfill_done,
             )
             .await;
+        }
+
+        if let Some(req) =
+            stop_if_requested(&stop_requested, &mut stop_rx, &audio_state, &ctx).await
+        {
+            stop_request = Some(req);
+            break;
         }
 
         // Stream health watchdog: check for cpal error flags and write_pos stalls.
@@ -2312,6 +2532,13 @@ async fn live_transcription_loop(
             }
         }
 
+        if let Some(req) =
+            stop_if_requested(&stop_requested, &mut stop_rx, &audio_state, &ctx).await
+        {
+            stop_request = Some(req);
+            break;
+        }
+
         // Poll VAD for *every* source, including those with an in-flight
         // task. The state machine needs to keep tracking is_speaking /
         // silence_since so a second utterance that starts and ends during
@@ -2342,7 +2569,9 @@ async fn live_transcription_loop(
                     .unwrap_or(&[]);
 
                 let mut best_action = VadAction::None;
-                if probs.is_empty() {
+                if source.force_drain {
+                    best_action = VadAction::ForceChunk;
+                } else if probs.is_empty() {
                     // Sticky fallback: no new frames in this batch. Use
                     // last_probability so the state machine keeps running
                     // against the most recent signal rather than freezing.
@@ -2363,18 +2592,7 @@ async fn live_transcription_loop(
                     }
                 }
 
-                // On stop, force-flush any in-progress speech to the
-                // scheduler at `FinalFlush` priority so the user's closing
-                // words don't get abandoned at shutdown.
-                if should_stop && source.is_speaking {
-                    best_action = VadAction::Chunk;
-                }
-                let origin = if should_stop {
-                    JobOrigin::FinalFlush
-                } else {
-                    JobOrigin::Live
-                };
-                (best_action, origin)
+                (best_action, JobOrigin::Live)
             })
             .collect();
 
@@ -2406,10 +2624,11 @@ async fn live_transcription_loop(
                     )
                     .await;
                     if let Some(prepared) = prepared {
-                        if prepared.dropped_head_seconds > 0.0 {
-                            let mut s = counters.lock().expect("counters mutex poisoned");
-                            s.cap_fired_total = s.cap_fired_total.saturating_add(1);
-                        }
+                        record_live_drain_backlog(
+                            &counters,
+                            prepared.origin,
+                            prepared.drain_backlog_seconds,
+                        );
                         let task_ctx = ctx.clone();
                         let task_counters = counters.clone();
                         let task_prompt = prompt.clone();
@@ -2459,24 +2678,54 @@ async fn live_transcription_loop(
 
         run_prompt_decay(&ctx, &prompt, &mut sources);
 
-        if should_stop {
-            break;
-        }
+        update_scheduler_live_busy(&ctx, &sources, chunk_tasks.len(), false);
+    }
+
+    if stop_request.is_some() {
+        tokio::time::sleep(Duration::from_secs_f32(STOP_TAIL_GRACE_SECS)).await;
+    }
+
+    let final_pending_chunks = if let Some(req) = stop_request.as_ref() {
+        copy_final_pending_chunks_until(
+            &sources,
+            &audio_state,
+            &ctx,
+            tuning.max_chunk_duration,
+            &req.positions,
+        )
+        .await
+    } else {
+        Vec::new()
+    };
+
+    if let (Some(ref mut ws), Some(req)) = (session_wav_state.as_mut(), stop_request.as_ref()) {
+        flush_session_wav_to_limit(ws, &audio_state, Some(&req.positions)).await;
     }
 
     drain_in_flight_chunks(&mut chunk_tasks, &mut sources).await;
-    dispatch_final_pending_chunks(
-        &mut sources,
-        &audio_state,
-        &ctx,
-        &counters,
-        &prompt,
-        tuning.max_chunk_duration,
-    )
-    .await;
+
+    if stop_request.is_some() {
+        dispatch_copied_final_chunks(&mut sources, final_pending_chunks, &ctx, &counters, &prompt)
+            .await;
+    } else {
+        dispatch_final_pending_chunks(
+            &mut sources,
+            &audio_state,
+            &ctx,
+            &counters,
+            &prompt,
+            tuning.max_chunk_duration,
+        )
+        .await;
+        if let Some(ref mut ws) = session_wav_state {
+            flush_session_wav_to_limit(ws, &audio_state, None).await;
+        }
+    }
+
+    ctx.scheduler.set_live_busy(false);
 
     if let Some(ws) = session_wav_state {
-        finalize_session_wav(ws, &audio_state, &ctx).await;
+        finalize_session_wav(ws, &ctx).await;
     }
 
     // Wait for concurrent backfill to finish before emitting Stopped.
@@ -2508,7 +2757,14 @@ async fn live_transcription_loop(
         }
     }
 
-    let (final_chunks, final_audio_seconds, final_cap_fired, final_lag, final_total_wall_ms) = {
+    let (
+        final_chunks,
+        final_audio_seconds,
+        final_backlog_chunks,
+        final_backlog_seconds,
+        final_lag,
+        final_total_wall_ms,
+    ) = {
         let s = counters.lock().expect("counters mutex poisoned");
         let lag = s.latest_completed_audio_offset_seconds.map(|chunk_end| {
             let session_time_now =
@@ -2518,7 +2774,8 @@ async fn live_transcription_loop(
         (
             s.total_chunks,
             s.total_audio_seconds,
-            s.cap_fired_total,
+            s.live_drain_backlog_chunks,
+            s.live_drain_backlog_seconds,
             lag,
             s.total_wall_ms,
         )
@@ -2532,7 +2789,8 @@ async fn live_transcription_loop(
             final_chunks,
             final_audio_seconds,
             final_lag,
-            final_cap_fired,
+            final_backlog_chunks,
+            final_backlog_seconds,
         );
     }
 
@@ -2552,7 +2810,8 @@ async fn live_transcription_loop(
         audio_secs = final_audio_seconds,
         wall_ms = final_total_wall_ms,
         mean_rtfx = ?mean_rtfx,
-        cap_fired_total = final_cap_fired,
+        live_drain_backlog_chunks = final_backlog_chunks,
+        live_drain_backlog_seconds = final_backlog_seconds,
         final_lag_secs = ?final_lag,
         exited_fatal = exited_fatal,
         "live transcription session ended"
@@ -2672,7 +2931,7 @@ async fn build_initial_sources_and_backfill(
 /// normal stop.
 fn emit_fatal_sidecar_error(ctx: &TranscriptionContext, counters: &Arc<StdMutex<SessionCounters>>) {
     error!("live transcription: sidecar died and could not be restarted — stopping");
-    let (chunks, audio_secs, cap_fired_total, lag_seconds) = {
+    let (chunks, audio_secs, backlog_chunks, backlog_seconds, lag_seconds) = {
         let s = counters.lock().expect("counters mutex poisoned");
         let lag = s.latest_completed_audio_offset_seconds.map(|chunk_end| {
             let session_time_now =
@@ -2682,7 +2941,8 @@ fn emit_fatal_sidecar_error(ctx: &TranscriptionContext, counters: &Arc<StdMutex<
         (
             s.total_chunks,
             s.total_audio_seconds,
-            s.cap_fired_total,
+            s.live_drain_backlog_chunks,
+            s.live_drain_backlog_seconds,
             lag,
         )
     };
@@ -2698,7 +2958,8 @@ fn emit_fatal_sidecar_error(ctx: &TranscriptionContext, counters: &Arc<StdMutex<
             session_id: ctx.config.session_id.clone(),
             effective_start_epoch_ms: None,
             lag_seconds,
-            cap_fired_total,
+            live_drain_backlog_chunks: backlog_chunks,
+            live_drain_backlog_seconds: backlog_seconds,
         },
     );
 }
@@ -2790,6 +3051,111 @@ async fn drain_in_flight_chunks(
     }
 }
 
+struct FinalPendingChunk {
+    samples: Vec<f32>,
+    sample_rate: u32,
+    audio_offset_seconds: f32,
+    source_label: AudioSourceLabel,
+}
+
+async fn copy_final_pending_chunks_until(
+    sources: &[SourceVadState],
+    audio_state: &AudioManagerState,
+    ctx: &TranscriptionContext,
+    max_chunk_duration: Duration,
+    stop_positions: &BufferPositions,
+) -> Vec<FinalPendingChunk> {
+    let mut pending = Vec::new();
+    for source in sources {
+        let limit = match source.label {
+            AudioSourceLabel::Mic => stop_positions.mic_pos,
+            AudioSourceLabel::System => stop_positions.system_pos,
+        };
+        let mut from = source.speech_start_pos;
+        let max_raw = max_raw_samples_for_duration(
+            max_chunk_duration,
+            source.source_sample_rate,
+            source.source_channels,
+        );
+
+        while from < limit {
+            let until = from.saturating_add(max_raw).min(limit);
+            let extraction = {
+                let manager = audio_state.lock().await;
+                extract_source_audio_until(&manager, &source.label, from, until)
+            };
+            let Some(extraction) = extraction else {
+                break;
+            };
+            if extraction.overrun {
+                warn!(
+                    marker = "live_stop_ring_overrun",
+                    source = ?source.label,
+                    requested_start = from,
+                    actual_start = extraction.start_pos,
+                    stop_pos = limit,
+                    "ring buffer overrun while copying stop-bounded final chunk"
+                );
+            }
+            let duration = extraction.samples.len() as f32 / extraction.sample_rate as f32;
+            if duration >= MIN_CHUNK_DURATION_SECS {
+                let samples_since_start = extraction
+                    .start_pos
+                    .saturating_sub(source.session_start_pos);
+                let audio_offset_seconds = ctx.session_offset_base_seconds
+                    + samples_since_start as f32
+                        / (source.source_sample_rate as f32 * source.source_channels as f32);
+                pending.push(FinalPendingChunk {
+                    samples: extraction.samples,
+                    sample_rate: extraction.sample_rate,
+                    audio_offset_seconds,
+                    source_label: source.label,
+                });
+            }
+            if extraction.end_pos <= from {
+                break;
+            }
+            from = extraction.end_pos;
+        }
+    }
+    pending
+}
+
+async fn dispatch_copied_final_chunks(
+    sources: &mut [SourceVadState],
+    chunks: Vec<FinalPendingChunk>,
+    ctx: &TranscriptionContext,
+    counters: &Arc<StdMutex<SessionCounters>>,
+    prompt: &Arc<StdMutex<PromptState>>,
+) {
+    for chunk in chunks {
+        let Some(source) = sources.iter_mut().find(|s| s.label == chunk.source_label) else {
+            continue;
+        };
+        let chunk_index = source.chunk_index;
+        source.chunk_index = source.chunk_index.wrapping_add(1);
+        let accumulated_text = std::mem::take(&mut source.accumulated_text);
+        let prepared = PreparedChunk {
+            samples: chunk.samples,
+            sample_rate: chunk.sample_rate,
+            audio_offset_seconds: chunk.audio_offset_seconds,
+            source_label: chunk.source_label,
+            chunk_index,
+            accumulated_text,
+            origin: JobOrigin::FinalFlush,
+            drain_backlog_seconds: 0.0,
+        };
+        let outcome = run_chunk_task(prepared, ctx.clone(), counters.clone(), prompt.clone()).await;
+        source.accumulated_text = outcome.accumulated_text;
+        source.has_in_flight_task = false;
+        source.force_drain = false;
+        if outcome.sidecar_dead {
+            warn!("final copied chunk reported sidecar dead");
+            break;
+        }
+    }
+}
+
 /// Final pending-speech dispatch at session stop. Any source whose stop-time
 /// `VadAction::Chunk` was skipped because a previous task was still running
 /// now has un-transcribed audio between its frozen `speech_start_pos` and the
@@ -2804,53 +3170,56 @@ async fn dispatch_final_pending_chunks(
     max_chunk_duration: Duration,
 ) {
     for source in sources.iter_mut() {
-        if source.has_in_flight_task {
-            // Reached only on the Phase 2 abort path — we aborted before an
-            // outcome landed. Skipping is safe: that source's state is already
-            // considered lost.
-            continue;
-        }
-        let has_pending = {
-            let manager = audio_state.lock().await;
-            let write_pos = source_write_pos(&manager, &source.label);
-            write_pos > source.speech_start_pos
-        };
-        if !has_pending {
-            continue;
-        }
-        debug!(
-            "live transcription stop: dispatching final pending chunk for {:?} \
-             (speech_start_pos={}, blocked by prior in-flight task)",
-            source.label, source.speech_start_pos
-        );
-        let prepared = prepare_chunk_dispatch(
-            source,
-            audio_state,
-            true,
-            JobOrigin::FinalFlush,
-            ctx.session_offset_base_seconds,
-            max_chunk_duration,
-        )
-        .await;
-        if let Some(prepared) = prepared {
-            if prepared.dropped_head_seconds > 0.0 {
-                let mut s = counters.lock().expect("counters mutex poisoned");
-                s.cap_fired_total = s.cap_fired_total.saturating_add(1);
+        loop {
+            if source.has_in_flight_task {
+                break;
             }
-            let task_ctx = ctx.clone();
-            let task_counters = counters.clone();
-            let task_prompt = prompt.clone();
+            let has_pending = {
+                let manager = audio_state.lock().await;
+                let write_pos = source_write_pos(&manager, &source.label);
+                write_pos > source.speech_start_pos
+            };
+            if !has_pending {
+                break;
+            }
+            debug!(
+                "live transcription stop: dispatching final pending chunk for {:?} \
+                 (speech_start_pos={}, bounded drain)",
+                source.label, source.speech_start_pos
+            );
+            let prepared = prepare_chunk_dispatch(
+                source,
+                audio_state,
+                true,
+                JobOrigin::FinalFlush,
+                ctx.session_offset_base_seconds,
+                max_chunk_duration,
+            )
+            .await;
+            let Some(prepared) = prepared else { break };
             let source_label = prepared.source_label;
-            let final_task = run_chunk_task(prepared, task_ctx, task_counters, task_prompt);
-            if tokio::time::timeout(Duration::from_secs(10), final_task)
-                .await
-                .is_err()
-            {
-                warn!(
-                    "live transcription stop: final pending chunk for {:?} exceeded 10s — \
-                     segment may be lost",
-                    source_label
-                );
+            let final_task =
+                run_chunk_task(prepared, ctx.clone(), counters.clone(), prompt.clone());
+            match tokio::time::timeout(Duration::from_secs(10), final_task).await {
+                Ok(outcome) => {
+                    source.accumulated_text = outcome.accumulated_text;
+                    source.has_in_flight_task = false;
+                    if outcome.sidecar_dead {
+                        warn!("final pending chunk reported sidecar dead");
+                        break;
+                    }
+                }
+                Err(_) => {
+                    warn!(
+                        "live transcription stop: final pending chunk for {:?} exceeded 10s — \
+                         segment may be lost",
+                        source_label
+                    );
+                    break;
+                }
+            }
+            if !source.force_drain {
+                break;
             }
         }
     }
@@ -3021,30 +3390,58 @@ async fn seed_prompt_from_backfill(
     true
 }
 
-/// Drain the final tail of session audio, finalize the session-WAV writer in
-/// the user's chosen export format, and persist the resulting part row to the
-/// DB before emitting `session-part-ready`. Called once at end-of-loop after
-/// in-flight chunks have drained. Empty recordings get the file deleted and a
-/// `session-wav-error` event instead.
-async fn finalize_session_wav(
-    mut ws: SessionWavState,
+/// Flush any remaining session audio. When `limit` is present, reads are
+/// bounded to the stop snapshot so post-stop samples cannot enter the part.
+async fn flush_session_wav_to_limit(
+    ws: &mut SessionWavState,
     audio_state: &AudioManagerState,
-    ctx: &TranscriptionContext,
+    limit: Option<&BufferPositions>,
 ) {
     let final_flush = {
         let manager = audio_state.lock().await;
-        manager.extract_since(&ws.flush_positions, ws.source, ws.mix_config.as_ref())
+        match limit {
+            Some(limit) => manager.extract_since_until(
+                &ws.flush_positions,
+                limit,
+                ws.source,
+                ws.mix_config.as_ref(),
+            ),
+            None => manager
+                .extract_since(&ws.flush_positions, ws.source, ws.mix_config.as_ref())
+                .map(
+                    |(samples, sample_rate, new_positions)| yapstack_audio::BoundedExtraction {
+                        samples,
+                        sample_rate,
+                        new_positions,
+                        overrun: false,
+                    },
+                ),
+        }
     };
-    if let Some((samples, sr, _new_pos)) = final_flush {
-        let to_write: std::borrow::Cow<[f32]> = if sr == ws.wav_sample_rate {
-            std::borrow::Cow::Borrowed(&samples)
+    if let Some(flush) = final_flush {
+        if flush.overrun {
+            warn!(
+                marker = "session_wav_stop_overrun",
+                session_id = %ws.session_id,
+                "ring buffer overrun while flushing session WAV to stop boundary"
+            );
+        }
+        let to_write: std::borrow::Cow<[f32]> = if flush.sample_rate == ws.wav_sample_rate {
+            std::borrow::Cow::Borrowed(&flush.samples)
         } else {
-            match yapstack_common::audio::resample(&samples, sr, ws.wav_sample_rate) {
+            match yapstack_common::audio::resample(
+                &flush.samples,
+                flush.sample_rate,
+                ws.wav_sample_rate,
+            ) {
                 Ok(cow) => std::borrow::Cow::Owned(cow.into_owned()),
                 Err(e) => {
                     error!(
                         "session WAV final flush resample {}Hz → {}Hz failed, dropping {} samples: {}",
-                        sr, ws.wav_sample_rate, samples.len(), e
+                        flush.sample_rate,
+                        ws.wav_sample_rate,
+                        flush.samples.len(),
+                        e
                     );
                     std::borrow::Cow::Owned(Vec::new())
                 }
@@ -3055,8 +3452,15 @@ async fn finalize_session_wav(
                 error!("session WAV final flush write failed: {}", e);
             }
         }
+        ws.flush_positions = flush.new_positions;
     }
+}
 
+/// Finalize the session-WAV writer in the user's chosen export format and
+/// persist the resulting part row to the DB before emitting
+/// `session-part-ready`. The caller must perform the final bounded/unbounded
+/// flush before invoking this.
+async fn finalize_session_wav(ws: SessionWavState, ctx: &TranscriptionContext) {
     if ws.writer.samples_written() == 0 {
         warn!(
             "session WAV had 0 samples written — deleting empty file for session {}",
@@ -3295,6 +3699,7 @@ async fn transcribe_chunk(
             engine: profile.engine_name.to_string(),
             origin: input.origin.into(),
             lag_seconds,
+            drain_backlog_seconds: input.drain_backlog_seconds,
             accel: profile.accel.clone(),
             variant: profile.variant.clone(),
         },
@@ -3312,6 +3717,7 @@ async fn transcribe_chunk(
         wall_ms = wall_ms,
         rtfx = ?rtfx,
         lag_seconds = ?lag_seconds,
+        drain_backlog_seconds = input.drain_backlog_seconds,
         engine = profile.engine_name,
         accel = profile.accel.as_deref(),
         variant = profile.variant.as_deref(),
@@ -3415,7 +3821,8 @@ async fn transcribe_chunk(
                     session_id: ctx.config.session_id.clone(),
                     effective_start_epoch_ms: None,
                     lag_seconds: None,
-                    cap_fired_total: 0,
+                    live_drain_backlog_chunks: 0,
+                    live_drain_backlog_seconds: 0.0,
                 },
             );
             TranscribeOutcome::SidecarDead
@@ -3465,7 +3872,7 @@ async fn transcribe_and_emit_chunk(
 
     if let TranscribeOutcome::Success(ref result) = outcome {
         // Short critical section — no await held.
-        let (total_chunks, total_audio_seconds, cap_fired_total) = {
+        let (total_chunks, total_audio_seconds, backlog_chunks, backlog_seconds) = {
             let mut s = counters.lock().expect("counters mutex poisoned");
             s.total_chunks += 1;
             s.total_audio_seconds += result.chunk_duration;
@@ -3484,7 +3891,12 @@ async fn transcribe_and_emit_chunk(
                 s.latest_completed_audio_offset_seconds
                     .map_or(chunk_end, |prev| prev.max(chunk_end)),
             );
-            (s.total_chunks, s.total_audio_seconds, s.cap_fired_total)
+            (
+                s.total_chunks,
+                s.total_audio_seconds,
+                s.live_drain_backlog_chunks,
+                s.live_drain_backlog_seconds,
+            )
         };
         prompt
             .lock()
@@ -3508,7 +3920,8 @@ async fn transcribe_and_emit_chunk(
             total_chunks,
             total_audio_seconds,
             lag_seconds,
-            cap_fired_total,
+            backlog_chunks,
+            backlog_seconds,
         );
     }
 
@@ -3681,20 +4094,16 @@ pub async fn start_live_transcription(
             let part_index = config.resume.as_ref().map(|r| r.part_index).unwrap_or(0);
             let wav_path = audio_dir.join(format!("{session_id}.{part_index}.wav"));
 
+            let source = config.source.clone().into();
             let sample_rate = {
                 let manager = audio_state.lock().await;
-                manager
-                    .mic_buffer_info()
-                    .map(|i| i.sample_rate)
-                    .or_else(|| manager.system_buffer_info().map(|i| i.sample_rate))
-                    .unwrap_or(48000)
+                manager.output_sample_rate_for(source)
             };
             let writer = yapstack_audio::SessionWavWriter::new(wav_path.clone(), sample_rate)
                 .map_err(|e| CommandError::Internal {
                     message: format!("failed to create session WAV: {e}"),
                 })?;
 
-            let source = config.source.clone().into();
             // Force normalize=false for the streaming WAV writer. Per-chunk normalization
             // (every ~300ms) causes jarring volume discontinuities — quiet passages get
             // amplified enormously while loud passages barely change. The user's normalize
@@ -3763,6 +4172,7 @@ pub async fn start_live_transcription(
         };
 
     let (stop_tx, stop_rx) = oneshot::channel();
+    let stop_requested = Arc::new(AtomicBool::new(false));
 
     let audio_state_clone = audio_state.inner().clone();
     let transcription_state_clone = transcription_state.inner().clone();
@@ -3844,7 +4254,8 @@ pub async fn start_live_transcription(
     let counters = Arc::new(StdMutex::new(SessionCounters {
         total_chunks: 0,
         total_audio_seconds: 0.0,
-        cap_fired_total: 0,
+        live_drain_backlog_chunks: 0,
+        live_drain_backlog_seconds: 0.0,
         total_wall_ms: 0,
         latest_completed_audio_offset_seconds: None,
     }));
@@ -3852,11 +4263,13 @@ pub async fn start_live_transcription(
     let task_handle = tokio::spawn({
         let ctx_guard = ctx.clone();
         let counters_for_loop = counters.clone();
+        let stop_requested_for_loop = Arc::clone(&stop_requested);
         async move {
             let result = AssertUnwindSafe(live_transcription_loop(
                 audio_state_clone,
                 ctx,
                 stop_rx,
+                stop_requested_for_loop,
                 session_wav_state,
                 counters_for_loop,
             ))
@@ -3886,7 +4299,8 @@ pub async fn start_live_transcription(
                         session_id: ctx_guard.config.session_id.clone(),
                         effective_start_epoch_ms: None,
                         lag_seconds: None,
-                        cap_fired_total: 0,
+                        live_drain_backlog_chunks: 0,
+                        live_drain_backlog_seconds: 0.0,
                     },
                 );
             }
@@ -3897,6 +4311,7 @@ pub async fn start_live_transcription(
         controller: LiveTranscriptionController {
             task_handle,
             stop_tx: Some(stop_tx),
+            stop_requested,
             session_id: controller_session_id,
             effective_start_epoch_ms,
             counters,
@@ -3915,13 +4330,22 @@ pub async fn start_live_transcription(
 #[specta::specta]
 pub async fn stop_live_transcription(
     live_state: tauri::State<'_, LiveTranscriptionState>,
+    audio_state: tauri::State<'_, AudioManagerState>,
 ) -> Result<(), CommandError> {
     let mut guard = live_state.lock().await;
 
     match guard.take() {
         Some(mut runtime) => {
+            runtime
+                .controller
+                .stop_requested
+                .store(true, Ordering::Release);
             if let Some(tx) = runtime.controller.stop_tx.take() {
-                let _ = tx.send(());
+                let positions = {
+                    let manager = audio_state.lock().await;
+                    stop_positions_with_tail(&manager)
+                };
+                let _ = tx.send(StopRequest { positions });
             }
             Ok(())
         }
@@ -3941,8 +4365,13 @@ pub async fn get_live_transcription_status(
     match &*guard {
         Some(runtime) => {
             let c = &runtime.controller;
-            let (chunks_processed, total_audio_seconds, lag_seconds, cap_fired_total) =
-                c.snapshot();
+            let (
+                chunks_processed,
+                total_audio_seconds,
+                lag_seconds,
+                live_drain_backlog_chunks,
+                live_drain_backlog_seconds,
+            ) = c.snapshot();
             let phase = if c.is_running() {
                 LiveTranscriptionPhase::Running
             } else {
@@ -3956,7 +4385,8 @@ pub async fn get_live_transcription_status(
                 session_id: c.session_id.clone(),
                 effective_start_epoch_ms: Some(c.effective_start_epoch_ms),
                 lag_seconds,
-                cap_fired_total,
+                live_drain_backlog_chunks,
+                live_drain_backlog_seconds,
             })
         }
         None => Ok(LiveTranscriptionStatus {
@@ -3967,7 +4397,8 @@ pub async fn get_live_transcription_status(
             session_id: None,
             effective_start_epoch_ms: None,
             lag_seconds: None,
-            cap_fired_total: 0,
+            live_drain_backlog_chunks: 0,
+            live_drain_backlog_seconds: 0.0,
         }),
     }
 }
@@ -4434,6 +4865,65 @@ mod tests {
                 w[1].start
             );
         }
+    }
+
+    #[test]
+    fn split_backfill_chunks_bounds_each_scheduler_job() {
+        let sr: u32 = 1_000;
+        let chunks = split_backfill_chunks(
+            vec![VadBackfillChunk {
+                start: 0,
+                end: 12_500,
+            }],
+            sr,
+        );
+
+        assert_eq!(
+            chunks,
+            vec![
+                VadBackfillChunk {
+                    start: 0,
+                    end: 5_000,
+                },
+                VadBackfillChunk {
+                    start: 5_000,
+                    end: 10_000,
+                },
+                VadBackfillChunk {
+                    start: 10_000,
+                    end: 12_500,
+                },
+            ]
+        );
+        assert!(chunks.iter().all(|chunk| {
+            chunk.end - chunk.start <= (BACKFILL_JOB_QUANTUM_SECS * sr as f32) as usize
+        }));
+    }
+
+    #[test]
+    fn stop_tail_samples_are_frame_aligned() {
+        assert_eq!(tail_samples_for(48_000, 2), 28_800);
+        assert_eq!(tail_samples_for(16_000, 1), 4_800);
+    }
+
+    #[test]
+    fn live_drain_backlog_counter_tracks_live_backlog_only() {
+        let counters = Arc::new(StdMutex::new(SessionCounters {
+            total_chunks: 0,
+            total_audio_seconds: 0.0,
+            live_drain_backlog_chunks: 0,
+            live_drain_backlog_seconds: 0.0,
+            total_wall_ms: 0,
+            latest_completed_audio_offset_seconds: None,
+        }));
+
+        record_live_drain_backlog(&counters, JobOrigin::Backfill, 9.0);
+        record_live_drain_backlog(&counters, JobOrigin::Live, 2.5);
+        record_live_drain_backlog(&counters, JobOrigin::Live, 0.0);
+
+        let state = counters.lock().expect("counters mutex poisoned");
+        assert_eq!(state.live_drain_backlog_chunks, 1);
+        assert_eq!(state.live_drain_backlog_seconds, 0.0);
     }
 
     /// Regression: after backfill extraction, the live VAD must start from

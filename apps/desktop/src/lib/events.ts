@@ -77,6 +77,8 @@ export type LiveTranscriptionPressureEvent = {
   origin: "live" | "backfill" | "final_flush";
   /** Null when the chunk did not produce a successful transcription. */
   lag_seconds: number | null;
+  /** Source-local preserved audio backlog after this live chunk dispatch. */
+  drain_backlog_seconds: number;
   /** Resolved accelerator (e.g. "webgpu", "coreml", "cpu", "metal", "cuda")
    *  captured at session start. Null if the sidecar didn't report one. */
   accel: string | null;

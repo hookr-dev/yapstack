@@ -50,11 +50,11 @@ Shared types used across all crates. No business logic.
 
 ### yapstack-audio
 All audio capture and processing. Core of the application.
-- `ring_buffer.rs` — Lock-free SPSC ring buffer for real-time audio. `UnsafeCell` + atomics. Producer API is zero-alloc (safe for audio callbacks). Consumer API allocates snapshots.
+- `ring_buffer.rs` — Lock-free SPSC ring buffer for real-time audio. `UnsafeCell` + atomics. Producer API is zero-alloc (safe for audio callbacks). Consumer API allocates snapshots, including bounded `snapshot_range()` reads for hard stop boundaries.
 - `device.rs` — Device enumeration via `cpal`
 - `mic.rs` — Microphone capture stream management. `stream_error: Arc<AtomicBool>` for cpal error propagation.
 - `system/` — System audio capture (macOS via cpal loopback on default output device, Windows stub, fallback `Unavailable`)
-- `manager.rs` — `AudioManager` orchestrates mic + system capture and exposes the position-based extraction API (`buffer_positions`, `extract_since`, `extract_sources_since`, `peek_energy_rms`) consumed by the live-transcription loop. Stream restart (`restart_mic`, `restart_system_audio`) preserves ring buffers across device rebinds.
+- `manager.rs` — `AudioManager` orchestrates mic + system capture and exposes the position-based extraction API (`buffer_positions`, `extract_since`, `extract_since_until`, `extract_sources_since`, `peek_energy_rms`) consumed by the live-transcription loop. Stream restart (`restart_mic`, `restart_system_audio`) preserves ring buffers across device rebinds.
 - `mixer.rs` — Pure functions for mixing mic + system audio with gain/normalization
 - `export.rs` — WAV file export via `hound` (16-bit PCM, f32 clamping). `SessionWavWriter` for incremental streaming WAV during live sessions.
 - `capture.rs` — Data types: `BufferPositions`, `SeparateExtraction` (the position-based extraction shapes consumed by the live-transcription loop)
@@ -93,7 +93,7 @@ Tauri commands layer. Thin wrappers that convert between domain types and DTOs (
 - `commands/capture.rs` — Audio cleanup commands only (`delete_audio_files` for per-part cleanup, `delete_session_wav` for legacy session-glob cleanup). Session lifecycle and audio finalization are owned by `commands/live_transcription.rs`.
 - `commands/transcription.rs` — Model management, transcription, sidecar lifecycle. Locks released before async I/O.
 - `commands/live_transcription.rs` — Real-time transcription controller with per-source VAD (`SourceVadState`), concurrent backfill processing (Silero-driven `vad_chunk_historical_audio` shares boundary choices with the live loop), prompt context windowing, prompt decay, stream health monitoring with auto-restart. Shared `TranscriptionContext` struct for immutable config passing. Extracts the `TranscriptionClient` from shared state at session start and hands it to a `TranscriptionScheduler` that owns it for the duration of the session. Streams session WAV incrementally via `SessionWavWriter`.
-- `commands/transcription_scheduler.rs` — Single-worker priority queue in front of the sidecar lane (`FinalFlush > Live > Backfill`, mic/system round-robin at the live tier). Sole caller of `TranscriptionClient::transcribe_with` during a session, which makes sidecar respawn race-free. See "Transcription Scheduler" below.
+- `commands/transcription_scheduler.rs` — Single-worker priority queue in front of the sidecar lane (`FinalFlush > Live > Backfill`, mic/system round-robin at the live tier, backfill gated while live is busy). Sole caller of `TranscriptionClient::transcribe_with` during a session, which makes sidecar respawn race-free. See "Transcription Scheduler" below.
 - `commands/dictation.rs` — `clipboard_paste` command for voice dictation output. Writes text to system clipboard via `pbcopy` (macOS) or `clip` (Windows), optionally triggers auto-paste via `osascript` keystroke simulation.
 - `commands/mod.rs` — `show_overlay_panel`, `hide_overlay_panel` commands (cfg-gated: macOS uses NSPanel via `tauri-nspanel`, non-macOS falls back to WebviewWindow show/hide). `get_autostart_enabled`, `set_autostart_enabled` commands via `tauri-plugin-autostart`.
 
@@ -117,17 +117,21 @@ start_live_transcription(config with session_id, audio_save_location?, audio_exp
     → Creates SessionWavWriter at $AUDIO_DIR/{session_id}.{part_index}.wav
     → Every 300ms: extract_since() from ring buffer → append to WAV file
     → On stop:
-        1. Final flush, then finalize per audioExportFormat:
+        1. Snapshot BufferPositions immediately and extend them by a short
+           bounded tail grace, then bound all final reads to
+           [last_flush_positions, stop_positions). Samples written after
+           that boundary are ignored for this session.
+        2. Final flush, then finalize per audioExportFormat:
            • format = "wav" → keep the WAV
            • format = "mp3" → re-encode at mp3Bitrate (lame) and DELETE the source WAV
-        2. Register parent dir with TrustedAudioDirs so the audio-stream:// handler can serve it
-        3. If config.persist_audio_part is true (default for real sessions),
+        3. Register parent dir with TrustedAudioDirs so the audio-stream:// handler can serve it
+        4. If config.persist_audio_part is true (default for real sessions),
            insert a session_audio_parts row from Rust (durable source of truth).
            Dictation passes false here because its synthetic session_id has no
            sessions row — the path is recorded against dictation_history instead.
-        4. Emit "session-part-ready" with { session_id, part_index, file_path, format,
+        5. Emit "session-part-ready" with { session_id, part_index, file_path, format,
            duration_seconds, sample_rate }
-        5. Empty recordings (0 samples written) emit "session-wav-error" instead and the
+        6. Empty recordings (0 samples written) emit "session-wav-error" instead and the
            file is deleted
 
 No audio lost regardless of session length. Each Resume produces a new part; the FE
@@ -193,13 +197,16 @@ Frontend: start_live_transcription(config)
            state machine the live loop uses, so backfill and live share
            boundary choices and there's no quality gap at the seam
         4. Skip entirely silent windows (no chunk emitted)
-        5. Submit each chunk to the scheduler at JobOrigin::Backfill
+        5. Split each historical chunk into the fixed backfill quantum before
+           scheduler submission. Sidecar inference is not preemptible, so this
+           bounds the worst-case live delay from an already-running backfill job.
+        6. Submit each chunk to the scheduler at JobOrigin::Backfill
            priority, interleaved across sources (chunk 0 all sources,
-           chunk 1, etc.). The scheduler drains backfill whenever it has
-           no FinalFlush or Live work outstanding.
-        6. Emit "live-segment" events with origin="backfill"
-        7. Emit "backfill-complete" event when the submitter finishes
-        8. Stop does *not* cancel the submitter — the scheduler keeps draining
+           chunk 1, etc.). The scheduler drains backfill only when it has
+           no FinalFlush/Live work queued and the live loop reports idle.
+        7. Emit "live-segment" events with origin="backfill"
+        8. Emit "backfill-complete" event when the submitter finishes
+        9. Stop does *not* cancel the submitter — the scheduler keeps draining
            backfill after the live loop has exited, capped only by the
            scheduler's shutdown timeout (default 5 min).
 
@@ -218,29 +225,40 @@ Frontend: start_live_transcription(config)
         4. poll_vad() per source, once per Silero frame — state machine
            iterates every probability so intra-poll speech isn't missed.
            Best-action summary (ForceChunk > Chunk > None) picked per tick.
-        5. On VadAction::Chunk (silence detected) or ForceChunk (max duration):
-            a. extract_sources_since()
+        5. On VadAction::Chunk (silence detected), ForceChunk (max duration),
+           or force-drain after a prior max-size slice:
+            a. Extract the oldest contiguous max-size range from the source.
+               If more already-captured audio remains, preserve the source
+               cursor and drain one chunk per source without growing the
+               scheduler queue. Status/pressure events report the remaining
+               drain backlog so slow-sidecar catch-up is visible in the UI.
             b. write_wav_to_temp() → temp WAV
-            c. Submit JobRequest to the scheduler at JobOrigin::Live (or
-               JobOrigin::FinalFlush when should_stop is true — these
-               outrank pending Live and Backfill so closing words survive)
+            c. Submit JobRequest to the scheduler at JobOrigin::Live
             d. Emit "live-segment" event with segments + metadata + origin
-        6. On stop: force-chunk any speaking source, then exit loop
+        6. On stop: set the live-busy scheduler gate, skip normal VAD polling,
+           idle cursor advancement, stream-health restarts, and unbounded WAV
+           flushing. Wait only for the bounded tail grace, copy final source
+           tails only up to the stop boundary, then exit the loop.
 
     → After loop exits (cleanup):
-        1. Drain in-flight chunk tasks (15 s — they hold no
+        1. Copy final pending live chunks from [speech_start_pos, stop_positions)
+           into memory before waiting on in-flight tasks.
+        2. Bounded final WAV flush from [flush_positions, stop_positions)
+        3. Drain in-flight chunk tasks (15 s — they hold no
            Arc<TranscriptionClient> clones under the scheduler, so no abort
-           phase is needed; FinalFlush priority means closing-words chunks
-           land first)
-        2. Final WAV flush + finalize per audioExportFormat (WAV kept / MP3 re-encoded + WAV deleted)
-        3. Register the parent dir as trusted; if config.persist_audio_part is true (default),
+           phase is needed)
+        4. Submit the copied final chunks at JobOrigin::FinalFlush so closing
+           words outrank pending Live and Backfill work, then clear the
+           live-busy gate so copied backfill can drain.
+        5. Finalize per audioExportFormat (WAV kept / MP3 re-encoded + WAV deleted)
+        6. Register the parent dir as trusted; if config.persist_audio_part is true (default),
            insert the session_audio_parts row from Rust. Dictation passes false here and stores
            the path on dictation_history instead. Then emit "session-part-ready" with
            { session_id, part_index, file_path, format, duration_seconds, sample_rate }
            (or "session-wav-error" on empty recordings)
-        4. Wait for the backfill submitter task to finish enqueuing chunks
+        7. Wait for the backfill submitter task to finish enqueuing chunks
            (capped at the scheduler's default shutdown timeout — 5 min)
-        5. scheduler.shutdown_and_return(timeout) — drains the queue
+        8. scheduler.shutdown_and_return(timeout) — drains the queue
            (FinalFlush, Live, then Backfill) and returns the client to
            TranscriptionClientState (even after panic via AssertUnwindSafe)
     → Per-source VAD: SourceVadState tracks mic/system independently
@@ -263,7 +281,8 @@ fixes that.
 1. `FinalFlush` — closing-words chunks emitted at session stop.
 2. `Live` — real-time chunks during the session, with strict mic/system
    round-robin so neither source can starve the other in mixed mode.
-3. `Backfill` — historical audio, drained whenever the higher tiers are idle.
+3. `Backfill` — historical audio, drained only when the higher tiers are idle
+   and the live loop has cleared the live-busy gate.
 
 **Single-owner client.** The scheduler owns the sole `Arc<TranscriptionClient>`
 clone for the duration of a session, which makes sidecar respawn race-free:
@@ -272,20 +291,41 @@ when a transcribe call fails and the sidecar is dead, the worker's
 older design had to fall back to "another task still holds the Arc, retry on
 next chunk" branches — that's gone.
 
-**Stop semantics.** Live loop signals stop → in-flight FinalFlush jobs drain
-first → backfill submitter finishes enqueuing → `shutdown_and_return` drains
-remaining Backfill jobs and hands the client back to `TranscriptionClientState`.
-The shutdown timeout (default 5 min) is the only ceiling — generous enough
-for a typical 5-minute backfill window to fully transcribe, bounded so a
-wedged sidecar can't hang the stop path forever. Backfill audio is owned by
-the submitter task as `Vec<f32>`, so ring-buffer churn after extraction
-cannot lose it.
+**Live-busy gate.** The live loop sets a scheduler guard while speech is
+active, live/final chunks are in flight, a force-drain backlog exists, or stop
+finalization is copying/dispatching bounded live tails. `Backfill` jobs remain
+queued during that window even if the sidecar worker becomes free; `FinalFlush`
+and `Live` jobs still dispatch immediately by priority.
+
+**Stop semantics.** `stop_live_transcription()` carries a `StopRequest` with
+the current `BufferPositions` extended by a short tail grace. The live loop
+stops normal ingestion and stream health work, waits only for that bounded
+tail window, copies final live tails from the stop-bounded ranges, flushes the
+session WAV only up to the same positions, drains in-flight live tasks, then
+submits the copied tails at `FinalFlush` priority. Only after those bounded
+live tasks finish does it clear the live-busy gate so copied backfill can
+drain. `shutdown_and_return` drains remaining Backfill jobs and hands the
+client back to `TranscriptionClientState`. The shutdown timeout (default
+5 min) is the only ceiling — generous enough for a typical 5-minute backfill
+window to fully transcribe, bounded so a wedged sidecar can't hang the stop
+path forever. Backfill audio is owned by the submitter task as `Vec<f32>`, so
+ring-buffer churn after extraction cannot lose it; ring-buffer audio written
+after the bounded stop tail is ignored for the stopped session.
 
 **Job submission API.** `scheduler.submit(JobRequest { origin, source,
 wav_path, language, initial_prompt, diarization })` returns a
 `oneshot::Receiver<JobOutcome>`. `JobOutcome` carries the
 `TranscriptionResult` (or a `SchedulerError`) and the worker's `wall_ms`
 for pressure telemetry.
+
+**Pressure metrics.** The status surface exposes two related-but-distinct
+numbers. `lag_seconds` is wall-clock minus the latest committed audio offset
+and folds in *every* source of delay — chunking, scheduler queueing, sidecar
+warmup, inference. `live_drain_backlog_seconds` is the source-local
+already-captured audio that hadn't been dispatched yet at the moment a Live
+chunk was sent; non-zero specifically attributes the slowness to the live tier
+force-draining preserved audio because the sidecar is slower than realtime.
+One can be zero while the other isn't, so both are kept.
 
 ### Stream Health Monitoring
 
@@ -834,6 +874,7 @@ The `AudioRingBuffer` is the performance-critical component:
 - **Producer** (audio callback): writes via `UnsafeCell`, stores `write_pos` with `Release`
 - **Consumer** (app thread): loads `write_pos` with `Acquire`, reads from buffer
 - **Monotonic counter**: `write_pos` never resets (wraps via modulo), enabling `snapshot_since()`
+- **Bounded reads**: `snapshot_range(from, until)` reads only the requested half-open cursor range, caps to committed samples, and reports `overrun` when the ring buffer has already overwritten the requested start. Hard-stop finalization and bounded live draining use this instead of implicitly reading to the current write head.
 - **Per-buffer format**: Each ring buffer is created with its device's native sample rate and channel count. `start_mic()` does not mutate `AudioManager.config` — the buffer carries its own format. All extraction methods read each buffer's `sample_rate()` / `channels()` and deinterleave multi-channel data to mono before mixing or WAV export.
 - **Default config**: `capture_history_seconds` (Rust default 180, frontend default 300 via `bufferMaxSeconds`). Devices typically operate at 48kHz (mono for mic, stereo for system audio on macOS). Ring buffer size is calculated from the actual device rate. `DEFAULT_SAMPLE_RATE` (16kHz) in `yapstack_common::config` is a fallback when no buffer is active.
 
@@ -893,8 +934,8 @@ The protocol supports HTTP `Range` headers for audio seeking. Returns `206 Parti
 2. **Lock-free ring buffer** — Audio callbacks cannot block. SPSC with atomics avoids mutex contention.
 3. **DTO layer in Tauri commands** — Domain types don't derive `specta::Type`. DTOs add the TypeScript generation derive and convert via `From` impls.
 4. **Feature flags for optional native deps** — `whisper` and `metal` on yapstack-sidecar keep the default build lightweight. System audio is always compiled in via cpal loopback (no feature flag).
-5. **16-bit PCM WAV export** — WAV files are written at the device's native sample rate (e.g. 48kHz). The sidecar resamples to 16kHz mono before Whisper inference. 16-bit quantization is sufficient (-96 dB noise floor).
-6. **Session tracking via write_pos** — Sessions record the ring buffer's monotonic write position at start, then `snapshot_since()` at end. No separate buffer needed. For long sessions (> buffer capacity), `SessionWavWriter` streams audio incrementally to disk every 300ms during the live transcription loop.
+5. **16-bit PCM WAV export** — WAV files are written at the configured capture source's output rate (mic for `MicOnly`, system for `SystemOnly`, mic-rate mixed output for `Mixed` when mic is present). The sidecar resamples to 16kHz mono before Whisper inference. 16-bit quantization is sufficient (-96 dB noise floor).
+6. **Session tracking via write_pos** — Sessions record the ring buffer's monotonic write position at start and stop. `SessionWavWriter` streams audio incrementally to disk every poll, and stop-time tails are flushed with `snapshot_range()` so post-stop samples never enter the finalized part.
 7. **Custom URI scheme for audio** — `audio-stream://` protocol serves session audio (WAV or MP3) from any allow-listed directory with range request support, avoiding cross-origin issues with the default asset protocol during development.
 8. **`session_audio_parts` is the durable source of truth for session audio** — Each session has zero or more part rows (`part_index = 0, 1, 2…`); when `LiveTranscriptionConfig.persist_audio_part` is true (default for actual sessions) the row is inserted from Rust at finalize time *before* `session-part-ready` is emitted, so a missed FE event can't lose the file. Dictation flips the flag off — its synthetic per-utterance id has no `sessions.id` row, so the path goes onto `dictation_history` instead and the parts table only ever holds rows that round-trip to a real session. Resuming a session appends a new part rather than overwriting; the FE concatenates parts at playback time. `audio_save_locations` tracks every directory the app has ever written into so reconciliation on next startup can recover orphans even if the row insert was missed.
 9. **`useDictation` registers Escape as a global hotkey only while non-idle** — Escape cancels an in-flight Dictation, suppresses the Output action, deletes the streamed audio, and skips the `dictation_history` write. The hotkey is unregistered when idle so it doesn't override the focused app's normal Escape handling.
