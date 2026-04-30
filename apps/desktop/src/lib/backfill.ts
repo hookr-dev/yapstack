@@ -1,4 +1,4 @@
-export const BACKFILL_STEPS_SECONDS = [5, 10, 15, 30, 60, 120, 300] as const;
+export const BACKFILL_STEPS_SECONDS = [30, 60, 120, 300] as const;
 
 export function formatBackfillSeconds(s: number): string {
   if (s <= 0) return "0s";
