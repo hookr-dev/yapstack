@@ -16,8 +16,10 @@ import {
 } from "@/components/ui/select";
 import {
   eventToGlobalBinding,
+  findShortcutConflict,
   shortcutCaptureActive,
 } from "@/lib/shortcuts";
+import { toast } from "sonner";
 import { suspendGlobalShortcuts, resumeGlobalShortcuts } from "@/hooks/useGlobalShortcuts";
 import { isMac } from "@/lib/utils";
 import { Plus, Trash2 } from "lucide-react";
@@ -318,10 +320,27 @@ export function DictationTab() {
 
   const handleKeybindCapture = useCallback(
     (shortcutId: string, binding: string) => {
+      const conflict = findShortcutConflict(
+        binding,
+        shortcutId,
+        true, // dictation slot bindings are always global
+        shortcutBindings,
+        dictation.slots,
+      );
+      if (conflict) {
+        const target =
+          conflict.kind === "dictation"
+            ? `dictation slot "${conflict.label}"`
+            : `"${conflict.label}"`;
+        toast.error(
+          `${formatGlobalDisplay(binding)} is already bound to ${target}. Rebind it first.`,
+        );
+        return;
+      }
       const newOverrides = { ...shortcutBindings, [shortcutId]: binding };
       updateSettings({ shortcutBindings: newOverrides });
     },
-    [shortcutBindings, updateSettings],
+    [shortcutBindings, dictation.slots, updateSettings],
   );
 
   const handleAddSlot = () => {
