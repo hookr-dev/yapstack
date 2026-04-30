@@ -541,7 +541,7 @@ lag_seconds: number | null;
  * dispatching one max-duration slice. Non-zero means the sidecar fell
  * behind real time, but audio is being preserved rather than dropped.
  */
-live_drain_backlog_chunks: number;
+live_drain_backlog_chunks: number; 
 /**
  * Latest backlog depth after a live max-duration slice was dispatched.
  * Returns to 0.0 once the live force-drain path catches up.
