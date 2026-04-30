@@ -4,7 +4,7 @@ import {
   ContextMenuItem,
   ContextMenuTrigger,
 } from "@/components/ui/context-menu";
-import { Bot, Play, Pause, Trash2, Copy, FileText } from "lucide-react";
+import { Bot, Play, Pause, Trash2, Copy, FileText, FolderOpen, FolderSearch } from "lucide-react";
 import { useDictationEntry } from "@/hooks/useDictationEntry";
 import type { DbDictationHistory } from "@/lib/db";
 
@@ -38,6 +38,8 @@ export function DictationFeedEntry({
     handleMoveToNote,
     handleOpenNote,
     handleDelete,
+    handleShowFile,
+    handleOpenFolder,
   } = useDictationEntry(entry);
 
   return (
@@ -86,17 +88,26 @@ export function DictationFeedEntry({
               </span>
             )}
             {entry.wav_file_path && (
-              <button
-                onClick={handlePlayAudio}
-                className={`rounded p-1 transition-colors ${playing ? "text-primary hover:text-primary/80 hover:bg-accent" : "text-muted-foreground hover:text-foreground hover:bg-accent"}`}
-                aria-label={playing ? "Pause audio" : "Play audio"}
-              >
-                {playing ? (
-                  <Pause className="h-3 w-3" />
-                ) : (
-                  <Play className="h-3 w-3" />
-                )}
-              </button>
+              <>
+                <button
+                  onClick={handlePlayAudio}
+                  className={`rounded p-1 transition-colors ${playing ? "text-primary hover:text-primary/80 hover:bg-accent" : "text-muted-foreground hover:text-foreground hover:bg-accent"}`}
+                  aria-label={playing ? "Pause audio" : "Play audio"}
+                >
+                  {playing ? (
+                    <Pause className="h-3 w-3" />
+                  ) : (
+                    <Play className="h-3 w-3" />
+                  )}
+                </button>
+                <button
+                  onClick={handleShowFile}
+                  className="rounded p-1 text-muted-foreground hover:text-foreground hover:bg-accent transition-colors"
+                  aria-label="Show file in Finder"
+                >
+                  <FolderSearch className="h-3 w-3" />
+                </button>
+              </>
             )}
             {entry.session_id ? (
               <button
@@ -143,14 +154,24 @@ export function DictationFeedEntry({
           Copy Text
         </ContextMenuItem>
         {entry.wav_file_path && (
-          <ContextMenuItem onClick={handlePlayAudio}>
-            {playing ? (
-              <Pause className="h-3.5 w-3.5 mr-2" />
-            ) : (
-              <Play className="h-3.5 w-3.5 mr-2" />
-            )}
-            {playing ? "Pause Audio" : "Play Audio"}
-          </ContextMenuItem>
+          <>
+            <ContextMenuItem onClick={handlePlayAudio}>
+              {playing ? (
+                <Pause className="h-3.5 w-3.5 mr-2" />
+              ) : (
+                <Play className="h-3.5 w-3.5 mr-2" />
+              )}
+              {playing ? "Pause Audio" : "Play Audio"}
+            </ContextMenuItem>
+            <ContextMenuItem onClick={handleShowFile}>
+              <FolderSearch className="h-3.5 w-3.5 mr-2" />
+              Show File in Finder
+            </ContextMenuItem>
+            <ContextMenuItem onClick={handleOpenFolder}>
+              <FolderOpen className="h-3.5 w-3.5 mr-2" />
+              Open Containing Folder
+            </ContextMenuItem>
+          </>
         )}
         {entry.session_id ? (
           <ContextMenuItem onClick={handleOpenNote}>

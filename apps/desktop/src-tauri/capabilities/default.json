@@ -21,6 +21,7 @@
     "global-shortcut:allow-is-registered",
     "opener:default",
     "opener:allow-reveal-item-in-dir",
+    "opener:allow-open-path",
     "autostart:allow-enable",
     "autostart:allow-disable",
     "autostart:allow-is-enabled",

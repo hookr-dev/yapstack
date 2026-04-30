@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 import { convertFileSrc } from "@tauri-apps/api/core";
+import { revealItemInDir, openPath } from "@tauri-apps/plugin-opener";
+import { dirname } from "@tauri-apps/api/path";
 import { useAppStore } from "@/stores/appStore";
 import {
   createManualSession as dbCreateManualSession,
@@ -107,6 +109,27 @@ export function useDictationEntry(entry: DbDictationHistory) {
     deleteEntry(entry.id);
   };
 
+  const handleShowFile = async () => {
+    if (!entry.wav_file_path) return;
+    try {
+      await revealItemInDir(entry.wav_file_path);
+    } catch (e) {
+      console.error("Failed to reveal file:", e);
+      toast.error("Couldn't reveal file");
+    }
+  };
+
+  const handleOpenFolder = async () => {
+    if (!entry.wav_file_path) return;
+    try {
+      const parent = await dirname(entry.wav_file_path);
+      await openPath(parent);
+    } catch (e) {
+      console.error("Failed to open folder:", e);
+      toast.error("Couldn't open folder");
+    }
+  };
+
   return {
     playing,
     handleCopy,
@@ -114,5 +137,7 @@ export function useDictationEntry(entry: DbDictationHistory) {
     handleMoveToNote,
     handleOpenNote,
     handleDelete,
+    handleShowFile,
+    handleOpenFolder,
   };
 }
