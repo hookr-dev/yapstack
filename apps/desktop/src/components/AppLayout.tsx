@@ -10,7 +10,6 @@ import { useKeyboardShortcuts } from "@/hooks/useKeyboardShortcuts";
 import { useTrayEvents } from "@/hooks/useTrayEvents";
 import { useAppStore } from "@/stores/appStore";
 import { TitleBar } from "@/components/TitleBar";
-import { SetupBanner } from "@/components/SetupBanner";
 import { SettingsPanel } from "@/components/SettingsPanel";
 import { AppSidebar } from "@/components/AppSidebar";
 import { NoteDetailView } from "@/components/NoteDetailView";
@@ -184,7 +183,6 @@ export function AppLayout() {
 
   const mainContent = (
     <main className="relative flex flex-1 flex-col min-w-0 h-full">
-      <SetupBanner />
       {currentView === "settings" && <SettingsPanel />}
       {currentView === "note-detail" && <NoteDetailView />}
       {currentView === "note-list" && <NoteCardList />}
