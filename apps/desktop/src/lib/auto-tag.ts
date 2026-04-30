@@ -23,6 +23,7 @@ interface FolderProfile {
 }
 
 const FOLDER_NAME_WEIGHT = 3.0;
+const FOLDER_DESCRIPTION_WEIGHT = 2.0;
 const MIN_FOLDER_TOKEN_LEN = 4;
 const MIN_TAG_TOKEN_LEN = 3;
 const DEFAULT_PROB_THRESHOLD = 0.55;
@@ -30,11 +31,33 @@ const DEFAULT_MIN_SCORE = 1.0;
 /** Words seen below this floor still divide by 1; above it we damp by sqrt. */
 const LENGTH_NORM_FLOOR_WORDS = 100;
 
+/**
+ * Common English stopwords. Only excludes words ≥4 chars (shorter tokens are
+ * already filtered by MIN_FOLDER_TOKEN_LEN / MIN_TAG_TOKEN_LEN). Without this
+ * list a folder description like "Notes about the Q3 launch" would score
+ * every transcript that contains "about" or "notes".
+ */
+const STOPWORDS = new Set([
+  "about", "above", "after", "again", "against", "also", "another",
+  "around", "because", "been", "before", "being", "below", "between",
+  "both", "could", "does", "doing", "down", "during", "each", "even",
+  "ever", "every", "from", "further", "have", "having", "here", "into",
+  "itself", "just", "more", "most", "much", "must", "myself", "ourselves",
+  "over", "same", "should", "some", "such", "than", "that", "their",
+  "them", "themselves", "then", "there", "these", "they", "this", "those",
+  "through", "under", "until", "very", "were", "what", "when", "where",
+  "which", "while", "with", "would", "your", "yours", "yourself",
+]);
+
 function tokenize(s: string): string[] {
   return s
     .toLowerCase()
     .split(/[^\p{L}\p{N}]+/u)
     .filter(Boolean);
+}
+
+function isUsefulToken(tok: string, minLen: number): boolean {
+  return tok.length >= minLen && !STOPWORDS.has(tok);
 }
 
 /**
@@ -85,8 +108,15 @@ export function buildFolderProfiles(
     const keywords = new Map<string, number>();
 
     for (const tok of tokenize(folder.name)) {
-      if (tok.length < MIN_FOLDER_TOKEN_LEN) continue;
+      if (!isUsefulToken(tok, MIN_FOLDER_TOKEN_LEN)) continue;
       keywords.set(tok, (keywords.get(tok) ?? 0) + FOLDER_NAME_WEIGHT);
+    }
+
+    if (folder.description) {
+      for (const tok of tokenize(folder.description)) {
+        if (!isUsefulToken(tok, MIN_FOLDER_TOKEN_LEN)) continue;
+        keywords.set(tok, (keywords.get(tok) ?? 0) + FOLDER_DESCRIPTION_WEIGHT);
+      }
     }
 
     const tagCounts = folderTagCounts.get(folder.id);
@@ -101,7 +131,7 @@ export function buildFolderProfiles(
         const weight = tf * idf;
         if (weight <= 0) continue;
         for (const tok of tokenize(tag.name)) {
-          if (tok.length < MIN_TAG_TOKEN_LEN) continue;
+          if (!isUsefulToken(tok, MIN_TAG_TOKEN_LEN)) continue;
           keywords.set(tok, (keywords.get(tok) ?? 0) + weight);
         }
       }
