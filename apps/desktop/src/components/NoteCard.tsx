@@ -2,7 +2,7 @@ import { type CSSProperties, memo, useMemo } from "react";
 import { useAppStore } from "@/stores/appStore";
 import type { DbSession } from "@/lib/db";
 import { cn, formatRelativeTime } from "@/lib/utils";
-import { Pin, PinOff, Mic, PenLine, Check, ExternalLink, FolderMinus, Trash2 } from "lucide-react";
+import { Pin, PinOff, Mic, PenLine, Check, ExternalLink, FolderMinus, Square, Trash2 } from "lucide-react";
 import { ICON_MAP } from "@/lib/folder-constants";
 import { useDraggable } from "@dnd-kit/core";
 import { getDisplayFolders, type FolderTreeNode } from "@/lib/folder-tree";
@@ -109,8 +109,10 @@ function FolderNode({
 export const NoteCard = memo(function NoteCard({ session }: { session: DbSession }) {
   const selectedSessionId = useAppStore((s) => s.selectedSessionId);
   const activeSessionId = useAppStore((s) => s.activeSessionId);
+  const sessionStopping = useAppStore((s) => s.sessionStopping);
   const openSession = useAppStore((s) => s.openSession);
   const deleteSession = useAppStore((s) => s.deleteSession);
+  const stopActiveSession = useAppStore((s) => s.stopActiveSession);
   const togglePin = useAppStore((s) => s.togglePin);
   const folders = useAppStore((s) => s.folders);
   const folderTree = useAppStore((s) => s.folderTree);
@@ -264,14 +266,24 @@ export const NoteCard = memo(function NoteCard({ session }: { session: DbSession
           </>
         )}
         <ContextMenuSeparator />
-        <ContextMenuItem
-          className="text-destructive"
-          disabled={isRecording}
-          onClick={() => deleteSession(session.id)}
-        >
-          <Trash2 />
-          Delete
-        </ContextMenuItem>
+        {isRecording ? (
+          <ContextMenuItem
+            className="text-destructive"
+            disabled={sessionStopping}
+            onClick={stopActiveSession}
+          >
+            <Square />
+            Stop recording
+          </ContextMenuItem>
+        ) : (
+          <ContextMenuItem
+            className="text-destructive"
+            onClick={() => deleteSession(session.id)}
+          >
+            <Trash2 />
+            Delete
+          </ContextMenuItem>
+        )}
       </ContextMenuContent>
     </ContextMenu>
   );
