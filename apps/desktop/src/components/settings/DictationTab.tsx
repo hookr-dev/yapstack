@@ -365,7 +365,8 @@ export function DictationTab() {
         <div>
           <h3 className="text-xs font-medium">Voice Dictation</h3>
           <p className="text-xs text-muted-foreground mt-0.5">
-            Hold a keybind to dictate, release to transcribe.
+            Hold a keybind to dictate, release to transcribe. Captures
+            your microphone only — system audio is never included.
           </p>
         </div>
         <Switch

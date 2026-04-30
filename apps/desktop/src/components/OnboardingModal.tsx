@@ -794,7 +794,8 @@ function ReadyStep({ onFinish }: { onFinish: () => void }) {
           />
         </div>
         <p className="text-[11px] text-muted-foreground mb-2">
-          Hold a key to dictate anywhere
+          Hold a key to dictate anywhere. Mic only — system audio is
+          never captured.
         </p>
         {dictation.enabled && defaultSlot && (
           <div className="flex items-center justify-between pt-2 border-t">
