@@ -4,7 +4,7 @@ import {
   ContextMenuItem,
   ContextMenuTrigger,
 } from "@/components/ui/context-menu";
-import { Bot, Play, Pause, Trash2, Copy, FileText, FolderOpen, FolderSearch } from "lucide-react";
+import { Bot, Play, Pause, Trash2, Copy, FileText, FolderSearch } from "lucide-react";
 import { useDictationEntry } from "@/hooks/useDictationEntry";
 import type { DbDictationHistory } from "@/lib/db";
 
@@ -39,7 +39,6 @@ export function DictationFeedEntry({
     handleOpenNote,
     handleDelete,
     handleShowFile,
-    handleOpenFolder,
   } = useDictationEntry(entry);
 
   return (
@@ -165,11 +164,7 @@ export function DictationFeedEntry({
             </ContextMenuItem>
             <ContextMenuItem onClick={handleShowFile}>
               <FolderSearch className="h-3.5 w-3.5 mr-2" />
-              Show File in Finder
-            </ContextMenuItem>
-            <ContextMenuItem onClick={handleOpenFolder}>
-              <FolderOpen className="h-3.5 w-3.5 mr-2" />
-              Open Containing Folder
+              Show audio file
             </ContextMenuItem>
           </>
         )}

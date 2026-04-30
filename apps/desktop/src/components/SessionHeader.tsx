@@ -32,7 +32,7 @@ import {
 import { formatDuration, formatElapsed } from "@/lib/utils";
 import { ICON_MAP } from "@/lib/folder-constants";
 import type { FolderTreeNode } from "@/lib/folder-tree";
-import { revealItemInDir } from "@tauri-apps/plugin-opener";
+import { revealAudioFile } from "@/lib/reveal-file";
 
 function RecordingBadge() {
   const activeSessionStartTime = useAppStore((s) => s.activeSessionStartTime);
@@ -270,11 +270,7 @@ export function SessionHeader({ session }: { session: DbSession }) {
                 // Reveal the most recent part. The other parts live in the
                 // same directory, so this gets the user there either way.
                 const latest = viewSessionParts[viewSessionParts.length - 1];
-                if (latest) {
-                  revealItemInDir(latest.file_path).catch((e) =>
-                    console.error("Failed to reveal file:", e),
-                  );
-                }
+                if (latest) revealAudioFile(latest.file_path);
               }}
             >
               <FolderOpen />
