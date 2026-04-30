@@ -44,11 +44,9 @@ export function AppSidebar() {
   const createFolder = useAppStore((s) => s.createFolder);
   const createManualNote = useAppStore((s) => s.createManualNote);
   const availableSeconds = useAppStore((s) =>
-    Math.floor(
-      Math.max(
-        s.bufferInfo?.mic?.available_seconds ?? 0,
-        s.bufferInfo?.system?.available_seconds ?? 0,
-      ),
+    Math.max(
+      s.bufferInfo?.mic?.available_seconds ?? 0,
+      s.bufferInfo?.system?.available_seconds ?? 0,
     ),
   );
   const shortcutBindings = useAppStore((s) => s.settings.shortcutBindings);
