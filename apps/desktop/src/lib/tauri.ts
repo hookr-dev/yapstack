@@ -20,6 +20,10 @@ export type TranscriptSegmentDto = {
   speaker_id: number | null;
 };
 
+/** Origin class of a live segment event. Mirrors the scheduler's priority
+ *  tier (FinalFlush > Live > Backfill). */
+export type SegmentOrigin = "live" | "backfill" | "final_flush";
+
 export type LiveSegmentEvent = {
   chunk_index: number;
   source: AudioSourceLabel;
@@ -27,7 +31,8 @@ export type LiveSegmentEvent = {
   audio_offset_seconds: number;
   chunk_duration_seconds: number;
   accumulated_text: string;
-  is_backfill: boolean;
+  /** Origin class set by the scheduler at emit time. */
+  origin: SegmentOrigin;
   /** Session this chunk belongs to. Late-arriving segments still persist to
    * this session even after the frontend has cleared activeSessionId. */
   session_id: string | null;

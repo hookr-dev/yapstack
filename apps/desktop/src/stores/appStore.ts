@@ -748,7 +748,7 @@ function createAppStore() {
               `offset=${event.audio_offset_seconds.toFixed(2)}s ` +
               `duration=${event.chunk_duration_seconds.toFixed(2)}s ` +
               `segments=${event.segments.length} ` +
-              `backfill=${event.is_backfill}`,
+              `origin=${event.origin}`,
           );
 
           // Prefer the session_id carried on the event so late-arriving
@@ -796,7 +796,7 @@ function createAppStore() {
           // effective (clamped) boundary and mis-classify early live
           // segments as backfill. Updated even for empty chunks (silence
           // still advances the rewind cursor).
-          if (event.is_backfill && targetSessionId === get().activeSessionId) {
+          if (event.origin === "backfill" && targetSessionId === get().activeSessionId) {
             const chunkEnd = event.audio_offset_seconds + event.chunk_duration_seconds;
             const current = get().backfillBoundarySeconds;
             if (current == null || chunkEnd > current) {
@@ -1075,10 +1075,22 @@ function createAppStore() {
           vocabulary_hints: vocabHints,
         };
 
+        // Pre-set `backfillActive` before the await so any `backfill-complete`
+        // event emitted by the spawned live task during the await transitions
+        // it cleanly to false. If we set it post-await instead, a fast or
+        // empty-branch backfill-complete could fire before our set, the
+        // listener would clear it to false, and our subsequent set would
+        // overwrite it back to true — leaving the UI affordance stuck on.
+        const requestedBackfill = (backfillSeconds ?? 0) > 0;
+        if (requestedBackfill) {
+          set({ backfillActive: true });
+        }
+
         const result = await commands.startLiveTranscription(config);
         if (result.status === "error") {
           // Clean up the DB row we just created
           await dbDeleteSession(sessionId).catch(() => {});
+          if (requestedBackfill) set({ backfillActive: false });
           throw new Error(result.error.message);
         }
 
@@ -1088,6 +1100,9 @@ function createAppStore() {
           trigger: trigger ?? "unknown",
         });
 
+        // Note: `backfillActive` deliberately omitted — the pre-await set
+        // above plus the `backfill-complete` listener are the source of
+        // truth. Re-asserting it here would re-introduce the race.
         set({
           activeSessionId: sessionId,
           activeSessionSegments: [],
@@ -1097,7 +1112,9 @@ function createAppStore() {
           livePhase: "Running",
           currentView: "note-detail",
           selectedSessionId: sessionId,
-          backfillActive: (backfillSeconds ?? 0) > 0,
+          // backfillActive intentionally omitted — pre-set before the await
+          // (and listener-driven thereafter) so a fast `backfill-complete`
+          // event arriving during the await isn't overwritten back to true.
           backfillBoundarySeconds: null,
         });
 

@@ -537,12 +537,16 @@ export type LiveTranscriptionStatus = { phase: LiveTranscriptionPhase; chunks_pr
  */
 lag_seconds: number | null; 
 /**
- * Cumulative count of times the Stage-3 head-drop cap fired this
- * session. Stays 0 in normal operation — any non-zero value indicates
- * audio was discarded to keep the inference queue bounded. Removed in
- * Stage 3 when cap-and-drop is replaced with queue-and-drain.
+ * Count of live chunks that left already-captured audio to drain after
+ * dispatching one max-duration slice. Non-zero means the sidecar fell
+ * behind real time, but audio is being preserved rather than dropped.
  */
-cap_fired_total: number }
+live_drain_backlog_chunks: number; 
+/**
+ * Latest backlog depth after a live max-duration slice was dispatched.
+ * Returns to 0.0 once the live force-drain path catches up.
+ */
+live_drain_backlog_seconds: number }
 /**
  * One log line visible to the frontend. `ts_ms` is unix-epoch milliseconds.
  */

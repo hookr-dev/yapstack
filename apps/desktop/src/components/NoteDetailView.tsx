@@ -213,8 +213,10 @@ export function NoteDetailView() {
               <ChatView
                 sessionId={selectedSessionId ?? undefined}
                 segments={segments}
-                backfillActive={backfillActive}
-                backfillBoundarySeconds={backfillBoundarySeconds}
+                backfillActive={backfillActive && isActiveSession}
+                backfillBoundarySeconds={
+                  isActiveSession ? backfillBoundarySeconds : null
+                }
                 isEditable={isEditable}
                 initialScrollToBottom={isActiveSession}
               />

@@ -7,6 +7,7 @@ pub mod logs;
 pub mod permissions;
 pub mod silero_vad;
 pub mod transcription;
+pub mod transcription_scheduler;
 
 use serde::Serialize;
 use specta::Type;

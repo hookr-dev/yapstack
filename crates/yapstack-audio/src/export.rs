@@ -1,6 +1,7 @@
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::mem::MaybeUninit;
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 
 use hound::{SampleFormat, WavSpec, WavWriter};
@@ -156,6 +157,21 @@ pub fn convert_wav_to_mp3(wav_path: &Path, bitrate_kbps: u16) -> Result<PathBuf>
     encoder
         .set_sample_rate(spec.sample_rate)
         .map_err(|e| AudioError::Mp3Encode(format!("set_sample_rate: {e:?}")))?;
+    // Pin the output sample rate to the input rate. Without this, LAME's
+    // auto-pick at low bitrates silently downsamples (e.g. 48 kHz input at
+    // 64 kbps becomes a 22.05 kHz output), which leaves the DB row recording
+    // the input rate while the file plays back at the output rate. Pinning
+    // keeps the file honest at the cost of some compression efficiency at
+    // low bitrates — caller controls the bitrate, so trading off is their
+    // call to make explicitly. LAME accepts only a fixed set of output
+    // rates (32/44.1/48 for MPEG-1, 16/22.05/24 for MPEG-2, 8/11.025/12 for
+    // MPEG-2.5); rates outside this set will surface as a build-time error
+    // rather than a silent override.
+    if let Some(rate) = NonZeroU32::new(spec.sample_rate) {
+        encoder
+            .set_output_sample_rate(Some(rate))
+            .map_err(|e| AudioError::Mp3Encode(format!("set_output_sample_rate: {e:?}")))?;
+    }
     encoder
         .set_num_channels(spec.channels as u8)
         .map_err(|e| AudioError::Mp3Encode(format!("set_num_channels: {e:?}")))?;
@@ -355,6 +371,52 @@ mod tests {
         assert!(!path.exists(), "WAV should be deleted after conversion");
         assert!(result_path.exists(), "MP3 should exist");
         assert!((duration - 1.0).abs() < 0.001);
+    }
+
+    /// Parse the sample rate of the first MPEG audio frame in a file.
+    /// Returns `None` if no frame header is found at offset 0 (test helper —
+    /// our encoder doesn't write ID3 tags, so the file starts with a frame).
+    fn mp3_first_frame_sample_rate(path: &Path) -> Option<u32> {
+        let bytes = std::fs::read(path).ok()?;
+        if bytes.len() < 4 {
+            return None;
+        }
+        let h = &bytes[..4];
+        if h[0] != 0xFF || (h[1] & 0xE0) != 0xE0 {
+            return None;
+        }
+        let version_id = (h[1] >> 3) & 0x03; // 3=MPEG-1, 2=MPEG-2, 0=MPEG-2.5
+        let sample_rate_idx = ((h[2] >> 2) & 0x03) as usize;
+        if sample_rate_idx == 3 || version_id == 1 {
+            return None;
+        }
+        Some(match version_id {
+            3 => [44_100u32, 48_000, 32_000][sample_rate_idx],
+            2 => [22_050u32, 24_000, 16_000][sample_rate_idx],
+            _ => [11_025u32, 12_000, 8_000][sample_rate_idx],
+        })
+    }
+
+    /// Regression: at low bitrates LAME's auto-pick previously emitted a
+    /// 22050 Hz output for a 48000 Hz input WAV, which left the DB row
+    /// reporting one rate while the file played back at another. Pinning
+    /// `set_output_sample_rate` to the input rate fixes that.
+    #[test]
+    fn test_mp3_output_sample_rate_matches_input_at_low_bitrate() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pin_sr.wav");
+        let mut writer = SessionWavWriter::new(path.clone(), 48000).unwrap();
+        // 0.5 s of audio at 48 kHz mono. Content doesn't matter; we only
+        // assert the MP3's frame-header sample rate.
+        writer.write_samples(&vec![0.0f32; 24_000]).unwrap();
+        let (mp3_path, _) = writer.finalize_as_mp3(64).unwrap();
+
+        let actual = mp3_first_frame_sample_rate(&mp3_path)
+            .expect("MP3 should start with a valid MPEG audio frame header");
+        assert_eq!(
+            actual, 48_000,
+            "expected MP3 to retain the WAV's 48 kHz rate, got {actual} Hz"
+        );
     }
 
     #[test]
