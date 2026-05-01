@@ -946,10 +946,22 @@ function createAppStore() {
           vocabulary_hints: vocabHints,
         };
 
+        // Pre-set `backfillActive` before the await so any `backfill-complete`
+        // event emitted by the spawned live task during the await transitions
+        // it cleanly to false. If we set it post-await instead, a fast or
+        // empty-branch backfill-complete could fire before our set, the
+        // listener would clear it to false, and our subsequent set would
+        // overwrite it back to true — leaving the UI affordance stuck on.
+        const requestedBackfill = (backfillSeconds ?? 0) > 0;
+        if (requestedBackfill) {
+          set({ backfillActive: true });
+        }
+
         const result = await commands.startLiveTranscription(config);
         if (result.status === "error") {
           // Clean up the DB row we just created
           await dbDeleteSession(sessionId).catch(() => {});
+          if (requestedBackfill) set({ backfillActive: false });
           throw new Error(result.error.message);
         }
 
@@ -959,6 +971,9 @@ function createAppStore() {
           trigger: trigger ?? "unknown",
         });
 
+        // Note: `backfillActive` deliberately omitted — the pre-await set
+        // above plus the `backfill-complete` listener are the source of
+        // truth. Re-asserting it here would re-introduce the race.
         set({
           activeSessionId: sessionId,
           activeSessionSegments: [],
@@ -968,7 +983,6 @@ function createAppStore() {
           livePhase: "Running",
           currentView: "note-detail",
           selectedSessionId: sessionId,
-          backfillActive: (backfillSeconds ?? 0) > 0,
         });
 
         // Reload sidebar

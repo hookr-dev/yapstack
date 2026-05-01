@@ -202,13 +202,22 @@ Frontend: start_live_transcription(config)
            bounds the worst-case live delay from an already-running backfill job.
         6. Submit each chunk to the scheduler at JobOrigin::Backfill
            priority, interleaved across sources (chunk 0 all sources,
-           chunk 1, etc.). The scheduler drains backfill only when it has
-           no FinalFlush/Live work queued and the live loop reports idle.
+           chunk 1, etc.), and *await each chunk's scheduler response*
+           before submitting the next. Per-chunk prompt context and
+           in-order segment emission both depend on this serial wait, so
+           the submitter is what's actually doing the draining. The
+           scheduler still admits Backfill jobs only when it has no
+           FinalFlush/Live work queued and the live loop reports idle.
         7. Emit "live-segment" events with origin="backfill"
-        8. Emit "backfill-complete" event when the submitter finishes
-        9. Stop does *not* cancel the submitter — the scheduler keeps draining
-           backfill after the live loop has exited, capped only by the
-           scheduler's shutdown timeout (default 5 min).
+        8. Emit "backfill-complete" event when the submitter finishes (or
+           immediately on session start if effective backfill is 0 — for a
+           short ring buffer or a resumed session — so the FE's
+           "backfill in progress" affordance always clears)
+        9. Stop does *not* cancel the submitter; the live loop waits up to
+           5 min for it to drain naturally. Chunks not yet submitted at
+           that timeout are lost (they live in the submitter's stack as
+           Vec<f32>, not on any durable queue), and the abort handle is
+           the last-resort escape hatch for a wedged submitter.
 
     Track 2 — Live VAD loop (runs concurrently; per-call diarization gated on
               ctx.config.diarization, initial_prompt gated on
@@ -256,11 +265,17 @@ Frontend: start_live_transcription(config)
            the path on dictation_history instead. Then emit "session-part-ready" with
            { session_id, part_index, file_path, format, duration_seconds, sample_rate }
            (or "session-wav-error" on empty recordings)
-        7. Wait for the backfill submitter task to finish enqueuing chunks
-           (capped at the scheduler's default shutdown timeout — 5 min)
-        8. scheduler.shutdown_and_return(timeout) — drains the queue
-           (FinalFlush, Live, then Backfill) and returns the client to
-           TranscriptionClientState (even after panic via AssertUnwindSafe)
+        7. Wait for the backfill submitter task to finish (capped at 5 min).
+           The submitter awaits each chunk's scheduler response before
+           submitting the next, so this is a wait for actual transcription,
+           not for an enqueue loop. Chunks not yet submitted at submitter
+           abort time are not on any durable queue and are lost.
+        8. scheduler.shutdown_and_return(timeout) — finishes whichever single
+           chunk is in-flight at the scheduler when the submitter exits and
+           returns the client to TranscriptionClientState (even after panic
+           via AssertUnwindSafe). On worker timeout the client is dropped
+           rather than returned, since an aborted worker may still hold an
+           in-flight Arc clone — the next session re-initializes the engine.
     → Per-source VAD: SourceVadState tracks mic/system independently
     → Prompt context: per-source accumulated_text (up to 1000 chars) truncated to prompt_context_chars (default 350) for Whisper initial_prompt
     → Prompt decay: clears both shared_prompt and per-source accumulated_text after prompt_decay_silence_seconds (default 5s) of
@@ -303,14 +318,20 @@ stops normal ingestion and stream health work, waits only for that bounded
 tail window, copies final live tails from the stop-bounded ranges, flushes the
 session WAV only up to the same positions, drains in-flight live tasks, then
 submits the copied tails at `FinalFlush` priority. Only after those bounded
-live tasks finish does it clear the live-busy gate so copied backfill can
-drain. `shutdown_and_return` drains remaining Backfill jobs and hands the
-client back to `TranscriptionClientState`. The shutdown timeout (default
-5 min) is the only ceiling — generous enough for a typical 5-minute backfill
-window to fully transcribe, bounded so a wedged sidecar can't hang the stop
-path forever. Backfill audio is owned by the submitter task as `Vec<f32>`, so
-ring-buffer churn after extraction cannot lose it; ring-buffer audio written
-after the bounded stop tail is ignored for the stopped session.
+live tasks finish does it clear the live-busy gate so the backfill submitter
+can drain. The live loop then awaits the backfill submitter's join (capped at
+5 min); the submitter awaits each chunk's scheduler response before submitting
+the next, so this wait is a wait for actual transcription to finish, not for
+an enqueue loop to drain. Anything still in the submitter's `Vec<f32>` chunk
+list at the join timeout is lost — there is no durable scheduler queue that
+holds chunks the submitter never submitted. After the submitter exits,
+`shutdown_and_return` finishes whatever single chunk is in-flight at the
+scheduler and hands the client back to `TranscriptionClientState`; on a
+worker-timeout abort it drops the client instead of returning it, since the
+aborted worker may still hold an in-flight Arc clone. Backfill audio captured
+into the submitter's `Vec<f32>` is durable against ring-buffer churn for as
+long as the submitter is alive; ring-buffer audio written after the bounded
+stop tail is ignored for the stopped session.
 
 **Job submission API.** `scheduler.submit(JobRequest { origin, source,
 wav_path, language, initial_prompt, diarization })` returns a

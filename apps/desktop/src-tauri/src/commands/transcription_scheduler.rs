@@ -18,14 +18,25 @@
 //! worker owns the only live `Arc<TranscriptionClient>` clone outside of its
 //! own brief in-call clone, so `Arc::try_unwrap` succeeds at `respawn()` time.
 //!
-//! Backfill durability: on stop, the live loop submits any in-flight speech
-//! as `FinalFlush` jobs, then waits for the backfill submitter task to finish
-//! enqueuing chunks, then calls `shutdown_and_return`. The worker drains the
-//! whole queue (FinalFlush + remaining Backfill) before exiting, so backfill
-//! audio that was already extracted into memory is never silently dropped on
-//! stop. The shutdown timeout is the only ceiling — generous (5 min) so a
-//! long backfill can finish, but bounded so a wedged sidecar can't hang the
-//! stop path forever.
+//! Backfill on stop: the live loop submits any in-flight speech as
+//! `FinalFlush` jobs, then awaits the *backfill submitter task* (the one
+//! spawned in `live_transcription.rs::process_backfill`). The submitter
+//! awaits each chunk's scheduler response before submitting the next — per-
+//! chunk prompt context and in-order segment emission both depend on this
+//! serial wait — so the submitter, not the scheduler, is what's actually
+//! draining backfill post-stop. Chunks not yet submitted at submitter abort
+//! time live in the submitter's stack as `Vec<f32>` and are lost; the
+//! scheduler holds no durable queue of unsubmitted chunks. The 5-min
+//! submitter-join timeout in the live loop is the real ceiling on backfill
+//! drain; `shutdown_and_return`'s timeout only governs whatever single chunk
+//! is in flight at the scheduler when the submitter exits.
+//!
+//! Worker-timeout safety: if `shutdown_and_return`'s timeout fires, the
+//! worker is aborted *and the transcription client is dropped* rather than
+//! returned to shared state. The aborted worker may still hold an in-flight
+//! Arc clone of the client; handing the same client to a new session would
+//! race the sidecar's response routing. Callers that observe a `false`
+//! return value should treat the engine as un-initialized.
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -268,28 +279,73 @@ impl TranscriptionScheduler {
     /// state it was extracted from. Safe to call multiple times.
     ///
     /// `timeout` caps how long we wait for the worker to drain — beyond it,
-    /// any unfinished jobs are cancelled and the client is taken back
-    /// forcibly. Use `DEFAULT_SHUTDOWN_TIMEOUT_SECS` unless you have a
-    /// reason to differ.
-    pub async fn shutdown_and_return(&self, timeout: Duration) {
+    /// any unfinished jobs are cancelled and the worker is aborted. Use
+    /// `DEFAULT_SHUTDOWN_TIMEOUT_SECS` unless you have a reason to differ.
+    ///
+    /// Returns `true` only if the transcription client was actually placed
+    /// back into shared state. Returns `false` for any path where shared
+    /// state is left empty: worker timeout (aborted; in-flight clone may
+    /// still be live), worker panic (e.g. the `Arc::try_unwrap` invariant
+    /// panic inside `respawn_client`, which leaves `inner.client = None`),
+    /// or any other non-clean exit. On `false`, callers must treat the
+    /// engine as un-initialized and re-init before the next session.
+    pub async fn shutdown_and_return(&self, timeout: Duration) -> bool {
         if self.inner.shutdown.swap(true, Ordering::AcqRel) {
-            return;
+            // A previous call already ran the take/return path. Whether
+            // the client was returned then is no longer observable here;
+            // the first caller is responsible for acting on the prior
+            // return value.
+            return true;
         }
-        // Wake the worker so it notices the shutdown flag.
-        self.inner.notify.notify_waiters();
+        // Wake the worker so it notices the shutdown flag. `notify_one`
+        // (not `notify_waiters`) is the correct primitive: it stores a
+        // permit if the worker isn't currently inside `notified().await`.
+        // Otherwise a shutdown set in the gap between the worker's
+        // `shutdown.load()` and its `notified().await` would be silently
+        // dropped, and the worker would sleep on an empty queue until
+        // the timeout aborts it — dropping the transcription client
+        // even though there was nothing to drain.
+        self.inner.notify.notify_one();
 
         let worker = {
             let mut guard = self.worker.lock().await;
             guard.take()
         };
+        // Track whether the worker exited cleanly. Anything else — abort,
+        // panic, cancellation — means we cannot trust that no in-flight
+        // clone of the client is still live, and we must drop our own.
+        let mut worker_clean = true;
         if let Some(worker) = worker {
+            // Capture the abort handle *before* `worker` is consumed by the
+            // timeout future. If the timeout fires we need to forcibly stop
+            // the worker — dropping the JoinHandle alone only detaches it,
+            // leaving the worker free to continue holding an in-flight clone
+            // of the transcription client.
+            let abort_handle = worker.abort_handle();
             match tokio::time::timeout(timeout, worker).await {
                 Ok(Ok(())) => {}
-                Ok(Err(e)) => warn!("scheduler worker joined with error: {}", e),
-                Err(_) => warn!(
-                    "scheduler worker did not exit within {}s — cancelling pending jobs",
-                    timeout.as_secs()
-                ),
+                Ok(Err(e)) => {
+                    // JoinError covers both panic and cancellation. The
+                    // worker may have panicked mid-`respawn_client`, which
+                    // takes `inner.client` *before* the panic — so the
+                    // client is already gone, and shared state must stay
+                    // empty.
+                    warn!(
+                        "scheduler worker joined with error: {} — \
+                         treating as engine drop",
+                        e
+                    );
+                    worker_clean = false;
+                }
+                Err(_) => {
+                    warn!(
+                        "scheduler worker did not exit within {}s — aborting; \
+                         transcription client will not be returned to shared state",
+                        timeout.as_secs()
+                    );
+                    abort_handle.abort();
+                    worker_clean = false;
+                }
             }
         }
 
@@ -300,16 +356,42 @@ impl TranscriptionScheduler {
             queues.cancel_all();
         }
 
-        // Return the client to shared state. We hold the *only* Arc clone
-        // outside the worker's transient in-call clones, so the Arc that
-        // remains here can be put straight back; no try_unwrap needed since
-        // shared_state already stores `Arc<TranscriptionClient>`.
-        let mut private_guard = self.inner.client.lock().await;
-        if let Some(arc_client) = private_guard.take() {
-            let mut shared = self.inner.shared_state.lock().await;
-            *shared = Some(arc_client);
-            debug!("returned transcription client to shared state");
+        let arc_client = self.inner.client.lock().await.take();
+
+        // The client is returned to shared state ONLY on the clean path:
+        // worker exited cleanly AND we still hold the client. Every other
+        // combination — worker non-clean, or client missing because a
+        // panic in `respawn_client` already dropped it — is an engine
+        // drop, and the caller must observe `false` to re-init.
+        if worker_clean {
+            if let Some(arc_client) = arc_client {
+                let mut shared = self.inner.shared_state.lock().await;
+                *shared = Some(arc_client);
+                debug!("returned transcription client to shared state");
+                return true;
+            }
+            // Reachable only if something outside this scheduler took the
+            // client — defensive, not expected in normal operation.
+            warn!(
+                "scheduler worker exited cleanly but no client to return; \
+                 next session will need to re-initialize the engine"
+            );
+            return false;
         }
+
+        if arc_client.is_some() {
+            error!(
+                "scheduler shutdown aborted worker; dropping transcription client \
+                 (next session will need to re-initialize the engine)"
+            );
+        } else {
+            error!(
+                "scheduler worker exited unexpectedly with no client retained \
+                 (next session will need to re-initialize the engine)"
+            );
+        }
+        drop(arc_client);
+        false
     }
 }
 

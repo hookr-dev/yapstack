@@ -2255,14 +2255,21 @@ async fn live_transcription_loop(
 
     // Spawn concurrent backfill processing.
     //
-    // Backfill is no longer cancelled on stop — it submits jobs to the
-    // scheduler at `Backfill` priority and the scheduler keeps draining
-    // them after the live loop has exited. The stop path waits for this
-    // task to finish enqueuing chunks, then calls
-    // `scheduler.shutdown_and_return` which drains any still-queued chunks
-    // up to a generous timeout. The abort handle remains as a last-resort
-    // escape hatch if `shutdown_and_return`'s timeout fires while the
-    // submitter is genuinely stuck (e.g. deadlocked Silero init).
+    // Backfill is no longer cancelled on stop — its submitter task keeps
+    // running after the live loop has exited and the stop path waits for
+    // it to finish. The submitter submits each chunk to the scheduler at
+    // `Backfill` priority and *awaits the scheduler response before
+    // submitting the next chunk* (each chunk's prompt context depends on
+    // the prior chunk's transcribed text, and segments emit in order as
+    // results arrive). That means the wait for backfill to finish is a
+    // wait for actual transcription, not a wait for an enqueue loop —
+    // chunks not yet submitted by the submitter at abort time are not on
+    // any durable queue and will be lost. The stop path's submitter-join
+    // timeout (default 5 min) is the real ceiling on backfill drain;
+    // `shutdown_and_return`'s timeout only governs whatever single chunk
+    // is in-flight at the scheduler when the submitter exits. The abort
+    // handle is the last-resort escape hatch if the submitter is genuinely
+    // stuck (e.g. deadlocked Silero init).
     let backfill_done = Arc::new(AtomicBool::new(false));
     let backfill_handle = if !backfill_audio.is_empty() {
         // Namespace live chunk indices to avoid collision with backfill (0..N)
@@ -2282,7 +2289,13 @@ async fn live_transcription_loop(
         let abort_handle = handle.abort_handle();
         Some((handle, abort_handle))
     } else {
+        // No backfill audio to process — either the user requested zero, the
+        // ring buffer had no history, or this is a resume. Tell the frontend
+        // immediately so the "backfill in progress" UI affordance clears
+        // even when the user requested non-zero backfill but the buffer was
+        // too short to honor it.
         backfill_done.store(true, Ordering::Release);
+        let _ = ctx.app_handle.emit("backfill-complete", ());
         None
     };
 
@@ -2730,18 +2743,23 @@ async fn live_transcription_loop(
 
     // Wait for concurrent backfill to finish before emitting Stopped.
     //
-    // Unlike the previous design, we never cancel the backfill submitter on
-    // stop. The submitter walks its in-memory chunk list and awaits each
-    // scheduler response in turn; the scheduler prioritizes `FinalFlush` and
-    // `Live` work over `Backfill`, so any closing-words chunks queued at stop
-    // outrank remaining backfill and drain quickly. The submitter then
-    // continues working through whatever backfill chunks remain.
+    // Unlike the previous design, we never proactively cancel the backfill
+    // submitter on stop. The submitter walks its in-memory chunk list and
+    // awaits each scheduler response in turn; the scheduler prioritizes
+    // `FinalFlush` and `Live` work over `Backfill`, so any closing-words
+    // chunks queued at stop outrank remaining backfill and drain quickly.
+    // The submitter then continues working through whatever backfill chunks
+    // remain.
     //
-    // The actual ceiling on "how long can backfill drain after stop" is set
-    // by `scheduler.shutdown_and_return` below — it caps total drain time so
-    // a wedged sidecar can't hang the stop path forever, but it's generous
-    // enough (default 5 min) that a normal backfill window completes. The
-    // abort handle is the last-resort escape hatch.
+    // This wait *is* the real ceiling on backfill drain time, because the
+    // submitter awaits each chunk's response before submitting the next.
+    // `shutdown_and_return` below only governs whatever single chunk
+    // (FinalFlush, Live, or Backfill) is in-flight at the scheduler when
+    // the submitter exits — chunks not yet submitted by the submitter at
+    // abort time are not on any durable queue and will be lost. The 5-min
+    // submitter-join timeout is generous enough that a normal backfill
+    // window completes; the abort handle is the last-resort escape hatch
+    // for a genuinely stuck submitter.
     if let Some((handle, abort_handle)) = backfill_handle {
         match tokio::time::timeout(Duration::from_secs(DEFAULT_SHUTDOWN_TIMEOUT_SECS), handle).await
         {
@@ -4276,16 +4294,22 @@ pub async fn start_live_transcription(
             .catch_unwind()
             .await;
 
-            // Always return the transcription client to shared state, even
-            // after a panic. The scheduler owns the sole `Arc` clone; its
-            // shutdown drains the worker, returns the client to the shared
-            // state, and logs loudly if the Arc is somehow still held
-            // elsewhere (which would indicate a bug in the scheduler itself,
-            // not a normal lifecycle event).
-            ctx_guard
+            // Always run scheduler shutdown, even after a panic. On a clean
+            // worker exit the client is returned to shared state. On worker
+            // timeout the scheduler drops the client (an aborted worker may
+            // still hold an in-flight clone of it), and we tell the frontend
+            // so its `enginePhase` doesn't stay `ready` while shared state
+            // is actually empty — the next recording attempt would otherwise
+            // pass the FE readiness check and then fail with `NotInitialized`.
+            let client_returned = ctx_guard
                 .scheduler
                 .shutdown_and_return(Duration::from_secs(DEFAULT_SHUTDOWN_TIMEOUT_SECS))
                 .await;
+            if !client_returned {
+                let _ = ctx_guard
+                    .app_handle
+                    .emit("transcription-engine-dropped", ());
+            }
 
             if let Err(panic) = result {
                 error!("live transcription panicked: {:?}", panic);

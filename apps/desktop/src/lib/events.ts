@@ -118,6 +118,7 @@ export const EVENTS = {
   LIVE_TRANSCRIPTION_WARNING: "live-transcription-warning",
   LIVE_TRANSCRIPTION_PRESSURE: "live-transcription-pressure",
   TRANSCRIPTION_ENGINE_LOADED: "transcription-engine-loaded",
+  TRANSCRIPTION_ENGINE_DROPPED: "transcription-engine-dropped",
   BACKFILL_COMPLETE: "backfill-complete",
   SESSION_PART_READY: "session-part-ready",
   SESSION_WAV_ERROR: "session-wav-error",
@@ -150,6 +151,7 @@ type EventPayloadMap = {
   [EVENTS.LIVE_TRANSCRIPTION_WARNING]: LiveTranscriptionWarningEvent;
   [EVENTS.LIVE_TRANSCRIPTION_PRESSURE]: LiveTranscriptionPressureEvent;
   [EVENTS.TRANSCRIPTION_ENGINE_LOADED]: TranscriptionEngineLoadedEvent;
+  [EVENTS.TRANSCRIPTION_ENGINE_DROPPED]: void;
   [EVENTS.BACKFILL_COMPLETE]: void;
   [EVENTS.SESSION_PART_READY]: SessionPartReadyEvent;
   [EVENTS.SESSION_WAV_ERROR]: SessionWavErrorEvent;
