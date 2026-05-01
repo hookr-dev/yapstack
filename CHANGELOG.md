@@ -10,11 +10,19 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 - **Auto-failover on device change** — the device picker now reflects the OS state in real time. When AirPods drop, a USB mic is unplugged, or the user changes the system default in Settings, capture automatically rebinds the affected Stream to the new system default and shows a transient toast naming the new device ("Switched mic to MacBook Pro Microphone"). System-audio loopback follows the default output (and the alerts/UI route) the same way. `Mixed` capture stops both Sources fail-fast if either can't be recovered.
 - New Tauri events `devices-changed` and `default-device-changed`. The frontend listens for both and reconciles the persisted `selectedMicDeviceId` when its device disappears.
 - Fourth Core Audio property listener for `kAudioHardwarePropertyDefaultSystemOutputDevice` (the alerts/UI route), distinct from the media output selector.
+- `RestartTarget::FollowDefault` mode for `restart_mic`/broker-driven failover. Probes the new system default *first*, then falls through to stored id/name. The watchdog path keeps `PreserveBinding` (stored id first) for stream-error / write-pos-stall recovery.
 
 ### Changed
 - The Rust audio crate's listener path moved from `AtomicBool` flag-polling to a runtime-agnostic `DeviceEventSink` consumed by an always-on Tauri-side broker. The broker debounces bursty Core Audio events in a 250 ms window and gates restarts on `kAudioDevicePropertyDeviceIsAlive`, replacing the previous unconditional 200 ms `thread::sleep` workaround for the AirPods/Bluetooth revert window.
 - Dropped the defensive ~30 s name-comparison drift poll inside the live-transcription loop. Device changes flow exclusively through the broker now; the missed-event safety net is no longer needed.
 - `stream-health` event payload now carries `bound_device_name` so the FE can render device names in auto-failover toasts.
+- Promoted broker decisions (debounce flush, default-device-changed resolution, failover routing source/target, same-device rebind warnings) to `info`/`warn` level so the failover chain is visible in default-level logs without enabling `RUST_LOG=debug`.
+
+### Fixed
+- cpal's runtime-allocated loopback aggregate (`com.cpal.LoopbackRecordAggregateDevice`) no longer appears in the input-device picker. The aggregate is a private cpal implementation detail used for system-audio loopback; it leaked into in-process device enumeration despite being flagged private to System Settings, and selecting it as a microphone crashed capture with "stream type not supported." Filtered at enumeration time and additionally rejected by `start_mic` as defense-in-depth.
+- `is_device_alive` now actually gates broker-driven restarts on macOS. The previous `strip_cpal_prefix` helper expected `"CoreAudio:"` (CamelCase), but cpal's `HostId::Display` lowercases — the real prefix is `"coreaudio:"`. Since the helper was a no-op for every real device id, the AirPods-revert IsAlive gate has been bypassing every gate-check since this code shipped.
+- Broker-driven Mic failover now actually moves to the new default. The old probe order (stored-id → stored-name → default) caused the live loop to silently re-bind to the *previous* device whenever it was still alive — exactly the symptom users hit when plugging into a Thunderbolt dock that brings a new audio interface online while the laptop's built-in mic stays present.
+- Devices with empty names are filtered from the picker so the dropdown can't render a confusing blank entry.
 
 ### Removed
 - `AudioManager::{mic_default_changed, system_audio_default_changed, device_list_changed, mic_input_drifted, system_audio_output_drifted, live_default_input_name, live_default_output_name}` and `DefaultDeviceWatcher::take_change` — superseded by the event-driven sink path.

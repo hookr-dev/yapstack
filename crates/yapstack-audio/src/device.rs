@@ -23,6 +23,32 @@ fn device_id(device: &cpal::Device) -> Option<String> {
     device.id().ok().map(|id| id.to_string())
 }
 
+/// UID of cpal's internal loopback aggregate device on macOS. cpal
+/// allocates this at runtime when a system-audio loopback Stream is
+/// constructed (`host/coreaudio/macos/loopback.rs`); see its source
+/// doc-comment ("users shouldn't be using it") — it is *not* a device
+/// the user should ever be able to select. It is created with
+/// `kAudioEndPointDeviceIsPrivateKey: true`, which hides it from
+/// System Settings → Sound and Audio MIDI Setup, but **not** from
+/// in-process `host.input_devices()` enumeration. Selecting it as a
+/// mic crashes capture with "stream type not supported" because the
+/// aggregate's stream format reflects a process tap on a specific
+/// output device, not a real input.
+const CPAL_LOOPBACK_AGGREGATE_UID: &str = "com.cpal.LoopbackRecordAggregateDevice";
+
+/// Returns true when a cpal device id (`"coreaudio:<uid>"` on macOS) or
+/// a bare device name corresponds to cpal's internal loopback aggregate.
+/// Filters apply to enumeration *and* to user-supplied `mic_device_id`
+/// validation in `start_capture`.
+pub(crate) fn is_cpal_loopback_aggregate(id: Option<&str>, name: Option<&str>) -> bool {
+    if let Some(id) = id {
+        if id.contains(CPAL_LOOPBACK_AGGREGATE_UID) {
+            return true;
+        }
+    }
+    matches!(name, Some("Cpal loopback record aggregate device"))
+}
+
 pub fn list_input_devices() -> Result<Vec<AudioDeviceInfo>> {
     let host = cpal::default_host();
     let default_id = host.default_input_device().and_then(|d| device_id(&d));
@@ -38,7 +64,20 @@ pub fn list_input_devices() -> Result<Vec<AudioDeviceInfo>> {
             Some(n) => n,
             None => continue,
         };
+        // Defensive: an empty name passes the cpal description() check
+        // but renders as a confusing blank entry in the picker. Skip.
+        if name.trim().is_empty() {
+            continue;
+        }
         let id = device_id(&device);
+
+        // cpal's runtime-allocated loopback aggregate leaks into input
+        // enumeration on macOS even though it's flagged private. Hide
+        // it — see `is_cpal_loopback_aggregate` for context.
+        if is_cpal_loopback_aggregate(id.as_deref(), Some(&name)) {
+            continue;
+        }
+
         let is_default = id.is_some() && id == default_id;
 
         if let Some(existing) = seen.get_mut(&name) {
@@ -94,7 +133,13 @@ pub fn list_output_devices() -> Result<Vec<AudioDeviceInfo>> {
             Some(n) => n,
             None => continue,
         };
+        if name.trim().is_empty() {
+            continue;
+        }
         let id = device_id(&device);
+        if is_cpal_loopback_aggregate(id.as_deref(), Some(&name)) {
+            continue;
+        }
         let is_default = id.is_some() && id == default_id;
 
         if let Some(existing) = seen.get_mut(&name) {
@@ -416,6 +461,40 @@ mod tests {
     }
 
     #[test]
+    fn loopback_aggregate_is_recognized_by_id() {
+        // cpal formats the id as "coreaudio:com.cpal.LoopbackRecordAggregateDevice".
+        assert!(is_cpal_loopback_aggregate(
+            Some("coreaudio:com.cpal.LoopbackRecordAggregateDevice"),
+            None,
+        ));
+        // Bare UID also matches (callers that strip the host prefix).
+        assert!(is_cpal_loopback_aggregate(
+            Some("com.cpal.LoopbackRecordAggregateDevice"),
+            None,
+        ));
+    }
+
+    #[test]
+    fn loopback_aggregate_is_recognized_by_name_only() {
+        // Belt-and-braces in case cpal ever fails to surface the UID
+        // but still returns the device name.
+        assert!(is_cpal_loopback_aggregate(
+            None,
+            Some("Cpal loopback record aggregate device"),
+        ));
+    }
+
+    #[test]
+    fn unrelated_devices_are_not_loopback_aggregate() {
+        assert!(!is_cpal_loopback_aggregate(
+            Some("coreaudio:BuiltInMicrophoneDevice"),
+            Some("MacBook Pro Microphone"),
+        ));
+        assert!(!is_cpal_loopback_aggregate(None, None));
+        assert!(!is_cpal_loopback_aggregate(Some(""), Some("")));
+    }
+
+    #[test]
     fn is_device_alive_returns_true_for_unknown_uid() {
         // Fail-open contract: unknown UID returns true. The actual restart
         // attempt is the authoritative check.
@@ -434,10 +513,15 @@ mod tests {
         let host = cpal::default_host();
         let dev = host.default_input_device().expect("need default input");
         let id = device_id(&dev).expect("default input has an id");
-        // cpal's macOS DeviceId Display is "CoreAudio:<uid>"; strip prefix.
+        // cpal's `HostId::Display` lowercases the host name, so the
+        // formatted id looks like `"coreaudio:<uid>"`. Strip the
+        // lowercase prefix to get the bare UID kAudioDevicePropertyDeviceUID
+        // returns. (Regression note: this test was previously stripping
+        // the CamelCase form and silently no-op'd on the real cpal output;
+        // the fix in strip_cpal_prefix kept this assertion accurate.)
         let uid = id
-            .strip_prefix("CoreAudio:")
-            .expect("macOS device id format");
+            .strip_prefix("coreaudio:")
+            .expect("macOS device id format is 'coreaudio:<uid>'");
         assert!(is_device_alive(uid));
     }
 

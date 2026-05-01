@@ -103,7 +103,42 @@ Prerequisites:
 - Preflight does not trigger a default-device-change restart (that path is gone). It only catches stream errors and write-pos stalls.
 - The session starts cleanly on whichever device is currently default.
 
-## 10. Concurrent device storm
+## 10. Thunderbolt audio interface connect (real-world failover regression)
+
+**Setup.** Boot YapStack on the built-in mic. Start a Capture (any source).
+
+**Action.** Plug the laptop into a Thunderbolt dock with audio capability (or a dock that brings a USB audio interface online). Wait a few seconds for macOS to enumerate it and update the default input.
+
+**Expect.**
+- A `default-device-changed` log line names the new device (visible at `info` level).
+- A `routing Mic failover to live loop (from=... → to=...)` log line shows the resolved transition.
+- Toast "Switched mic to {new device}" appears.
+- Audio segments resume on the new device. The debug overlay's mic level meter responds to your voice.
+- **Regression check:** before the `RestartTarget::FollowDefault` fix, the broker would re-bind to the *old* device because the old device was still alive (the laptop's built-in mic doesn't disappear when a dock appears). If the toast says "Switched to MacBook Pro Microphone" but the OS says the dock is now default, that fix has regressed.
+
+## 11. cpal loopback aggregate must not appear in the picker
+
+**Setup.** Start a `Mixed` or `SystemOnly` Capture so cpal allocates its private loopback aggregate device. Open Settings → Audio.
+
+**Expect.**
+- The Input Device dropdown does **not** show "Cpal loopback record aggregate device" or any entry whose id contains `com.cpal.LoopbackRecordAggregateDevice`.
+- The Output Device list (if visible) likewise does not show it.
+- No empty-named entries appear.
+
+**Regression check.** Stop and restart Capture; cpal recreates the aggregate. Confirm it still doesn't surface in the picker.
+
+## 12. Manual selection of an output device as a mic must error cleanly
+
+**Setup.** Even after the fixes, defensively confirm that if a user somehow has a stale `selectedMicDeviceId` pointing at the loopback aggregate or any output-only device, capture refuses cleanly rather than crashing.
+
+**Action.** In a debug build, set `useAppStore.getState().updateSettings({ selectedMicDeviceId: "coreaudio:com.cpal.LoopbackRecordAggregateDevice" })` from the devtools console, then start a Capture.
+
+**Expect.**
+- `start_capture` returns an error with a message that names the loopback aggregate as not selectable.
+- The FE surfaces the error toast through the existing capture-error path.
+- No process crash, no opaque "stream type not supported" message.
+
+## 13. Concurrent device storm
 
 **Setup.** Start a Capture. While it's running, perform: USB unplug → wait 1 s → AirPods connect → wait 1 s → AirPods disconnect.
 
@@ -111,3 +146,19 @@ Prerequisites:
 - The broker coalesces overlapping events within each 250 ms window. At most one toast per discrete user action.
 - No `restart_abandoned` from over-eager retries.
 - Capture is alive at the end on whichever device is current.
+
+---
+
+## Reading the broker logs
+
+The most common failure mode is "the failover ran but bound to the wrong device." With the logging promotions, the diagnosis flow is:
+
+1. `device broker: listener fired (...)` — `debug` level. Confirms the Core Audio property listener actually fired for that selector. Missing → the listener never registered (boot error?) or the OS didn't push the event.
+2. `device broker: debounce flush — device_list=..., default_input=..., default_output=...` — `info` level. Confirms the broker observed the kinds you'd expect for the user action. AirPods drop → `default_input=true`; speaker swap → `default_output=true`.
+3. `device broker: default-device-changed kind=Input device=Some("...")` — `info`. The resolved new default device name. If this is wrong (or `None`), `default_input_device()` is failing.
+4. `device broker: routing Mic failover to live loop (from=... → to=...)` — `info`. Names both endpoints of the failover. If `from == to`, the dispatch is moot (broker should have skipped); if `to == None`, the new default couldn't be resolved.
+5. `stream health: Microphone needs restart (device-change, target=FollowDefault), attempt 1/3` — `warn`. The live loop received the intent and is invoking the restart with the right probe order.
+6. `device broker: direct Mic restart re-bound to the same device (...)` — `warn`. Same-device rebind on broker-driven dispatch is a regression signal: the new default's id matches the old. Either the OS hasn't fully committed the change, or `RestartTarget::FollowDefault` isn't being honored.
+7. `stream-health` event with `bound_device_name` — eventual outcome. The FE's "Switched to {name}" toast displays this.
+
+If steps 1–4 fire but step 5 doesn't, the `RestartIntent` is being lost between broker and live loop — check that `RestartIntentInbox` is set (live transcription is running) and the broker's `try_send_intent` returned `true`.

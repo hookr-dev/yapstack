@@ -1299,7 +1299,7 @@ async fn preflight_stream_health(
                 "preflight: mic stream needs restart (error={}, stalled={})",
                 mic_err, stalled
             );
-            match manager.restart_mic() {
+            match manager.restart_mic(yapstack_audio::manager::RestartTarget::PreserveBinding) {
                 Ok(_) => restarted.push(AudioSourceLabel::Mic),
                 Err(e) => {
                     error!("preflight: mic restart failed: {}", e);
@@ -1737,7 +1737,17 @@ async fn check_stream_health(
         // iteration gets a fresh mutable view without consuming the slot.
         #[allow(clippy::needless_option_as_deref)]
         let ws_borrow = session_wav_state.as_deref_mut();
-        attempt_source_restart(source, audio_state, app_handle, ws_borrow, &reason).await;
+        // Watchdog-driven restart: cpal error or write-pos stall. The
+        // bound device is presumed still correct; just the stream died.
+        attempt_source_restart(
+            source,
+            audio_state,
+            app_handle,
+            ws_borrow,
+            &reason,
+            yapstack_audio::manager::RestartTarget::PreserveBinding,
+        )
+        .await;
     }
 
     // Mixed mid-capture fail-fast. The user's intent with Mixed is
@@ -1801,12 +1811,14 @@ async fn attempt_source_restart(
     app_handle: &AppHandle,
     mut session_wav_state: Option<&mut SessionWavState>,
     reason: &str,
+    target: yapstack_audio::manager::RestartTarget,
 ) {
     let source_name = source_display_name(&source.label);
     warn!(
-        "stream health: {} needs restart ({}), attempt {}/{}",
+        "stream health: {} needs restart ({}, target={:?}), attempt {}/{}",
         source_name,
         reason,
+        target,
         source.restart_attempts + 1,
         STREAM_RESTART_MAX_ATTEMPTS
     );
@@ -1816,7 +1828,10 @@ async fn attempt_source_restart(
     let restart_result = {
         let mut manager = audio_state.lock().await;
         match source.label {
-            AudioSourceLabel::Mic => manager.restart_mic(),
+            AudioSourceLabel::Mic => manager.restart_mic(target),
+            // System audio always uses cpal's default output — there is
+            // no explicit-output picking to preserve, so the target
+            // parameter is structurally a no-op for this path.
             AudioSourceLabel::System => manager.restart_system_audio(),
         }
     };
@@ -2100,12 +2115,18 @@ async fn live_transcription_loop(
                 };
                 if let Some(source) = sources.iter_mut().find(|s| s.label == target_label) {
                     let ws_borrow = session_wav_state.as_mut();
+                    // Broker-driven restart: the OS just told us the
+                    // default device changed. We *want* the new default,
+                    // not the previously-bound one — probe the new
+                    // default first and let `restart_mic` fall through
+                    // to stored id/name only if the OS hasn't settled.
                     attempt_source_restart(
                         source,
                         &audio_state,
                         &ctx.app_handle,
                         ws_borrow,
                         "device-change",
+                        yapstack_audio::manager::RestartTarget::FollowDefault,
                     )
                     .await;
                 }

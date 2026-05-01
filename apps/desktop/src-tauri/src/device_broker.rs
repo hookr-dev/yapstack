@@ -93,6 +93,7 @@ pub fn spawn(
             tokio::select! {
                 maybe_event = rx.recv() => match maybe_event {
                     Some(first_event) => {
+                        debug!("device broker: listener fired ({:?}), opening debounce window", first_event);
                         let mut state = CollapsedEvents::default();
                         state.merge(first_event);
 
@@ -112,6 +113,14 @@ pub fn spawn(
                             }
                         }
 
+                        info!(
+                            "device broker: debounce flush — \
+                             device_list={}, default_input={}, default_output={}, default_system_output={}",
+                            state.device_list,
+                            state.default_input,
+                            state.default_output,
+                            state.default_system_output,
+                        );
                         flush(&app_handle, &audio_state, &restart_intent_inbox, state).await;
                     }
                     None => {
@@ -219,22 +228,29 @@ async fn dispatch_mic_restart(audio_state: &AudioManagerState, inbox: &RestartIn
             .map(yapstack_audio::device::is_device_alive)
             .unwrap_or(false);
         if still_alive {
-            debug!(
+            info!(
                 "device broker: explicit Mic ({:?}) still alive — ignoring DefaultInputChanged",
                 bound_uid
             );
             return;
         }
+        info!(
+            "device broker: explicit Mic ({:?}) is gone — falling over to system default",
+            bound_uid
+        );
     }
 
-    let default_uid = yapstack_audio::device::default_input_device()
-        .ok()
-        .and_then(|info| info.id);
+    let new_default = yapstack_audio::device::default_input_device().ok();
+    let default_uid = new_default.as_ref().and_then(|info| info.id.clone());
+    let default_name = new_default.as_ref().map(|info| info.name.clone());
     alive_gate(default_uid.as_deref()).await;
 
     let sent = try_send_intent(inbox, RestartIntent::Mic);
     if sent {
-        debug!("device broker: routed Mic restart to live loop");
+        info!(
+            "device broker: routing Mic failover to live loop (from={:?} → to={:?})",
+            bound_uid, default_name
+        );
         return;
     }
 
@@ -243,24 +259,41 @@ async fn dispatch_mic_restart(audio_state: &AudioManagerState, inbox: &RestartIn
         return;
     }
     let mut manager = audio_state.lock().await;
-    match manager.restart_mic() {
-        Ok(report) => info!(
-            "device broker: direct Mic restart ({:?}, bound={:?})",
-            report.outcome, report.bound_device_name
-        ),
+    match manager.restart_mic(yapstack_audio::manager::RestartTarget::FollowDefault) {
+        Ok(report) => {
+            if report.same_device {
+                warn!(
+                    "device broker: direct Mic restart re-bound to the same device ({:?}) — \
+                     OS may still be settling; retry on next event",
+                    report.new_device_id
+                );
+            } else {
+                info!(
+                    "device broker: direct Mic restart succeeded ({:?}, bound={:?})",
+                    report.outcome, report.bound_device_name
+                );
+            }
+        }
         Err(e) => warn!("device broker: direct Mic restart failed: {}", e),
     }
 }
 
 async fn dispatch_system_restart(audio_state: &AudioManagerState, inbox: &RestartIntentInbox) {
-    let default_uid = yapstack_audio::device::default_output_device()
-        .ok()
-        .and_then(|info| info.id);
+    let new_default = yapstack_audio::device::default_output_device().ok();
+    let default_uid = new_default.as_ref().and_then(|info| info.id.clone());
+    let default_name = new_default.as_ref().map(|info| info.name.clone());
+    let bound_name = {
+        let manager = audio_state.lock().await;
+        manager.system_audio_bound_device().map(|s| s.to_string())
+    };
     alive_gate(default_uid.as_deref()).await;
 
     let sent = try_send_intent(inbox, RestartIntent::System);
     if sent {
-        debug!("device broker: routed System restart to live loop");
+        info!(
+            "device broker: routing System failover to live loop (from={:?} → to={:?})",
+            bound_name, default_name
+        );
         return;
     }
 
@@ -271,10 +304,20 @@ async fn dispatch_system_restart(audio_state: &AudioManagerState, inbox: &Restar
         return;
     }
     match manager.restart_system_audio() {
-        Ok(report) => info!(
-            "device broker: direct System restart ({:?}, bound={:?})",
-            report.outcome, report.bound_device_name
-        ),
+        Ok(report) => {
+            if report.same_device {
+                warn!(
+                    "device broker: direct System restart re-bound to the same device ({:?}) — \
+                     OS may still be settling",
+                    report.new_device_id
+                );
+            } else {
+                info!(
+                    "device broker: direct System restart succeeded ({:?}, bound={:?})",
+                    report.outcome, report.bound_device_name
+                );
+            }
+        }
         Err(e) => warn!("device broker: direct System restart failed: {}", e),
     }
 }
@@ -297,11 +340,21 @@ fn try_send_intent(inbox: &RestartIntentInbox, intent: RestartIntent) -> bool {
     }
 }
 
-/// Strip cpal's macOS `DeviceId` prefix (`"CoreAudio:"`) so the bare
+/// Strip cpal's macOS `DeviceId` prefix (`"coreaudio:"`) so the bare
 /// `kAudioDevicePropertyDeviceUID` string can be passed to
-/// `yapstack_audio::device::is_device_alive`.
+/// `yapstack_audio::device::is_device_alive`. cpal's `HostId::Display`
+/// lowercases the host name (see `cpal/src/platform/mod.rs`), so the
+/// real prefix is lowercase — `CoreAudio:` (CamelCase) never appears
+/// in `device.id().to_string()`. The match is case-insensitive
+/// belt-and-braces in case cpal ever changes the formatter.
 fn strip_cpal_prefix(uid: &str) -> &str {
-    uid.strip_prefix("CoreAudio:").unwrap_or(uid)
+    if let Some(rest) = uid.strip_prefix("coreaudio:") {
+        return rest;
+    }
+    if let Some(rest) = uid.strip_prefix("CoreAudio:") {
+        return rest;
+    }
+    uid
 }
 
 #[cfg(test)]
@@ -358,7 +411,22 @@ mod tests {
     }
 
     #[test]
-    fn strip_cpal_prefix_removes_known_prefix() {
+    fn strip_cpal_prefix_removes_lowercase_prefix() {
+        // cpal's actual `HostId::Display` lowercases the host name, so
+        // the prefix is "coreaudio:" — this is the path real device
+        // ids take. Regression test for the bug where the helper used
+        // CamelCase and silently no-op'd every macOS UID.
+        assert_eq!(strip_cpal_prefix("coreaudio:BuiltInMic"), "BuiltInMic");
+        assert_eq!(
+            strip_cpal_prefix("coreaudio:com.apple.audio.SystemMicrophone"),
+            "com.apple.audio.SystemMicrophone"
+        );
+    }
+
+    #[test]
+    fn strip_cpal_prefix_falls_back_on_camelcase() {
+        // Belt-and-braces in case cpal ever changes its formatter back
+        // to CamelCase or a hand-built id uses it.
         assert_eq!(strip_cpal_prefix("CoreAudio:BuiltInMic"), "BuiltInMic");
     }
 
@@ -369,8 +437,9 @@ mod tests {
         // is_device_alive's fail-open path.
         assert_eq!(strip_cpal_prefix("BuiltInMic"), "BuiltInMic");
         assert_eq!(strip_cpal_prefix(""), "");
-        assert_eq!(strip_cpal_prefix("Wasapi:something"), "Wasapi:something");
+        assert_eq!(strip_cpal_prefix("wasapi:something"), "wasapi:something");
     }
+
 
     #[test]
     fn try_send_intent_returns_false_for_empty_inbox() {
@@ -443,10 +512,34 @@ fn emit_devices_changed(app_handle: &AppHandle) {
             return;
         }
     };
+    let input_summary: Vec<String> = inputs
+        .iter()
+        .map(|d| {
+            format!(
+                "{}{}",
+                d.name,
+                if d.is_default { " (default)" } else { "" }
+            )
+        })
+        .collect();
+    let output_summary: Vec<String> = outputs
+        .iter()
+        .map(|d| {
+            format!(
+                "{}{}",
+                d.name,
+                if d.is_default { " (default)" } else { "" }
+            )
+        })
+        .collect();
+    info!(
+        "device broker: devices-changed — inputs=[{}], outputs=[{}]",
+        input_summary.join(", "),
+        output_summary.join(", ")
+    );
     let mut all = inputs;
     all.extend(outputs);
     let payload: Vec<AudioDeviceInfoDto> = all.into_iter().map(AudioDeviceInfoDto::from).collect();
-    debug!("device broker: emitting devices-changed ({} devices)", payload.len());
     if let Err(e) = app_handle.emit("devices-changed", payload) {
         warn!("device broker: emit devices-changed failed: {}", e);
     }
@@ -467,16 +560,19 @@ fn emit_default_changed(app_handle: &AppHandle, kind: DefaultDeviceKindDto) {
     let (device_id, device_name) = match resolved {
         Ok(info) => (info.id, Some(info.name)),
         Err(e) => {
-            debug!("device broker: resolving default {:?} failed: {}", kind, e);
+            warn!("device broker: resolving default {:?} failed: {}", kind, e);
             (None, None)
         }
     };
+    info!(
+        "device broker: default-device-changed kind={:?} device={:?}",
+        kind, device_name
+    );
     let payload = DefaultDeviceChangedPayload {
         kind,
         device_id,
         device_name,
     };
-    debug!("device broker: emitting default-device-changed {:?}", payload);
     if let Err(e) = app_handle.emit("default-device-changed", payload) {
         warn!("device broker: emit default-device-changed failed: {}", e);
     }
