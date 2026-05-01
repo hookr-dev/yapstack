@@ -11,6 +11,7 @@ import { buildVocabularyHints } from "@/lib/transcription";
 
 export function useAutoTag(sessionId: string | null, isRecording: boolean) {
   const folders = useAppStore((s) => s.folders);
+  const folderTree = useAppStore((s) => s.folderTree);
   const tags = useAppStore((s) => s.tags);
   const sessionFolderMap = useAppStore((s) => s.sessionFolderMap);
   const sessionTagMap = useAppStore((s) => s.sessionTagMap);
@@ -23,6 +24,11 @@ export function useAutoTag(sessionId: string | null, isRecording: boolean) {
   const profilesRef = useRef(
     buildFolderProfiles(folders, tags, sessionFolderMap, sessionTagMap),
   );
+  // Sessions for which the user has already filed a folder via this UI.
+  // Lives outside the tracker so the completion state survives the
+  // tracker rebuild that fires when sessionFolderMap mutates after accept
+  // or override (otherwise the bar would flash back into view).
+  const completedSessionsRef = useRef(new Set<string>());
 
   // Profiles depend on the global folder/tag membership graph; the runtime
   // tracker just consumes them. Rebuild when any of those inputs change so a
@@ -44,10 +50,14 @@ export function useAutoTag(sessionId: string | null, isRecording: boolean) {
       return;
     }
     const existingFolders = sessionFolderMap[sessionId] ?? [];
-    trackerRef.current = new FolderSuggestionTracker(
+    const tracker = new FolderSuggestionTracker(
       profilesRef.current,
       existingFolders,
     );
+    if (completedSessionsRef.current.has(sessionId)) {
+      tracker.complete();
+    }
+    trackerRef.current = tracker;
     processedCountRef.current = 0;
   }, [sessionId, isRecording, sessionFolderMap]);
 
@@ -62,8 +72,6 @@ export function useAutoTag(sessionId: string | null, isRecording: boolean) {
     for (const seg of newSegments) {
       latest = trackerRef.current.processSegment(seg.text);
     }
-    // The tracker now returns the current top recommendation (0 or 1 item)
-    // each call, so replace state rather than append to it.
     setSuggestions((prev) => {
       if (latest.length === 0 && prev.length === 0) return prev;
       if (
@@ -76,19 +84,35 @@ export function useAutoTag(sessionId: string | null, isRecording: boolean) {
     });
   }, [activeSessionSegments, isRecording]);
 
+  const refreshVocabularyHints = useCallback(async () => {
+    const updatedHints = buildVocabularyHints(await listFolders(), await listTags());
+    if (updatedHints) {
+      commands.updateVocabularyHints(updatedHints).catch(() => {});
+    }
+  }, []);
+
   const acceptSuggestion = useCallback(
     async (suggestion: FolderSuggestion) => {
       if (!sessionId) return;
+      completedSessionsRef.current.add(sessionId);
       trackerRef.current?.accept(suggestion.id);
-      setSuggestions((prev) => prev.filter((s) => s.id !== suggestion.id));
+      setSuggestions([]);
       await addSessionToFolder(sessionId, suggestion.id);
-
-      const updatedHints = buildVocabularyHints(await listFolders(), await listTags());
-      if (updatedHints) {
-        commands.updateVocabularyHints(updatedHints).catch(() => {});
-      }
+      await refreshVocabularyHints();
     },
-    [sessionId, addSessionToFolder],
+    [sessionId, addSessionToFolder, refreshVocabularyHints],
+  );
+
+  const applyOverride = useCallback(
+    async (folderId: string) => {
+      if (!sessionId) return;
+      completedSessionsRef.current.add(sessionId);
+      trackerRef.current?.complete();
+      setSuggestions([]);
+      await addSessionToFolder(sessionId, folderId);
+      await refreshVocabularyHints();
+    },
+    [sessionId, addSessionToFolder, refreshVocabularyHints],
   );
 
   const dismissSuggestion = useCallback((suggestion: FolderSuggestion) => {
@@ -96,5 +120,12 @@ export function useAutoTag(sessionId: string | null, isRecording: boolean) {
     setSuggestions((prev) => prev.filter((s) => s.id !== suggestion.id));
   }, []);
 
-  return { suggestions, acceptSuggestion, dismissSuggestion };
+  return {
+    suggestions,
+    folders,
+    folderTree,
+    acceptSuggestion,
+    applyOverride,
+    dismissSuggestion,
+  };
 }

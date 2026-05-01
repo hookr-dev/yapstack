@@ -162,6 +162,13 @@ export class FolderSuggestionTracker {
   private existingFolderIds: Set<string>;
   private threshold: number;
   private minScore: number;
+  /**
+   * Once the user picks any folder via the suggestion UI (accept the
+   * recommendation or override with a different one), the channel is closed
+   * for this session. Re-recommending after the user has already filed the
+   * session is noisy. Dismiss is per-folder and does NOT flip this flag.
+   */
+  private completed = false;
 
   constructor(
     profiles: FolderProfile[],
@@ -199,6 +206,7 @@ export class FolderSuggestionTracker {
   }
 
   private currentRecommendation(): FolderSuggestion[] {
+    if (this.completed) return [];
     if (this.scores.size === 0) return [];
 
     const lengthDamp = Math.max(1, Math.sqrt(this.wordsSeen / LENGTH_NORM_FLOOR_WORDS));
@@ -242,6 +250,12 @@ export class FolderSuggestionTracker {
   accept(folderId: string): void {
     this.accepted.add(folderId);
     this.existingFolderIds.add(folderId);
+    this.completed = true;
+  }
+
+  /** User picked a folder via the override path (not the recommended one). */
+  complete(): void {
+    this.completed = true;
   }
 
   addExistingFolder(folderId: string): void {

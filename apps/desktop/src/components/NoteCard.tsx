@@ -1,4 +1,4 @@
-import { type CSSProperties, memo, useMemo } from "react";
+import { memo, useMemo } from "react";
 import { useAppStore } from "@/stores/appStore";
 import type { DbSession } from "@/lib/db";
 import { cn, formatRelativeTime } from "@/lib/utils";
@@ -17,14 +17,7 @@ import {
   ContextMenuTrigger,
 } from "@/components/ui/context-menu";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
-
-function folderBadgeStyle(color: string | null): CSSProperties {
-  if (!color) return {};
-  return {
-    backgroundColor: `color-mix(in oklch, ${color} 15%, transparent)`,
-    color: color,
-  };
-}
+import { folderBadgeStyle } from "@/lib/folder-badge";
 
 function FolderNodeItem({
   folder,
