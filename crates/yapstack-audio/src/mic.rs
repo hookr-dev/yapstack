@@ -24,10 +24,11 @@ pub struct MicrophoneCapture {
     last_device_name: Option<String>,
     /// True when `start()` was called without an explicit `device_id`, so we
     /// intentionally bound whatever the OS default input was at that moment.
-    /// Used by the drift-poll defense (`mic_input_drifted`): if the user
-    /// explicitly picked a non-default device, a mismatch against the
-    /// current default is the configured state, not drift, and the check
-    /// would otherwise fire on every poll.
+    /// Surfaced via `AudioManager::mic_bound_is_default` so the device
+    /// broker can distinguish "follow default" from an explicit pick on
+    /// `DefaultInputChanged` events: an explicit-but-still-alive pick
+    /// keeps its binding, an explicit-but-disappeared pick falls over
+    /// to the new default, a follow-default binding always fails over.
     bound_is_default: bool,
 }
 

@@ -521,10 +521,6 @@ struct SourceVadState {
     restart_attempts: u32,
     /// When the last restart was attempted (for cooldown).
     last_restart_at: Option<Instant>,
-    /// When the defensive device-identity drift poll last ran. Throttled to
-    /// a few seconds so the `cpal::default_host()` call isn't made on every
-    /// ~100–300 ms loop tick.
-    last_device_check_at: Option<Instant>,
     /// True while a background chunk task is running for this source. VAD
     /// state keeps updating (so second-utterance-during-in-flight is still
     /// captured) but dispatch and idle-cursor advance are gated off.
@@ -568,7 +564,6 @@ impl SourceVadState {
             last_write_pos_advance: Instant::now(),
             restart_attempts: 0,
             last_restart_at: None,
-            last_device_check_at: None,
             silero: SileroSource::new(initial_pos),
         }
     }
@@ -1224,12 +1219,6 @@ const STREAM_STALL_THRESHOLD_SECS: f32 = 2.0;
 const STREAM_RESTART_MAX_ATTEMPTS: u32 = 3;
 /// Minimum seconds between restart attempts for the same source.
 const STREAM_RESTART_COOLDOWN_SECS: f32 = 5.0;
-/// Throttle for the defensive device-identity drift poll. Primary detection
-/// is the push-based CoreAudio property listener (Layer 0); this poll only
-/// covers the rare case where listener registration fails or the OS drops
-/// an event. A short throttle caps the cost of the periodic
-/// `cpal::default_host()` lookup.
-const DEVICE_IDENTITY_POLL_INTERVAL_SECS: f32 = 3.0;
 
 // --- Pure stream health decision helpers ---
 
@@ -1762,11 +1751,11 @@ async fn check_stream_health(
             .any(|s| s.restart_attempts >= STREAM_RESTART_MAX_ATTEMPTS)
 }
 
-/// Layers 1–3: symptom-based detection, gated by the speculative-restart
+/// Symptom-based stream-failure detection, gated by the speculative-restart
 /// cooldown in the caller. Layer 1 is the cpal error-callback flag (instant);
-/// Layer 2 is the write-position stall watchdog (~2 s); Layer 3 is the
-/// defensive device-identity drift poll that catches a missed Layer-0 event.
-/// Returns the first reason that fires, or `None` if none do.
+/// Layer 2 is the write-position stall watchdog (~2 s). Default-device
+/// changes are handled by the device broker, not here. Returns the first
+/// reason that fires, or `None` if none do.
 async fn evaluate_speculative_signals(
     source: &mut SourceVadState,
     audio_state: &AudioManagerState,
@@ -1794,31 +1783,6 @@ async fn evaluate_speculative_signals(
         && should_stall_restart(&source.label)
     {
         return Some("write position stalled".into());
-    }
-
-    // Layer 3: defensive device-identity drift poll. Throttled.
-    let should_check = source
-        .last_device_check_at
-        .is_none_or(|t| t.elapsed() > Duration::from_secs_f32(DEVICE_IDENTITY_POLL_INTERVAL_SECS));
-    if should_check {
-        source.last_device_check_at = Some(Instant::now());
-        let drift = match source.label {
-            AudioSourceLabel::Mic => manager.mic_input_drifted(),
-            AudioSourceLabel::System => manager.system_audio_output_drifted(),
-        };
-        if let Some(new_name) = drift {
-            let bound = match source.label {
-                AudioSourceLabel::Mic => manager.mic_bound_device(),
-                AudioSourceLabel::System => manager.system_audio_bound_device(),
-            }
-            .map(str::to_string)
-            .unwrap_or_else(|| "<unknown>".into());
-            warn!(
-                "device identity drift without listener event: '{}' → '{}' (rebinding)",
-                bound, new_name
-            );
-            return Some("device identity drift (listener missed)".into());
-        }
     }
 
     None

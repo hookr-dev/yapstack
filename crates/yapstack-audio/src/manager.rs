@@ -854,72 +854,6 @@ impl AudioManager {
         self.mic.last_device_name()
     }
 
-    /// Defensive device-identity drift check. Returns `Some(current_default_name)`
-    /// when the currently-bound system-audio output device differs from the
-    /// OS default output device, else `None`. Only meaningful when system
-    /// capture is running. This is the fallback for the push listener —
-    /// the listener should fire first under normal conditions.
-    pub fn system_audio_output_drifted(&self) -> Option<String> {
-        if !self.system.is_running() {
-            return None;
-        }
-        let bound = self.system.last_device_name()?;
-        let current = current_default_output_name()?;
-        if current != bound {
-            Some(current)
-        } else {
-            None
-        }
-    }
-
-    /// Defensive device-identity drift check for the microphone. Returns
-    /// `Some(current_default_name)` when the currently-bound input device
-    /// differs from the OS default input device, else `None`.
-    ///
-    /// Skipped when the mic was bound to a user-selected non-default device:
-    /// the drift check exists to catch a missed CoreAudio default-device
-    /// notification, which is only meaningful if we're tracking the default.
-    /// Without this guard the check reports drift on every poll for users
-    /// who explicitly pick a non-default mic, producing a restart storm.
-    pub fn mic_input_drifted(&self) -> Option<String> {
-        if !self.mic.is_running() {
-            return None;
-        }
-        if !self.mic.bound_is_default() {
-            return None;
-        }
-        let bound = self.mic.last_device_name()?;
-        let current = current_default_input_name()?;
-        if current != bound {
-            Some(current)
-        } else {
-            None
-        }
-    }
-}
-
-fn current_default_output_name() -> Option<String> {
-    use cpal::traits::{DeviceTrait, HostTrait};
-    let device = cpal::default_host().default_output_device()?;
-    device.description().ok().map(|d| d.name().to_string())
-}
-
-fn current_default_input_name() -> Option<String> {
-    use cpal::traits::{DeviceTrait, HostTrait};
-    let device = cpal::default_host().default_input_device()?;
-    device.description().ok().map(|d| d.name().to_string())
-}
-
-/// Public live-query helper for the current OS default output device name.
-/// Used by the stream-health layer to re-verify a push-listener event after
-/// a settle delay — so we don't rebind during a macOS "revert" window.
-pub fn live_default_output_name() -> Option<String> {
-    current_default_output_name()
-}
-
-/// Public live-query helper for the current OS default input device name.
-pub fn live_default_input_name() -> Option<String> {
-    current_default_input_name()
 }
 
 impl Default for AudioManager {
@@ -1235,13 +1169,6 @@ mod tests {
         let manager = AudioManager::new();
         assert!(manager.system_audio_bound_device().is_none());
         assert!(manager.mic_bound_device().is_none());
-    }
-
-    #[test]
-    fn test_drift_none_when_not_running() {
-        let manager = AudioManager::new();
-        assert!(manager.system_audio_output_drifted().is_none());
-        assert!(manager.mic_input_drifted().is_none());
     }
 
     #[test]
