@@ -328,6 +328,13 @@ interface AppState {
   liveTranscriptionActive: boolean;
   livePhase: LiveTranscriptionPhase | null;
   backfillActive: boolean;
+  /// Audio offset (seconds) where backfill ends and live audio begins, used to
+  /// position the "Processing prior audio" indicator between old and new
+  /// segments in the chat. Seeded from the requested backfill duration, then
+  /// expanded as backfill chunks land so the boundary tracks effective
+  /// (clamped) backfill rather than requested. Null when no backfill is
+  /// active for this session.
+  backfillBoundarySeconds: number | null;
   // True from when the user clicks Stop until the backend's Stopped/Error
   // event fires. Lets the UI show a pulsing "Finalizing…" state immediately
   // while the engine drains the current chunk + finalizes the WAV.
@@ -637,6 +644,7 @@ function createAppStore() {
       liveTranscriptionActive: false,
       livePhase: null,
       backfillActive: false,
+      backfillBoundarySeconds: null,
       sessionStopping: false,
       noteRefreshCounter: 0,
       playbackTime: 0,
@@ -698,6 +706,7 @@ function createAppStore() {
                 liveTranscriptionActive: false,
                 livePhase: null,
                 backfillActive: false,
+                backfillBoundarySeconds: null,
                 sessionStopping: false,
               });
 
@@ -778,6 +787,21 @@ function createAppStore() {
               hidden: 0,
               speaker_id: seg.speaker_id ?? null,
             });
+          }
+
+          // Track the highest end-offset seen from a backfill chunk so the
+          // chat indicator can sit at the actual backfill→live boundary.
+          // Stays null until the first backfill chunk lands — using the
+          // requested duration as a placeholder would over-shoot the
+          // effective (clamped) boundary and mis-classify early live
+          // segments as backfill. Updated even for empty chunks (silence
+          // still advances the rewind cursor).
+          if (event.is_backfill && targetSessionId === get().activeSessionId) {
+            const chunkEnd = event.audio_offset_seconds + event.chunk_duration_seconds;
+            const current = get().backfillBoundarySeconds;
+            if (current == null || chunkEnd > current) {
+              set({ backfillBoundarySeconds: chunkEnd });
+            }
           }
 
           if (newSegments.length === 0) return;
@@ -1074,6 +1098,7 @@ function createAppStore() {
           currentView: "note-detail",
           selectedSessionId: sessionId,
           backfillActive: (backfillSeconds ?? 0) > 0,
+          backfillBoundarySeconds: null,
         });
 
         // Reload sidebar
@@ -1191,6 +1216,7 @@ function createAppStore() {
           selectedSessionId: sessionId,
           sessionStopping: false,
           backfillActive: false,
+          backfillBoundarySeconds: null,
         });
       },
 
