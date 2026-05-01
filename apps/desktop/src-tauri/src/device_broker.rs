@@ -304,6 +304,109 @@ fn strip_cpal_prefix(uid: &str) -> &str {
     uid.strip_prefix("CoreAudio:").unwrap_or(uid)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex as StdMutex;
+
+    #[test]
+    fn collapsed_events_default_all_false() {
+        let s = CollapsedEvents::default();
+        assert!(!s.device_list);
+        assert!(!s.default_input);
+        assert!(!s.default_output);
+        assert!(!s.default_system_output);
+    }
+
+    #[test]
+    fn collapsed_events_merge_sets_each_kind() {
+        let mut s = CollapsedEvents::default();
+        s.merge(DeviceEvent::DeviceListChanged);
+        s.merge(DeviceEvent::DefaultInputChanged);
+        s.merge(DeviceEvent::DefaultOutputChanged);
+        s.merge(DeviceEvent::DefaultSystemOutputChanged);
+        assert!(s.device_list);
+        assert!(s.default_input);
+        assert!(s.default_output);
+        assert!(s.default_system_output);
+    }
+
+    #[test]
+    fn collapsed_events_merge_is_idempotent_per_kind() {
+        // Repeated events of the same kind during the debounce window
+        // collapse to a single emit pass.
+        let mut s = CollapsedEvents::default();
+        s.merge(DeviceEvent::DefaultInputChanged);
+        s.merge(DeviceEvent::DefaultInputChanged);
+        s.merge(DeviceEvent::DefaultInputChanged);
+        assert!(s.default_input);
+        assert!(!s.default_output);
+        assert!(!s.default_system_output);
+        assert!(!s.device_list);
+    }
+
+    #[test]
+    fn collapsed_events_merge_preserves_independent_kinds() {
+        let mut s = CollapsedEvents::default();
+        s.merge(DeviceEvent::DefaultOutputChanged);
+        s.merge(DeviceEvent::DeviceListChanged);
+        // Output and DeviceList both fired; the other two stayed clean.
+        assert!(s.default_output);
+        assert!(s.device_list);
+        assert!(!s.default_input);
+        assert!(!s.default_system_output);
+    }
+
+    #[test]
+    fn strip_cpal_prefix_removes_known_prefix() {
+        assert_eq!(strip_cpal_prefix("CoreAudio:BuiltInMic"), "BuiltInMic");
+    }
+
+    #[test]
+    fn strip_cpal_prefix_leaves_other_strings_alone() {
+        // Non-cpal-format strings (raw UID, empty, foreign prefix) must
+        // pass through unchanged so callers can pipe them straight into
+        // is_device_alive's fail-open path.
+        assert_eq!(strip_cpal_prefix("BuiltInMic"), "BuiltInMic");
+        assert_eq!(strip_cpal_prefix(""), "");
+        assert_eq!(strip_cpal_prefix("Wasapi:something"), "Wasapi:something");
+    }
+
+    #[test]
+    fn try_send_intent_returns_false_for_empty_inbox() {
+        let inbox: RestartIntentInbox = Arc::new(StdMutex::new(None));
+        assert!(!try_send_intent(&inbox, RestartIntent::Mic));
+        assert!(!try_send_intent(&inbox, RestartIntent::System));
+    }
+
+    #[test]
+    fn try_send_intent_routes_to_populated_inbox() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<RestartIntent>();
+        let inbox: RestartIntentInbox = Arc::new(StdMutex::new(Some(tx)));
+
+        assert!(try_send_intent(&inbox, RestartIntent::Mic));
+        assert!(try_send_intent(&inbox, RestartIntent::System));
+
+        // Both intents arrived in order.
+        let first = rx.try_recv().expect("first intent buffered");
+        let second = rx.try_recv().expect("second intent buffered");
+        assert!(matches!(first, RestartIntent::Mic));
+        assert!(matches!(second, RestartIntent::System));
+    }
+
+    #[test]
+    fn try_send_intent_returns_false_when_receiver_was_dropped() {
+        // The live loop ended (receiver dropped) but the inbox still
+        // holds a stale sender. send() returns Err, broker falls back
+        // to direct restart.
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<RestartIntent>();
+        drop(rx);
+        let inbox: RestartIntentInbox = Arc::new(StdMutex::new(Some(tx)));
+
+        assert!(!try_send_intent(&inbox, RestartIntent::Mic));
+    }
+}
+
 /// Bluetooth/AirPods absorbs the default-device change before the route
 /// is fully alive. If `is_device_alive` reports false, give macOS one
 /// more debounce window to settle, then fall through. We don't block
