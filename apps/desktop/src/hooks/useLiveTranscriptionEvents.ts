@@ -60,7 +60,13 @@ export function useLiveTranscriptionEvents() {
         });
         const toastId = `stream-health-${payload.source}`;
         if (payload.status === "restarted") {
-          toast.success(payload.message, { id: toastId, duration: 3000 });
+          // Auto-failover toast names the new device when known.
+          // Falls back to the existing diagnostic message otherwise.
+          const sourceLabel = payload.source === "Mic" ? "mic" : "system audio";
+          const text = payload.bound_device_name
+            ? `Switched ${sourceLabel} to ${payload.bound_device_name}`
+            : payload.message;
+          toast.success(text, { id: toastId, duration: 3000 });
         } else {
           toast.error(payload.message, {
             id: toastId,

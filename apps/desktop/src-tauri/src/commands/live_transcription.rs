@@ -1738,7 +1738,8 @@ async fn check_stream_health(
     audio_state: &AudioManagerState,
     app_handle: &AppHandle,
     mut session_wav_state: Option<&mut SessionWavState>,
-) {
+    is_mixed: bool,
+) -> bool {
     for source in sources.iter_mut() {
         if source.restart_attempts >= STREAM_RESTART_MAX_ATTEMPTS {
             continue;
@@ -1762,6 +1763,16 @@ async fn check_stream_health(
         let ws_borrow = session_wav_state.as_deref_mut();
         attempt_source_restart(source, audio_state, app_handle, ws_borrow, &reason).await;
     }
+
+    // Mixed mid-capture fail-fast. The user's intent with Mixed is
+    // "capture both", not "limp along on the surviving Source", so a
+    // terminal restart failure on either side ends the whole Capture.
+    // The per-source `restart_abandoned` toast was already emitted from
+    // inside `attempt_source_restart`; no extra event needed here.
+    is_mixed
+        && sources
+            .iter()
+            .any(|s| s.restart_attempts >= STREAM_RESTART_MAX_ATTEMPTS)
 }
 
 /// Layer 0: OS-authoritative rebind signal. Returns `Some(reason)` only when
@@ -2306,13 +2317,28 @@ async fn live_transcription_loop(
         // Triggers auto-restart if a stream has died silently.
         // restart_mic() tries the previously stored device first, then falls back to
         // the provided name (None = system default).
-        check_stream_health(
+        let mixed_fail_fast = check_stream_health(
             &mut sources,
             &audio_state,
             &ctx.app_handle,
             session_wav_state.as_mut(),
+            matches!(source, CaptureSource::Mixed),
         )
         .await;
+
+        // Mixed mid-capture fail-fast: stop both Sources and exit. The
+        // per-Source `restart_abandoned` toast was already emitted; the
+        // session naturally winds down through the standard cleanup
+        // path (drain in-flight chunks, finalize WAV, etc.).
+        if mixed_fail_fast {
+            warn!(
+                "Mixed capture: terminal restart failure on a Source — ending session"
+            );
+            let mut manager = audio_state.lock().await;
+            let _ = manager.stop_all();
+            drop(manager);
+            break;
+        }
 
         if !prompt_seeded_from_backfill
             && seed_prompt_from_backfill(&ctx, &prompt, &mut sources).await
