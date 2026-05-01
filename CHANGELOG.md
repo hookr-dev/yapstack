@@ -6,6 +6,19 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+### Added
+- **Auto-failover on device change** — the device picker now reflects the OS state in real time. When AirPods drop, a USB mic is unplugged, or the user changes the system default in Settings, capture automatically rebinds the affected Stream to the new system default and shows a transient toast naming the new device ("Switched mic to MacBook Pro Microphone"). System-audio loopback follows the default output (and the alerts/UI route) the same way. `Mixed` capture stops both Sources fail-fast if either can't be recovered.
+- New Tauri events `devices-changed` and `default-device-changed`. The frontend listens for both and reconciles the persisted `selectedMicDeviceId` when its device disappears.
+- Fourth Core Audio property listener for `kAudioHardwarePropertyDefaultSystemOutputDevice` (the alerts/UI route), distinct from the media output selector.
+
+### Changed
+- The Rust audio crate's listener path moved from `AtomicBool` flag-polling to a runtime-agnostic `DeviceEventSink` consumed by an always-on Tauri-side broker. The broker debounces bursty Core Audio events in a 250 ms window and gates restarts on `kAudioDevicePropertyDeviceIsAlive`, replacing the previous unconditional 200 ms `thread::sleep` workaround for the AirPods/Bluetooth revert window.
+- Dropped the defensive ~30 s name-comparison drift poll inside the live-transcription loop. Device changes flow exclusively through the broker now; the missed-event safety net is no longer needed.
+- `stream-health` event payload now carries `bound_device_name` so the FE can render device names in auto-failover toasts.
+
+### Removed
+- `AudioManager::{mic_default_changed, system_audio_default_changed, device_list_changed, mic_input_drifted, system_audio_output_drifted, live_default_input_name, live_default_output_name}` and `DefaultDeviceWatcher::take_change` — superseded by the event-driven sink path.
+
 ## [1.0.0-alpha.7] - 2026-04-30
 
 ### Added
