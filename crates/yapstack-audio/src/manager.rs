@@ -9,7 +9,9 @@ use crate::error::AudioError;
 use crate::mic::MicrophoneCapture;
 use crate::mixer::{self, MixConfig};
 use crate::ring_buffer::{AudioRingBuffer, RingBufferInfo, SharedAudioRingBuffer};
-use crate::system::device_watcher::{DefaultDeviceKind, DefaultDeviceWatcher};
+use crate::system::device_watcher::{
+    DefaultDeviceKind, DefaultDeviceWatcher, DeviceEventSink,
+};
 use crate::system::SystemAudioCapture;
 use crate::DeviceStreamConfig;
 
@@ -751,6 +753,27 @@ impl AudioManager {
                 probed.channels,
             ));
             (fresh, RestartOutcome::BufferReplaced)
+        }
+    }
+
+    /// Attach a single sink that receives every device-change event from
+    /// every registered watcher. Replaces any previously attached sink.
+    /// Pass `None` to detach.
+    ///
+    /// The sink is invoked on the Core Audio listener thread; it must be
+    /// cheap and non-blocking. Typical implementations forward the event
+    /// into a channel and return.
+    pub fn subscribe_device_events(&self, sink: Option<DeviceEventSink>) {
+        for watcher in [
+            self.input_watcher.as_ref(),
+            self.output_watcher.as_ref(),
+            self.system_output_watcher.as_ref(),
+            self.devices_watcher.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            watcher.set_sink(sink.clone());
         }
     }
 

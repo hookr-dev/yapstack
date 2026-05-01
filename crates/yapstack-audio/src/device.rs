@@ -206,6 +206,143 @@ pub(crate) fn resolve_input_device(id: Option<&str>, name: Option<&str>) -> Resu
         .ok_or(AudioError::NoDevicesAvailable)
 }
 
+/// Returns `true` if a device with the given Core Audio UID is currently
+/// alive on the system. Returns `true` (fail-open) on non-macOS, when the
+/// UID is not present, or when any Core Audio call fails — a stale "yes"
+/// is harmless because the actual restart attempt will surface the error
+/// via the existing stream-health path.
+///
+/// `uid` is the bare `kAudioDevicePropertyDeviceUID` string. cpal's
+/// `device.id().to_string()` returns the form `"CoreAudio:<uid>"`; callers
+/// passing that form should strip the `CoreAudio:` prefix first. A
+/// non-matching string falls into the fail-open path.
+#[cfg(target_os = "macos")]
+pub fn is_device_alive(uid: &str) -> bool {
+    use coreaudio_sys::{
+        kAudioDevicePropertyDeviceIsAlive, kAudioDevicePropertyDeviceUID,
+        kAudioHardwarePropertyDevices, kAudioObjectPropertyElementMain,
+        kAudioObjectPropertyScopeGlobal, kAudioObjectSystemObject, kCFStringEncodingUTF8, noErr,
+        AudioObjectGetPropertyData, AudioObjectGetPropertyDataSize, AudioObjectID,
+        AudioObjectPropertyAddress, CFIndex, CFRelease, CFStringGetCString, CFStringGetLength,
+        CFStringRef,
+    };
+    use std::ffi::c_void;
+    use std::mem::size_of;
+
+    unsafe {
+        // Step 1: enumerate all device IDs.
+        let devices_addr = AudioObjectPropertyAddress {
+            mSelector: kAudioHardwarePropertyDevices,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain,
+        };
+        let mut size: u32 = 0;
+        let status = AudioObjectGetPropertyDataSize(
+            kAudioObjectSystemObject,
+            &devices_addr,
+            0,
+            std::ptr::null(),
+            &mut size,
+        );
+        if status != noErr as i32 || size == 0 {
+            return true;
+        }
+        let count = (size as usize) / size_of::<AudioObjectID>();
+        let mut device_ids: Vec<AudioObjectID> = vec![0; count];
+        let mut size_io = size;
+        let status = AudioObjectGetPropertyData(
+            kAudioObjectSystemObject,
+            &devices_addr,
+            0,
+            std::ptr::null(),
+            &mut size_io,
+            device_ids.as_mut_ptr() as *mut c_void,
+        );
+        if status != noErr as i32 {
+            return true;
+        }
+
+        // Step 2: scan for a device whose UID matches.
+        for device_id in device_ids {
+            let uid_addr = AudioObjectPropertyAddress {
+                mSelector: kAudioDevicePropertyDeviceUID,
+                mScope: kAudioObjectPropertyScopeGlobal,
+                mElement: kAudioObjectPropertyElementMain,
+            };
+            let mut device_uid_ref: CFStringRef = std::ptr::null();
+            let mut sz: u32 = size_of::<CFStringRef>() as u32;
+            let s = AudioObjectGetPropertyData(
+                device_id,
+                &uid_addr,
+                0,
+                std::ptr::null(),
+                &mut sz,
+                &mut device_uid_ref as *mut CFStringRef as *mut c_void,
+            );
+            if s != noErr as i32 || device_uid_ref.is_null() {
+                continue;
+            }
+
+            // CFString -> Rust String (copy then release the CFString — Core
+            // Audio returns a +1 retained reference that the caller owns).
+            let len: CFIndex = CFStringGetLength(device_uid_ref);
+            let max_size: CFIndex = (len * 4) + 1; // UTF-8 worst case
+            let mut buf = vec![0i8; max_size as usize];
+            let ok = CFStringGetCString(
+                device_uid_ref,
+                buf.as_mut_ptr(),
+                max_size,
+                kCFStringEncodingUTF8,
+            );
+            CFRelease(device_uid_ref as *const _);
+            if ok == 0 {
+                continue;
+            }
+            let nul = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+            let bytes: &[u8] =
+                std::slice::from_raw_parts(buf.as_ptr() as *const u8, nul);
+            let device_uid = match std::str::from_utf8(bytes) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            if device_uid != uid {
+                continue;
+            }
+
+            // Step 3: query IsAlive on the matching device.
+            let alive_addr = AudioObjectPropertyAddress {
+                mSelector: kAudioDevicePropertyDeviceIsAlive,
+                mScope: kAudioObjectPropertyScopeGlobal,
+                mElement: kAudioObjectPropertyElementMain,
+            };
+            let mut alive: u32 = 0;
+            let mut sz: u32 = size_of::<u32>() as u32;
+            let s = AudioObjectGetPropertyData(
+                device_id,
+                &alive_addr,
+                0,
+                std::ptr::null(),
+                &mut sz,
+                &mut alive as *mut u32 as *mut c_void,
+            );
+            if s != noErr as i32 {
+                return true;
+            }
+            return alive != 0;
+        }
+
+        // UID not present in the system's device list — fail-open. The actual
+        // restart attempt will surface a real error if the caller tries to
+        // bind to it.
+        true
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn is_device_alive(_uid: &str) -> bool {
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -252,6 +389,32 @@ mod tests {
         // Both None → system default
         let result = resolve_input_device(None, None);
         let _ = result;
+    }
+
+    #[test]
+    fn is_device_alive_returns_true_for_unknown_uid() {
+        // Fail-open contract: unknown UID returns true. The actual restart
+        // attempt is the authoritative check.
+        assert!(is_device_alive("definitely-not-a-real-device-uid-zzzz"));
+    }
+
+    #[test]
+    fn is_device_alive_returns_true_for_empty_uid() {
+        assert!(is_device_alive(""));
+    }
+
+    #[test]
+    #[cfg_attr(not(target_os = "macos"), ignore)] // Non-macOS: trivially true.
+    #[ignore] // Requires hardware to assert true on a known UID.
+    fn is_device_alive_returns_true_for_default_input() {
+        let host = cpal::default_host();
+        let dev = host.default_input_device().expect("need default input");
+        let id = device_id(&dev).expect("default input has an id");
+        // cpal's macOS DeviceId Display is "CoreAudio:<uid>"; strip prefix.
+        let uid = id
+            .strip_prefix("CoreAudio:")
+            .expect("macOS device id format");
+        assert!(is_device_alive(uid));
     }
 
     #[test]
