@@ -483,6 +483,7 @@ pub fn run() {
         .manage(Arc::new(Mutex::new(AudioManager::new())) as commands::audio::AudioManagerState)
         .manage(Arc::new(Mutex::new(None::<TrayIcon>)) as TrayState)
         .manage(Arc::new(Mutex::new(None)) as commands::live_transcription::LiveTranscriptionState)
+        .manage(Arc::new(StdMutex::new(None)) as commands::live_transcription::RestartIntentInbox)
         .manage(Arc::new(StdMutex::new(HashSet::<PathBuf>::new())) as TrustedAudioDirs)
         .manage({
             let (tx, _) = watch::channel(false);

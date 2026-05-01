@@ -468,6 +468,26 @@ pub struct LiveTranscriptionRuntime {
 
 pub type LiveTranscriptionState = Arc<Mutex<Option<LiveTranscriptionRuntime>>>;
 
+/// Inbox for cross-thread "please restart this Source" requests, used by
+/// the device broker (`device_broker` module) when a Core Audio default
+/// device change requires re-binding a Stream. Set to `Some(sender)` for
+/// the lifetime of an active live-transcription session, `None`
+/// otherwise. The broker checks the inbox before deciding whether to
+/// route a restart through the live loop (which knows how to reset
+/// `SourceVadState`) or to call `AudioManager::restart_*` directly.
+pub type RestartIntentSender = tokio::sync::mpsc::UnboundedSender<RestartIntent>;
+pub type RestartIntentInbox = Arc<StdMutex<Option<RestartIntentSender>>>;
+
+/// What the broker is asking the live loop to do. Narrow on purpose —
+/// the loop doesn't need a "target device id" because it always rebinds
+/// to the current OS default (the broker has already debounced and
+/// confirmed `is_device_alive`).
+#[derive(Debug, Clone, Copy)]
+pub enum RestartIntent {
+    Mic,
+    System,
+}
+
 // --- VAD helpers ---
 
 /// Per-source voice activity detection state.
@@ -2034,6 +2054,7 @@ async fn live_transcription_loop(
     audio_state: AudioManagerState,
     ctx: TranscriptionContext,
     mut stop_rx: oneshot::Receiver<()>,
+    mut restart_intent_rx: tokio::sync::mpsc::UnboundedReceiver<RestartIntent>,
     mut session_wav_state: Option<SessionWavState>,
     counters: Arc<StdMutex<SessionCounters>>,
 ) {
@@ -2171,6 +2192,33 @@ async fn live_transcription_loop(
                 // same wakeup window without blocking.
                 while let Some(Some(outcome)) = chunk_tasks.next().now_or_never() {
                     pending_outcomes.push(outcome);
+                }
+                false
+            }
+            // Device broker is asking us to fail over a Source. We honor
+            // it by calling the existing `attempt_source_restart` path
+            // (which resets `SourceVadState` cursor + Silero state and
+            // updates the session-WAV flush position). The broker has
+            // already debounced and `is_device_alive`-gated, so we don't
+            // re-check those here. The legacy listener-flag poll is
+            // still alive (Phase 8 removes it); whichever wins, the
+            // existing throttle in `attempt_source_restart` collapses
+            // duplicates.
+            Some(intent) = restart_intent_rx.recv() => {
+                let target_label = match intent {
+                    RestartIntent::Mic => AudioSourceLabel::Mic,
+                    RestartIntent::System => AudioSourceLabel::System,
+                };
+                if let Some(source) = sources.iter_mut().find(|s| s.label == target_label) {
+                    let ws_borrow = session_wav_state.as_mut();
+                    attempt_source_restart(
+                        source,
+                        &audio_state,
+                        &ctx.app_handle,
+                        ws_borrow,
+                        "device-change",
+                    )
+                    .await;
                 }
                 false
             }
@@ -3523,6 +3571,7 @@ pub async fn start_live_transcription(
     audio_state: tauri::State<'_, AudioManagerState>,
     transcription_state: tauri::State<'_, TranscriptionClientState>,
     live_state: tauri::State<'_, LiveTranscriptionState>,
+    restart_intent_inbox: tauri::State<'_, RestartIntentInbox>,
     app_handle: AppHandle,
     mut config: LiveTranscriptionConfig,
 ) -> Result<LiveTranscriptionStartResult, CommandError> {
@@ -3764,6 +3813,21 @@ pub async fn start_live_transcription(
 
     let (stop_tx, stop_rx) = oneshot::channel();
 
+    // Channel for RestartIntents from the device broker. The sender is
+    // installed in the managed inbox so the broker can find it; the
+    // receiver is consumed by the live loop. Replaces any prior sender
+    // (which would only exist if a previous session crashed without
+    // clearing the inbox in stop_live_transcription).
+    let (restart_intent_tx, restart_intent_rx) =
+        tokio::sync::mpsc::unbounded_channel::<RestartIntent>();
+    {
+        let mut inbox_guard = restart_intent_inbox
+            .inner()
+            .lock()
+            .expect("restart-intent inbox poisoned");
+        *inbox_guard = Some(restart_intent_tx);
+    }
+
     let audio_state_clone = audio_state.inner().clone();
     let transcription_state_clone = transcription_state.inner().clone();
 
@@ -3852,6 +3916,7 @@ pub async fn start_live_transcription(
                 audio_state_clone,
                 ctx,
                 stop_rx,
+                restart_intent_rx,
                 session_wav_state,
                 counters_for_loop,
             ))
@@ -3913,8 +3978,21 @@ pub async fn start_live_transcription(
 #[specta::specta]
 pub async fn stop_live_transcription(
     live_state: tauri::State<'_, LiveTranscriptionState>,
+    restart_intent_inbox: tauri::State<'_, RestartIntentInbox>,
 ) -> Result<(), CommandError> {
     let mut guard = live_state.lock().await;
+
+    // Clear the restart-intent inbox first so the broker can't post into
+    // a soon-to-be-dropped receiver. The loop's select! will hit the
+    // stop_rx branch and exit; any drained-but-unprocessed intent is
+    // discarded along with the receiver.
+    {
+        let mut inbox_guard = restart_intent_inbox
+            .inner()
+            .lock()
+            .expect("restart-intent inbox poisoned");
+        *inbox_guard = None;
+    }
 
     match guard.take() {
         Some(mut runtime) => {
