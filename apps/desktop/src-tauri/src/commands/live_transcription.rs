@@ -1275,18 +1275,7 @@ async fn preflight_stream_health(
     // change notification. Consuming the flag here means a listener event
     // fired between sessions still triggers a rebind on preflight, before
     // first extraction reads stale audio.
-    let (
-        mic_initial,
-        sys_initial,
-        mic_err,
-        sys_err,
-        has_mic_buf,
-        has_sys_buf,
-        mic_default_changed,
-        sys_default_changed,
-        mic_drift,
-        sys_drift,
-    ) = {
+    let (mic_initial, sys_initial, mic_err, sys_err, has_mic_buf, has_sys_buf) = {
         let m = audio_state.lock().await;
         (
             m.mic_write_pos(),
@@ -1295,10 +1284,6 @@ async fn preflight_stream_health(
             m.system_has_stream_error(),
             m.mic_buffer().is_some(),
             m.system_buffer().is_some(),
-            m.mic_default_changed(),
-            m.system_audio_default_changed(),
-            m.mic_input_drifted(),
-            m.system_audio_output_drifted(),
         )
     };
 
@@ -1317,11 +1302,13 @@ async fn preflight_stream_health(
     if check_mic {
         let mic_now = manager.mic_write_pos();
         let stalled = mic_now == mic_initial && should_stall_restart(&AudioSourceLabel::Mic);
-        let device_changed = mic_default_changed || mic_drift.is_some();
-        if mic_err || stalled || device_changed {
+        // Default-device-change preflight is now handled by the device
+        // broker's `RestartIntent` path; preflight only catches stream
+        // errors and write-position stalls left over from idle time.
+        if mic_err || stalled {
             warn!(
-                "preflight: mic stream needs restart (error={}, stalled={}, device_changed={})",
-                mic_err, stalled, device_changed
+                "preflight: mic stream needs restart (error={}, stalled={})",
+                mic_err, stalled
             );
             match manager.restart_mic() {
                 Ok(_) => restarted.push(AudioSourceLabel::Mic),
@@ -1336,11 +1323,10 @@ async fn preflight_stream_health(
     if check_system {
         let sys_now = manager.system_write_pos();
         let stalled = sys_now == sys_initial && should_stall_restart(&AudioSourceLabel::System);
-        let device_changed = sys_default_changed || sys_drift.is_some();
-        if sys_err || stalled || device_changed {
+        if sys_err || stalled {
             warn!(
-                "preflight: system stream needs restart (error={}, stalled={}, device_changed={})",
-                sys_err, stalled, device_changed
+                "preflight: system stream needs restart (error={}, stalled={})",
+                sys_err, stalled
             );
             match manager.restart_system_audio() {
                 Ok(_) => restarted.push(AudioSourceLabel::System),
@@ -1745,18 +1731,19 @@ async fn check_stream_health(
             continue;
         }
 
-        let mut reason = evaluate_listener_signal(source, audio_state).await;
-
-        if reason.is_none() {
-            let in_cooldown = source.last_restart_at.is_some_and(|t| {
-                t.elapsed() < Duration::from_secs_f32(STREAM_RESTART_COOLDOWN_SECS)
-            });
-            if !in_cooldown {
-                reason = evaluate_speculative_signals(source, audio_state).await;
-            }
+        // OS-driven default-device changes are handled by the device
+        // broker, which routes a `RestartIntent` into the live loop's
+        // inbox (Phase 6). The remaining symptom-based watchdog
+        // (Layers 1-2: cpal error flag + write-pos stall) lives here.
+        let in_cooldown = source.last_restart_at.is_some_and(|t| {
+            t.elapsed() < Duration::from_secs_f32(STREAM_RESTART_COOLDOWN_SECS)
+        });
+        if in_cooldown {
+            continue;
         }
-
-        let Some(reason) = reason else { continue };
+        let Some(reason) = evaluate_speculative_signals(source, audio_state).await else {
+            continue;
+        };
         // `as_deref_mut` reborrows the `Option<&mut _>` so each loop
         // iteration gets a fresh mutable view without consuming the slot.
         #[allow(clippy::needless_option_as_deref)]
@@ -1773,79 +1760,6 @@ async fn check_stream_health(
         && sources
             .iter()
             .any(|s| s.restart_attempts >= STREAM_RESTART_MAX_ATTEMPTS)
-}
-
-/// Layer 0: OS-authoritative rebind signal. Returns `Some(reason)` only when
-/// the CoreAudio listener fired AND a re-query after a 200 ms settle confirms
-/// the default device is genuinely different from what's bound — macOS can
-/// momentarily revert the default during a Bluetooth handshake (cpal#1175),
-/// so the settle-and-recheck is what keeps us from rebinding to a still-dead
-/// device. Listener signals bypass the speculative-restart cooldown because
-/// they're a real OS push, not a guess.
-async fn evaluate_listener_signal(
-    source: &SourceVadState,
-    audio_state: &AudioManagerState,
-) -> Option<String> {
-    let listener_fired = {
-        let manager = audio_state.lock().await;
-        let default_changed = match source.label {
-            AudioSourceLabel::Mic => manager.mic_default_changed(),
-            AudioSourceLabel::System => manager.system_audio_default_changed(),
-        };
-        // Device-list change is a shared signal consumed once per tick; fold
-        // it into the listener-fired decision for the first source that
-        // inspects it.
-        let devices_changed = manager.device_list_changed();
-        default_changed || devices_changed
-    };
-    if !listener_fired {
-        return None;
-    }
-
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
-    let manager = audio_state.lock().await;
-    let bound = match source.label {
-        AudioSourceLabel::Mic => manager.mic_bound_device(),
-        AudioSourceLabel::System => manager.system_audio_bound_device(),
-    }
-    .map(str::to_string);
-    let current_default = match source.label {
-        AudioSourceLabel::Mic => yapstack_audio::manager::live_default_input_name(),
-        AudioSourceLabel::System => yapstack_audio::manager::live_default_output_name(),
-    };
-    let direction = match source.label {
-        AudioSourceLabel::Mic => "input",
-        AudioSourceLabel::System => "output",
-    };
-    match (bound.as_deref(), current_default.as_deref()) {
-        (Some(b), Some(c)) if b != c => {
-            info!(
-                "default {} device change confirmed after settle: '{}' → '{}', rebinding",
-                direction, b, c
-            );
-            Some("default device changed".into())
-        }
-        (Some(b), Some(c)) => {
-            // Listener fired but the default unchanged once the OS finished
-            // settling — spurious / transient signal. Let the stall watchdog
-            // catch a real disconnect.
-            debug!(
-                "listener fired for {} but default unchanged after settle (still '{}' ≈ '{}') — skipping restart",
-                direction, b, c
-            );
-            None
-        }
-        _ => {
-            // Bound name unavailable (stream never started or no device
-            // resolved). Trust the listener and rebind.
-            info!(
-                "default {} device changed (bound='{:?}', current='{:?}'), rebinding",
-                direction, bound, current_default
-            );
-            Some("default device changed".into())
-        }
-    }
 }
 
 /// Layers 1–3: symptom-based detection, gated by the speculative-restart
