@@ -55,6 +55,12 @@ pub struct AudioManager {
     /// capture path degrades to the write-pos stall watchdog in that case.
     input_watcher: Option<DefaultDeviceWatcher>,
     output_watcher: Option<DefaultDeviceWatcher>,
+    /// Watches `kAudioHardwarePropertyDefaultSystemOutputDevice` — the
+    /// alerts/UI route, distinct from the media `Output` selector. macOS
+    /// can change them independently (e.g. media routes to AirPods while
+    /// system sounds stay on the speakers); covering both is needed so
+    /// system-audio loopback follows whichever the user changed.
+    system_output_watcher: Option<DefaultDeviceWatcher>,
     /// Device-list watcher — fires on `kAudioHardwarePropertyDevices`
     /// (hardware added/removed). Complements the default-device watchers
     /// because some macOS versions fire the device-list property *before*
@@ -80,6 +86,9 @@ impl AudioManager {
         let output_watcher = DefaultDeviceWatcher::new(DefaultDeviceKind::Output)
             .map_err(|e| warn!("output default-device listener unavailable: {}", e))
             .ok();
+        let system_output_watcher = DefaultDeviceWatcher::new(DefaultDeviceKind::DefaultSystemOutput)
+            .map_err(|e| warn!("default-system-output listener unavailable: {}", e))
+            .ok();
         let devices_watcher = DefaultDeviceWatcher::new(DefaultDeviceKind::Devices)
             .map_err(|e| warn!("device-list listener unavailable: {}", e))
             .ok();
@@ -93,6 +102,7 @@ impl AudioManager {
             system_buffer: None,
             input_watcher,
             output_watcher,
+            system_output_watcher,
             devices_watcher,
         }
     }
@@ -746,14 +756,24 @@ impl AudioManager {
 
     /// Returns `true` if the OS has pushed a default-output-device change
     /// notification since the last call *and* system audio capture is
-    /// currently running. Consumes the pending flag.
+    /// currently running. Consumes the pending flag for both the media
+    /// `Output` selector and the alerts/UI `DefaultSystemOutput` selector;
+    /// either changing should rebind the loopback.
     pub fn system_audio_default_changed(&self) -> bool {
-        self.system.is_running()
-            && self
-                .output_watcher
-                .as_ref()
-                .map(|w| w.take_change())
-                .unwrap_or(false)
+        if !self.system.is_running() {
+            return false;
+        }
+        let output_changed = self
+            .output_watcher
+            .as_ref()
+            .map(|w| w.take_change())
+            .unwrap_or(false);
+        let system_output_changed = self
+            .system_output_watcher
+            .as_ref()
+            .map(|w| w.take_change())
+            .unwrap_or(false);
+        output_changed || system_output_changed
     }
 
     /// Returns `true` if the OS has pushed a default-input-device change

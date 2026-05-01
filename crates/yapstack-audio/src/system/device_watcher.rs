@@ -75,10 +75,20 @@ use crate::error::AudioError;
 /// versions the device-list notification precedes the default-device
 /// notification during AirPods handshake, so it serves as an earlier
 /// trigger for rebind.
+///
+/// `DefaultSystemOutput` subscribes to
+/// `kAudioHardwarePropertyDefaultSystemOutputDevice`, which is distinct
+/// from `Output` (`kAudioHardwarePropertyDefaultOutputDevice`): the former
+/// is the route for system alerts and UI sounds, the latter for media.
+/// Both can change independently; covering both is necessary to keep
+/// system-audio loopback bound to whatever the user actually means by
+/// "system output." See Hammerspoon's `hs.audiodevice.watcher` for prior
+/// art covering all four selectors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DefaultDeviceKind {
     Input,
     Output,
+    DefaultSystemOutput,
     Devices,
 }
 
@@ -87,10 +97,10 @@ mod imp {
     use super::*;
     use coreaudio_sys::{
         kAudioHardwarePropertyDefaultInputDevice, kAudioHardwarePropertyDefaultOutputDevice,
-        kAudioHardwarePropertyDevices, kAudioObjectPropertyElementMaster,
-        kAudioObjectPropertyScopeGlobal, kAudioObjectSystemObject, noErr,
-        AudioObjectAddPropertyListener, AudioObjectID, AudioObjectPropertyAddress,
-        AudioObjectPropertySelector, AudioObjectRemovePropertyListener,
+        kAudioHardwarePropertyDefaultSystemOutputDevice, kAudioHardwarePropertyDevices,
+        kAudioObjectPropertyElementMain, kAudioObjectPropertyScopeGlobal,
+        kAudioObjectSystemObject, noErr, AudioObjectAddPropertyListener, AudioObjectID,
+        AudioObjectPropertyAddress, AudioObjectPropertySelector, AudioObjectRemovePropertyListener,
     };
     use std::ffi::c_void;
     use tracing::{info, warn};
@@ -129,6 +139,9 @@ mod imp {
         match kind {
             DefaultDeviceKind::Input => kAudioHardwarePropertyDefaultInputDevice,
             DefaultDeviceKind::Output => kAudioHardwarePropertyDefaultOutputDevice,
+            DefaultDeviceKind::DefaultSystemOutput => {
+                kAudioHardwarePropertyDefaultSystemOutputDevice
+            }
             DefaultDeviceKind::Devices => kAudioHardwarePropertyDevices,
         }
     }
@@ -140,7 +153,7 @@ mod imp {
         let property = AudioObjectPropertyAddress {
             mSelector: selector_for(kind),
             mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMaster,
+            mElement: kAudioObjectPropertyElementMain,
         };
 
         // Box the Arc so the listener proc has a stable pointer for its lifetime.
@@ -288,5 +301,23 @@ mod tests {
         devices.flag.store(true, Ordering::Release);
         assert!(!default_out.take_change());
         assert!(devices.take_change());
+    }
+
+    #[test]
+    fn take_change_starts_false_for_default_system_output() {
+        let w = DefaultDeviceWatcher::new(DefaultDeviceKind::DefaultSystemOutput)
+            .expect("default-system-output kind registers");
+        assert!(!w.take_change());
+    }
+
+    #[test]
+    fn default_system_output_flag_is_independent() {
+        let media =
+            DefaultDeviceWatcher::new(DefaultDeviceKind::Output).expect("output registers");
+        let alerts = DefaultDeviceWatcher::new(DefaultDeviceKind::DefaultSystemOutput)
+            .expect("default-system-output registers");
+        alerts.flag.store(true, Ordering::Release);
+        assert!(!media.take_change());
+        assert!(alerts.take_change());
     }
 }
