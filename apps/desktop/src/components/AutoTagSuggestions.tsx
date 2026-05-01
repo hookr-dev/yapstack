@@ -72,7 +72,6 @@ function SuggestionRow({
   onApplyOverride: (folderId: string) => void;
   onDismiss: (s: FolderSuggestion) => void;
 }) {
-  const pct = Math.round(suggestion.confidence * 100);
   // Only show the override picker when there's a meaningful alternative.
   // Single-folder users go through the dropdown for nothing — degrade to
   // inline check + dismiss buttons instead.
@@ -81,7 +80,7 @@ function SuggestionRow({
   if (!hasOverrideOptions) {
     return (
       <div className="flex items-center gap-1">
-        <SuggestionPill suggestion={suggestion} pct={pct} interactive={false} />
+        <SuggestionPill suggestion={suggestion} interactive={false} />
         <button
           onClick={() => onAccept(suggestion)}
           className="rounded-full p-0.5 text-muted-foreground hover:bg-primary/15 hover:text-primary transition-colors"
@@ -102,7 +101,7 @@ function SuggestionRow({
             className="cursor-pointer outline-none"
             aria-label={`Confirm or change folder for ${suggestion.name}`}
           >
-            <SuggestionPill suggestion={suggestion} pct={pct} interactive />
+            <SuggestionPill suggestion={suggestion} interactive />
           </button>
         </DropdownMenuTrigger>
         <DropdownMenuContent align="start" className="min-w-[200px]">
@@ -115,11 +114,6 @@ function SuggestionRow({
               name={suggestion.name}
               icon={suggestion.icon}
               color={suggestion.color}
-              trailing={
-                <span className="text-[10px] tabular-nums text-muted-foreground">
-                  {pct}%
-                </span>
-              }
             />
           </DropdownMenuItem>
           <DropdownMenuSeparator />
@@ -148,33 +142,23 @@ function SuggestionRow({
 
 function SuggestionPill({
   suggestion,
-  pct,
   interactive,
 }: {
   suggestion: FolderSuggestion;
-  pct: number;
   interactive: boolean;
 }) {
   const FolderIcon = suggestion.icon ? ICON_MAP[suggestion.icon] : Folder;
-  const confidenceClass =
-    suggestion.confidenceLevel === "high"
-      ? "text-primary"
-      : "text-muted-foreground";
   return (
     <div
       className={cn(
-        "inline-flex items-center gap-1.5 rounded-md px-2.5 py-1 text-xs font-medium transition-colors",
+        "inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-medium transition-colors",
         suggestion.color ? "" : "bg-muted text-muted-foreground",
         interactive && "hover:brightness-95 dark:hover:brightness-110",
       )}
       style={folderBadgeStyle(suggestion.color)}
-      title={`Confidence: ${pct}%`}
     >
       <FolderIcon className="h-2.5 w-2.5 shrink-0" />
       <span>{suggestion.name}</span>
-      <span className={cn("text-[10px] tabular-nums", confidenceClass)}>
-        {pct}%
-      </span>
       {interactive && <ChevronDown className="h-3 w-3 shrink-0 opacity-60" />}
     </div>
   );

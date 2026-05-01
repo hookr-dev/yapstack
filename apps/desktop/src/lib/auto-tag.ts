@@ -6,9 +6,8 @@ export interface FolderSuggestion {
   name: string;
   icon: string | null;
   color: string | null;
-  /** Probability across all candidate folders, 0..1. */
+  /** Probability across all candidate folders, 0..1. Kept for logs / telemetry; not rendered in the UI. */
   confidence: number;
-  confidenceLevel: "high" | "medium";
   /** Sum of weighted keyword hits, length-normalized. Telemetry / debug. */
   score: number;
 }
@@ -237,7 +236,6 @@ export class FolderSuggestionTracker {
         icon: top.profile.icon,
         color: top.profile.color,
         confidence: probability,
-        confidenceLevel: probability >= 0.75 ? "high" : "medium",
         score: Math.round(top.score * 10) / 10,
       },
     ];
