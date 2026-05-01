@@ -794,53 +794,6 @@ impl AudioManager {
         }
     }
 
-    /// Returns `true` if the OS has pushed a default-output-device change
-    /// notification since the last call *and* system audio capture is
-    /// currently running. Consumes the pending flag for both the media
-    /// `Output` selector and the alerts/UI `DefaultSystemOutput` selector;
-    /// either changing should rebind the loopback.
-    pub fn system_audio_default_changed(&self) -> bool {
-        if !self.system.is_running() {
-            return false;
-        }
-        let output_changed = self
-            .output_watcher
-            .as_ref()
-            .map(|w| w.take_change())
-            .unwrap_or(false);
-        let system_output_changed = self
-            .system_output_watcher
-            .as_ref()
-            .map(|w| w.take_change())
-            .unwrap_or(false);
-        output_changed || system_output_changed
-    }
-
-    /// Returns `true` if the OS has pushed a default-input-device change
-    /// notification since the last call *and* mic capture is currently
-    /// running. Consumes the pending flag.
-    pub fn mic_default_changed(&self) -> bool {
-        self.mic.is_running()
-            && self
-                .input_watcher
-                .as_ref()
-                .map(|w| w.take_change())
-                .unwrap_or(false)
-    }
-
-    /// Returns `true` if the OS has pushed a device-list change notification
-    /// (hardware added/removed) since the last call. Consumes the pending
-    /// flag. Callers combine this with bound-vs-default comparison to decide
-    /// whether to rebind — the list change alone doesn't mean *our* device
-    /// is affected, but it is an earlier trigger than default-device change
-    /// during AirPods/Bluetooth handshakes on some macOS versions.
-    pub fn device_list_changed(&self) -> bool {
-        self.devices_watcher
-            .as_ref()
-            .map(|w| w.take_change())
-            .unwrap_or(false)
-    }
-
     /// Returns the device name the system audio stream is currently bound to,
     /// or `None` if not running / identity unknown. Used by the defensive
     /// device-identity drift poll.
@@ -1155,16 +1108,6 @@ mod tests {
     }
 
     #[test]
-    fn test_default_changed_is_false_when_not_running() {
-        // Idle manager should never report a default-device change — the
-        // flag is gated on `is_running()` so stale listener signals from a
-        // previous session can't cause spurious restarts.
-        let manager = AudioManager::new();
-        assert!(!manager.system_audio_default_changed());
-        assert!(!manager.mic_default_changed());
-    }
-
-    #[test]
     fn test_bound_device_none_when_not_running() {
         let manager = AudioManager::new();
         assert!(manager.system_audio_bound_device().is_none());
@@ -1281,13 +1224,6 @@ mod tests {
         assert!(report.same_device);
         assert_eq!(report.new_device_id.as_deref(), Some("dev-A"));
         assert_eq!(report.bound_device_name.as_deref(), Some("Dev A"));
-    }
-
-    #[test]
-    fn test_device_list_changed_starts_false() {
-        let manager = AudioManager::new();
-        // Fresh manager, no property change yet — flag must be false.
-        assert!(!manager.device_list_changed());
     }
 
     #[test]
