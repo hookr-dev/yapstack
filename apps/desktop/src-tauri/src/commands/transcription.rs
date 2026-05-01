@@ -639,7 +639,7 @@ fn find_sidecar_path() -> Result<PathBuf, CommandError> {
     } else {
         ""
     };
-    let sidecar_name = format!("yapstack-sidecar-{target_triple}{ext}");
+    let sidecar_name = format!("yapstack-transcription-sidecar-{target_triple}{ext}");
 
     let path = exe_dir.join(&sidecar_name);
     if path.exists() {
@@ -647,8 +647,21 @@ fn find_sidecar_path() -> Result<PathBuf, CommandError> {
     }
 
     // Fallback: try without target triple (development mode)
-    let fallback_name = format!("yapstack-sidecar{ext}");
+    let fallback_name = format!("yapstack-transcription-sidecar{ext}");
     let path = exe_dir.join(&fallback_name);
+    if path.exists() {
+        return Ok(path);
+    }
+
+    // TODO: remove after one release. Backcompat for stale dev mirrors that
+    // still carry the pre-rename `yapstack-sidecar` binary name.
+    let legacy_suffixed = format!("yapstack-sidecar-{target_triple}{ext}");
+    let path = exe_dir.join(&legacy_suffixed);
+    if path.exists() {
+        return Ok(path);
+    }
+    let legacy_plain = format!("yapstack-sidecar{ext}");
+    let path = exe_dir.join(&legacy_plain);
     if path.exists() {
         return Ok(path);
     }

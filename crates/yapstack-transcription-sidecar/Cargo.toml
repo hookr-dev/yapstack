@@ -1,5 +1,5 @@
 [package]
-name = "yapstack-sidecar"
+name = "yapstack-transcription-sidecar"
 version = "0.1.0"
 edition = "2021"
 license.workspace = true

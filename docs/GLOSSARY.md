@@ -15,7 +15,7 @@ Canonical names for things in YapStack. Use these in code, commits, and tickets 
 ## Transcription
 
 - **Engine** — `Whisper | Parakeet`. User-selectable in settings; backed by separate sidecar features.
-- **Sidecar** — `yapstack-sidecar` binary. Spawned by the desktop app; communicates over JSON-line IPC on stdin/stdout. Logs to stderr.
+- **Sidecar** — `yapstack-transcription-sidecar` binary. Spawned by the desktop app; communicates over JSON-line IPC on stdin/stdout. Logs to stderr.
 - **IPC protocol** — tagged JSON unions (`SidecarRequest::Transcribe`, `SidecarResponse::Transcription`, etc.). One `id: u64` per request for correlation.
 - **VAD (voice activity detection)** — Silero V5 ONNX model, shared singleton. Per-source state machines emit speech/silence transitions.
 - **Backfill** — historical audio from before recording started, transcribed concurrently with the live stream. Segments carry `origin: "backfill"`. The scheduler drains backfill at the lowest priority, behind FinalFlush and Live.

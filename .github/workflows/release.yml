@@ -59,10 +59,10 @@ jobs:
       - name: Install dependencies
         run: pnpm install
 
-      - name: Build sidecar
+      - name: Build sidecars
         env:
           SOURCE_DATE_EPOCH: "1"
-        run: ./scripts/build-sidecar.sh
+        run: ./scripts/build-sidecars.sh
 
       - name: Import code signing certificate
         env:

@@ -14,8 +14,8 @@ else
   echo "WARNING: No .env file found — notarization will be skipped"
 fi
 
-echo "=== Building sidecar (release) ==="
-"$SCRIPT_DIR/build-sidecar.sh"
+echo "=== Building sidecars (release) ==="
+"$SCRIPT_DIR/build-sidecars.sh"
 
 echo ""
 echo "=== Building DMG ==="

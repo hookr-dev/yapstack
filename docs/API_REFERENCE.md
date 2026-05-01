@@ -493,13 +493,13 @@ pub enum TranscriptionError {
 
 ---
 
-## yapstack-sidecar
+## yapstack-transcription-sidecar
 
 Binary. No public API. Communicates via JSON-line IPC.
 
 **CLI**:
 ```
-yapstack-sidecar
+yapstack-transcription-sidecar
     [--engine whisper|parakeet]                # default: whisper (preserves prior CLI behavior)
     [--model /path/to/model[/dir]]              # ggml file for Whisper, model dir for Parakeet
     [--vad-model /path/to/silero.bin]           # Whisper only
@@ -509,7 +509,7 @@ yapstack-sidecar
 
 **Env vars**:
 - `YAPSTACK_PARAKEET_ACCEL=auto|cpu|coreml|webgpu` — selects the ORT execution provider for Parakeet (`auto` = CoreML when no external `.onnx.data` files, else CPU)
-- `RUST_LOG` — standard tracing override; default is `info,yapstack_sidecar=debug`
+- `RUST_LOG` — standard tracing override; default is `info,yapstack_transcription_sidecar=debug`
 
 **Feature flags**:
 - `whisper` — Whisper transcription via whisper-rs (requires cmake)
