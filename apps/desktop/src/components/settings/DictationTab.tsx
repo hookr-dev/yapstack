@@ -16,31 +16,13 @@ import {
 } from "@/components/ui/select";
 import {
   eventToGlobalBinding,
+  findShortcutConflict,
   shortcutCaptureActive,
 } from "@/lib/shortcuts";
+import { toast } from "sonner";
 import { suspendGlobalShortcuts, resumeGlobalShortcuts } from "@/hooks/useGlobalShortcuts";
-import { isMac } from "@/lib/utils";
+import { formatGlobalShortcutDisplay } from "@/lib/utils";
 import { Plus, Trash2 } from "lucide-react";
-
-function formatGlobalDisplay(binding: string): string {
-  if (!binding) return "Not set";
-  const parts = binding.split("+");
-  if (isMac) {
-    const symbols: string[] = [];
-    for (const p of parts) {
-      if (p === "CommandOrControl") symbols.push("\u2318");
-      else if (p === "Shift") symbols.push("\u21E7");
-      else if (p === "Alt") symbols.push("\u2325");
-      else if (p === "Backspace") symbols.push("\u232B");
-      else if (p === "Escape") symbols.push("\u238B");
-      else symbols.push(p.toUpperCase());
-    }
-    return symbols.join("");
-  }
-  return parts
-    .map((p) => (p === "CommandOrControl" ? "Ctrl" : p))
-    .join("+");
-}
 
 const OUTPUT_ACTION_LABELS: Record<DictationOutputAction, string> = {
   paste: "Paste",
@@ -78,7 +60,7 @@ function KeybindRecorder({
       onClick={() => setRecording(true)}
       className="inline-flex items-center justify-center rounded border px-1.5 py-1 keybind-display text-xs min-w-[56px] transition-colors border-border bg-background text-foreground hover:bg-muted cursor-pointer"
     >
-      {formatGlobalDisplay(binding)}
+      {formatGlobalShortcutDisplay(binding)}
     </button>
   );
 }
@@ -116,7 +98,7 @@ function KeybindCaptureInline({
       const captured = eventToGlobalBinding(e);
       if (captured) {
         pendingRef.current = captured;
-        setPendingDisplay(formatGlobalDisplay(captured));
+        setPendingDisplay(formatGlobalShortcutDisplay(captured));
       }
     }
 
@@ -318,10 +300,27 @@ export function DictationTab() {
 
   const handleKeybindCapture = useCallback(
     (shortcutId: string, binding: string) => {
+      const conflict = findShortcutConflict(
+        binding,
+        shortcutId,
+        true, // dictation slot bindings are always global
+        shortcutBindings,
+        dictation.slots,
+      );
+      if (conflict) {
+        const target =
+          conflict.kind === "dictation"
+            ? `dictation slot "${conflict.label}"`
+            : `"${conflict.label}"`;
+        toast.error(
+          `${formatGlobalShortcutDisplay(binding)} is already bound to ${target}. Rebind it first.`,
+        );
+        return;
+      }
       const newOverrides = { ...shortcutBindings, [shortcutId]: binding };
       updateSettings({ shortcutBindings: newOverrides });
     },
-    [shortcutBindings, updateSettings],
+    [shortcutBindings, dictation.slots, updateSettings],
   );
 
   const handleAddSlot = () => {
@@ -365,7 +364,8 @@ export function DictationTab() {
         <div>
           <h3 className="text-xs font-medium">Voice Dictation</h3>
           <p className="text-xs text-muted-foreground mt-0.5">
-            Hold a keybind to dictate, release to transcribe.
+            Hold a keybind to dictate, release to transcribe. Captures
+            your microphone only — system audio is never included.
           </p>
         </div>
         <Switch

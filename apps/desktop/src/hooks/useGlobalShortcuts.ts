@@ -219,11 +219,9 @@ export function useGlobalShortcuts() {
               !s.activeSessionId
             ) {
               focusWindow().then(() => {
-                const avail = Math.floor(
-                  Math.max(
-                    s.bufferInfo?.mic?.available_seconds ?? 0,
-                    s.bufferInfo?.system?.available_seconds ?? 0,
-                  ),
+                const avail = Math.max(
+                  s.bufferInfo?.mic?.available_seconds ?? 0,
+                  s.bufferInfo?.system?.available_seconds ?? 0,
                 );
                 s.createAndStartSession(avail, "shortcut");
               });

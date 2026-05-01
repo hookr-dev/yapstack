@@ -2,7 +2,7 @@ import { useState, useEffect, useRef, useCallback } from "react";
 import { useAppStore } from "@/stores/appStore";
 import {
   FolderSuggestionTracker,
-  buildFolderKeywordMap,
+  buildFolderProfiles,
   type FolderSuggestion,
 } from "@/lib/auto-tag";
 import { commands } from "@/lib/tauri";
@@ -11,18 +11,36 @@ import { buildVocabularyHints } from "@/lib/transcription";
 
 export function useAutoTag(sessionId: string | null, isRecording: boolean) {
   const folders = useAppStore((s) => s.folders);
+  const folderTree = useAppStore((s) => s.folderTree);
+  const tags = useAppStore((s) => s.tags);
   const sessionFolderMap = useAppStore((s) => s.sessionFolderMap);
+  const sessionTagMap = useAppStore((s) => s.sessionTagMap);
   const activeSessionSegments = useAppStore((s) => s.activeSessionSegments);
   const addSessionToFolder = useAppStore((s) => s.addSessionToFolder);
 
   const [suggestions, setSuggestions] = useState<FolderSuggestion[]>([]);
   const trackerRef = useRef<FolderSuggestionTracker | null>(null);
   const processedCountRef = useRef(0);
-  const keywordMapRef = useRef(buildFolderKeywordMap(folders));
+  const profilesRef = useRef(
+    buildFolderProfiles(folders, tags, sessionFolderMap, sessionTagMap),
+  );
+  // Sessions for which the user has already filed a folder via this UI.
+  // Lives outside the tracker so the completion state survives the
+  // tracker rebuild that fires when sessionFolderMap mutates after accept
+  // or override (otherwise the bar would flash back into view).
+  const completedSessionsRef = useRef(new Set<string>());
 
+  // Profiles depend on the global folder/tag membership graph; the runtime
+  // tracker just consumes them. Rebuild when any of those inputs change so a
+  // newly-created folder or a tag added mid-session is reflected.
   useEffect(() => {
-    keywordMapRef.current = buildFolderKeywordMap(folders);
-  }, [folders]);
+    profilesRef.current = buildFolderProfiles(
+      folders,
+      tags,
+      sessionFolderMap,
+      sessionTagMap,
+    );
+  }, [folders, tags, sessionFolderMap, sessionTagMap]);
 
   useEffect(() => {
     if (!sessionId || !isRecording) {
@@ -32,7 +50,14 @@ export function useAutoTag(sessionId: string | null, isRecording: boolean) {
       return;
     }
     const existingFolders = sessionFolderMap[sessionId] ?? [];
-    trackerRef.current = new FolderSuggestionTracker(existingFolders);
+    const tracker = new FolderSuggestionTracker(
+      profilesRef.current,
+      existingFolders,
+    );
+    if (completedSessionsRef.current.has(sessionId)) {
+      tracker.complete();
+    }
+    trackerRef.current = tracker;
     processedCountRef.current = 0;
   }, [sessionId, isRecording, sessionFolderMap]);
 
@@ -43,41 +68,64 @@ export function useAutoTag(sessionId: string | null, isRecording: boolean) {
     if (newSegments.length === 0) return;
     processedCountRef.current = activeSessionSegments.length;
 
+    let latest: FolderSuggestion[] = [];
     for (const seg of newSegments) {
-      const newSuggestions = trackerRef.current.processSegment(
-        seg.text,
-        keywordMapRef.current,
-      );
-      if (newSuggestions.length > 0) {
-        setSuggestions((prev) => {
-          const existingIds = new Set(prev.map((s) => s.id));
-          const unique = newSuggestions.filter((s) => !existingIds.has(s.id));
-          return unique.length > 0 ? [...prev, ...unique] : prev;
-        });
-      }
+      latest = trackerRef.current.processSegment(seg.text);
     }
+    setSuggestions((prev) => {
+      if (latest.length === 0 && prev.length === 0) return prev;
+      if (
+        latest.length === prev.length &&
+        latest.every((s, i) => s.id === prev[i].id && s.confidence === prev[i].confidence)
+      ) {
+        return prev;
+      }
+      return latest;
+    });
   }, [activeSessionSegments, isRecording]);
+
+  const refreshVocabularyHints = useCallback(async () => {
+    const updatedHints = buildVocabularyHints(await listFolders(), await listTags());
+    if (updatedHints) {
+      commands.updateVocabularyHints(updatedHints).catch(() => {});
+    }
+  }, []);
 
   const acceptSuggestion = useCallback(
     async (suggestion: FolderSuggestion) => {
       if (!sessionId) return;
-      trackerRef.current?.accept(suggestion.name);
-      setSuggestions((prev) => prev.filter((s) => s.id !== suggestion.id));
+      completedSessionsRef.current.add(sessionId);
+      trackerRef.current?.accept(suggestion.id);
+      setSuggestions([]);
       await addSessionToFolder(sessionId, suggestion.id);
-      trackerRef.current?.addExistingFolder(suggestion.id);
-
-      const updatedHints = buildVocabularyHints(await listFolders(), await listTags());
-      if (updatedHints) {
-        commands.updateVocabularyHints(updatedHints).catch(() => {});
-      }
+      await refreshVocabularyHints();
     },
-    [sessionId, addSessionToFolder],
+    [sessionId, addSessionToFolder, refreshVocabularyHints],
+  );
+
+  const applyOverride = useCallback(
+    async (folderId: string) => {
+      if (!sessionId) return;
+      completedSessionsRef.current.add(sessionId);
+      trackerRef.current?.complete();
+      setSuggestions([]);
+      await addSessionToFolder(sessionId, folderId);
+      await refreshVocabularyHints();
+    },
+    [sessionId, addSessionToFolder, refreshVocabularyHints],
   );
 
   const dismissSuggestion = useCallback((suggestion: FolderSuggestion) => {
-    trackerRef.current?.dismiss(suggestion.name);
+    trackerRef.current?.dismiss(suggestion.id);
     setSuggestions((prev) => prev.filter((s) => s.id !== suggestion.id));
   }, []);
 
-  return { suggestions, acceptSuggestion, dismissSuggestion };
+  return {
+    suggestions,
+    folders,
+    folderTree,
+    acceptSuggestion,
+    applyOverride,
+    dismissSuggestion,
+  };
 }

@@ -18,7 +18,7 @@ import {
 } from "@/components/ui/select";
 import { ChevronsUpDown, Folder, RotateCcw } from "lucide-react";
 import { open } from "@tauri-apps/plugin-dialog";
-import { revealItemInDir } from "@tauri-apps/plugin-opener";
+import { revealAudioFile } from "@/lib/reveal-file";
 import { appDataDir } from "@tauri-apps/api/path";
 import type { CaptureSourceDto } from "@/lib/tauri";
 
@@ -45,9 +45,7 @@ export function AudioTab() {
 
   const handleOpenFolder = async () => {
     const folder = audioSaveLocation ?? (await appDataDir()) + "/audio";
-    revealItemInDir(folder).catch((e) =>
-      console.error("Failed to reveal folder:", e),
-    );
+    revealAudioFile(folder);
   };
 
   return (

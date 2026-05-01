@@ -156,6 +156,46 @@ export function getBinding(
  */
 export const shortcutCaptureActive = { current: false };
 
+export interface ShortcutConflict {
+  kind: "static" | "dictation";
+  label: string;
+}
+
+/**
+ * Returns the conflicting shortcut if `binding` is already used in the same
+ * scope as `recordingId`, or null when the binding is free. Callers reject
+ * the rebind on conflict — overlapping bindings are never silently stolen.
+ */
+export function findShortcutConflict(
+  binding: string,
+  recordingId: string,
+  isGlobal: boolean,
+  overrides: Record<string, string>,
+  dictationSlots: { id: string; name: string; defaultBinding?: string }[],
+): ShortcutConflict | null {
+  for (const shortcut of SHORTCUTS) {
+    if (shortcut.id === recordingId) continue;
+    if (shortcut.isGlobal !== isGlobal) continue;
+    const otherBinding = getBinding(shortcut.id, overrides);
+    if (otherBinding && otherBinding === binding) {
+      return { kind: "static", label: shortcut.label };
+    }
+  }
+
+  if (isGlobal) {
+    for (const slot of dictationSlots) {
+      const slotShortcutId = `global.dictation-${slot.id}`;
+      if (slotShortcutId === recordingId) continue;
+      const otherBinding = overrides[slotShortcutId] ?? slot.defaultBinding ?? "";
+      if (otherBinding && otherBinding === binding) {
+        return { kind: "dictation", label: slot.name };
+      }
+    }
+  }
+
+  return null;
+}
+
 import { isMac } from "@/lib/utils";
 
 /**

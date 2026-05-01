@@ -89,9 +89,15 @@ export function GeneralTab() {
     trackUpdateInstallStarted({ version: updateStatus.version });
     try {
       await downloadAndInstallUpdate((progress) => {
-        if (progress.contentLength && progress.contentLength > 0) {
-          setInstallProgress(Math.round((progress.downloaded / progress.contentLength) * 100));
-        }
+        if (!progress.contentLength || progress.contentLength <= 0) return;
+        const pct = Math.min(
+          100,
+          Math.round((progress.downloaded / progress.contentLength) * 100),
+        );
+        // Monotonic: a stale or repeated "Started" event must not pull the
+        // bar backward. Same-value setState bails out, so this also avoids
+        // re-renders for the many sub-1% chunk events.
+        setInstallProgress((prev) => (pct > prev ? pct : prev));
       });
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);

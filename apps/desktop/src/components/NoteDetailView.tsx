@@ -41,6 +41,7 @@ export function NoteDetailView() {
       : null,
   );
   const backfillActive = useAppStore((s) => s.backfillActive);
+  const backfillBoundarySeconds = useAppStore((s) => s.backfillBoundarySeconds);
   const playbackTime = useAppStore((s) => s.playbackTime);
   const setPlaybackTime = useAppStore((s) => s.setPlaybackTime);
   const setIsPlaying = useAppStore((s) => s.setIsPlaying);
@@ -55,10 +56,14 @@ export function NoteDetailView() {
 
   const isActiveSession = selectedSessionId === activeSessionId;
 
-  const { suggestions, acceptSuggestion, dismissSuggestion } = useAutoTag(
-    selectedSessionId,
-    isActiveSession,
-  );
+  const {
+    suggestions,
+    folders: autoTagFolders,
+    folderTree: autoTagFolderTree,
+    acceptSuggestion,
+    applyOverride,
+    dismissSuggestion,
+  } = useAutoTag(selectedSessionId, isActiveSession);
 
   const session = isActiveSession ? activeSession : viewSession;
 
@@ -196,7 +201,10 @@ export function NoteDetailView() {
         <SessionHeader session={session} />
         <AutoTagSuggestions
           suggestions={suggestions}
+          folders={autoTagFolders}
+          folderTree={autoTagFolderTree}
           onAccept={acceptSuggestion}
+          onApplyOverride={applyOverride}
           onDismiss={dismissSuggestion}
         />
         <ResizablePanelGroup orientation="horizontal" className="flex-1">
@@ -206,6 +214,7 @@ export function NoteDetailView() {
                 sessionId={selectedSessionId ?? undefined}
                 segments={segments}
                 backfillActive={backfillActive}
+                backfillBoundarySeconds={backfillBoundarySeconds}
                 isEditable={isEditable}
                 initialScrollToBottom={isActiveSession}
               />

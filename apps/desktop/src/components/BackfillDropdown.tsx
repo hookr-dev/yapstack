@@ -12,6 +12,7 @@ import {
 } from "@/components/ui/tooltip";
 import { Button } from "@/components/ui/button";
 import { Rewind } from "lucide-react";
+import { BACKFILL_STEPS_SECONDS, formatBackfillSeconds } from "@/lib/backfill";
 
 export function BackfillDropdown({
   availableSeconds,
@@ -22,6 +23,8 @@ export function BackfillDropdown({
   canCreate: boolean;
   onBackfill: (seconds?: number) => void;
 }) {
+  const visibleSteps = BACKFILL_STEPS_SECONDS.filter((d) => d < availableSeconds);
+  const display = formatBackfillSeconds(availableSeconds);
   return (
     <DropdownMenu>
       <Tooltip>
@@ -30,30 +33,26 @@ export function BackfillDropdown({
             <Button
               variant="ghost"
               size="icon-xs"
-              disabled={!canCreate}
+              disabled={!canCreate || availableSeconds <= 0}
             >
               <Rewind className="h-3.5 w-3.5" />
             </Button>
           </DropdownMenuTrigger>
         </TooltipTrigger>
         <TooltipContent>
-          Rewind ({availableSeconds}s available)
+          Rewind ({display} available)
         </TooltipContent>
       </Tooltip>
       <DropdownMenuContent align="start">
         <DropdownMenuItem onClick={() => onBackfill(availableSeconds)}>
-          Full buffer ({availableSeconds}s)
+          Full buffer ({display})
         </DropdownMenuItem>
-        {[30, 60, 120, 300].some((d) => d < availableSeconds) && (
-          <DropdownMenuSeparator />
-        )}
-        {[30, 60, 120, 300]
-          .filter((d) => d < availableSeconds)
-          .map((d) => (
-            <DropdownMenuItem key={d} onClick={() => onBackfill(d)}>
-              Last {d}s
-            </DropdownMenuItem>
-          ))}
+        {visibleSteps.length > 0 && <DropdownMenuSeparator />}
+        {visibleSteps.map((d) => (
+          <DropdownMenuItem key={d} onClick={() => onBackfill(d)}>
+            Last {d}s
+          </DropdownMenuItem>
+        ))}
       </DropdownMenuContent>
     </DropdownMenu>
   );

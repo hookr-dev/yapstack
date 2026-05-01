@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 import { convertFileSrc } from "@tauri-apps/api/core";
+import { revealAudioFile } from "@/lib/reveal-file";
 import { useAppStore } from "@/stores/appStore";
 import {
   createManualSession as dbCreateManualSession,
@@ -107,6 +108,11 @@ export function useDictationEntry(entry: DbDictationHistory) {
     deleteEntry(entry.id);
   };
 
+  const handleShowFile = () => {
+    if (!entry.wav_file_path) return;
+    void revealAudioFile(entry.wav_file_path);
+  };
+
   return {
     playing,
     handleCopy,
@@ -114,5 +120,6 @@ export function useDictationEntry(entry: DbDictationHistory) {
     handleMoveToNote,
     handleOpenNote,
     handleDelete,
+    handleShowFile,
   };
 }

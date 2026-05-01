@@ -10,6 +10,7 @@ export function ChatView({
   sessionId,
   segments,
   backfillActive,
+  backfillBoundarySeconds,
   isEditable,
   currentPlaybackTime,
   onTimestampClick,
@@ -20,6 +21,10 @@ export function ChatView({
   sessionId?: string;
   segments: DbSegment[];
   backfillActive?: boolean;
+  /// Audio offset (seconds) where backfill ends and live audio begins. Used
+  /// to position the "Processing prior audio" indicator between old and new
+  /// segments. Null until the first backfill chunk lands.
+  backfillBoundarySeconds?: number | null;
   isEditable?: boolean;
   currentPlaybackTime?: number;
   onTimestampClick?: (time: number) => void;
@@ -80,6 +85,28 @@ export function ChatView({
   }, [selectedSegmentIds, clearSegmentSelection, deleteSegments, isEditable]);
 
   const orderedIds = useMemo(() => segments.map((s) => s.id), [segments]);
+
+  // Split segments at the backfill→live boundary so the "Processing prior
+  // audio" indicator sits between old and new audio. Backfill segments
+  // occupy offsets `0..backfillBoundarySeconds`; live audio comes after.
+  // Until the first backfill chunk lands, boundary is null and every
+  // received segment is live (rendered below the indicator).
+  const { backfillSegments, liveSegments } = useMemo(() => {
+    if (!backfillActive) {
+      return { backfillSegments: segments, liveSegments: [] as DbSegment[] };
+    }
+    const boundary = backfillBoundarySeconds ?? 0;
+    const splitIndex = segments.findIndex(
+      (s) => s.audio_offset_seconds >= boundary,
+    );
+    if (splitIndex === -1) {
+      return { backfillSegments: segments, liveSegments: [] as DbSegment[] };
+    }
+    return {
+      backfillSegments: segments.slice(0, splitIndex),
+      liveSegments: segments.slice(splitIndex),
+    };
+  }, [segments, backfillActive, backfillBoundarySeconds]);
 
   // Marquee selection state — drag-select on whitespace within the
   // transcript. Bubbles own their own click handling (incl. ContextMenu
@@ -410,7 +437,7 @@ export function ChatView({
         >
           <TranscriptSegments
             sessionId={sessionId ?? ""}
-            segments={segments}
+            segments={backfillSegments}
             isEditable={!!isEditable}
             activeSegmentId={activeSegmentId}
             activeRef={activeRef}
@@ -418,17 +445,6 @@ export function ChatView({
             orderedIds={orderedIds}
             onTimestampClick={handleTimestampClick}
           />
-          {marquee && (
-            <div
-              className="pointer-events-none absolute rounded border border-primary/50 bg-primary/10"
-              style={{
-                left: marquee.left,
-                top: marquee.top,
-                width: marquee.width,
-                height: marquee.height,
-              }}
-            />
-          )}
           {backfillActive && (
             <div className="flex items-center gap-4 py-2 text-muted-foreground">
               <div className="h-px flex-1 border-t border-dashed" />
@@ -439,6 +455,29 @@ export function ChatView({
               <span className="text-[11px] font-medium">Processing prior audio</span>
               <div className="h-px flex-1 border-t border-dashed" />
             </div>
+          )}
+          {liveSegments.length > 0 && (
+            <TranscriptSegments
+              sessionId={sessionId ?? ""}
+              segments={liveSegments}
+              isEditable={!!isEditable}
+              activeSegmentId={activeSegmentId}
+              activeRef={activeRef}
+              selectedSegmentIds={selectedSegmentIds}
+              orderedIds={orderedIds}
+              onTimestampClick={handleTimestampClick}
+            />
+          )}
+          {marquee && (
+            <div
+              className="pointer-events-none absolute rounded border border-primary/50 bg-primary/10"
+              style={{
+                left: marquee.left,
+                top: marquee.top,
+                width: marquee.width,
+                height: marquee.height,
+              }}
+            />
           )}
           <div ref={bottomRef} />
         </div>

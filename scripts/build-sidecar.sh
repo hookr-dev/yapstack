@@ -154,14 +154,15 @@ for target in "${TARGETS[@]}"; do
     # Dev fallback: `find_sidecar_path()` in apps/desktop looks for
     # `<exe_dir>/yapstack-sidecar-<triple>` first, then falls back to
     # `<exe_dir>/yapstack-sidecar`. In `pnpm tauri dev` the running exe
-    # lives in target/debug/, where tauri-cli builds the un-suffixed
-    # `yapstack-sidecar` once at app build time and never updates it on
-    # later sidecar rebuilds. Mirror our fresh build there so an
-    # iterative `pnpm build:sidecar:dev` plus a sidecar respawn (kill
-    # the sidecar; the live controller auto-restarts) actually picks
-    # up the new code without rebuilding the desktop app.
+    # lives in target/debug/, where any plain `cargo build` (e.g. via
+    # `pnpm check`, `cargo test --all`, IDE rust-analyzer) rebuilds the
+    # un-suffixed `yapstack-sidecar` with **default features only** —
+    # no webgpu / coreml / metal — silently clobbering the feature-rich
+    # build the dev runtime needs. Mirror to the triple-suffixed name
+    # instead: `find_sidecar_path` picks it up first, and cargo never
+    # writes to that path, so the mirror survives workspace rebuilds.
     if ! $RELEASE && [[ "$target" != *"windows"* ]]; then
-        dev_runtime_dest="$PROJECT_ROOT/target/debug/yapstack-sidecar"
+        dev_runtime_dest="$PROJECT_ROOT/target/debug/yapstack-sidecar-${target}"
         if [ -d "$PROJECT_ROOT/target/debug" ]; then
             cp "$dest" "$dev_runtime_dest"
             chmod +x "$dev_runtime_dest"

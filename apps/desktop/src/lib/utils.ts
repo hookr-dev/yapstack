@@ -145,3 +145,28 @@ export function formatShortcutDisplay(binding: string): string {
   }
   return labels.join("+");
 }
+
+/**
+ * Format a Tauri global-shortcut binding ("CommandOrControl+Shift+N",
+ * "Control+Shift+D") for display. Symbols on Mac, "Ctrl+…" on others.
+ */
+export function formatGlobalShortcutDisplay(binding: string): string {
+  if (!binding) return "Not set";
+  const parts = binding.split("+");
+  if (isMac) {
+    const symbols: string[] = [];
+    for (const p of parts) {
+      if (p === "CommandOrControl") symbols.push("⌘");
+      else if (p === "Control") symbols.push("⌃");
+      else if (p === "Shift") symbols.push("⇧");
+      else if (p === "Alt") symbols.push("⌥");
+      else if (p === "Backspace") symbols.push("⌫");
+      else if (p === "Escape") symbols.push("⎋");
+      else symbols.push(p.toUpperCase());
+    }
+    return symbols.join("");
+  }
+  return parts
+    .map((p) => (p === "CommandOrControl" || p === "Control" ? "Ctrl" : p))
+    .join("+");
+}
