@@ -165,6 +165,30 @@ pub fn default_input_device() -> Result<AudioDeviceInfo> {
     })
 }
 
+pub fn default_output_device() -> Result<AudioDeviceInfo> {
+    let host = cpal::default_host();
+    let device = host
+        .default_output_device()
+        .ok_or(AudioError::NoDevicesAvailable)?;
+    let name = device
+        .description()
+        .map(|d| {
+            d.extended()
+                .first()
+                .cloned()
+                .unwrap_or_else(|| d.name().to_string())
+        })
+        .map_err(|e| AudioError::DeviceInit(e.to_string()))?;
+    let id = device_id(&device);
+
+    Ok(AudioDeviceInfo {
+        id,
+        name,
+        device_type: DeviceType::Output,
+        is_default: true,
+    })
+}
+
 /// Resolves an input device by ID first, then by name, then falls back to system default.
 pub(crate) fn resolve_input_device(id: Option<&str>, name: Option<&str>) -> Result<cpal::Device> {
     let host = cpal::default_host();
