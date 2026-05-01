@@ -41,6 +41,13 @@ export type StreamHealthEvent = {
   source: "Mic" | "System";
   status: "restarted" | "restart_failed" | "restart_abandoned";
   message: string;
+  /**
+   * Human-readable name of the device the Stream is bound to after the
+   * event. Set on successful auto-failover so the UI can render
+   * "Switched to {name}" toasts. `null` for failures or when the underlying
+   * capture didn't report a device name.
+   */
+  bound_device_name?: string | null;
 };
 
 /**

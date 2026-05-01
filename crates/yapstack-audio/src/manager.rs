@@ -42,6 +42,10 @@ pub struct RestartReport {
     pub same_device: bool,
     /// The device ID the stream is bound to after the restart, if any.
     pub new_device_id: Option<String>,
+    /// Human-readable name of the device the stream is bound to after the
+    /// restart, if known. Surfaced through `stream-health` so the FE can
+    /// render a "Switched to {name}" toast on auto-failover.
+    pub bound_device_name: Option<String>,
 }
 
 pub struct AudioManager {
@@ -662,10 +666,12 @@ impl AudioManager {
                     self.mic.set_bound_is_default(preserve_bound_is_default);
                     let new_device_id = self.mic.last_device_id().map(|s| s.to_string());
                     let same_device = old_device_id.is_some() && old_device_id == new_device_id;
+                    let bound_device_name = self.mic.last_device_name().map(|s| s.to_string());
                     return Ok(RestartReport {
                         outcome,
                         same_device,
                         new_device_id,
+                        bound_device_name,
                     });
                 }
                 Err(e) => {
@@ -719,10 +725,12 @@ impl AudioManager {
 
         let new_device_id = self.system.last_device_id().map(|s| s.to_string());
         let same_device = old_device_id.is_some() && old_device_id == new_device_id;
+        let bound_device_name = self.system.last_device_name().map(|s| s.to_string());
         Ok(RestartReport {
             outcome,
             same_device,
             new_device_id,
+            bound_device_name,
         })
     }
 
@@ -1332,9 +1340,11 @@ mod tests {
             outcome: RestartOutcome::BufferPreserved,
             same_device: true,
             new_device_id: Some("dev-A".into()),
+            bound_device_name: Some("Dev A".into()),
         };
         assert!(report.same_device);
         assert_eq!(report.new_device_id.as_deref(), Some("dev-A"));
+        assert_eq!(report.bound_device_name.as_deref(), Some("Dev A"));
     }
 
     #[test]

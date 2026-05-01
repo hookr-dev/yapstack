@@ -220,6 +220,12 @@ pub struct StreamHealthEvent {
     /// "restarted" | "restart_failed" | "restart_abandoned"
     pub status: String,
     pub message: String,
+    /// Human-readable name of the device the Stream is bound to after the
+    /// event. Set on successful auto-failover so the FE can render
+    /// "Switched to {name}" toasts. `None` for failures or when the
+    /// underlying capture didn't report a device name.
+    #[serde(default)]
+    pub bound_device_name: Option<String>,
 }
 
 /// Per-chunk timing telemetry. Emitted after every transcribe attempt (success
@@ -1330,6 +1336,7 @@ async fn preflight_stream_health(
                             source: AudioSourceLabel::System,
                             status: "restart_failed".into(),
                             message: format!("preflight system restart failed: {e}"),
+                            bound_device_name: None,
                         },
                     );
                 }
@@ -1341,12 +1348,22 @@ async fn preflight_stream_health(
 
     for label in restarted {
         let name = source_display_name(&label);
+        let bound_device_name = {
+            let manager = audio_state.lock().await;
+            match label {
+                AudioSourceLabel::Mic => manager.mic_bound_device().map(|s| s.to_string()),
+                AudioSourceLabel::System => {
+                    manager.system_audio_bound_device().map(|s| s.to_string())
+                }
+            }
+        };
         let _ = app_handle.emit(
             "stream-health",
             StreamHealthEvent {
                 source: label,
                 status: "restarted".into(),
                 message: format!("{name} stream restarted (preflight)"),
+                bound_device_name,
             },
         );
     }
@@ -1937,6 +1954,7 @@ async fn attempt_source_restart(
                     source: source.label,
                     status: "restarted".into(),
                     message: format!("{} stream restarted ({})", source_name, reason),
+                    bound_device_name: report.bound_device_name.clone(),
                 },
             );
         }
@@ -1960,6 +1978,7 @@ async fn attempt_source_restart(
                         "{} stream restart failed: {} (attempt {}/{})",
                         source_name, e, source.restart_attempts, STREAM_RESTART_MAX_ATTEMPTS
                     ),
+                    bound_device_name: None,
                 },
             );
         }

@@ -1,5 +1,6 @@
 mod commands;
 mod db;
+mod device_broker;
 mod logging;
 
 const WINDOW_MAIN: &str = "main";
@@ -625,6 +626,16 @@ pub fn run() {
                 let mut guard = tray_state_clone.lock().await;
                 *guard = Some(tray);
             });
+
+            // Always-on device-change broker. Owns the receiving end of
+            // the audio crate's runtime-agnostic device-event sink. Phase 3
+            // logs only; later phases emit `devices-changed` /
+            // `default-device-changed` and route restart intents.
+            device_broker::spawn(
+                app.handle().clone(),
+                app.state::<AudioManagerState>().inner().clone(),
+                app.state::<ShutdownSignal>().subscribe(),
+            );
 
             // Spawn background event emitter for capture status + buffer info + tray updates
             // Only emits when values actually change to avoid flooding the webview.
