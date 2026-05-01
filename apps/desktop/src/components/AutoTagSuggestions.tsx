@@ -105,20 +105,15 @@ function SuggestionRow({
           </button>
         </DropdownMenuTrigger>
         <DropdownMenuContent align="start" className="min-w-[200px]">
-          <DropdownMenuItem
-            onClick={() => onAccept(suggestion)}
-            className="bg-accent/40 focus:bg-accent"
-          >
-            <Check className="text-primary" />
-            <FolderRow
-              name={suggestion.name}
-              icon={suggestion.icon}
-              color={suggestion.color}
-            />
+          <DropdownMenuItem onClick={() => onAccept(suggestion)}>
+            <RecommendedFolderIcon suggestion={suggestion} />
+            <span className="flex-1">
+              Add to <span className="font-medium">{suggestion.name}</span>
+            </span>
           </DropdownMenuItem>
           <DropdownMenuSeparator />
           <div className="px-2 pt-1 pb-0.5 text-[10px] uppercase tracking-wide text-muted-foreground">
-            Or pick another
+            Or pick a different folder
           </div>
           {folderTree.map((node) => (
             <FolderPickerNode
@@ -147,7 +142,7 @@ function SuggestionPill({
   suggestion: FolderSuggestion;
   interactive: boolean;
 }) {
-  const FolderIcon = suggestion.icon ? ICON_MAP[suggestion.icon] : Folder;
+  const FolderIcon = pickFolderIcon(suggestion.icon);
   return (
     <div
       className={cn(
@@ -164,23 +159,33 @@ function SuggestionPill({
   );
 }
 
+function pickFolderIcon(icon: string | null) {
+  return icon ? ICON_MAP[icon] : Folder;
+}
+
+function RecommendedFolderIcon({ suggestion }: { suggestion: FolderSuggestion }) {
+  const FolderIcon = pickFolderIcon(suggestion.icon);
+  return (
+    <FolderIcon
+      style={suggestion.color ? { color: suggestion.color } : undefined}
+    />
+  );
+}
+
 function FolderRow({
   name,
   icon,
   color,
-  trailing,
 }: {
   name: string;
   icon: string | null;
   color: string | null;
-  trailing?: React.ReactNode;
 }) {
-  const FolderIcon = icon ? ICON_MAP[icon] : Folder;
+  const FolderIcon = pickFolderIcon(icon);
   return (
     <>
       <FolderIcon style={color ? { color } : undefined} />
       <span className="flex-1">{name}</span>
-      {trailing}
     </>
   );
 }
