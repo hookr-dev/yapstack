@@ -41,6 +41,7 @@ export function NoteDetailView() {
       : null,
   );
   const backfillActive = useAppStore((s) => s.backfillActive);
+  const backfillBoundarySeconds = useAppStore((s) => s.backfillBoundarySeconds);
   const playbackTime = useAppStore((s) => s.playbackTime);
   const setPlaybackTime = useAppStore((s) => s.setPlaybackTime);
   const setIsPlaying = useAppStore((s) => s.setIsPlaying);
@@ -213,6 +214,7 @@ export function NoteDetailView() {
                 sessionId={selectedSessionId ?? undefined}
                 segments={segments}
                 backfillActive={backfillActive}
+                backfillBoundarySeconds={backfillBoundarySeconds}
                 isEditable={isEditable}
                 initialScrollToBottom={isActiveSession}
               />

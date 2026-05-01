@@ -6,6 +6,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+### Fixed
+- "Processing prior audio" indicator in the chat now sits at the actual backfill→live boundary instead of being pinned to the bottom of the transcript. Backfill segments occupy offsets `0..effective_backfill_seconds` and live segments come after; the divider tracks the highest end-offset seen on backfill chunks so it slides into place as the rewind buffer streams in.
+
 ## [1.0.0-alpha.7] - 2026-04-30
 
 ### Added
