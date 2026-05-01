@@ -20,10 +20,10 @@ import { BackfillDropdown } from "@/components/BackfillDropdown";
 import { StatusPopover } from "@/components/StatusPopover";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 
-function StatusDot({ color }: { color: string }) {
+function StatusDot({ color, pulse }: { color: string; pulse?: boolean }) {
   return (
     <span
-      className={`inline-block h-2 w-2 rounded-full ${color}`}
+      className={`inline-block h-2 w-2 rounded-full ${color} ${pulse ? "animate-pulse" : ""}`}
       aria-hidden
     />
   );
@@ -63,16 +63,24 @@ export function TitleBar() {
     return () => window.removeEventListener("yapstack:toggle-search", handler);
   }, []);
 
+  // Single source of truth for engine + capture status. The status dot in
+  // this title bar is the only place these states should surface — no banners
+  // in the main content area.
   let dotColor = "bg-muted-foreground";
   let statusText = "Idle";
+  // Pulse during any transitional / not-yet-ready state so the dot doesn't
+  // look idle while work is in progress. Steady when ready or errored.
+  let dotPulse = false;
 
   if (enginePhase === "downloading") {
-    dotColor = "bg-yellow-500";
+    dotColor = "bg-amber-500";
     const pct = modelDownloadProgress ?? 0;
     statusText = `Downloading model (${Math.round(pct)}%)`;
+    dotPulse = true;
   } else if (enginePhase === "initializing") {
-    dotColor = "bg-yellow-500";
+    dotColor = "bg-amber-500";
     statusText = "Loading engine...";
+    dotPulse = true;
   } else if (enginePhase === "error") {
     dotColor = "bg-red-500";
     statusText = engineError ?? "Error";
@@ -84,12 +92,13 @@ export function TitleBar() {
       dotColor = "bg-red-500";
       statusText = captureStatus.error_message ?? "Capture error";
     } else {
-      dotColor = "bg-yellow-500";
+      dotColor = "bg-amber-500";
       statusText = "Engine ready";
     }
   } else {
     dotColor = "bg-muted-foreground";
     statusText = "Setting up...";
+    dotPulse = true;
   }
 
   return (
@@ -163,7 +172,7 @@ export function TitleBar() {
             <Popover>
               <PopoverTrigger asChild>
                 <button className="flex items-center gap-1.5 rounded px-2 py-0.5 text-xs text-muted-foreground hover:bg-muted">
-                  <StatusDot color={dotColor} />
+                  <StatusDot color={dotColor} pulse={dotPulse} />
                   <span className="max-w-[180px] truncate">{statusText}</span>
                 </button>
               </PopoverTrigger>

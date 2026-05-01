@@ -22,7 +22,7 @@ import {
   suspendGlobalShortcuts,
   resumeGlobalShortcuts,
 } from "@/hooks/useGlobalShortcuts";
-import { formatShortcutDisplay, isMac } from "@/lib/utils";
+import { formatGlobalShortcutDisplay, formatShortcutDisplay } from "@/lib/utils";
 import {
   Dialog,
   DialogOverlay,
@@ -63,24 +63,6 @@ import {
 } from "lucide-react";
 import { commands, type CaptureSourceDto } from "@/lib/tauri";
 import { YapStackIcon } from "@/components/YapStackIcon";
-
-function formatGlobalDisplay(binding: string): string {
-  if (!binding) return "Not set";
-  const parts = binding.split("+");
-  if (isMac) {
-    const symbols: string[] = [];
-    for (const p of parts) {
-      if (p === "CommandOrControl") symbols.push("\u2318");
-      else if (p === "Shift") symbols.push("\u21E7");
-      else if (p === "Alt") symbols.push("\u2325");
-      else symbols.push(p);
-    }
-    return symbols.join("");
-  }
-  return parts
-    .map((p) => (p === "CommandOrControl" ? "Ctrl" : p))
-    .join("+");
-}
 
 // --- Progress Dots ---
 
@@ -650,7 +632,7 @@ function KeybindCaptureInline({
       const captured = eventToGlobalBinding(e);
       if (captured) {
         pendingRef.current = captured;
-        setPendingDisplay(formatGlobalDisplay(captured));
+        setPendingDisplay(formatGlobalShortcutDisplay(captured));
       }
     }
 
@@ -772,7 +754,7 @@ function ReadyStep({ onFinish }: { onFinish: () => void }) {
                   </span>
                 )}
                 <span className="keybind-display text-[11px] font-medium text-foreground bg-background border rounded px-1.5 py-0.5">
-                  {isGlobal ? formatGlobalDisplay(binding) : formatShortcutDisplay(binding)}
+                  {isGlobal ? formatGlobalShortcutDisplay(binding) : formatShortcutDisplay(binding)}
                 </span>
               </div>
             </div>
@@ -811,7 +793,7 @@ function ReadyStep({ onFinish }: { onFinish: () => void }) {
                 className="inline-flex items-center justify-center rounded border px-1.5 py-0.5 keybind-display text-[10px] min-w-[56px] hover:border-primary/50 transition-colors"
               >
                 {defaultSlotBinding
-                  ? formatGlobalDisplay(defaultSlotBinding)
+                  ? formatGlobalShortcutDisplay(defaultSlotBinding)
                   : "Click to set"}
               </button>
             )}

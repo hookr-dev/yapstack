@@ -55,10 +55,14 @@ export function NoteDetailView() {
 
   const isActiveSession = selectedSessionId === activeSessionId;
 
-  const { suggestions, acceptSuggestion, dismissSuggestion } = useAutoTag(
-    selectedSessionId,
-    isActiveSession,
-  );
+  const {
+    suggestions,
+    folders: autoTagFolders,
+    folderTree: autoTagFolderTree,
+    acceptSuggestion,
+    applyOverride,
+    dismissSuggestion,
+  } = useAutoTag(selectedSessionId, isActiveSession);
 
   const session = isActiveSession ? activeSession : viewSession;
 
@@ -196,7 +200,10 @@ export function NoteDetailView() {
         <SessionHeader session={session} />
         <AutoTagSuggestions
           suggestions={suggestions}
+          folders={autoTagFolders}
+          folderTree={autoTagFolderTree}
           onAccept={acceptSuggestion}
+          onApplyOverride={applyOverride}
           onDismiss={dismissSuggestion}
         />
         <ResizablePanelGroup orientation="horizontal" className="flex-1">

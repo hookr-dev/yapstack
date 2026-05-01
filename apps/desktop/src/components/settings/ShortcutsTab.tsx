@@ -3,6 +3,7 @@ import { useAppStore } from "@/stores/appStore";
 import {
   SHORTCUTS,
   SHORTCUT_CATEGORIES,
+  findShortcutConflict,
   getBinding,
   eventToBinding,
   eventToGlobalBinding,
@@ -10,33 +11,10 @@ import {
 } from "@/lib/shortcuts";
 import { suspendGlobalShortcuts, resumeGlobalShortcuts } from "@/hooks/useGlobalShortcuts";
 import type { ShortcutDefinition } from "@/lib/shortcuts";
-import { formatShortcutDisplay, isMac } from "@/lib/utils";
+import { formatGlobalShortcutDisplay, formatShortcutDisplay } from "@/lib/utils";
 import { Globe, RotateCcw } from "lucide-react";
 import { Button } from "@/components/ui/button";
-
-/**
- * Format a global binding (CommandOrControl+Shift+N) for display.
- */
-function formatGlobalDisplay(binding: string): string {
-  if (!binding) return "Not set";
-  const parts = binding.split("+");
-  if (isMac) {
-    const symbols: string[] = [];
-    for (const p of parts) {
-      if (p === "CommandOrControl") symbols.push("\u2318");
-      else if (p === "Control") symbols.push("\u2303");
-      else if (p === "Shift") symbols.push("\u21E7");
-      else if (p === "Alt") symbols.push("\u2325");
-      else if (p === "Backspace") symbols.push("\u232B");
-      else if (p === "Escape") symbols.push("\u238B");
-      else symbols.push(p.toUpperCase());
-    }
-    return symbols.join("");
-  }
-  return parts
-    .map((p) => (p === "CommandOrControl" || p === "Control" ? "Ctrl" : p))
-    .join("+");
-}
+import { toast } from "sonner";
 
 function ShortcutRow({
   shortcut,
@@ -54,7 +32,7 @@ function ShortcutRow({
   conflict: string | null;
 }) {
   const displayBinding = shortcut.isGlobal
-    ? formatGlobalDisplay(binding)
+    ? formatGlobalShortcutDisplay(binding)
     : formatShortcutDisplay(binding);
 
   return (
@@ -139,7 +117,7 @@ function RecordingRow({
         pendingRef.current = binding;
         setPendingDisplay(
           shortcut.isGlobal
-            ? formatGlobalDisplay(binding)
+            ? formatGlobalShortcutDisplay(binding)
             : formatShortcutDisplay(binding),
         );
       }
@@ -228,39 +206,26 @@ export function ShortcutsTab() {
       const staticShortcut = SHORTCUTS.find((s) => s.id === recordingId);
       const isGlobal = staticShortcut?.isGlobal ?? recordingId.startsWith("global.");
 
-      const newOverrides = { ...overrides, [recordingId]: binding };
-
-      // Clear conflicting shortcuts in same scope
-      // Check static shortcuts
-      for (const shortcut of SHORTCUTS) {
-        if (shortcut.id === recordingId) continue;
-        if (shortcut.isGlobal !== isGlobal) continue;
-
-        const otherBinding = getBinding(shortcut.id, overrides);
-        if (otherBinding === binding) {
-          delete newOverrides[shortcut.id];
-          if (shortcut.defaultBinding === binding) {
-            newOverrides[shortcut.id] = "";
-          }
-        }
+      const conflict = findShortcutConflict(
+        binding,
+        recordingId,
+        isGlobal,
+        overrides,
+        dictationSlots,
+      );
+      if (conflict) {
+        const target =
+          conflict.kind === "dictation"
+            ? `dictation slot "${conflict.label}"`
+            : `"${conflict.label}"`;
+        toast.error(
+          `${formatGlobalShortcutDisplay(binding)} is already bound to ${target}. Rebind it first.`,
+        );
+        setRecordingId(null);
+        return;
       }
 
-      // Check dynamic dictation shortcuts (only when rebinding a global shortcut)
-      if (isGlobal) {
-        for (const slot of dictationSlots) {
-          const slotShortcutId = `global.dictation-${slot.id}`;
-          if (slotShortcutId === recordingId) continue;
-          const otherBinding = overrides[slotShortcutId] ?? slot.defaultBinding ?? "";
-          if (otherBinding === binding) {
-            delete newOverrides[slotShortcutId];
-            if (slot.defaultBinding === binding) {
-              newOverrides[slotShortcutId] = "";
-            }
-          }
-        }
-      }
-
-      updateSettings({ shortcutBindings: newOverrides });
+      updateSettings({ shortcutBindings: { ...overrides, [recordingId]: binding } });
       setRecordingId(null);
     },
     [recordingId, overrides, dictationSlots, updateSettings],
