@@ -42,10 +42,10 @@ export function TitleBar() {
 
   const shortcutBindings = useAppStore((s) => s.settings.shortcutBindings);
   const availableSeconds = useAppStore((s) =>
-    Math.floor(Math.max(
+    Math.max(
       s.bufferInfo?.mic?.available_seconds ?? 0,
       s.bufferInfo?.system?.available_seconds ?? 0,
-    )),
+    ),
   );
   const [searchOpen, setSearchOpen] = useState(false);
   const { canCreate, handleNew } = useCreateSession();

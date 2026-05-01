@@ -16,6 +16,7 @@ import { groupSessionsByDay } from "@/lib/utils";
 import { getFolderPath, getDescendantIds } from "@/lib/folder-tree";
 import { ICON_MAP } from "@/lib/folder-constants";
 import { DictationHistoryList } from "@/components/DictationHistoryList";
+import { BACKFILL_STEPS_SECONDS, formatBackfillSeconds } from "@/lib/backfill";
 
 export function NoteCardList() {
   const sessions = useAppStore((s) => s.sessions);
@@ -25,11 +26,9 @@ export function NoteCardList() {
   const folders = useAppStore((s) => s.folders);
   const folderChildMap = useAppStore((s) => s.folderChildMap);
   const availableSeconds = useAppStore((s) =>
-    Math.floor(
-      Math.max(
-        s.bufferInfo?.mic?.available_seconds ?? 0,
-        s.bufferInfo?.system?.available_seconds ?? 0,
-      ),
+    Math.max(
+      s.bufferInfo?.mic?.available_seconds ?? 0,
+      s.bufferInfo?.system?.available_seconds ?? 0,
     ),
   );
   const { canCreate, handleNew } = useCreateSession();
@@ -179,23 +178,21 @@ export function NoteCardList() {
                   <DropdownMenuTrigger asChild>
                     <Button size="sm" variant="outline">
                       <Rewind className="mr-2 h-4 w-4" />
-                      Rewind ({availableSeconds}s)
+                      Rewind ({formatBackfillSeconds(availableSeconds)})
                     </Button>
                   </DropdownMenuTrigger>
                   <DropdownMenuContent>
                     <DropdownMenuItem onClick={() => handleNew(availableSeconds)}>
-                      Full buffer ({availableSeconds}s)
+                      Full buffer ({formatBackfillSeconds(availableSeconds)})
                     </DropdownMenuItem>
-                    {[30, 60, 120, 300].some((d) => d < availableSeconds) && (
+                    {BACKFILL_STEPS_SECONDS.some((d) => d < availableSeconds) && (
                       <DropdownMenuSeparator />
                     )}
-                    {[30, 60, 120, 300]
-                      .filter((d) => d < availableSeconds)
-                      .map((d) => (
-                        <DropdownMenuItem key={d} onClick={() => handleNew(d)}>
-                          Last {d}s
-                        </DropdownMenuItem>
-                      ))}
+                    {BACKFILL_STEPS_SECONDS.filter((d) => d < availableSeconds).map((d) => (
+                      <DropdownMenuItem key={d} onClick={() => handleNew(d)}>
+                        Last {d}s
+                      </DropdownMenuItem>
+                    ))}
                   </DropdownMenuContent>
                 </DropdownMenu>
               )}
