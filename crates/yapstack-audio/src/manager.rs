@@ -602,6 +602,15 @@ impl AudioManager {
         self.mic.last_device_id()
     }
 
+    /// Returns `true` if the current mic binding is following the system
+    /// default. `false` if the user explicitly picked a non-default
+    /// device. Callers (notably the device broker's auto-failover path)
+    /// use this to decide whether to skip a Mic restart on
+    /// `DefaultInputChanged` when the explicit pick is still alive.
+    pub fn mic_bound_is_default(&self) -> bool {
+        self.mic.bound_is_default()
+    }
+
     /// Restarts the microphone stream. Reuses the existing ring buffer when
     /// the new device's sample rate / channel count match; otherwise
     /// allocates a fresh buffer so extraction and WAV metadata stay

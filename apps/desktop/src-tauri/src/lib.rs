@@ -629,12 +629,17 @@ pub fn run() {
             });
 
             // Always-on device-change broker. Owns the receiving end of
-            // the audio crate's runtime-agnostic device-event sink. Phase 3
-            // logs only; later phases emit `devices-changed` /
-            // `default-device-changed` and route restart intents.
+            // the audio crate's runtime-agnostic device-event sink,
+            // emits `devices-changed` / `default-device-changed`, and
+            // routes auto-failover restart intents through the live
+            // transcription loop (or directly to AudioManager when no
+            // live session is running).
             device_broker::spawn(
                 app.handle().clone(),
                 app.state::<AudioManagerState>().inner().clone(),
+                app.state::<commands::live_transcription::RestartIntentInbox>()
+                    .inner()
+                    .clone(),
                 app.state::<ShutdownSignal>().subscribe(),
             );
 
