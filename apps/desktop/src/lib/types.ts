@@ -293,6 +293,24 @@ async clipboardPaste(text: string, autoPaste: boolean) : Promise<Result<null, Co
     else return { status: "error", error: e  as any };
 }
 },
+/**
+ * Lower the system output volume to `target` (0.0..=1.0). No-op if the
+ * current volume is already at or below `target`. Snapshots the prior
+ * value so `restore_volume` can put it back. Always succeeds from the
+ * frontend's perspective: any platform-level error is logged and
+ * swallowed because volume control is a UX nicety, not load-bearing for
+ * the caller.
+ */
+async applyVolumeDuck(target: number) : Promise<void> {
+    await TAURI_INVOKE("apply_volume_duck", { target });
+},
+/**
+ * Restore the volume snapshotted at the most recent `apply_volume_duck`
+ * call. No-op if no snapshot is held.
+ */
+async restoreVolume() : Promise<void> {
+    await TAURI_INVOKE("restore_volume");
+},
 async checkScreenCapturePermission() : Promise<Result<ScreenCapturePermissionDto, CommandError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("check_screen_capture_permission") };

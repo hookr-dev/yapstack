@@ -263,6 +263,13 @@ export interface Settings {
   mp3Bitrate: number;
   dictation: DictationSettings;
   showRecordingIndicator: boolean;
+  /// Lower the system output volume during the recording phase of a
+  /// dictation, so the user can hear themselves over earphone playback.
+  /// Restored as soon as recording ends. Only ever lowers — never raises.
+  /// macOS only (no-op on other platforms).
+  dictationDuckEnabled: boolean;
+  /// Target volume to duck to, in [0, 1]. Default 0.2.
+  dictationDuckTarget: number;
   onboarding: OnboardingState;
 }
 
@@ -572,6 +579,8 @@ const defaultSettings: Settings = {
   mp3Bitrate: 64,
   dictation: DEFAULT_DICTATION_SETTINGS,
   showRecordingIndicator: true,
+  dictationDuckEnabled: false,
+  dictationDuckTarget: 0.2,
   onboarding: { completedFlows: {} },
 };
 
@@ -2388,7 +2397,7 @@ function createAppStore() {
     }),
     {
       name: "yapstack-settings",
-      version: 23,
+      version: 24,
       partialize: (state) => ({
         settings: state.settings,
       }),
@@ -2568,6 +2577,13 @@ function createAppStore() {
           // the broken behavior in the meantime.
           const old = state.settings as Record<string, unknown>;
           old.diarizationEnabled = false;
+        }
+        if (version < 24 && state.settings) {
+          const old = state.settings as Record<string, unknown>;
+          if (old.dictationDuckEnabled === undefined)
+            old.dictationDuckEnabled = false;
+          if (old.dictationDuckTarget === undefined)
+            old.dictationDuckTarget = 0.2;
         }
         return state as unknown as { settings: Settings };
       },

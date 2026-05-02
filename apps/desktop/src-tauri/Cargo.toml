@@ -19,6 +19,7 @@ yapstack-transcription = { path = "../../../crates/yapstack-transcription" }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 tracing-appender = "0.2"
+thiserror = { workspace = true }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 # Used by `db::ensure_runtime_schema` to perform a single direct ALTER TABLE
 # at startup (out-of-band of tauri-plugin-sql's migration list).
@@ -55,3 +56,6 @@ tempfile = { workspace = true }
 
 [target."cfg(target_os = \"macos\")".dependencies]
 tauri-nspanel = { git = "https://github.com/ahkohd/tauri-nspanel", branch = "v2.1" }
+# CoreAudio FFI for the dictation duck feature (system_volume module).
+# Same version pinned in yapstack-audio so cargo deduplicates the build.
+coreaudio-sys = { version = "0.2", default-features = false, features = ["core_audio"] }

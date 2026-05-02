@@ -176,6 +176,8 @@ export const tauriCommandsMock = () => ({
       },
     }),
     clipboardPaste: vi.fn().mockResolvedValue({ status: "ok", data: null }),
+    applyVolumeDuck: vi.fn().mockResolvedValue(undefined),
+    restoreVolume: vi.fn().mockResolvedValue(undefined),
     checkScreenCapturePermission: vi
       .fn()
       .mockResolvedValue({ status: "ok", data: "Granted" }),
