@@ -653,19 +653,6 @@ fn find_sidecar_path() -> Result<PathBuf, CommandError> {
         return Ok(path);
     }
 
-    // TODO: remove after one release. Backcompat for stale dev mirrors that
-    // still carry the pre-rename `yapstack-sidecar` binary name.
-    let legacy_suffixed = format!("yapstack-sidecar-{target_triple}{ext}");
-    let path = exe_dir.join(&legacy_suffixed);
-    if path.exists() {
-        return Ok(path);
-    }
-    let legacy_plain = format!("yapstack-sidecar{ext}");
-    let path = exe_dir.join(&legacy_plain);
-    if path.exists() {
-        return Ok(path);
-    }
-
     Err(CommandError::NotFound {
         message: format!(
             "sidecar binary not found at {} or {}",

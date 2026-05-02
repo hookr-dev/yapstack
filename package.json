@@ -10,7 +10,6 @@
     "dev": "pnpm --filter @yapstack/desktop build:sidecars:dev && pnpm --filter @yapstack/desktop dev:tauri",
     "dev:frontend": "pnpm --filter @yapstack/desktop dev",
     "build": "pnpm --filter @yapstack/desktop build:all",
-    "build:sidecar": "pnpm --filter @yapstack/desktop build:sidecar",
     "build:sidecars": "pnpm --filter @yapstack/desktop build:sidecars",
     "build:dmg": "pnpm --filter @yapstack/desktop build:dmg",
     "build:tauri": "pnpm --filter @yapstack/desktop build:tauri",

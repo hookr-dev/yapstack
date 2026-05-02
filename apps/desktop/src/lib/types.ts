@@ -471,7 +471,8 @@ backfill_seconds: number;
  */
 source: CaptureSourceDto; 
 /**
- * Mix config for Mixed source (kept for backward compat).
+ * Mix config for `Mixed` source. `None` for `MicOnly` / `SystemOnly`,
+ * where mixing is undefined.
  */
 mix_config: MixConfigDto | null; 
 /**
