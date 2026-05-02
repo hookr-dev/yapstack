@@ -6,6 +6,7 @@ import { trackDictationSlotCreated, trackDictationSlotDeleted, trackDictationSlo
 import { Switch } from "@/components/ui/switch";
 import { Label } from "@/components/ui/label";
 import { Separator } from "@/components/ui/separator";
+import { Slider } from "@/components/ui/slider";
 import { Button } from "@/components/ui/button";
 import {
   Select,
@@ -254,6 +255,8 @@ function SlotCard({
 export function DictationTab() {
   const dictation = useAppStore((s) => s.settings.dictation);
   const shortcutBindings = useAppStore((s) => s.settings.shortcutBindings);
+  const dictationDuckEnabled = useAppStore((s) => s.settings.dictationDuckEnabled);
+  const dictationDuckTarget = useAppStore((s) => s.settings.dictationDuckTarget);
   const updateSettings = useAppStore((s) => s.updateSettings);
 
   const handleToggleEnabled = (checked: boolean) => {
@@ -404,6 +407,45 @@ export function DictationTab() {
                 <SelectItem value="toggle" className="text-xs">Toggle</SelectItem>
               </SelectContent>
             </Select>
+          </div>
+
+          <Separator />
+
+          {/* Volume Duck */}
+          <div className="space-y-3">
+            <div className="flex items-center justify-between">
+              <div>
+                <Label className="text-xs">Lower volume while recording</Label>
+                <p className="text-[11px] text-muted-foreground mt-0.5">
+                  Quiets system audio so you can hear yourself.
+                </p>
+              </div>
+              <Switch
+                checked={dictationDuckEnabled}
+                onCheckedChange={(checked) =>
+                  updateSettings({ dictationDuckEnabled: checked })
+                }
+              />
+            </div>
+            <div className="space-y-1.5">
+              <div className="flex items-center justify-between">
+                <Label className="text-[11px] text-muted-foreground">Duck to</Label>
+                <span className="text-[11px] text-muted-foreground tabular-nums">
+                  {Math.round(dictationDuckTarget * 100)}%
+                </span>
+              </div>
+              <Slider
+                min={0}
+                max={100}
+                step={5}
+                value={[Math.round(dictationDuckTarget * 100)]}
+                disabled={!dictationDuckEnabled}
+                onValueChange={(values) => {
+                  const pct = values[0] ?? 20;
+                  updateSettings({ dictationDuckTarget: pct / 100 });
+                }}
+              />
+            </div>
           </div>
 
           <Separator />

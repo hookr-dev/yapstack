@@ -7945,6 +7945,7 @@ name = "yapstack-desktop"
 version = "1.0.0-alpha.7"
 dependencies = [
  "chrono",
+ "coreaudio-sys",
  "futures-util",
  "hound",
  "percent-encoding",
@@ -7970,6 +7971,7 @@ dependencies = [
  "tauri-plugin-updater",
  "tauri-specta",
  "tempfile",
+ "thiserror 2.0.18",
  "tokio",
  "tracing",
  "tracing-appender",

@@ -126,12 +126,47 @@ export function useDictation() {
   const energyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const silentPollCountRef = useRef(0);
   const noInputShownRef = useRef(false);
+  // Tauri command tasks have no inter-task ordering guarantee, so a fast
+  // tap can land the duck and restore commands out of order on the backend.
+  // These refs let restore-then-duck and stop-then-start cycles serialize:
+  // a restore awaits any pending duck before invoking the backend; a duck
+  // awaits any pending restore before invoking the backend.
+  const pendingDuckRef = useRef<Promise<unknown> | null>(null);
+  const pendingRestoreRef = useRef<Promise<void> | null>(null);
 
   useEffect(() => {
     // Typed read defeats TS control-flow narrowing of stateRef.current after
     // intermediate assignments (e.g. = "transcribing"), so cancel bail-points
     // can compare against "cancelling".
     const phase = (): DictationState => stateRef.current;
+
+    /**
+     * Restore the system output volume after a dictation duck. Awaits any
+     * pending duck first so we can't race past it; coalesces concurrent
+     * callers onto a single in-flight promise.
+     */
+    function safeRestoreVolume(): Promise<void> {
+      if (pendingRestoreRef.current) {
+        return pendingRestoreRef.current;
+      }
+      const promise = (async () => {
+        // pendingDuckRef holds a promise that has its own .catch, so it
+        // never rejects — no try/catch needed on the await.
+        if (pendingDuckRef.current) await pendingDuckRef.current;
+        try {
+          await commands.restoreVolume();
+        } catch {
+          // Volume control is a UX nicety; never let it bubble.
+        }
+      })();
+      pendingRestoreRef.current = promise;
+      promise.finally(() => {
+        if (pendingRestoreRef.current === promise) {
+          pendingRestoreRef.current = null;
+        }
+      });
+      return promise;
+    }
 
     function cleanupListeners() {
       unlistenSegmentRef.current?.();
@@ -182,6 +217,25 @@ export function useDictation() {
       dictationIdRef.current = crypto.randomUUID();
       accumulatedTextRef.current = "";
       wavInfoRef.current = null;
+
+      // Chain the apply behind any pending restore so a stale restore from
+      // a prior cycle can't land on the backend after our snapshot is taken
+      // and clear it mid-recording.
+      if (s.settings.dictationDuckEnabled) {
+        const target = s.settings.dictationDuckTarget;
+        const prerequisite = pendingRestoreRef.current ?? Promise.resolve();
+        const duckPromise = prerequisite
+          .then(() => commands.applyVolumeDuck(target))
+          .catch((err) => {
+            console.debug("volume duck failed:", err);
+          });
+        pendingDuckRef.current = duckPromise;
+        duckPromise.finally(() => {
+          if (pendingDuckRef.current === duckPromise) {
+            pendingDuckRef.current = null;
+          }
+        });
+      }
 
       // Register Escape as a Global hotkey for the duration of this Dictation
       // so the user can cancel from any app, not just YapStack's main window.
@@ -277,6 +331,9 @@ export function useDictation() {
 
       if (result.status === "error") {
         cleanupListeners();
+        // Awaited before setIdle so a rapid retry can't start a new duck
+        // while this restore is still in flight.
+        await safeRestoreVolume();
         setIdle();
         toast.error(`Dictation failed: ${result.error.message}`);
         trackDictationFailed({
@@ -342,6 +399,9 @@ export function useDictation() {
       const s = useAppStore.getState();
       const slot = s.settings.dictation.slots.find((sl) => sl.id === slotIdRef.current);
       if (!slot) {
+        // Slot disappeared mid-recording (deleted from settings while the
+        // hotkey was held). Awaited before setIdle to block a rapid re-press.
+        await safeRestoreVolume();
         setIdle();
         cleanupListeners();
         hideBubble();
@@ -355,6 +415,11 @@ export function useDictation() {
         // Signal stop — the loop will force-transcribe remaining audio
         stateRef.current = "transcribing";
         emitBubbleState("transcribing", slot.name);
+        // Release the duck the moment we leave "recording" so the user's
+        // normal volume is back before transcription / AI / output work
+        // begins. Restore runs in the background; the awaits below give
+        // it ample time to land before setIdle.
+        safeRestoreVolume();
 
         await commands.stopLiveTranscription();
         if (phase() === "cancelling") return;
@@ -553,6 +618,10 @@ export function useDictation() {
       // handleStop bail-point will see "cancelling" and exit without running
       // its own teardown.
       stateRef.current = "cancelling";
+      // Mirror handleStop: release the duck on exit from "recording".
+      // Restore runs in the background; the awaits below give it time
+      // to land before setIdle.
+      safeRestoreVolume();
 
       abortRef.current?.abort();
       // Unblock handleStop's wait on the Stopped/Error status event.
@@ -610,9 +679,9 @@ export function useDictation() {
       window.removeEventListener("yapstack:dictation-stop", handleStop);
       window.removeEventListener("yapstack:dictation-cancel", handleCancel);
       abortRef.current?.abort();
-      // Stop live transcription if dictation is active on teardown
       if (stateRef.current !== "idle" && stateRef.current !== "done") {
         commands.stopLiveTranscription().catch(() => {});
+        safeRestoreVolume();
         unregisterCancelHotkey();
       }
       cleanupListeners();
