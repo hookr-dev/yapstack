@@ -78,6 +78,8 @@ The shared vocabulary for YapStack. Use these terms verbatim in code, docs, PRDs
 | **Dictation activation mode** | How a slot's hotkey behaves: `hold` (push-to-talk, recording while held) or `toggle` (press to start/stop).          | Trigger mode              |
 | **Output action**          | What to do with a finished dictation: `paste` into the focused field, `clipboard`, or `new-note` (create a session).    | Insertion mode, sink      |
 | **Dictation history**      | Persisted log of past dictation outputs, distinct from sessions and exposed in the sidebar's `dictation` list filter.   | Recents                   |
+| **Volume duck**            | Temporarily lowering the system output volume during a dictation so the user can hear themselves over earphone playback. Snapshots `(device_id, prior_level)` at apply and restores that *original* device on release, so a default-output change mid-duck (AirPods connect, USB DAC unplug) doesn't strand the original device at the ducked level. Only ever lowers — never raises. macOS only; no-op elsewhere. | Volume lowering, attenuation |
+| **Duck target**            | The volume level (0.0–1.0) the system output is reduced to during a **Volume duck**. Persisted as `dictationDuckTarget`. | Duck level, ducked volume |
 
 ## Shortcuts and permissions
 
