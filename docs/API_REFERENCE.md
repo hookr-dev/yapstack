@@ -684,6 +684,14 @@ Internal module — not exported via Tauri. See ARCHITECTURE.md § "Transcriptio
 
 Writes `text` to system clipboard via `pbcopy` (macOS) or `clip` (Windows). If `auto_paste` is true, waits 50ms then simulates Cmd+V via `osascript` (macOS only).
 
+### System Volume Commands (`commands/system_volume.rs`)
+| Command | Args | Returns |
+|---------|------|---------|
+| `apply_volume_duck` | `target: f32` (0.0..=1.0) | `()` |
+| `restore_volume` | — | `()` |
+
+Generic ducking surface — the commands know nothing about dictation; callers decide policy. `apply_volume_duck` lowers the default output to `target`, snapshotting `(device_id, prior_level)` on the first apply of a duck cycle. No-op when the current level is already at or below `target` (no snapshot is taken — restore stays a no-op). `restore_volume` puts the snapshotted device back to its prior level even if the system default has since changed; it's also a no-op if no snapshot is held. Both commands swallow platform errors and return `()` because volume control is a UX nicety, not load-bearing for the caller. macOS only today; Windows / Linux are no-op stubs.
+
 ### Overlay Panel Commands (`commands/mod.rs`)
 | Command | Args | Returns |
 |---------|------|---------|

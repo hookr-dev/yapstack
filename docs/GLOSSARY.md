@@ -36,6 +36,7 @@ Canonical names for things in YapStack. Use these in code, commits, and tickets 
 - **Tag** — flat metadata applied by AI during summarization. Lighter than folders.
 - **Dictation** — short voice-to-text utterance, processed via a per-slot system prompt and routed to paste/copy/note. Distinct from sessions; persisted in `dictation_history`.
 - **Slot** — named dictation configuration with its own keybind, mode (hold/toggle), AI prompt, and output action.
+- **Volume duck** — temporarily lowering the system output volume during a dictation so you can hear yourself over earphone playback. Snapshots `(device_id, prior_level)` so the *original* device is restored even if the default output changes mid-duck. macOS only; no-op elsewhere. Mechanism in `apps/desktop/src-tauri/src/system_volume.rs`; Tauri surface in `commands/system_volume.rs`.
 
 ## Auto-updater & release
 

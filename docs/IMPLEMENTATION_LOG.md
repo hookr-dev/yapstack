@@ -1338,6 +1338,56 @@ A second pass on the scheduler-driven pipeline that closes the remaining "audio 
 
 ---
 
+## Phase 34 — Dictation Volume Ducking (macOS) + Sidecar Crate Restructure
+
+### What was built
+
+Two unrelated changes that landed together in the alpha.8 cycle.
+
+1. **Dictation volume ducking.** Opt-in setting on the Dictation tab that lowers the system output volume to a configured target while a dictation is recording, then restores it the instant the user releases the key. Settings: `dictationDuckEnabled: bool` (default false), `dictationDuckTarget: number` in `[0, 1]` (default 0.2). New backend module `apps/desktop/src-tauri/src/system_volume.rs` (mechanism, ~590 lines incl. tests) plus `commands/system_volume.rs` (Tauri surface, ~40 lines).
+2. **`yapstack-sidecar` → `yapstack-transcription-sidecar` rename.** Behaviour-preserving repackaging that makes room for additional sidecar workers (e.g. an embedding sidecar) without naming ambiguity. Crate, binary, build script, and tracing target all renamed; a wrapper `scripts/build-sidecars.sh` now fans out to per-worker scripts.
+
+### Bugs / needs being addressed
+
+- **Ducking:** users on earphone playback have no clean way to talk over a podcast or call to dictate a quick note. Pausing media is often inconvenient, and reaching for the volume keys mid-sentence doesn't work well with hold-to-talk. Ducking gives them an automatic "duck while talking, restore on release" loop.
+- **Sidecar rename:** the project now anticipates a second sidecar worker (embeddings for semantic search). Naming the existing one `yapstack-sidecar` would have made the new one's name awkward (`yapstack-embedding-sidecar` next to a generic `yapstack-sidecar`). The rename was the cheapest moment to do this — before any external integration depends on the binary name.
+
+### Key decisions
+
+- **Mechanism / policy split.** The `system_volume` module knows nothing about dictation; it exposes generic `apply_duck(target)` / `restore()` and a `(device_id, level)` snapshot. Dictation is the only caller today, but a future feature (e.g. duck during meetings) can reuse the mechanism without entangling the volume code with dictation state. Reflected in module names: `system_volume::apply_duck` (mechanism) vs. `apply_volume_duck` (Tauri command, also generic).
+- **Snapshot the *device*, not just the level.** macOS users routinely change default output mid-session (Bluetooth headphone connect, wired DAC unplug). Restoring "the system default to level X" would silently leave the *originally* ducked device stuck at the ducked level forever. The snapshot is `(device_id, prior_level)` and restore explicitly targets that device.
+- **Never raises.** If the user's current level is already at or below the target, `apply_duck` is a no-op and no snapshot is captured. Without this guard, a user dictating with the volume already at 5% would have it bumped to the 20% target on apply and *stay there* on restore.
+- **Apply / restore hold the snapshot mutex across the volume set.** Concurrent ops can't interleave into a state where the snapshot is updated but the volume isn't (or vice versa) — that would either leak the ducked level forever or strand a snapshot of an already-ducked level as if it were the user's prior choice.
+- **Frontend serializes apply/restore across cycles via two pending-promise refs.** A fast stop-then-start cycle (release key, immediately re-press) could otherwise interleave a `restore` and the next `apply` at the backend and strand the volume — the second `apply` would snapshot the ducked level as if it were the user's choice. The hook awaits any pending duck before invoking restore, and any pending restore before invoking duck. Restore is also awaited on the post-duck-error and slot-disappeared paths *before* `setIdle` so a rapid retry can't start a new duck on top of an unresolved restore.
+- **`RunEvent::Exit` calls `restore` as a final safety net.** If the app crashes or quits while ducked, the user shouldn't have to reboot to get their volume back. Belt-and-braces in addition to the per-cycle restore in the dictation hook.
+- **Errors are swallowed at the command boundary.** Volume control is a UX nicety, not load-bearing for the dictation flow — a CoreAudio failure shouldn't surface as a toast or block the recording. The mechanism still returns `Result` so internal callers can log; the Tauri surface just `warn!`s and returns `()`.
+- **`build-sidecars.sh` is a wrapper, not a replacement.** Per-worker scripts (`build-transcription-sidecar.sh` today) keep their own concerns; the wrapper is for callers that want "build everything" without knowing the worker list. Existing npm scripts (`build:sidecar[:dev]`) kept as compat aliases pointing at the per-worker script.
+
+### Files Changed
+
+| File | Change |
+|------|--------|
+| `apps/desktop/src-tauri/src/system_volume.rs` | New — `apply_duck`, `restore`, `(device_id, level)` snapshot, macOS CoreAudio FFI, no-op stubs for non-macOS, with property test–style coverage of the snapshot/restore lifecycle (device-swap mid-duck, already-quieter no-op, repeated-apply behaviour, restore without snapshot). |
+| `apps/desktop/src-tauri/src/commands/system_volume.rs` | New — Tauri surface (`apply_volume_duck`, `restore_volume`); error-swallowing wrappers. |
+| `apps/desktop/src-tauri/src/lib.rs` | Register the new module + commands; add `RunEvent::Exit` safety-net restore. |
+| `apps/desktop/src-tauri/src/logging.rs` | Update tracing target name for the renamed sidecar crate. |
+| `apps/desktop/src/components/settings/DictationTab.tsx` | New "Lower system volume during dictation" toggle + target slider. |
+| `apps/desktop/src/hooks/useDictation.ts` | Apply/restore at the recording-phase boundaries; cycle serialization via `pendingDuckRef` / `pendingRestoreRef`; restore on error and slot-disappeared paths awaited before `setIdle`. |
+| `apps/desktop/src/stores/appStore.ts` | New persisted settings: `dictationDuckEnabled`, `dictationDuckTarget`. |
+| `apps/desktop/src/lib/types.ts`, `apps/desktop/src/lib/tauri.ts` | Generated bindings for the new commands. |
+| `crates/yapstack-sidecar/` → `crates/yapstack-transcription-sidecar/` | Crate renamed; binary name follows. |
+| `scripts/build-sidecar.sh` → `scripts/build-transcription-sidecar.sh` | Per-worker build script renamed. |
+| `scripts/build-sidecars.sh` | New wrapper that fans out to per-worker build scripts. |
+| `apps/desktop/src-tauri/tauri.conf.json` | `externalBin` updated for the renamed binary. |
+| `.github/workflows/ci-checks.yml`, `.github/workflows/release.yml`, `scripts/build-dmg.sh` | Updated for the renamed crate / script. |
+| `crates/yapstack-transcription/src/client.rs` | Tracing target renamed to `yapstack_transcription_sidecar`. |
+| `README.md`, `AGENTS.md`, `docs/ARCHITECTURE.md`, `docs/API_REFERENCE.md`, `docs/AGENT_GUIDE.md`, `docs/DEVELOPMENT.md`, `docs/GLOSSARY.md`, `docs/UBIQUITOUS_LANGUAGE.md`, `docs/PRINCIPLES.md`, `docs/adr/0001-adopt-agents-md.md` | Sidecar references updated; ARCHITECTURE/API_REFERENCE/GLOSSARY also gain ducking surface; README alpha warning made generic. |
+
+### What was learned
+
+- **Ducking is an interaction problem, not just a system call.** The CoreAudio side is two FFI calls; the hard parts were all in the lifecycle: device swap mid-duck, hold-to-talk press/release storms, app crash mid-duck, post-restore retry races. Most of `system_volume.rs`'s test coverage and the dictation hook's promise refs exist to handle those, not the volume change itself.
+- **Generic command surface paid for itself in 24 hours.** The `apply_volume_duck` / `restore_volume` commands were written generic from the start (they take `target: f32`, not `dictation_settings: ...`). When a follow-up came up about ducking during full sessions too, no backend change was needed — same commands, different policy caller.
+
 ## What's Not Yet Built
 
 - **End-to-end integration tests** — capture audio, transcribe, verify text (unit + component tests now exist; integration tests still needed)

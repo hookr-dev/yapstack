@@ -18,7 +18,7 @@
 ---
 
 > [!WARNING]
-> **YapStack v1.0.0-alpha.5 — first public alpha release (2026-04-28).** Officially supported on macOS (Apple Silicon recommended). Builds on Intel Macs and Windows are experimental — see [Platform Support](#platform-support) below. Schema and APIs may evolve; pin a tag for any serious use.
+> **YapStack is in alpha.** Officially supported on macOS (Apple Silicon recommended). Builds on Intel Macs and Windows are experimental — see [Platform Support](#platform-support) below. Schema, APIs, and on-disk formats may still change between releases; pin a specific version for any serious use, and expect to read the [`CHANGELOG`](CHANGELOG.md) before upgrading.
 
 > [!NOTE]
 > **Vibe-coded with AI assistance.** YapStack is built using AI pair-programming as a first-class part of the workflow, and we plan to keep iterating that way. Contributions are welcome — your prompts, enhancements, modifications, and PRs back into the project. Bring whatever tools you want; we care about correctness, design clarity, and tests, not provenance.
