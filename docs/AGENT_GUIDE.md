@@ -17,7 +17,7 @@ Skip everything else until a task forces it.
 |---|---|
 | Audio capture, ring buffer | `crates/yapstack-audio/` |
 | Sidecar IPC types | `crates/yapstack-common/src/types.rs` |
-| Transcription engines | `crates/yapstack-sidecar/src/engines/` (`whisper.rs`, `parakeet.rs`) |
+| Transcription engines | `crates/yapstack-transcription-sidecar/src/engines/` (`whisper.rs`, `parakeet.rs`) |
 | Tauri command layer | `apps/desktop/src-tauri/src/commands/` |
 | Live transcription loop | `apps/desktop/src-tauri/src/commands/live_transcription.rs` |
 | DB migrations | `apps/desktop/src-tauri/src/db.rs` |
@@ -41,7 +41,7 @@ When uncertain, `git grep -n <symbol>` from repo root.
 ### Adding a sidecar IPC message
 
 1. Extend `SidecarRequest` and/or `SidecarResponse` in `crates/yapstack-common/src/types.rs`.
-2. Wire the dispatcher branch in `crates/yapstack-sidecar/src/main.rs`.
+2. Wire the dispatcher branch in `crates/yapstack-transcription-sidecar/src/main.rs`.
 3. Implement on the `TranscriptionBackend` trait if engine-specific.
 4. Surface in `TranscriptionClient` (`crates/yapstack-transcription/src/client.rs`).
 5. **Critical**: forward + backward compatibility across mismatched sidecar/host versions. Bumping the protocol requires an ADR.

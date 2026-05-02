@@ -394,7 +394,7 @@ impl TranscriptionClient {
                 Ok(Some(line)) => {
                     let stripped = strip_ansi(&line);
                     if !stripped.trim().is_empty() {
-                        info!(target: "yapstack_sidecar", "{}", stripped);
+                        info!(target: "yapstack_transcription_sidecar", "{}", stripped);
                     }
                 }
                 Ok(None) => {

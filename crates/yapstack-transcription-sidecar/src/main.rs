@@ -152,8 +152,9 @@ async fn send_error(id: u64, message: String) {
 
 #[tokio::main]
 async fn main() {
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,yapstack_sidecar=debug"));
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        tracing_subscriber::EnvFilter::new("info,yapstack_transcription_sidecar=debug")
+    });
     // No ANSI colors: desktop captures this stderr into its log UI where
     // raw escape codes render as garbage.
     tracing_subscriber::fmt()

@@ -137,7 +137,7 @@ Tauri v2 app with a Rust backend and React frontend. Five crates handle distinct
 | `yapstack-common` | Shared types, config, audio utilities |
 | `yapstack-audio` | Lock-free ring buffers, mic/system capture, WAV export |
 | `yapstack-transcription` | Model management, sidecar IPC |
-| `yapstack-sidecar` | Standalone Whisper / Parakeet inference binary |
+| `yapstack-transcription-sidecar` | Standalone Whisper / Parakeet inference binary |
 | `yapstack-desktop` | Tauri command layer, live transcription controller |
 
 Detailed docs under [`docs/`](docs/):

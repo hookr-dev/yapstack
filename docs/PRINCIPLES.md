@@ -6,7 +6,7 @@ Design, testing, and coding posture for YapStack. Short and opinionated. When yo
 
 ## Design
 
-**DTO boundary at the Tauri layer.** Library crates (`yapstack-common`, `yapstack-audio`, `yapstack-transcription`, `yapstack-sidecar`) use `serde` only. `specta::Type` lives in `apps/desktop/src-tauri/src/commands/` — each command defines a DTO with a `From<DomainType>` impl. Do not pull `specta` or `tauri` into the `yapstack-*` crates; it couples business logic to the command shell and bloats compile times.
+**DTO boundary at the Tauri layer.** Library crates (`yapstack-common`, `yapstack-audio`, `yapstack-transcription`, `yapstack-transcription-sidecar`) use `serde` only. `specta::Type` lives in `apps/desktop/src-tauri/src/commands/` — each command defines a DTO with a `From<DomainType>` impl. Do not pull `specta` or `tauri` into the `yapstack-*` crates; it couples business logic to the command shell and bloats compile times.
 
 **Lock-free audio path.** The capture hot path (mic / system) writes into an SPSC ring buffer with `Release`/`Acquire` orderings on a monotonic `write_pos`. Never introduce a mutex on this path. Consumers read via `snapshot_since(pos)` — if you need coordination, add a position counter, not a lock.
 
