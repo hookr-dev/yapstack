@@ -41,7 +41,8 @@ pub struct LiveTranscriptionConfig {
     pub backfill_seconds: f32,
     /// Audio source.
     pub source: CaptureSourceDto,
-    /// Mix config for Mixed source (kept for backward compat).
+    /// Mix config for `Mixed` source. `None` for `MicOnly` / `SystemOnly`,
+    /// where mixing is undefined.
     pub mix_config: Option<MixConfigDto>,
     /// Whisper language.
     pub language: Option<String>,
