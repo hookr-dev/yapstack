@@ -22,12 +22,17 @@ import {
   listAllSessionFolders,
   getNote,
   getSessionSegments,
+  getSegmentsByIds,
+  getDictationsByIds,
+  getNotesByIds,
 } from "./db";
 import type { DbNote, DbSegment, DbFolder } from "./db";
 import { markdownToBasicHtml, formatSegmentSpeaker } from "./ai";
 import { formatTime, stripHtml } from "./utils";
 import { findBranchConflicts, getFolderPath } from "./folder-tree";
 import { useAppStore } from "@/stores/appStore";
+import { commands } from "@/lib/tauri";
+import { normalizeTiptapToText } from "@/lib/note-text";
 
 // --- Core types ---
 
@@ -140,13 +145,21 @@ export interface SessionToolContext {
 }
 
 /**
- * Context for retrieval-only chats (folder / pinned / all). Carries no
- * single-session pre-image — only the allow-list that pins retrieval tools
- * to the chat's filter so the model can't reach outside the user's view.
+ * Context for retrieval-only chats (folder / pinned / all / dictation).
+ * Carries no single-session pre-image — only the allow-list that pins
+ * retrieval tools to the chat's filter so the model can't reach outside
+ * the user's view.
+ *
+ * `surfaceFilter` constrains which embedding surfaces a semantic-search
+ * call can return from. Multi-session chats leave it undefined (all
+ * surfaces allowed); dictation chats set it to ["Dictation"] so a stray
+ * call from a dictation-only view cannot leak transcript or note
+ * results.
  */
 export interface RetrievalToolContext {
   scope: "retrieval";
   allowedSessionIds: string[];
+  surfaceFilter?: ("Segment" | "Dictation" | "Note")[];
 }
 
 /**
@@ -1403,8 +1416,13 @@ registerTool({
       plans.map((p) => ({ segmentId: p.segmentId, previousText: p.previousText })),
     );
 
+    const settings = useAppStore.getState().settings;
+    const reembed = settings.embeddingsEnabled && settings.language === "en";
     for (const p of plans) {
       await updateSegmentText(p.segmentId, p.newText);
+      if (reembed && p.newText.trim()) {
+        commands.embedSegment(p.segmentId, p.newText).catch(() => undefined);
+      }
     }
 
     const detail = `Replaced "${find}" with "${replace}" in ${plans.length} segment${plans.length === 1 ? "" : "s"}`;
@@ -1431,8 +1449,13 @@ registerTool({
   },
   undo: async (undoData) => {
     const data = undoData as { segmentId: string; previousText: string }[];
+    const settings = useAppStore.getState().settings;
+    const reembed = settings.embeddingsEnabled && settings.language === "en";
     for (const { segmentId, previousText } of data) {
       await updateSegmentText(segmentId, previousText);
+      if (reembed && previousText.trim()) {
+        commands.embedSegment(segmentId, previousText).catch(() => undefined);
+      }
     }
   },
 });
@@ -1509,6 +1532,269 @@ registerTool({
         summary: detail,
         evidence: result,
         affectedIds: top.map((h) => h.dictationId),
+      },
+    };
+  },
+  undo: async () => {},
+});
+
+// --- Tool: search_semantic ---
+//
+// Local-embedding (BGE-small-en-v1.5) semantic search across segments,
+// dictations, and notes. Complements the BM25-based search_segments /
+// search_notes / search_dictations tools — semantic search wins when
+// the user's wording doesn't share keywords with the source text
+// ("the meeting where we got frustrated about latency"); BM25 wins on
+// exact strings.
+//
+// English-only by design — the embedding model is English-only and
+// non-English content isn't embedded. We gate inside execute(); when
+// the language is not English the tool returns a no-op message that
+// nudges the model toward the FTS tools instead.
+//
+// Hidden segments and soft-deleted segments are filtered at
+// enrichment time (the SQL WHERE clauses in getSegmentsByIds), so the
+// chat model never sees them.
+
+registerTool({
+  kind: "read",
+  affects: [],
+  schema: {
+    type: "function",
+    function: {
+      name: "search_semantic",
+      description:
+        "Semantic search across the user's transcripts, notes, and dictations using local embeddings. Use this when the user's question is conceptual and the relevant source text might not share exact keywords with the query (e.g. 'the conversation about scaling', 'the note where I worried about latency'). Pairs naturally with BM25 search_segments / search_notes / search_dictations — call those for exact-string matching, this one for meaning. English-only.",
+      parameters: {
+        type: "object",
+        properties: {
+          query: {
+            type: "string",
+            description: "Free-form natural-language query.",
+          },
+          limit: {
+            type: ["integer", "null"],
+            description: "Max combined results across surfaces (default 10, max 25).",
+          },
+          surfaces: {
+            type: ["array", "null"],
+            items: { type: "string", enum: ["segment", "dictation", "note"] },
+            description:
+              "Which surfaces to search. Omit to search all three. Use a subset to scope the search (e.g. ['note'] to search only user-written notes).",
+          },
+        },
+        required: ["query", "limit", "surfaces"],
+        additionalProperties: false,
+      },
+    },
+  },
+  execute: async (args, ctx) => {
+    const query = String(args.query ?? "").trim();
+    const limitArg = args.limit;
+    const limit = Math.min(
+      typeof limitArg === "number" && limitArg > 0 ? limitArg : 10,
+      25,
+    );
+
+    // Scope clamp: session chat → that session only; multi-session chat
+    // with a non-empty allow-list → those sessions only; dictation chat
+    // → no session clamp but ["Dictation"] surface only.
+    const allowed: string[] | null =
+      ctx.scope === "session"
+        ? [ctx.sessionId]
+        : ctx.allowedSessionIds.length > 0
+          ? ctx.allowedSessionIds
+          : null;
+    const allowedSet = allowed ? new Set(allowed) : null;
+    const surfaceFilter =
+      ctx.scope === "retrieval" && ctx.surfaceFilter?.length
+        ? new Set(ctx.surfaceFilter)
+        : null;
+
+    const ALL_SURFACES = ["Segment", "Dictation", "Note"] as const;
+    const SURFACE_MAP = {
+      segment: "Segment",
+      dictation: "Dictation",
+      note: "Note",
+    } as const;
+    const surfacesArg = Array.isArray(args.surfaces) ? args.surfaces : null;
+    const requested: ("Segment" | "Dictation" | "Note")[] = surfacesArg?.length
+      ? surfacesArg
+          .map((s) => SURFACE_MAP[String(s).toLowerCase() as keyof typeof SURFACE_MAP])
+          .filter((s): s is "Segment" | "Dictation" | "Note" => Boolean(s))
+      : [...ALL_SURFACES];
+    const surfaces = surfaceFilter
+      ? requested.filter((s) => surfaceFilter.has(s))
+      : requested;
+
+    if (!query) {
+      return {
+        name: "search_semantic",
+        label: "Semantic",
+        detail: "Empty query",
+        result: "Error: search_semantic requires a non-empty query.",
+      };
+    }
+
+    if (surfaces.length === 0) {
+      return {
+        name: "search_semantic",
+        label: "Semantic",
+        detail: "Surfaces blocked",
+        result:
+          "The current chat scope does not allow searching the requested surfaces. Use the BM25 search tool that matches this chat (e.g. search_dictations in a dictation chat).",
+      };
+    }
+
+    const settings = useAppStore.getState().settings;
+    if (!settings.embeddingsEnabled || settings.language !== "en") {
+      return {
+        name: "search_semantic",
+        label: "Semantic",
+        detail: "Unavailable",
+        result:
+          "Semantic search is disabled or the user's language is not English. Use search_segments / search_notes / search_dictations instead.",
+      };
+    }
+
+    const status = await commands.embeddingModelStatus();
+    if (status.status !== "ok" || !status.data.ready) {
+      return {
+        name: "search_semantic",
+        label: "Semantic",
+        detail: "Model loading",
+        result:
+          "Embedding model is still loading. Try a BM25 search tool instead, or retry shortly.",
+      };
+    }
+
+    const search = await commands.searchSemantic(query, limit, surfaces, allowed);
+    if (search.status !== "ok") {
+      return {
+        name: "search_semantic",
+        label: "Semantic",
+        detail: "Search failed",
+        result: `Error: ${search.error.message}`,
+      };
+    }
+    const hits = search.data;
+    if (hits.length === 0) {
+      return {
+        name: "search_semantic",
+        label: "Semantic",
+        detail: `No matches for "${query}"`,
+        result: `No semantic matches for "${query}".`,
+      };
+    }
+
+    // Bulk lookup per surface to enrich hit ids with display text. The
+    // SQL WHERE clauses in getSegmentsByIds filter out hidden + soft-
+    // deleted segments at the source; if a hit's row was filtered, we
+    // drop the hit silently. Notes get HTML-stripped to plain text for
+    // the LLM's snippet.
+    const segIds = hits.filter((h) => h.source_kind === "Segment").map((h) => h.source_id);
+    const dictIds = hits.filter((h) => h.source_kind === "Dictation").map((h) => h.source_id);
+    const noteIds = hits.filter((h) => h.source_kind === "Note").map((h) => h.source_id);
+    const [segments, dictations, notes] = await Promise.all([
+      getSegmentsByIds(segIds),
+      getDictationsByIds(dictIds),
+      getNotesByIds(noteIds),
+    ]);
+    const segById = new Map(segments.map((s) => [s.id, s]));
+    const dictById = new Map(dictations.map((d) => [d.id, d]));
+    const noteById = new Map(notes.map((n) => [n.id, n]));
+
+    type Enriched = {
+      kind: "Segment" | "Dictation" | "Note";
+      id: string;
+      sessionId: string | null;
+      text: string;
+      distance: number;
+    };
+    const enriched: Enriched[] = [];
+    for (const hit of hits) {
+      if (hit.source_kind === "Segment") {
+        const seg = segById.get(hit.source_id);
+        if (!seg) continue;
+        enriched.push({
+          kind: "Segment",
+          id: seg.id,
+          sessionId: seg.session_id,
+          text: seg.text,
+          distance: hit.distance,
+        });
+      } else if (hit.source_kind === "Dictation") {
+        const d = dictById.get(hit.source_id);
+        if (!d) continue;
+        const text = (d.output_text && d.output_text.trim()) || d.input_text || "";
+        enriched.push({
+          kind: "Dictation",
+          id: d.id,
+          sessionId: d.session_id,
+          text,
+          distance: hit.distance,
+        });
+      } else {
+        const n = noteById.get(hit.source_id);
+        if (!n) continue;
+        enriched.push({
+          kind: "Note",
+          id: n.id,
+          sessionId: n.session_id,
+          text: normalizeTiptapToText(n.content),
+          distance: hit.distance,
+        });
+      }
+    }
+
+    // Defense in depth — Rust already clamps by allow-list, but a hit
+    // could still come back with a session_id outside the set if the
+    // backend regresses. Hits without a session_id (orphan dictations)
+    // are dropped when scope filtering is active.
+    const scoped = allowedSet
+      ? enriched.filter((e) => e.sessionId !== null && allowedSet.has(e.sessionId))
+      : enriched;
+    const final = scoped.slice(0, limit);
+
+    if (final.length === 0) {
+      return {
+        name: "search_semantic",
+        label: "Semantic",
+        detail: "No visible matches in scope",
+        result: `Semantic hits resolved to hidden, deleted, or out-of-scope rows; nothing to show.`,
+      };
+    }
+
+    const detail = `Matched ${final.length} item${final.length === 1 ? "" : "s"}`;
+    const result = `Semantic matches (closest first):\n${final
+      .map((e) => {
+        const sid = e.sessionId ? ` session_id=${e.sessionId}` : "";
+        const segRef = e.kind === "Segment" ? ` [[seg:${e.id}]]` : "";
+        return `- ${e.kind.toLowerCase()}_id=${e.id} distance=${e.distance.toFixed(3)}${sid}${segRef}\n  ${e.text.slice(0, 600)}`;
+      })
+      .join("\n")}`;
+
+    console.log(
+      `[search_semantic] q=${JSON.stringify(query)} surfaces=${surfaces.join(",")} ` +
+        `scope=${allowedSet ? allowedSet.size : "global"} k=${limit} ` +
+        `raw_hits=${hits.length} final=${final.length}`,
+      final.map((e) => ({
+        kind: e.kind,
+        id: e.id,
+        distance: Number(e.distance.toFixed(3)),
+        snippet: e.text.slice(0, 120),
+      })),
+    );
+
+    return {
+      name: "search_semantic",
+      label: "Semantic",
+      detail,
+      result,
+      observation: {
+        summary: detail,
+        evidence: result,
+        affectedIds: final.map((e) => e.id),
       },
     };
   },

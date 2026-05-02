@@ -488,6 +488,16 @@ export function useDictation() {
             wav_duration_seconds: wavInfoRef.current?.duration ?? null,
             session_id: noteSessionId,
           });
+          // Embed the cleaner text — AI output if it ran, else raw input.
+          const settings = useAppStore.getState().settings;
+          if (settings.embeddingsEnabled && settings.language === "en") {
+            const embedText = (text && text.trim()) || (inputText && inputText.trim()) || "";
+            if (embedText) {
+              commands
+                .embedDictation(dictationIdRef.current, embedText)
+                .catch(() => undefined);
+            }
+          }
         } catch (e) {
           console.error("Failed to save dictation history:", e);
         }

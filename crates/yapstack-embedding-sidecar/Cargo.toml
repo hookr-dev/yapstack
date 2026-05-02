@@ -1,0 +1,20 @@
+[package]
+name = "yapstack-embedding-sidecar"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+yapstack-common = { path = "../yapstack-common" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+# Pinned exactly. The model identity recorded per embedding row
+# (`model_version` in *_embeddings_meta) is meaningless if the
+# fastembed crate is allowed to drift across patch versions and
+# changes the underlying tokenizer or weight layout. Bumping this
+# is a deliberate decision that triggers a re-embed migration.
+fastembed = "=5.13.4"

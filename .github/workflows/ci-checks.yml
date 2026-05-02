@@ -65,6 +65,7 @@ jobs:
         run: |
           mkdir -p apps/desktop/src-tauri/binaries
           touch apps/desktop/src-tauri/binaries/yapstack-transcription-sidecar-aarch64-apple-darwin
+          touch apps/desktop/src-tauri/binaries/yapstack-embedding-sidecar-aarch64-apple-darwin
           touch apps/desktop/src-tauri/binaries/libwebgpu_dawn.dylib
 
       - name: Clippy

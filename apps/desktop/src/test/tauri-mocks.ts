@@ -211,5 +211,29 @@ export const tauriCommandsMock = () => ({
     clearLogs: vi.fn().mockResolvedValue({ status: "ok", data: null }),
     getLogDir: vi.fn().mockResolvedValue({ status: "ok", data: "/mock/logs" }),
     revealLogDir: vi.fn().mockResolvedValue({ status: "ok", data: null }),
+    embedSegment: vi.fn().mockResolvedValue({ status: "ok", data: null }),
+    embedDictation: vi.fn().mockResolvedValue({ status: "ok", data: null }),
+    embedNote: vi.fn().mockResolvedValue({ status: "ok", data: null }),
+    searchSemantic: vi.fn().mockResolvedValue({ status: "ok", data: [] }),
+    embeddingModelStatus: vi.fn().mockResolvedValue({
+      status: "ok",
+      data: { ready: false, model_name: null, model_version: null, dimensions: null },
+    }),
+    deleteSegmentEmbedding: vi
+      .fn()
+      .mockResolvedValue({ status: "ok", data: null }),
+    deleteDictationEmbedding: vi
+      .fn()
+      .mockResolvedValue({ status: "ok", data: null }),
+    deleteSessionEmbeddings: vi
+      .fn()
+      .mockResolvedValue({ status: "ok", data: 0 }),
+    listMissingEmbeddings: vi
+      .fn()
+      .mockResolvedValue({ status: "ok", data: [] }),
+    embedAndStoreBatch: vi.fn().mockResolvedValue({ status: "ok", data: 0 }),
+    ensureEmbeddingReady: vi
+      .fn()
+      .mockResolvedValue({ status: "ok", data: null }),
   },
 });

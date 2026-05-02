@@ -1,5 +1,7 @@
 import Database from "@tauri-apps/plugin-sql";
 import { stripHtml } from "./utils";
+import { commands } from "@/lib/tauri";
+import { normalizeTiptapToText } from "@/lib/note-text";
 
 // --- Types ---
 
@@ -383,6 +385,35 @@ async function ensureRuntimeSchema(db: Database): Promise<void> {
        WHERE wav_file_path IS NOT NULL`,
     )
     .catch(() => {});
+
+  // v16 — embedding meta tables. Same dev-DB rationale as session_audio_parts:
+  // idempotent CREATE IF NOT EXISTS so dev DBs with misaligned `_sqlx_migrations`
+  // history still get them. The vec0 sibling tables are created by the Rust
+  // `embedding_db::EmbeddingStore::open` on the parallel rusqlite connection.
+  const metaTables: { table: string; idCol: string; idx: string }[] = [
+    { table: "segment_embeddings_meta", idCol: "segment_id", idx: "idx_segment_embeddings_meta_segment" },
+    { table: "dictation_embeddings_meta", idCol: "dictation_id", idx: "idx_dictation_embeddings_meta_dict" },
+    { table: "note_embeddings_meta", idCol: "note_id", idx: "idx_note_embeddings_meta_note" },
+  ];
+  for (const { table, idCol, idx } of metaTables) {
+    await db
+      .execute(
+        `CREATE TABLE IF NOT EXISTS ${table} (
+           rowid INTEGER PRIMARY KEY,
+           ${idCol} TEXT NOT NULL UNIQUE,
+           content_hash TEXT NOT NULL,
+           model_name TEXT NOT NULL,
+           model_version TEXT NOT NULL,
+           dimensions INTEGER NOT NULL,
+           created_at TEXT NOT NULL,
+           updated_at TEXT NOT NULL
+         )`,
+      )
+      .catch(() => {});
+    await db
+      .execute(`CREATE INDEX IF NOT EXISTS ${idx} ON ${table}(${idCol})`)
+      .catch(() => {});
+  }
 }
 
 // --- Session CRUD ---
@@ -454,8 +485,48 @@ export async function markSessionRecording(id: string): Promise<void> {
   );
 }
 
+/**
+ * Bulk lookups used by the semantic-search tool to enrich KNN hits with
+ * source-row data. All three filter applicable lifecycle state at the SQL
+ * level so the chat model never sees hidden / soft-deleted rows.
+ */
+export async function getSegmentsByIds(ids: string[]): Promise<DbSegment[]> {
+  if (ids.length === 0) return [];
+  const db = await getDb();
+  const placeholders = ids.map((_, i) => `$${i + 1}`).join(",");
+  return await db.select<DbSegment[]>(
+    `SELECT * FROM segments WHERE id IN (${placeholders})
+       AND deleted_at IS NULL AND hidden = 0`,
+    ids,
+  );
+}
+
+export async function getDictationsByIds(
+  ids: string[],
+): Promise<DbDictationHistory[]> {
+  if (ids.length === 0) return [];
+  const db = await getDb();
+  const placeholders = ids.map((_, i) => `$${i + 1}`).join(",");
+  return await db.select<DbDictationHistory[]>(
+    `SELECT * FROM dictation_history WHERE id IN (${placeholders})`,
+    ids,
+  );
+}
+
+export async function getNotesByIds(ids: string[]): Promise<DbNote[]> {
+  if (ids.length === 0) return [];
+  const db = await getDb();
+  const placeholders = ids.map((_, i) => `$${i + 1}`).join(",");
+  return await db.select<DbNote[]>(
+    `SELECT * FROM notes WHERE id IN (${placeholders})`,
+    ids,
+  );
+}
+
 export async function deleteSession(id: string): Promise<void> {
   const db = await getDb();
+  // Embedding cascade runs first so the join back to source rows still resolves.
+  await commands.deleteSessionEmbeddings(id).catch(() => undefined);
   await db.execute("DELETE FROM sessions WHERE id = $1", [id]);
 }
 
@@ -487,6 +558,12 @@ export async function getSessionsByIds(ids: string[]): Promise<DbSession[]> {
 
 export async function deleteAllSessions(): Promise<void> {
   const db = await getDb();
+  // Reap embeddings before nuking sessions — the cascade joins back to
+  // source rows by session_id, so it has to run while those rows exist.
+  const sessions = await db.select<{ id: string }[]>("SELECT id FROM sessions");
+  for (const s of sessions) {
+    await commands.deleteSessionEmbeddings(s.id).catch(() => undefined);
+  }
   // CASCADE handles child tables: segments, notes (→ note_versions),
   // chat_messages, session_folders
   await db.execute("DELETE FROM sessions");
@@ -826,17 +903,32 @@ export async function saveNote(
 ): Promise<void> {
   const db = await getDb();
   const existing = await getNote(sessionId);
+  let noteId: string;
   if (existing) {
+    noteId = existing.id;
     await db.execute(
       "UPDATE notes SET content = $1, updated_at = datetime('now') WHERE id = $2",
       [content, existing.id],
     );
   } else {
-    const id = crypto.randomUUID();
+    noteId = crypto.randomUUID();
     await db.execute(
       "INSERT INTO notes (id, session_id, content) VALUES ($1, $2, $3)",
-      [id, sessionId, content],
+      [noteId, sessionId, content],
     );
+  }
+  // Embed the cleaned plain text — raw Tiptap HTML biases the model
+  // away from the semantics. appStore is dynamically imported to avoid
+  // a circular module dep (appStore → db).
+  const { useAppStore } = await import("@/stores/appStore");
+  const settings = useAppStore.getState().settings;
+  if (settings.embeddingsEnabled && settings.language === "en") {
+    const plain = normalizeTiptapToText(content);
+    if (plain) {
+      commands.embedNote(noteId, plain).catch(() => undefined);
+    } else {
+      commands.deleteNoteEmbedding(noteId).catch(() => undefined);
+    }
   }
 }
 

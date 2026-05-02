@@ -11,6 +11,8 @@ import { useUpdateCheck } from "@/hooks/useUpdateCheck";
 import { DictationBubble } from "@/components/DictationBubble";
 import { RecordingIndicator } from "@/components/RecordingIndicator";
 import { WINDOWS } from "@/lib/events";
+import { commands } from "@/lib/tauri";
+import { startEmbeddingBackfill } from "@/lib/embedding-backfill";
 
 const WINDOW_POS_KEY = "yapstack-window-position";
 
@@ -114,6 +116,17 @@ function MainApp() {
       unlisten.then((fn) => fn());
     };
   }, []);
+
+  useEffect(() => startEmbeddingBackfill(), []);
+
+  // Warm up the embedding sidecar on opt-in so model download happens
+  // before the user's first recording, not on the first segment write.
+  const embeddingsEnabled = useAppStore((s) => s.settings.embeddingsEnabled);
+  const language = useAppStore((s) => s.settings.language);
+  useEffect(() => {
+    if (!embeddingsEnabled || language !== "en") return;
+    void commands.ensureEmbeddingReady().catch(() => undefined);
+  }, [embeddingsEnabled, language]);
 
   return (
     <div className="h-screen w-screen overflow-hidden bg-background text-foreground">

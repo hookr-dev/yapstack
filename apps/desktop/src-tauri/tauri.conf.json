@@ -87,7 +87,10 @@
     "createUpdaterArtifacts": "v1Compatible",
     "active": true,
     "targets": "all",
-    "externalBin": ["binaries/yapstack-transcription-sidecar"],
+    "externalBin": [
+      "binaries/yapstack-transcription-sidecar",
+      "binaries/yapstack-embedding-sidecar"
+    ],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

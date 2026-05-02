@@ -264,6 +264,13 @@ export interface Settings {
   dictation: DictationSettings;
   showRecordingIndicator: boolean;
   onboarding: OnboardingState;
+  /// Local text-embedding pipeline switch. When true, every new English
+  /// segment / dictation / note is embedded by the local sidecar (BGE-small
+  /// EN v1.5) and stored in sqlite-vec for semantic retrieval. Hidden under
+  /// "Advanced" in Settings — defaults true so users get value with zero
+  /// configuration. Disabling stops new writes and pauses backfill but
+  /// leaves the model file on disk so re-enabling is instant.
+  embeddingsEnabled: boolean;
 }
 
 export type EnginePhase =
@@ -573,6 +580,7 @@ const defaultSettings: Settings = {
   dictation: DEFAULT_DICTATION_SETTINGS,
   showRecordingIndicator: true,
   onboarding: { completedFlows: {} },
+  embeddingsEnabled: true,
 };
 
 function updateSessionFolderMap(
@@ -809,6 +817,16 @@ function createAppStore() {
           try {
             for (const segment of newSegments) {
               await insertSegment(segment);
+            }
+
+            const settings = get().settings;
+            if (settings.embeddingsEnabled && settings.language === "en") {
+              for (const segment of newSegments) {
+                if (!segment.text || !segment.text.trim()) continue;
+                commands
+                  .embedSegment(segment.id, segment.text)
+                  .catch(() => undefined);
+              }
             }
 
             // DB persistence is done. The remaining work updates the in-memory
@@ -2104,6 +2122,10 @@ function createAppStore() {
       editSegmentText: async (segmentId: string, newText: string) => {
         try {
           await dbUpdateSegmentText(segmentId, newText);
+          const settings = get().settings;
+          if (settings.embeddingsEnabled && settings.language === "en" && newText.trim()) {
+            commands.embedSegment(segmentId, newText).catch(() => undefined);
+          }
           await get().refreshViewSessionSegments();
         } catch (e) {
           console.error("Failed to edit segment:", e);
@@ -2114,6 +2136,7 @@ function createAppStore() {
       deleteSegment: async (segmentId: string) => {
         try {
           await dbSoftDeleteSegment(segmentId);
+          commands.deleteSegmentEmbedding(segmentId).catch(() => undefined);
           await get().refreshViewSessionSegments();
         } catch (e) {
           console.error("Failed to delete segment:", e);
@@ -2206,6 +2229,9 @@ function createAppStore() {
         if (ids.length === 0) return;
         try {
           await dbSoftDeleteSegments(ids);
+          for (const id of ids) {
+            commands.deleteSegmentEmbedding(id).catch(() => undefined);
+          }
           set({
             selectedSegmentIds: new Set(),
             lastSelectedSegmentId: null,
@@ -2292,6 +2318,7 @@ function createAppStore() {
             }
           }
           await dbDeleteDictationHistoryEntry(id);
+          commands.deleteDictationEmbedding(id).catch(() => undefined);
           set({ dictationHistory: get().dictationHistory.filter((h) => h.id !== id) });
         } catch (e) {
           console.error("Failed to delete dictation history entry:", e);
@@ -2319,7 +2346,12 @@ function createAppStore() {
               });
             }
           }
+          // Snapshot ids before the bulk delete so we can hard-delete embeddings.
+          const dictationIds = get().dictationHistory.map((e) => e.id);
           await dbClearDictationHistory();
+          for (const id of dictationIds) {
+            commands.deleteDictationEmbedding(id).catch(() => undefined);
+          }
           set({ dictationHistory: [] });
         } catch (e) {
           console.error("Failed to clear dictation history:", e);
@@ -2388,7 +2420,7 @@ function createAppStore() {
     }),
     {
       name: "yapstack-settings",
-      version: 23,
+      version: 24,
       partialize: (state) => ({
         settings: state.settings,
       }),
@@ -2568,6 +2600,15 @@ function createAppStore() {
           // the broken behavior in the meantime.
           const old = state.settings as Record<string, unknown>;
           old.diarizationEnabled = false;
+        }
+        if (version < 24 && state.settings) {
+          // Backfill the embeddings opt-out for existing users. Zustand's
+          // shallow merge would otherwise leave the key undefined, which
+          // every gate (live hooks, backfill, semantic-search tool) treats
+          // as disabled — so without this an upgraded install would silently
+          // skip the entire pipeline until the user manually toggles it.
+          const old = state.settings as Record<string, unknown>;
+          if (old.embeddingsEnabled === undefined) old.embeddingsEnabled = true;
         }
         return state as unknown as { settings: Settings };
       },

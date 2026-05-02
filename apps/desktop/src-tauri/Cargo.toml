@@ -16,13 +16,20 @@ tauri-build = { version = "2", features = [] }
 yapstack-audio = { path = "../../../crates/yapstack-audio" }
 yapstack-common = { path = "../../../crates/yapstack-common" }
 yapstack-transcription = { path = "../../../crates/yapstack-transcription" }
+yapstack-embedding = { path = "../../../crates/yapstack-embedding" }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 tracing-appender = "0.2"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 # Used by `db::ensure_runtime_schema` to perform a single direct ALTER TABLE
 # at startup (out-of-band of tauri-plugin-sql's migration list).
+# Also used by `embedding_db` for vector ops via the sqlite-vec extension —
+# vec0 virtual tables and KNN queries can only run on connections where
+# sqlite-vec is loaded, so we keep a parallel rusqlite connection
+# dedicated to those reads/writes.
 rusqlite = { version = "0.32", features = ["bundled"] }
+sqlite-vec = "0.1"
+sha2 = { workspace = true }
 hound = { workspace = true }
 tauri = { version = "2", features = ["tray-icon", "macos-private-api", "image-png"] }
 tauri-plugin-shell = "2"

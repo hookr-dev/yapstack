@@ -881,6 +881,59 @@ pub fn migrations() -> Vec<Migration> {
         "#,
             kind: MigrationKind::Up,
         },
+        Migration {
+            version: 16,
+            description: "embedding metadata tables (segments/dictations/notes)",
+            // The vec0 virtual tables (segment_embeddings_vec etc.) are
+            // created by `embedding_db::EmbeddingStore::open` on the parallel
+            // rusqlite connection that has the sqlite-vec extension loaded —
+            // tauri-plugin-sql's sqlx connection cannot CREATE VIRTUAL TABLE
+            // using vec0 because the extension is not loaded on it.
+            //
+            // The meta tables here are plain SQLite — they hold the rowid
+            // mapping back to the source row plus content_hash / model
+            // provenance for future re-embed migrations. vec0 virtual
+            // tables don't accept FK constraints, so meta/vec consistency
+            // is enforced transactionally by the `embedding_db` module.
+            sql: r#"
+            CREATE TABLE segment_embeddings_meta (
+                rowid INTEGER PRIMARY KEY,
+                segment_id TEXT NOT NULL UNIQUE,
+                content_hash TEXT NOT NULL,
+                model_name TEXT NOT NULL,
+                model_version TEXT NOT NULL,
+                dimensions INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX idx_segment_embeddings_meta_segment ON segment_embeddings_meta(segment_id);
+
+            CREATE TABLE dictation_embeddings_meta (
+                rowid INTEGER PRIMARY KEY,
+                dictation_id TEXT NOT NULL UNIQUE,
+                content_hash TEXT NOT NULL,
+                model_name TEXT NOT NULL,
+                model_version TEXT NOT NULL,
+                dimensions INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX idx_dictation_embeddings_meta_dict ON dictation_embeddings_meta(dictation_id);
+
+            CREATE TABLE note_embeddings_meta (
+                rowid INTEGER PRIMARY KEY,
+                note_id TEXT NOT NULL UNIQUE,
+                content_hash TEXT NOT NULL,
+                model_name TEXT NOT NULL,
+                model_version TEXT NOT NULL,
+                dimensions INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX idx_note_embeddings_meta_note ON note_embeddings_meta(note_id);
+        "#,
+            kind: MigrationKind::Up,
+        },
         // segments.speaker_id is added by the frontend's `getDb()` after
         // migrations run — kept out of the migration list because some
         // local dev DBs picked up a "ghost" v11 entry from another branch
@@ -902,7 +955,7 @@ mod tests {
     fn test_migrations_sequential_versions() {
         let m = migrations();
         let actual_versions: Vec<i64> = m.iter().map(|x| x.version).collect();
-        assert_eq!(actual_versions, (1..=15).collect::<Vec<_>>());
+        assert_eq!(actual_versions, (1..=16).collect::<Vec<_>>());
     }
 
     #[test]
@@ -973,9 +1026,21 @@ mod tests {
     fn test_migration_count() {
         assert_eq!(
             migrations().len(),
-            15,
-            "v1-v15; segments.speaker_id is patched at runtime by the frontend's getDb()"
+            16,
+            "v1-v16; segments.speaker_id is patched at runtime by the frontend's getDb()"
         );
+    }
+
+    #[test]
+    fn test_migration_v16_creates_embedding_meta_tables() {
+        let m = migrations();
+        let v16 = &m[15];
+        assert_eq!(v16.version, 16);
+        assert!(v16.sql.contains("CREATE TABLE segment_embeddings_meta"));
+        assert!(v16.sql.contains("CREATE TABLE dictation_embeddings_meta"));
+        assert!(v16.sql.contains("CREATE TABLE note_embeddings_meta"));
+        assert!(v16.sql.contains("content_hash"));
+        assert!(v16.sql.contains("model_version"));
     }
 
     #[test]

@@ -1,6 +1,7 @@
 pub mod audio;
 pub mod capture;
 pub mod dictation;
+pub mod embedding;
 pub mod error;
 pub mod live_transcription;
 pub mod logs;

@@ -40,9 +40,11 @@ The shared vocabulary for YapStack. Use these terms verbatim in code, docs, PRDs
 | **Engine**          | A transcription backend the sidecar can run: `Whisper` or `Parakeet`. Selected per session.                         | Backend, model type, provider   |
 | **Variant**         | A specific weights bundle for an engine, e.g. a Parakeet TDT v3 directory.                                          | Model size, flavor              |
 | **Model**           | The downloaded weights on disk: a single ggml file (Whisper) or a multi-file ONNX directory (Parakeet, Sortformer). | Weights, checkpoint             |
-| **Sidecar**         | A standalone worker process spawned by the desktop app that speaks JSON-line IPC. Generic pattern; today the only sidecar is the transcription sidecar. | Worker, helper process          |
+| **Sidecar**         | A standalone worker process spawned by the desktop app that speaks JSON-line IPC. Two ship today: the transcription sidecar and the embedding sidecar. | Worker, helper process          |
 | **Transcription sidecar** | The `yapstack-transcription-sidecar` binary that hosts Whisper or Parakeet for one session.                   | Whisper sidecar, ASR worker     |
-| **Embedding sidecar** | Reserved name (`yapstack-embedding-sidecar`) for the planned embedding worker. Not yet implemented.              | Vectorizer, embedder            |
+| **Embedding sidecar** | The `yapstack-embedding-sidecar` binary that hosts `fastembed-rs` (BGE-small-en-v1.5). Lazy-spawned on first English embed/search request, restartable independently of the transcription sidecar. | Vectorizer, embedder            |
+| **Embedding store** | The `embedding_db::EmbeddingStore` Rust module — single API over the `*_embeddings_vec` (sqlite-vec virtual tables) and `*_embeddings_meta` (regular SQLite) pairs. Keys vec0 rows by integer rowid; meta tracks `content_hash`, `model_name`, `model_version`. | Vector DB, KNN index           |
+| **Semantic search** | The `search_semantic` AI tool — KNN over local embeddings, scope-clamped to the active chat's allow-list and surface filter via `commands::embedding::search_semantic`. English-only, gated on `Settings.embeddingsEnabled`. | Vector search, RAG retrieval    |
 | **Execution provider** | The ORT runtime backend for Parakeet: `cpu`, `coreml`, or `webgpu`. Chosen per spawn via `YAPSTACK_PARAKEET_ACCEL`. | Accelerator, EP only            |
 | **Transcription client** | The Rust-side handle that owns the sidecar process and sends transcribe/load/shutdown requests.                | Whisper client (legacy alias)   |
 

@@ -1,5 +1,6 @@
 mod commands;
 mod db;
+mod embedding_db;
 mod logging;
 
 const WINDOW_MAIN: &str = "main";
@@ -262,6 +263,10 @@ fn read_file_range(path: &Path, start: u64, end: u64) -> std::io::Result<Vec<u8>
 }
 
 pub fn run() {
+    // Register sqlite-vec for every rusqlite connection opened later in
+    // this process — must run before any Connection::open call. Idempotent.
+    embedding_db::register_vec_extension();
+
     let specta_builder =
         tauri_specta::Builder::<tauri::Wry>::new().commands(tauri_specta::collect_commands![
             commands::health_check,
@@ -304,6 +309,18 @@ pub fn run() {
             commands::logs::clear_logs,
             commands::logs::get_log_dir,
             commands::logs::reveal_log_dir,
+            commands::embedding::embed_segment,
+            commands::embedding::embed_dictation,
+            commands::embedding::embed_note,
+            commands::embedding::search_semantic,
+            commands::embedding::embedding_model_status,
+            commands::embedding::delete_segment_embedding,
+            commands::embedding::delete_dictation_embedding,
+            commands::embedding::delete_note_embedding,
+            commands::embedding::delete_session_embeddings,
+            commands::embedding::list_missing_embeddings,
+            commands::embedding::embed_and_store_batch,
+            commands::embedding::ensure_embedding_ready,
         ]);
 
     #[cfg(debug_assertions)]
@@ -534,7 +551,7 @@ pub fn run() {
             }
             app.manage(Arc::new(db_path.clone()) as DbPath);
 
-            let model_manager = ModelManager::new(app_data_dir);
+            let model_manager = ModelManager::new(app_data_dir.clone());
             app.manage(
                 Arc::new(Mutex::new(model_manager)) as commands::transcription::ModelManagerState
             );
@@ -543,6 +560,24 @@ pub fn run() {
             app.manage(
                 Arc::new(Mutex::new(None)) as commands::transcription::TranscriptionClientState
             );
+
+            // Embedding state. Opens the parallel rusqlite connection
+            // (which creates the vec0 virtual tables alongside the v16
+            // meta tables) and registers a lazy supervisor handle —
+            // nothing spawns until the frontend calls
+            // `ensure_embedding_ready` (or any other embed_* command),
+            // so users who have embeddings disabled or non-English
+            // selected never download the model.
+            let embedding_store = Arc::new(
+                crate::embedding_db::EmbeddingStore::open(&db_path).expect("embedding store open"),
+            );
+            let cache_dir = app_data_dir.join("models").join("embedding");
+            std::fs::create_dir_all(&cache_dir).ok();
+            app.manage(commands::embedding::EmbeddingState {
+                supervisor: Arc::new(Mutex::new(None)),
+                store: embedding_store,
+                cache_dir,
+            });
 
             let menu = build_tray_menu(app.handle(), false, false)?;
 

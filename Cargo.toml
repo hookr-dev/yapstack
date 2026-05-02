@@ -5,6 +5,8 @@ members = [
     "crates/yapstack-audio",
     "crates/yapstack-transcription",
     "crates/yapstack-transcription-sidecar",
+    "crates/yapstack-embedding",
+    "crates/yapstack-embedding-sidecar",
     "apps/desktop/src-tauri",
 ]
 

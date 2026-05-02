@@ -139,6 +139,7 @@ export function createSessionTools(sessionId: string): AIContextTools {
       "search_sessions",
       "get_session_context",
       "search_dictations",
+      "search_semantic",
       "replace_in_transcript",
     ],
     contextType: "session",
@@ -265,6 +266,7 @@ export function createMultiSessionTools(
       "get_session_context",
       "search_folders",
       "search_dictations",
+      "search_semantic",
     ],
     contextType: "multi-session",
     // Retrieval tools don't read session-scoped ToolContext; they hit the DB
@@ -290,7 +292,7 @@ export function createMultiSessionTools(
  */
 export function createDictationTools(): AIContextTools {
   return {
-    availableToolIds: ["search_dictations"],
+    availableToolIds: ["search_dictations", "search_semantic"],
     contextType: "multi-session",
     getToolContext: async () => ({
       scope: "retrieval",
@@ -298,6 +300,10 @@ export function createDictationTools(): AIContextTools {
       // history is its own table) but a stray future tool that *does*
       // consult `allowedSessionIds` will fail closed.
       allowedSessionIds: [],
+      // Restrict semantic search to dictation embeddings — without this,
+      // a dictation chat could pull transcript / note hits via the
+      // semantic surface and leak content from the user's session view.
+      surfaceFilter: ["Dictation"],
     }),
   };
 }

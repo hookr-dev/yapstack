@@ -145,6 +145,7 @@ export function TranscriptionTab() {
   const maxChunkSeconds = useAppStore((s) => s.settings.maxChunkSeconds);
   const silenceDurationMs = useAppStore((s) => s.settings.silenceDurationMs);
   const promptContextChars = useAppStore((s) => s.settings.promptContextChars);
+  const embeddingsEnabled = useAppStore((s) => s.settings.embeddingsEnabled);
   const promptDecaySilenceSeconds = useAppStore(
     (s) => s.settings.promptDecaySilenceSeconds,
   );
@@ -341,6 +342,25 @@ export function TranscriptionTab() {
             currentValue={promptDecaySilenceSeconds}
             onChange={(v) => updateSettings({ promptDecaySilenceSeconds: v })}
           />
+          <Separator />
+          <div className="flex items-start justify-between gap-4">
+            <div className="space-y-1">
+              <Label htmlFor="embeddings-enabled" className="text-sm">
+                Local semantic search
+              </Label>
+              <p className="text-xs text-muted-foreground">
+                Embeds new English transcripts, dictations, and notes locally
+                (~67 MB model on first use) so the AI chat can find content by
+                meaning, not just keywords. Turn off to skip the model download
+                and stop indexing.
+              </p>
+            </div>
+            <Switch
+              id="embeddings-enabled"
+              checked={embeddingsEnabled}
+              onCheckedChange={(v) => updateSettings({ embeddingsEnabled: v })}
+            />
+          </div>
         </CollapsibleContent>
       </Collapsible>
     </>

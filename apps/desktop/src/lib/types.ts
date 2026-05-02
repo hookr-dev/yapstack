@@ -391,6 +391,120 @@ async revealLogDir() : Promise<Result<null, CommandError>> {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
+},
+async embedSegment(segmentId: string, text: string) : Promise<Result<null, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("embed_segment", { segmentId, text }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async embedDictation(dictationId: string, text: string) : Promise<Result<null, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("embed_dictation", { dictationId, text }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async embedNote(noteId: string, text: string) : Promise<Result<null, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("embed_note", { noteId, text }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Semantic KNN search across one or more surfaces. `allowed_session_ids`
+ * (Some, non-empty) clamps results to those sessions and applies
+ * segment lifecycle filters (`hidden = 0 AND deleted_at IS NULL`) at
+ * the SQL JOIN level so out-of-scope rows are dropped during the KNN
+ * join, not after — otherwise tightly-scoped chats can return empty
+ * when most top-k hits are out of scope.
+ */
+async searchSemantic(query: string, k: number, kinds: SourceKindDto[], allowedSessionIds: string[] | null) : Promise<Result<SemanticHitDto[], CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("search_semantic", { query, k, kinds, allowedSessionIds }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async embeddingModelStatus() : Promise<Result<EmbeddingModelStatusDto, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("embedding_model_status") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async deleteSegmentEmbedding(segmentId: string) : Promise<Result<null, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("delete_segment_embedding", { segmentId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async deleteDictationEmbedding(dictationId: string) : Promise<Result<null, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("delete_dictation_embedding", { dictationId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async deleteNoteEmbedding(noteId: string) : Promise<Result<null, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("delete_note_embedding", { noteId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async deleteSessionEmbeddings(sessionId: string) : Promise<Result<number, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("delete_session_embeddings", { sessionId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Returns up to `batch_size` source rows (id + text) that lack an
+ * embedding for the given surface. Used by the frontend backfill worker
+ * to pull work batches.
+ */
+async listMissingEmbeddings(kind: SourceKindDto, batchSize: number) : Promise<Result<MissingRowDto[], CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("list_missing_embeddings", { kind, batchSize }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Batch embed + upsert. Used by backfill — frontend collects a batch via
+ * `list_missing_embeddings`, then hands it back here. We embed in one
+ * `embed_batch` round-trip, then upsert each result.
+ */
+async embedAndStoreBatch(kind: SourceKindDto, rows: MissingRowDto[]) : Promise<Result<number, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("embed_and_store_batch", { kind, rows }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async ensureEmbeddingReady() : Promise<Result<null, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("ensure_embedding_ready") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
 }
 }
 
@@ -424,8 +538,15 @@ export type CaptureStatusDto = { state: CaptureStateDto; mic_active: boolean; sy
  * Serializes to `{ "kind": "...", "message": "..." }` via `#[serde(tag = "kind")]`.
  * Auto-generated TypeScript types via specta.
  */
-export type CommandError = { kind: "Audio"; message: string } | { kind: "Transcription"; message: string } | { kind: "NotInitialized"; message: string } | { kind: "InvalidInput"; message: string } | { kind: "NotFound"; message: string } | { kind: "Internal"; message: string }
+export type CommandError = { kind: "Audio"; message: string } | { kind: "Transcription"; message: string } | { kind: "Embedding"; message: string } | { kind: "NotInitialized"; message: string } | { kind: "InvalidInput"; message: string } | { kind: "NotFound"; message: string } | { kind: "Internal"; message: string }
 export type DeviceTypeDto = "Input" | "Output"
+export type EmbeddingModelStatusDto = { 
+/**
+ * `true` once the sidecar has finished loading the model and is
+ * ready to embed. Frontend uses this to decide whether to show the
+ * "indexing" indicator.
+ */
+ready: boolean; model_name: string | null; model_version: string | null; dimensions: number | null }
 /**
  * Engine capabilities + supported languages for the cascading UI in Settings.
  */
@@ -556,6 +677,7 @@ export type LogEntry = { ts_ms: number; level: LogLevel; target: string; message
  * typed union instead of an unchecked string.
  */
 export type LogLevel = "ERROR" | "WARN" | "INFO" | "DEBUG" | "TRACE"
+export type MissingRowDto = { id: string; text: string }
 export type MixConfigDto = { mic_gain: number; system_gain: number; normalize: boolean }
 export type ModelInfoDto = { size: ModelSizeDto; downloaded: boolean; path: string | null; display_name: string; approximate_size_bytes: number }
 export type ModelSizeDto = "Tiny" | "Base" | "Small" | "Medium"
@@ -583,8 +705,10 @@ part_index: number;
 offset_base_seconds: number }
 export type RingBufferInfoDto = { capacity_samples: number; samples_written: number; available_samples: number; capacity_seconds: number; available_seconds: number; sample_rate: number; channels: number }
 export type ScreenCapturePermissionDto = "Granted" | "NotDetermined" | "Unavailable"
+export type SemanticHitDto = { source_id: string; source_kind: SourceKindDto; distance: number }
 export type SortformerModelInfoDto = { variant: SortformerVariantDto; downloaded: boolean; display_name: string; approximate_size_bytes: number }
 export type SortformerVariantDto = "V2_1"
+export type SourceKindDto = "Segment" | "Dictation" | "Note"
 export type TranscriptionStatusDto = { initialized: boolean }
 
 /** tauri-specta globals **/
