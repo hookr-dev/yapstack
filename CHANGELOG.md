@@ -8,7 +8,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ### Added
 - **Auto-failover on device change** — the device picker now reflects the OS state in real time. When AirPods drop, a USB mic is unplugged, or the user changes the system default in Settings, capture automatically rebinds the affected Stream to the new system default and shows a transient toast naming the new device ("Switched mic to MacBook Pro Microphone"). System-audio loopback follows the default output (and the alerts/UI route) the same way. `Mixed` capture stops both Sources fail-fast if either can't be recovered.
-- New Tauri events `devices-changed` and `default-device-changed`. The frontend listens for both and reconciles the persisted `selectedMicDeviceId` when its device disappears.
+- New Tauri events `devices-changed` and `default-device-changed`. The frontend listens for `devices-changed` and reconciles the persisted `selectedMicDeviceId` when its device disappears; `default-device-changed` is emitted per-kind for diagnostics and future per-kind UI affordances. The broker also re-emits `devices-changed` whenever any default kind flips so the FE store's `is_default` flags stay current without a second listener.
 - Fourth Core Audio property listener for `kAudioHardwarePropertyDefaultSystemOutputDevice` (the alerts/UI route), distinct from the media output selector.
 - `RestartTarget::FollowDefault` mode for `restart_mic`/broker-driven failover. Probes the new system default *first*, then falls through to stored id/name. The watchdog path keeps `PreserveBinding` (stored id first) for stream-error / write-pos-stall recovery.
 

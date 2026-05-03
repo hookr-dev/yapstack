@@ -529,12 +529,32 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(not(target_os = "macos"), ignore)] // Non-macOS stub: always Unknown.
-    fn device_liveness_unknown_uid_is_absent_on_macos() {
-        // On macOS, enumeration succeeds and the UID is genuinely missing.
-        // This is the bug fix for the prior fail-open behavior: the
-        // explicit-pick branch in the broker depends on Absent ≠ Alive
-        // so an unplugged USB mic actually triggers failover.
+    fn device_liveness_unknown_uid_is_not_alive() {
+        // The strict policy in the broker only skips failover on `Alive`.
+        // For a UID that doesn't match any system device the result must
+        // therefore be anything *except* `Alive` — typically `Absent`
+        // (enumeration succeeded, no match) on macOS, or `Unknown`
+        // (Core Audio enumeration failed, or non-macOS stub). Both
+        // outcomes correctly trigger failover; we don't pin one over
+        // the other because the Core Audio enumeration result varies
+        // by environment (sandboxing, headless CI). A separate hardware
+        // test below pins `Alive` for a known-live UID.
+        assert_ne!(
+            device_liveness("definitely-not-a-real-device-uid-zzzz"),
+            DeviceLiveness::Alive
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    #[ignore] // Requires Core Audio enumeration to succeed (interactive macOS only).
+    fn device_liveness_unknown_uid_is_absent_when_core_audio_enumerates() {
+        // Hardware-gated companion to the policy test above: on a real
+        // macOS desktop where Core Audio enumeration succeeds, an unknown
+        // UID resolves to `Absent` specifically (not `Unknown`). This is
+        // the path real users hit when an explicit USB mic is unplugged
+        // mid-session, so we want a focused regression check — but it's
+        // ignored by default because headless CI returns `Unknown`.
         assert_eq!(
             device_liveness("definitely-not-a-real-device-uid-zzzz"),
             DeviceLiveness::Absent
