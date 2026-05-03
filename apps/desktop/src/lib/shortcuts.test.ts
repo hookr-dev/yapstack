@@ -23,6 +23,41 @@ describe("SHORTCUTS / SHORTCUT_MAP", () => {
   });
 });
 
+describe("allowInEditor flag", () => {
+  it("marks command-palette as allowed in editor", () => {
+    expect(SHORTCUT_MAP.get("command-palette")?.allowInEditor).toBe(true);
+  });
+
+  it("rebinds toggle-sidebar to mod+\\ (Notion convention) and allows it in the editor", () => {
+    const def = SHORTCUT_MAP.get("toggle-sidebar");
+    expect(def?.defaultBinding).toBe("mod+\\");
+    expect(def?.allowInEditor).toBe(true);
+  });
+
+  it("does not mark go-back (escape) as allowed in editor", () => {
+    expect(SHORTCUT_MAP.get("go-back")?.allowInEditor).toBeFalsy();
+  });
+
+  it("does not mark delete-session (mod+backspace) as allowed in editor — collides with line delete", () => {
+    expect(SHORTCUT_MAP.get("delete-session")?.allowInEditor).toBeFalsy();
+  });
+
+  it("marks navigation/global-feeling shortcuts as allowed in editor", () => {
+    for (const id of [
+      "toggle-sidebar",
+      "open-settings",
+      "filter-all",
+      "filter-pinned",
+      "new-note",
+      "stop-recording",
+      "toggle-chat",
+      "pin-session",
+    ]) {
+      expect(SHORTCUT_MAP.get(id)?.allowInEditor, `${id} should be allowInEditor`).toBe(true);
+    }
+  });
+});
+
 describe("getBinding", () => {
   it("returns default binding when no override", () => {
     expect(getBinding("command-palette", {})).toBe("mod+k");

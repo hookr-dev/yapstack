@@ -151,7 +151,7 @@ Defaults (Mac bindings shown; `mod` = ⌘ on Mac, Ctrl elsewhere):
 | `global.stop-recording` | ⌘⌥S | Recording | Global |
 | `global.new-note` | ⌘⌥. | Recording | Global |
 | `command-palette` | ⌘K | Navigation | In-app |
-| `toggle-sidebar` | ⌘B | Navigation | In-app |
+| `toggle-sidebar` | ⌘\ | Navigation | In-app |
 | `open-settings` | ⌘, | Navigation | In-app |
 | `go-back` | Esc | Navigation | In-app |
 | `filter-all` | ⌘1 | Navigation | In-app |

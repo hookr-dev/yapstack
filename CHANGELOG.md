@@ -6,6 +6,22 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+### Added
+- **Multi-color highlights in the note editor.** Yellow, green, blue, purple, red palette themed for both light and dark; pick from the highlight dropdown in the toolbar or selection bubble. Highlights re-theme automatically — they're stored as CSS variable references that resolve per theme at render time.
+- **Heading dropdown shows the current level.** The heading button reads "H1" / "H2" / "Normal" and the active row inside the dropdown is highlighted.
+- **Selection bubble menu is scoped to inline marks** — bold, italic, underline, strike, code, highlight, link. Block-level formatting (headings, lists, blockquote, code block) lives in the static toolbar, matching Notion / Linear / Novel conventions.
+- **Static toolbar adds Link and Code Block buttons.** Multi-line fenced ` ``` ` code blocks were already supported by the input rule and round-trip through markdown; the toolbar now exposes them alongside an explicit Link control.
+- **Pasting markdown with fenced code blocks parses correctly.** When a paste's plain-text payload contains a ` ``` ` fence and there's no rich HTML alternative on the clipboard, the paste is parsed as markdown — so copying a code block out of a terminal, GitHub issue, or markdown file lands as a real code block instead of a flat string.
+
+### Changed
+- **Toolbar and bubble-menu active states are reactive and visible.** Buttons re-render on selection changes (via `useEditorState`) and gain an accent underline when their mark or block is active, so cases like "bold persists on a new line" are obvious.
+- **Sidebar shortcut moved from ⌘B to ⌘\\ (Notion convention)** so it stops fighting TipTap's bold binding inside notes. Both shortcuts now work as intended; existing custom rebinds are preserved.
+- **In-app shortcuts can fire while typing in a note.** Command palette (⌘K), sidebar (⌘\\), settings (⌘,), filter switches (⌘1/⌘2), new note (⌘N), stop recording (⌘.), toggle chat (⌘J), and pin (⌘D) now work with editor focus. Escape and ⌘⌫ still defer to the editor.
+- **Selection bubble menu stays inside the editor.** Floating UI's flip/shift now use the editor's contenteditable as the boundary, so the bubble can no longer land on the static toolbar above or the floating chat bar below; it also renders at `z-50` so it always sits above other floating UI.
+
+### Fixed
+- **Note checklist checkboxes are themed and aligned.** Checked state uses the accent color with a contrast checkmark and a focus-visible ring; the checkbox aligns with the first line of text and stays aligned across wraps.
+
 ## [1.0.0-alpha.8] - 2026-05-02
 
 ### Added

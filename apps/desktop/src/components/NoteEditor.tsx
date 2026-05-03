@@ -1,5 +1,5 @@
 import { useEffect, useRef, useCallback } from "react";
-import { useEditor, EditorContent } from "@tiptap/react";
+import { useEditor, EditorContent, useEditorState } from "@tiptap/react";
 import { BubbleMenu } from "@tiptap/react/menus";
 import StarterKit from "@tiptap/starter-kit";
 import { Markdown } from "@tiptap/markdown";
@@ -22,10 +22,12 @@ import {
   ListChecks,
   Quote,
   Code,
+  SquareCode,
   Highlighter,
   ChevronDown,
   Link as LinkIcon,
   ALargeSmall,
+  Eraser,
 } from "lucide-react";
 import type { Editor } from "@tiptap/react";
 import {
@@ -48,6 +50,18 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 
+// `value` is the literal string TipTap writes into mark inline `style="background-color: ..."`,
+// so a `var(...)` reference resolves per theme at render time.
+const HIGHLIGHT_COLORS = [
+  { name: "Yellow", value: "var(--tt-color-highlight-yellow)" },
+  { name: "Green", value: "var(--tt-color-highlight-green)" },
+  { name: "Blue", value: "var(--tt-color-highlight-blue)" },
+  { name: "Purple", value: "var(--tt-color-highlight-purple)" },
+  { name: "Red", value: "var(--tt-color-highlight-red)" },
+] as const;
+
+type HighlightColor = (typeof HIGHLIGHT_COLORS)[number]["value"];
+
 function ToolbarButton({
   onClick,
   isActive,
@@ -67,7 +81,7 @@ function ToolbarButton({
           size="icon-xs"
           onClick={onClick}
           data-active={isActive || undefined}
-          className="data-[active]:bg-accent data-[active]:text-accent-foreground"
+          className="relative data-[active]:bg-accent data-[active]:text-accent-foreground data-[active]:after:absolute data-[active]:after:bottom-0.5 data-[active]:after:left-1/2 data-[active]:after:h-0.5 data-[active]:after:w-3 data-[active]:after:-translate-x-1/2 data-[active]:after:rounded-full data-[active]:after:bg-accent-foreground"
         >
           {children}
         </Button>
@@ -92,7 +106,7 @@ function BubbleButton({
       size="icon-xs"
       onClick={onClick}
       data-active={isActive || undefined}
-      className="h-7 w-7 data-[active]:bg-accent data-[active]:text-accent-foreground"
+      className="relative h-7 w-7 data-[active]:bg-accent data-[active]:text-accent-foreground data-[active]:after:absolute data-[active]:after:bottom-0.5 data-[active]:after:left-1/2 data-[active]:after:h-0.5 data-[active]:after:w-2.5 data-[active]:after:-translate-x-1/2 data-[active]:after:rounded-full data-[active]:after:bg-accent-foreground"
     >
       {children}
     </Button>
@@ -101,71 +115,145 @@ function BubbleButton({
 
 function HeadingDropdown({
   editor,
-  size = "toolbar",
+  level,
 }: {
   editor: Editor;
-  size?: "toolbar" | "bubble";
+  level: 1 | 2 | 3 | 4 | null;
 }) {
+  const label = level == null ? "Normal" : `H${level}`;
+  const isActive = level != null;
   return (
     <DropdownMenu>
-      {size === "toolbar" ? (
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <DropdownMenuTrigger asChild>
-              <Button
-                variant="ghost"
-                size="xs"
-                className="gap-0.5 text-xs font-medium"
-              >
-                <ALargeSmall className="h-4 w-4" />
-                <ChevronDown className="h-3 w-3 opacity-50" />
-              </Button>
-            </DropdownMenuTrigger>
-          </TooltipTrigger>
-          <TooltipContent side="bottom">Heading level</TooltipContent>
-        </Tooltip>
-      ) : (
-        <DropdownMenuTrigger asChild>
-          <Button
-            variant="ghost"
-            size="icon-xs"
-            className="h-7 w-7"
-          >
-            <ALargeSmall className="h-3.5 w-3.5" />
-          </Button>
-        </DropdownMenuTrigger>
-      )}
-      <DropdownMenuContent align="start" portal={size === "toolbar"}>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <DropdownMenuTrigger asChild>
+            <Button
+              variant="ghost"
+              size="xs"
+              data-active={isActive || undefined}
+              className="gap-0.5 text-xs font-medium data-[active]:bg-accent data-[active]:text-accent-foreground"
+            >
+              <ALargeSmall className="h-4 w-4" />
+              <span className="ml-0.5 tabular-nums">{label}</span>
+              <ChevronDown className="h-3 w-3 opacity-50" />
+            </Button>
+          </DropdownMenuTrigger>
+        </TooltipTrigger>
+        <TooltipContent side="bottom">Heading level</TooltipContent>
+      </Tooltip>
+      <DropdownMenuContent align="start">
         <DropdownMenuItem
-          className="text-xs"
+          data-active={level == null || undefined}
+          className="text-xs data-[active]:bg-accent data-[active]:text-accent-foreground"
           onClick={() => editor.chain().focus().setParagraph().run()}
         >
           Normal text
         </DropdownMenuItem>
         <DropdownMenuItem
-          className="text-base font-bold"
+          data-active={level === 1 || undefined}
+          className="text-base font-bold data-[active]:bg-accent data-[active]:text-accent-foreground"
           onClick={() => editor.chain().focus().toggleHeading({ level: 1 }).run()}
         >
           Heading 1
         </DropdownMenuItem>
         <DropdownMenuItem
-          className="text-sm font-semibold"
+          data-active={level === 2 || undefined}
+          className="text-sm font-semibold data-[active]:bg-accent data-[active]:text-accent-foreground"
           onClick={() => editor.chain().focus().toggleHeading({ level: 2 }).run()}
         >
           Heading 2
         </DropdownMenuItem>
         <DropdownMenuItem
-          className="text-[13px] font-medium"
+          data-active={level === 3 || undefined}
+          className="text-[13px] font-medium data-[active]:bg-accent data-[active]:text-accent-foreground"
           onClick={() => editor.chain().focus().toggleHeading({ level: 3 }).run()}
         >
           Heading 3
         </DropdownMenuItem>
         <DropdownMenuItem
-          className="text-xs font-medium"
+          data-active={level === 4 || undefined}
+          className="text-xs font-medium data-[active]:bg-accent data-[active]:text-accent-foreground"
           onClick={() => editor.chain().focus().toggleHeading({ level: 4 }).run()}
         >
           Heading 4
         </DropdownMenuItem>
+      </DropdownMenuContent>
+    </DropdownMenu>
+  );
+}
+
+function HighlightDropdown({
+  editor,
+  isActive,
+  currentColor,
+  size = "toolbar",
+}: {
+  editor: Editor;
+  isActive: boolean;
+  currentColor: HighlightColor | null;
+  size?: "toolbar" | "bubble";
+}) {
+  const apply = (color: HighlightColor) => {
+    editor.chain().focus().setHighlight({ color }).run();
+  };
+  const remove = () => {
+    editor.chain().focus().unsetHighlight().run();
+  };
+  const trigger =
+    size === "toolbar" ? (
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <DropdownMenuTrigger asChild>
+            <Button
+              variant="ghost"
+              size="icon-xs"
+              data-active={isActive || undefined}
+              className="data-[active]:bg-accent data-[active]:text-accent-foreground"
+            >
+              <Highlighter />
+            </Button>
+          </DropdownMenuTrigger>
+        </TooltipTrigger>
+        <TooltipContent side="bottom">Highlight</TooltipContent>
+      </Tooltip>
+    ) : (
+      <DropdownMenuTrigger asChild>
+        <Button
+          variant="ghost"
+          size="icon-xs"
+          data-active={isActive || undefined}
+          className="h-7 w-7 data-[active]:bg-accent data-[active]:text-accent-foreground"
+        >
+          <Highlighter className="h-3.5 w-3.5" />
+        </Button>
+      </DropdownMenuTrigger>
+    );
+  return (
+    <DropdownMenu>
+      {trigger}
+      <DropdownMenuContent align="start" portal={size === "toolbar"} className="min-w-0 p-1">
+        <div className="flex items-center gap-1 px-1 py-0.5">
+          {HIGHLIGHT_COLORS.map((c) => (
+            <button
+              key={c.value}
+              type="button"
+              onClick={() => apply(c.value)}
+              aria-label={`Highlight ${c.name.toLowerCase()}`}
+              data-active={currentColor === c.value || undefined}
+              className="size-5 rounded-full border border-border ring-offset-1 ring-offset-popover transition-shadow hover:ring-2 hover:ring-ring data-[active]:ring-2 data-[active]:ring-ring"
+              style={{ background: c.value }}
+            />
+          ))}
+          <div className="mx-0.5 h-5 w-px bg-border" />
+          <button
+            type="button"
+            onClick={remove}
+            aria-label="Remove highlight"
+            className="flex size-5 items-center justify-center rounded text-muted-foreground hover:bg-accent hover:text-accent-foreground"
+          >
+            <Eraser className="h-3 w-3" />
+          </button>
+        </div>
       </DropdownMenuContent>
     </DropdownMenu>
   );
@@ -193,7 +281,7 @@ export function NoteEditor({
       }),
       TaskList,
       TaskItem.configure({ nested: true }),
-      Highlight.configure({ multicolor: false }),
+      Highlight.configure({ multicolor: true }),
       Underline,
       Link.configure({
         openOnClick: false,
@@ -215,6 +303,17 @@ export function NoteEditor({
         const manager = editor?.storage.markdown?.manager;
         if (!manager) return slice.content.textBetween(0, slice.content.size);
         return manager.serialize({ type: "doc", content: nodes });
+      },
+      // When the clipboard payload is plain-text markdown (no rich HTML
+      // alternative) and contains a code fence, parse it as markdown so
+      // ```code blocks``` and other markdown survive the paste.
+      handlePaste: (_view, event) => {
+        const text = event.clipboardData?.getData("text/plain");
+        if (!text || !text.includes("```")) return false;
+        if (event.clipboardData?.getData("text/html")) return false;
+        if (!editor) return false;
+        editor.commands.insertContent(text, { contentType: "markdown" });
+        return true;
       },
     },
     onUpdate: ({ editor }) => {
@@ -312,7 +411,6 @@ export function NoteEditor({
     return () => window.removeEventListener("yapstack:seek-segment", handleSeek);
   }, [onSeekTime]);
 
-  // Bubble menu link handler
   const handleSetLink = useCallback(() => {
     if (!editor) return;
     const previousUrl = editor.getAttributes("link").href ?? "";
@@ -325,59 +423,88 @@ export function NoteEditor({
     }
   }, [editor]);
 
-  if (!editor) return null;
+  // `editor.isActive(...)` is not reactive in React; this hook re-renders on transactions.
+  const state = useEditorState({
+    editor,
+    selector: ({ editor: e }) =>
+      e
+        ? {
+            isBold: e.isActive("bold"),
+            isItalic: e.isActive("italic"),
+            isUnderline: e.isActive("underline"),
+            isStrike: e.isActive("strike"),
+            isCode: e.isActive("code"),
+            isCodeBlock: e.isActive("codeBlock"),
+            isHighlight: e.isActive("highlight"),
+            isLink: e.isActive("link"),
+            isBulletList: e.isActive("bulletList"),
+            isOrderedList: e.isActive("orderedList"),
+            isTaskList: e.isActive("taskList"),
+            isBlockquote: e.isActive("blockquote"),
+            headingLevel: (e.getAttributes("heading").level ?? null) as
+              | 1 | 2 | 3 | 4 | null,
+            highlightColor:
+              (e.getAttributes("highlight").color as HighlightColor | undefined) ?? null,
+          }
+        : null,
+  });
+
+  if (!editor || !state) return null;
 
   return (
     <div className="flex flex-1 flex-col min-h-0">
       <div className="flex items-center gap-0.5 border-b bg-muted/30 px-3 py-1.5">
         <ToolbarButton
           onClick={() => editor.chain().focus().toggleBold().run()}
-          isActive={editor.isActive("bold")}
+          isActive={state.isBold}
           tooltip="Bold"
         >
           <Bold />
         </ToolbarButton>
         <ToolbarButton
           onClick={() => editor.chain().focus().toggleItalic().run()}
-          isActive={editor.isActive("italic")}
+          isActive={state.isItalic}
           tooltip="Italic"
         >
           <Italic />
         </ToolbarButton>
         <ToolbarButton
           onClick={() => editor.chain().focus().toggleUnderline().run()}
-          isActive={editor.isActive("underline")}
+          isActive={state.isUnderline}
           tooltip="Underline"
         >
           <UnderlineIcon />
         </ToolbarButton>
         <ToolbarButton
           onClick={() => editor.chain().focus().toggleStrike().run()}
-          isActive={editor.isActive("strike")}
+          isActive={state.isStrike}
           tooltip="Strikethrough"
         >
           <Strikethrough />
         </ToolbarButton>
+        <ToolbarButton onClick={handleSetLink} isActive={state.isLink} tooltip="Link">
+          <LinkIcon />
+        </ToolbarButton>
         <div className="mx-1 h-4 w-px bg-border" />
-        <HeadingDropdown editor={editor} size="toolbar" />
+        <HeadingDropdown editor={editor} level={state.headingLevel} />
         <div className="mx-1 h-4 w-px bg-border" />
         <ToolbarButton
           onClick={() => editor.chain().focus().toggleBulletList().run()}
-          isActive={editor.isActive("bulletList")}
+          isActive={state.isBulletList}
           tooltip="Bullet List"
         >
           <List />
         </ToolbarButton>
         <ToolbarButton
           onClick={() => editor.chain().focus().toggleOrderedList().run()}
-          isActive={editor.isActive("orderedList")}
+          isActive={state.isOrderedList}
           tooltip="Ordered List"
         >
           <ListOrdered />
         </ToolbarButton>
         <ToolbarButton
           onClick={() => editor.chain().focus().toggleTaskList().run()}
-          isActive={editor.isActive("taskList")}
+          isActive={state.isTaskList}
           tooltip="Checklist"
         >
           <ListChecks />
@@ -385,25 +512,31 @@ export function NoteEditor({
         <div className="mx-1 h-4 w-px bg-border" />
         <ToolbarButton
           onClick={() => editor.chain().focus().toggleBlockquote().run()}
-          isActive={editor.isActive("blockquote")}
+          isActive={state.isBlockquote}
           tooltip="Blockquote"
         >
           <Quote />
         </ToolbarButton>
         <ToolbarButton
           onClick={() => editor.chain().focus().toggleCode().run()}
-          isActive={editor.isActive("code")}
-          tooltip="Code"
+          isActive={state.isCode}
+          tooltip="Inline code"
         >
           <Code />
         </ToolbarButton>
         <ToolbarButton
-          onClick={() => editor.chain().focus().toggleHighlight().run()}
-          isActive={editor.isActive("highlight")}
-          tooltip="Highlight"
+          onClick={() => editor.chain().focus().toggleCodeBlock().run()}
+          isActive={state.isCodeBlock}
+          tooltip="Code block"
         >
-          <Highlighter />
+          <SquareCode />
         </ToolbarButton>
+        <HighlightDropdown
+          editor={editor}
+          isActive={state.isHighlight}
+          currentColor={state.highlightColor}
+          size="toolbar"
+        />
         <div className="flex-1" />
       </div>
       <BubbleMenu
@@ -417,56 +550,61 @@ export function NoteEditor({
             if (node.type.name === "segmentReference") hasSegRef = true;
             return !hasSegRef;
           });
-          if (hasSegRef) return false;
-          return true;
+          return !hasSegRef;
         }}
-        options={{ placement: "top", offset: { mainAxis: 12 } }}
+        options={{
+          placement: "top",
+          offset: { mainAxis: 8 },
+          // Bound flip/shift to the editor's contenteditable so the bubble can't
+          // escape into the static toolbar above or the FloatingChatBar below.
+          flip: {
+            boundary: editor.view.dom,
+            fallbackPlacements: ["bottom", "top"],
+            padding: 8,
+          },
+          shift: { boundary: editor.view.dom, padding: 8 },
+        }}
       >
-        <div className="flex items-center gap-0.5 rounded-lg border bg-popover p-1 shadow-lg">
+        <div className="z-50 flex items-center gap-0.5 rounded-lg border bg-popover p-1 shadow-lg">
           <BubbleButton
             onClick={() => editor.chain().focus().toggleBold().run()}
-            isActive={editor.isActive("bold")}
+            isActive={state.isBold}
           >
             <Bold className="h-3.5 w-3.5" />
           </BubbleButton>
           <BubbleButton
             onClick={() => editor.chain().focus().toggleItalic().run()}
-            isActive={editor.isActive("italic")}
+            isActive={state.isItalic}
           >
             <Italic className="h-3.5 w-3.5" />
           </BubbleButton>
           <BubbleButton
             onClick={() => editor.chain().focus().toggleUnderline().run()}
-            isActive={editor.isActive("underline")}
+            isActive={state.isUnderline}
           >
             <UnderlineIcon className="h-3.5 w-3.5" />
           </BubbleButton>
           <BubbleButton
             onClick={() => editor.chain().focus().toggleStrike().run()}
-            isActive={editor.isActive("strike")}
+            isActive={state.isStrike}
           >
             <Strikethrough className="h-3.5 w-3.5" />
           </BubbleButton>
           <BubbleButton
             onClick={() => editor.chain().focus().toggleCode().run()}
-            isActive={editor.isActive("code")}
+            isActive={state.isCode}
           >
             <Code className="h-3.5 w-3.5" />
           </BubbleButton>
-          <BubbleButton
-            onClick={() => editor.chain().focus().toggleHighlight().run()}
-            isActive={editor.isActive("highlight")}
-          >
-            <Highlighter className="h-3.5 w-3.5" />
-          </BubbleButton>
-          <BubbleButton
-            onClick={handleSetLink}
-            isActive={editor.isActive("link")}
-          >
+          <HighlightDropdown
+            editor={editor}
+            isActive={state.isHighlight}
+            currentColor={state.highlightColor}
+            size="bubble"
+          />
+          <BubbleButton onClick={handleSetLink} isActive={state.isLink}>
             <LinkIcon className="h-3.5 w-3.5" />
           </BubbleButton>
-          <div className="mx-0.5 h-4 w-px bg-border" />
-          <HeadingDropdown editor={editor} size="bubble" />
         </div>
       </BubbleMenu>
       <div className="flex-1 overflow-auto pb-16 select-text">
