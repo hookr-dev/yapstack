@@ -416,6 +416,15 @@ interface AppState {
   ) => void;
   setListFilter: (filter: ListFilter) => void;
   refreshDevices: () => Promise<void>;
+  /**
+   * Apply a freshly enumerated device list to the store. Reconciles
+   * `settings.selectedMicDeviceId`: if the persisted device is no longer
+   * present, resets to `null` (= follow default) and toasts the user
+   * with the new effective default name. Called by the device broker's
+   * `devices-changed` subscription and by `refreshDevices` after a
+   * direct IPC fetch.
+   */
+  applyDeviceList: (devices: AudioDeviceInfoDto[]) => void;
   refreshModels: () => Promise<void>;
   updateSettings: (partial: Partial<Settings>) => void;
   clearAllSessions: () => Promise<void>;
@@ -1358,11 +1367,40 @@ function createAppStore() {
         try {
           const result = await commands.listAudioDevices();
           if (result.status === "ok") {
-            set({ devices: result.data });
+            get().applyDeviceList(result.data);
           }
         } catch (e) {
           console.error("Failed to refresh devices:", e);
         }
+      },
+
+      applyDeviceList: (devices) => {
+        const prevSelectedId = get().settings.selectedMicDeviceId;
+        set({ devices });
+
+        // Reconcile selection. Only inputs are eligible for the mic.
+        if (prevSelectedId == null) return;
+        const stillPresent = devices.some(
+          (d) => d.id === prevSelectedId && d.device_type === "Input",
+        );
+        if (stillPresent) return;
+
+        // The persisted mic is gone. Drop to "follow default" and tell
+        // the user which device they're now on. The toast id dedupes if
+        // the broker fires several `devices-changed` in quick succession
+        // (e.g. during a bluetooth disconnect storm).
+        const newDefault = devices.find(
+          (d) => d.is_default && d.device_type === "Input",
+        );
+        set((state) => ({
+          settings: { ...state.settings, selectedMicDeviceId: null },
+        }));
+        toast.info(
+          newDefault
+            ? `Selected microphone disappeared — using ${newDefault.name}`
+            : "Selected microphone disappeared — using system default",
+          { id: "mic-disappeared" },
+        );
       },
 
       refreshModels: async () => {

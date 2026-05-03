@@ -24,10 +24,11 @@ pub struct MicrophoneCapture {
     last_device_name: Option<String>,
     /// True when `start()` was called without an explicit `device_id`, so we
     /// intentionally bound whatever the OS default input was at that moment.
-    /// Used by the drift-poll defense (`mic_input_drifted`): if the user
-    /// explicitly picked a non-default device, a mismatch against the
-    /// current default is the configured state, not drift, and the check
-    /// would otherwise fire on every poll.
+    /// Surfaced via `AudioManager::mic_bound_is_default` so the device
+    /// broker can distinguish "follow default" from an explicit pick on
+    /// `DefaultInputChanged` events: an explicit-but-still-alive pick
+    /// keeps its binding, an explicit-but-disappeared pick falls over
+    /// to the new default, a follow-default binding always fails over.
     bound_is_default: bool,
 }
 
@@ -112,13 +113,13 @@ impl MicrophoneCapture {
         self.bound_is_default
     }
 
-    /// Overrides the `bound_is_default` flag. Used by `restart_mic` to
-    /// preserve the caller's original tracking intent when a restart
-    /// falls through candidates — without this, restarting via the stored
-    /// device-id path (even when that device *is* currently the OS default)
-    /// would flip the flag off and silently disable the drift check for
-    /// the remainder of the session.
-    pub fn set_bound_is_default(&mut self, value: bool) {
+    /// Overrides the `bound_is_default` flag. `restart_mic` writes the
+    /// flag derived by `derive_bound_is_default` through this setter at
+    /// the end of a successful restart, so the post-restart flag
+    /// reflects whether the new binding actually tracks the system
+    /// default (rather than getting frozen at the original `start`-time
+    /// value).
+    pub(crate) fn set_bound_is_default(&mut self, value: bool) {
         self.bound_is_default = value;
     }
 

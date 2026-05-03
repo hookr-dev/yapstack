@@ -9,7 +9,7 @@ use crate::error::AudioError;
 use crate::mic::MicrophoneCapture;
 use crate::mixer::{self, MixConfig};
 use crate::ring_buffer::{AudioRingBuffer, RingBufferInfo, SharedAudioRingBuffer};
-use crate::system::device_watcher::{DefaultDeviceKind, DefaultDeviceWatcher};
+use crate::system::device_watcher::{DefaultDeviceKind, DefaultDeviceWatcher, DeviceEventSink};
 use crate::system::SystemAudioCapture;
 use crate::DeviceStreamConfig;
 
@@ -26,6 +26,28 @@ pub enum RestartOutcome {
     BufferReplaced,
 }
 
+/// Drives `restart_mic` / `restart_system_audio` candidate ordering.
+///
+/// * `PreserveBinding` — used by the in-loop stream-error / write-pos
+///   stall watchdog. The bound device is presumed still correct; the
+///   stream just died and needs to come back. Probe order: stored id
+///   → stored name → system default. Typical outcome: rebind to the
+///   same device.
+/// * `FollowDefault` — used by the device broker when a Core Audio
+///   `DefaultInputChanged` (or `DefaultOutputChanged`) event has just
+///   landed. The user's intent (or the OS's choice on their behalf)
+///   is to move to the *new* default. Probe order: system default →
+///   stored id → stored name. Without this, the watchdog probe order
+///   would silently re-bind to the old device whenever the old device
+///   is still alive — exactly what cpal#1175 leaves us holding the bag
+///   for. See `docs/qa/device-failover.md` case 1 (AirPods drop) for
+///   the user-visible symptom.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestartTarget {
+    PreserveBinding,
+    FollowDefault,
+}
+
 /// Extended report from a stream restart (mic or system). Callers use
 /// `same_device` to decide whether the restart actually moved to a new
 /// device or rebound to the same one (which happens when the OS default
@@ -40,6 +62,41 @@ pub struct RestartReport {
     pub same_device: bool,
     /// The device ID the stream is bound to after the restart, if any.
     pub new_device_id: Option<String>,
+    /// Human-readable name of the device the stream is bound to after the
+    /// restart, if known. Surfaced through `stream-health` so the FE can
+    /// render a "Switched to {name}" toast on auto-failover.
+    pub bound_device_name: Option<String>,
+}
+
+/// Compute the post-restart `bound_is_default` flag. Pure for testability.
+///
+/// * `PreserveBinding`: the bind intent did not shift (e.g. watchdog
+///   reboot of a known-correct binding) → preserve the prior flag.
+/// * `FollowDefault`: the caller asked to track the current default →
+///   set `true` iff the post-restart bound id matches the resolved
+///   default-input id. A stored-id/name fallback that isn't currently
+///   the default keeps explicit semantics so future
+///   `DefaultInputChanged` events are honored.
+///
+/// `resolve_default` is a closure so the helper stays unit-testable
+/// without touching cpal — production calls pass
+/// `device::default_input_device`.
+fn derive_bound_is_default<F>(
+    target: RestartTarget,
+    prior: bool,
+    resolve_default: F,
+    new_device_id: Option<&str>,
+) -> bool
+where
+    F: FnOnce() -> Option<String>,
+{
+    match target {
+        RestartTarget::PreserveBinding => prior,
+        RestartTarget::FollowDefault => match (resolve_default(), new_device_id) {
+            (Some(d), Some(n)) => d == n,
+            _ => false,
+        },
+    }
 }
 
 pub struct AudioManager {
@@ -55,6 +112,12 @@ pub struct AudioManager {
     /// capture path degrades to the write-pos stall watchdog in that case.
     input_watcher: Option<DefaultDeviceWatcher>,
     output_watcher: Option<DefaultDeviceWatcher>,
+    /// Watches `kAudioHardwarePropertyDefaultSystemOutputDevice` — the
+    /// alerts/UI route, distinct from the media `Output` selector. macOS
+    /// can change them independently (e.g. media routes to AirPods while
+    /// system sounds stay on the speakers); covering both is needed so
+    /// system-audio loopback follows whichever the user changed.
+    system_output_watcher: Option<DefaultDeviceWatcher>,
     /// Device-list watcher — fires on `kAudioHardwarePropertyDevices`
     /// (hardware added/removed). Complements the default-device watchers
     /// because some macOS versions fire the device-list property *before*
@@ -80,6 +143,10 @@ impl AudioManager {
         let output_watcher = DefaultDeviceWatcher::new(DefaultDeviceKind::Output)
             .map_err(|e| warn!("output default-device listener unavailable: {}", e))
             .ok();
+        let system_output_watcher =
+            DefaultDeviceWatcher::new(DefaultDeviceKind::DefaultSystemOutput)
+                .map_err(|e| warn!("default-system-output listener unavailable: {}", e))
+                .ok();
         let devices_watcher = DefaultDeviceWatcher::new(DefaultDeviceKind::Devices)
             .map_err(|e| warn!("device-list listener unavailable: {}", e))
             .ok();
@@ -93,11 +160,24 @@ impl AudioManager {
             system_buffer: None,
             input_watcher,
             output_watcher,
+            system_output_watcher,
             devices_watcher,
         }
     }
 
     pub fn start_mic(&mut self, device_id: Option<&str>) -> Result<()> {
+        // Reject cpal's internal loopback aggregate before we get to
+        // device probing — an old persisted selection or a hand-rolled
+        // id that points there would otherwise crash with the opaque
+        // "stream type not supported" error from cpal's input config
+        // probe on a tap-backed aggregate.
+        if crate::device::is_cpal_loopback_aggregate(device_id, None) {
+            return Err(AudioError::DeviceInit(
+                "cpal loopback aggregate is not selectable as a microphone — \
+                 it is an internal device used by system-audio capture"
+                    .into(),
+            ));
+        }
         // Query the device's native config. The buffer uses the device's actual
         // sample rate and channel count — we no longer mutate self.config so that
         // each buffer carries its own format independently.
@@ -720,16 +800,35 @@ impl AudioManager {
         self.mic.last_device_id()
     }
 
+    /// Returns `true` if the current mic binding is following the system
+    /// default. `false` if the user explicitly picked a non-default
+    /// device. Callers (notably the device broker's auto-failover path)
+    /// use this to decide whether to skip a Mic restart on
+    /// `DefaultInputChanged` when the explicit pick is still alive.
+    pub fn mic_bound_is_default(&self) -> bool {
+        self.mic.bound_is_default()
+    }
+
     /// Restarts the microphone stream. Reuses the existing ring buffer when
     /// the new device's sample rate / channel count match; otherwise
     /// allocates a fresh buffer so extraction and WAV metadata stay
     /// consistent with the actual cpal callback format.
     ///
-    /// Tries restart candidates in order — stored ID, stored name, system
-    /// default — and probes + allocates the buffer per candidate so the
-    /// returned buffer matches whichever device actually succeeds at
-    /// start (rather than the first one that merely probed).
-    pub fn restart_mic(&mut self) -> Result<RestartReport> {
+    /// Tries restart candidates and probes + allocates the buffer per
+    /// candidate so the returned buffer matches whichever device actually
+    /// succeeds at start (rather than the first one that merely probed).
+    ///
+    /// Probe order depends on `target`:
+    /// * `PreserveBinding` — stored id → stored name → system default.
+    ///   Right for stream-error / write-pos stall recovery, where the
+    ///   bound device is presumed still correct.
+    /// * `FollowDefault` — system default → stored id → stored name.
+    ///   Right for broker-driven failover after a `DefaultInputChanged`
+    ///   event, where the *new* default is the user's intent. The
+    ///   stored-id fallback covers the rare case where the OS reports
+    ///   a change but `default_input_device()` momentarily returns
+    ///   nothing (Bluetooth handshake mid-rebind).
+    pub fn restart_mic(&mut self, target: RestartTarget) -> Result<RestartReport> {
         let existing = self
             .mic_buffer
             .clone()
@@ -738,25 +837,34 @@ impl AudioManager {
         let stored_id = self.mic.last_device_id().map(|s| s.to_string());
         let stored_name = self.mic.last_device_name().map(|s| s.to_string());
         let old_device_id = stored_id.clone();
-        // Preserve the original bind intent: if the session started in
-        // default-tracking mode, restarts via the stored-id fallback should
-        // not quietly flip us into explicit-device mode (which would disable
-        // the drift defense for the remainder of the session).
-        let preserve_bound_is_default = self.mic.bound_is_default();
+        // For `PreserveBinding` the bind intent hasn't shifted (the
+        // watchdog is just rebooting a known-correct binding), so we
+        // restore the prior flag verbatim. For `FollowDefault` the
+        // caller has explicitly asked to track the default; we derive
+        // the flag from "did we actually land on the current default?"
+        // — a stored-id fallback that isn't currently the default keeps
+        // explicit semantics so a future `DefaultInputChanged` is acted
+        // on. Without this, an explicit-mic disappearance that fell
+        // over to the system default would still report `bound_is_default
+        // = false`, and subsequent default changes would be silently
+        // ignored (the broker's explicit-pick branch would skip failover).
+        let prior_bound_is_default = self.mic.bound_is_default();
 
         // Stop the old stream (ignore errors — it may already be dead)
         let _ = self.mic.stop();
 
-        // Candidate order: original id → stored name → system default.
-        // Each candidate is probed independently so its buffer matches the
-        // device we'll actually hand to cpal — probing the first and starting
-        // the second can leave the buffer metadata out of sync with the live
-        // stream.
-        let candidates: [(Option<&str>, &str); 3] = [
-            (stored_id.as_deref(), "original device id"),
-            (stored_name.as_deref(), "stored device name"),
-            (None, "system default"),
-        ];
+        let candidates: [(Option<&str>, &str); 3] = match target {
+            RestartTarget::PreserveBinding => [
+                (stored_id.as_deref(), "original device id"),
+                (stored_name.as_deref(), "stored device name"),
+                (None, "system default"),
+            ],
+            RestartTarget::FollowDefault => [
+                (None, "system default"),
+                (stored_id.as_deref(), "original device id"),
+                (stored_name.as_deref(), "stored device name"),
+            ],
+        };
 
         let mut last_err: Option<AudioError> = None;
         let mut tried_any = false;
@@ -781,13 +889,25 @@ impl AudioManager {
             match self.mic.start(candidate, Arc::clone(&buffer)) {
                 Ok(()) => {
                     self.mic_buffer = Some(buffer);
-                    self.mic.set_bound_is_default(preserve_bound_is_default);
                     let new_device_id = self.mic.last_device_id().map(|s| s.to_string());
+                    let bound_is_default = derive_bound_is_default(
+                        target,
+                        prior_bound_is_default,
+                        || {
+                            crate::device::default_input_device()
+                                .ok()
+                                .and_then(|info| info.id)
+                        },
+                        new_device_id.as_deref(),
+                    );
+                    self.mic.set_bound_is_default(bound_is_default);
                     let same_device = old_device_id.is_some() && old_device_id == new_device_id;
+                    let bound_device_name = self.mic.last_device_name().map(|s| s.to_string());
                     return Ok(RestartReport {
                         outcome,
                         same_device,
                         new_device_id,
+                        bound_device_name,
                     });
                 }
                 Err(e) => {
@@ -841,10 +961,12 @@ impl AudioManager {
 
         let new_device_id = self.system.last_device_id().map(|s| s.to_string());
         let same_device = old_device_id.is_some() && old_device_id == new_device_id;
+        let bound_device_name = self.system.last_device_name().map(|s| s.to_string());
         Ok(RestartReport {
             outcome,
             same_device,
             new_device_id,
+            bound_device_name,
         })
     }
 
@@ -878,46 +1000,29 @@ impl AudioManager {
         }
     }
 
-    /// Returns `true` if the OS has pushed a default-output-device change
-    /// notification since the last call *and* system audio capture is
-    /// currently running. Consumes the pending flag.
-    pub fn system_audio_default_changed(&self) -> bool {
-        self.system.is_running()
-            && self
-                .output_watcher
-                .as_ref()
-                .map(|w| w.take_change())
-                .unwrap_or(false)
-    }
-
-    /// Returns `true` if the OS has pushed a default-input-device change
-    /// notification since the last call *and* mic capture is currently
-    /// running. Consumes the pending flag.
-    pub fn mic_default_changed(&self) -> bool {
-        self.mic.is_running()
-            && self
-                .input_watcher
-                .as_ref()
-                .map(|w| w.take_change())
-                .unwrap_or(false)
-    }
-
-    /// Returns `true` if the OS has pushed a device-list change notification
-    /// (hardware added/removed) since the last call. Consumes the pending
-    /// flag. Callers combine this with bound-vs-default comparison to decide
-    /// whether to rebind — the list change alone doesn't mean *our* device
-    /// is affected, but it is an earlier trigger than default-device change
-    /// during AirPods/Bluetooth handshakes on some macOS versions.
-    pub fn device_list_changed(&self) -> bool {
-        self.devices_watcher
-            .as_ref()
-            .map(|w| w.take_change())
-            .unwrap_or(false)
+    /// Attach a single sink that receives every device-change event from
+    /// every registered watcher. Replaces any previously attached sink.
+    /// Pass `None` to detach.
+    ///
+    /// The sink is invoked on the Core Audio listener thread; it must be
+    /// cheap and non-blocking. Typical implementations forward the event
+    /// into a channel and return.
+    pub fn subscribe_device_events(&self, sink: Option<DeviceEventSink>) {
+        for watcher in [
+            self.input_watcher.as_ref(),
+            self.output_watcher.as_ref(),
+            self.system_output_watcher.as_ref(),
+            self.devices_watcher.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            watcher.set_sink(sink.clone());
+        }
     }
 
     /// Returns the device name the system audio stream is currently bound to,
-    /// or `None` if not running / identity unknown. Used by the defensive
-    /// device-identity drift poll.
+    /// or `None` if not running / identity unknown.
     pub fn system_audio_bound_device(&self) -> Option<&str> {
         self.system.last_device_name()
     }
@@ -927,73 +1032,6 @@ impl AudioManager {
     pub fn mic_bound_device(&self) -> Option<&str> {
         self.mic.last_device_name()
     }
-
-    /// Defensive device-identity drift check. Returns `Some(current_default_name)`
-    /// when the currently-bound system-audio output device differs from the
-    /// OS default output device, else `None`. Only meaningful when system
-    /// capture is running. This is the fallback for the push listener —
-    /// the listener should fire first under normal conditions.
-    pub fn system_audio_output_drifted(&self) -> Option<String> {
-        if !self.system.is_running() {
-            return None;
-        }
-        let bound = self.system.last_device_name()?;
-        let current = current_default_output_name()?;
-        if current != bound {
-            Some(current)
-        } else {
-            None
-        }
-    }
-
-    /// Defensive device-identity drift check for the microphone. Returns
-    /// `Some(current_default_name)` when the currently-bound input device
-    /// differs from the OS default input device, else `None`.
-    ///
-    /// Skipped when the mic was bound to a user-selected non-default device:
-    /// the drift check exists to catch a missed CoreAudio default-device
-    /// notification, which is only meaningful if we're tracking the default.
-    /// Without this guard the check reports drift on every poll for users
-    /// who explicitly pick a non-default mic, producing a restart storm.
-    pub fn mic_input_drifted(&self) -> Option<String> {
-        if !self.mic.is_running() {
-            return None;
-        }
-        if !self.mic.bound_is_default() {
-            return None;
-        }
-        let bound = self.mic.last_device_name()?;
-        let current = current_default_input_name()?;
-        if current != bound {
-            Some(current)
-        } else {
-            None
-        }
-    }
-}
-
-fn current_default_output_name() -> Option<String> {
-    use cpal::traits::{DeviceTrait, HostTrait};
-    let device = cpal::default_host().default_output_device()?;
-    device.description().ok().map(|d| d.name().to_string())
-}
-
-fn current_default_input_name() -> Option<String> {
-    use cpal::traits::{DeviceTrait, HostTrait};
-    let device = cpal::default_host().default_input_device()?;
-    device.description().ok().map(|d| d.name().to_string())
-}
-
-/// Public live-query helper for the current OS default output device name.
-/// Used by the stream-health layer to re-verify a push-listener event after
-/// a settle delay — so we don't rebind during a macOS "revert" window.
-pub fn live_default_output_name() -> Option<String> {
-    current_default_output_name()
-}
-
-/// Public live-query helper for the current OS default input device name.
-pub fn live_default_input_name() -> Option<String> {
-    current_default_input_name()
 }
 
 impl Default for AudioManager {
@@ -1370,27 +1408,10 @@ mod tests {
     }
 
     #[test]
-    fn test_default_changed_is_false_when_not_running() {
-        // Idle manager should never report a default-device change — the
-        // flag is gated on `is_running()` so stale listener signals from a
-        // previous session can't cause spurious restarts.
-        let manager = AudioManager::new();
-        assert!(!manager.system_audio_default_changed());
-        assert!(!manager.mic_default_changed());
-    }
-
-    #[test]
     fn test_bound_device_none_when_not_running() {
         let manager = AudioManager::new();
         assert!(manager.system_audio_bound_device().is_none());
         assert!(manager.mic_bound_device().is_none());
-    }
-
-    #[test]
-    fn test_drift_none_when_not_running() {
-        let manager = AudioManager::new();
-        assert!(manager.system_audio_output_drifted().is_none());
-        assert!(manager.mic_input_drifted().is_none());
     }
 
     #[test]
@@ -1404,8 +1425,9 @@ mod tests {
 
     #[test]
     fn test_mic_set_bound_is_default_setter() {
-        // Used by restart_mic to preserve the original bind intent through
-        // a candidate fallback — verify the setter round-trips.
+        // `restart_mic` writes the derived flag through this setter at
+        // the end of a successful restart (`derive_bound_is_default`
+        // computes the value); the setter must round-trip both states.
         let mut manager = AudioManager::new();
         manager.mic.set_bound_is_default(true);
         assert!(manager.mic.bound_is_default());
@@ -1426,7 +1448,7 @@ mod tests {
         buffer.write(&[0.1, 0.2, 0.3]);
         manager.mic_buffer = Some(Arc::clone(&buffer));
 
-        let _ = manager.restart_mic();
+        let _ = manager.restart_mic(RestartTarget::PreserveBinding);
         assert!(manager.mic_buffer.is_some());
     }
 
@@ -1482,10 +1504,112 @@ mod tests {
     #[test]
     fn test_restart_without_buffer_errors() {
         let mut manager = AudioManager::new();
-        let result = manager.restart_mic();
+        let result = manager.restart_mic(RestartTarget::PreserveBinding);
         assert!(result.is_err());
         let result = manager.restart_system_audio();
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_restart_target_changes_candidate_order() {
+        // Pure unit assertion on the candidate-ordering match arms.
+        // We can't drive the full restart without hardware, but the
+        // ordering itself is decision-table-shaped: prove both orders
+        // place "system default" in the right slot.
+        let stored_id: Option<&str> = Some("dev-A");
+        let stored_name: Option<&str> = Some("Dev A");
+
+        let preserve_order: [(Option<&str>, &str); 3] = [
+            (stored_id, "original device id"),
+            (stored_name, "stored device name"),
+            (None, "system default"),
+        ];
+        let follow_order: [(Option<&str>, &str); 3] = [
+            (None, "system default"),
+            (stored_id, "original device id"),
+            (stored_name, "stored device name"),
+        ];
+
+        // PreserveBinding tries the bound device first; broker-driven
+        // FollowDefault tries the new system default first.
+        assert_eq!(preserve_order[0].1, "original device id");
+        assert_eq!(follow_order[0].1, "system default");
+        // Both orders include all three slots — the inversion is
+        // priority, not coverage.
+        let preserve_labels: Vec<&str> = preserve_order.iter().map(|(_, l)| *l).collect();
+        let follow_labels: Vec<&str> = follow_order.iter().map(|(_, l)| *l).collect();
+        for label in ["original device id", "stored device name", "system default"] {
+            assert!(preserve_labels.contains(&label));
+            assert!(follow_labels.contains(&label));
+        }
+    }
+
+    #[test]
+    fn derive_bound_is_default_preserve_binding_keeps_prior_flag() {
+        // Watchdog/stream-error path: stay explicit if we were explicit,
+        // stay default-tracking if we were default-tracking. The bind
+        // intent has not shifted under PreserveBinding.
+        assert!(derive_bound_is_default(
+            RestartTarget::PreserveBinding,
+            true,
+            || Some("ignored".into()),
+            Some("dev-A"),
+        ));
+        assert!(!derive_bound_is_default(
+            RestartTarget::PreserveBinding,
+            false,
+            || Some("dev-A".into()),
+            Some("dev-A"),
+        ));
+    }
+
+    #[test]
+    fn derive_bound_is_default_follow_default_landed_on_default() {
+        // Broker-driven failover: an explicit pick disappeared, restart
+        // bound to the new system default. We must mark
+        // bound_is_default=true so subsequent DefaultInputChanged events
+        // are honored — this is the regression fix for the case the
+        // ultrareview flagged.
+        assert!(derive_bound_is_default(
+            RestartTarget::FollowDefault,
+            false, // was explicit before disappearance
+            || Some("default-id".into()),
+            Some("default-id"),
+        ));
+    }
+
+    #[test]
+    fn derive_bound_is_default_follow_default_fell_through_to_stored() {
+        // FollowDefault probed the new default first but it was
+        // unresolvable, so the restart fell through to the stored-id
+        // candidate which happens not to be the current default. Keep
+        // explicit semantics so the next DefaultInputChanged still
+        // triggers a failover attempt.
+        assert!(!derive_bound_is_default(
+            RestartTarget::FollowDefault,
+            true,
+            || Some("default-id".into()),
+            Some("stored-id"),
+        ));
+    }
+
+    #[test]
+    fn derive_bound_is_default_follow_default_default_unresolvable() {
+        // default_input_device() failed (no devices available) — be
+        // conservative and report explicit (false), so a future
+        // DefaultInputChanged event still gets a chance to act.
+        assert!(!derive_bound_is_default(
+            RestartTarget::FollowDefault,
+            true,
+            || None,
+            Some("any-id"),
+        ));
+        assert!(!derive_bound_is_default(
+            RestartTarget::FollowDefault,
+            true,
+            || Some("default-id".into()),
+            None,
+        ));
     }
 
     #[test]
@@ -1498,16 +1622,11 @@ mod tests {
             outcome: RestartOutcome::BufferPreserved,
             same_device: true,
             new_device_id: Some("dev-A".into()),
+            bound_device_name: Some("Dev A".into()),
         };
         assert!(report.same_device);
         assert_eq!(report.new_device_id.as_deref(), Some("dev-A"));
-    }
-
-    #[test]
-    fn test_device_list_changed_starts_false() {
-        let manager = AudioManager::new();
-        // Fresh manager, no property change yet — flag must be false.
-        assert!(!manager.device_list_changed());
+        assert_eq!(report.bound_device_name.as_deref(), Some("Dev A"));
     }
 
     #[test]

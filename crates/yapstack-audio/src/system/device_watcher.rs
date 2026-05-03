@@ -49,23 +49,48 @@
 //! A naive listener-driven restart that re-queries `default_output_device()`
 //! during that revert window binds back to the same dead device.
 //!
-//! Our workaround in the health-check path:
-//! 1. Sleep ~200 ms after the listener fires to let macOS settle.
-//! 2. Re-query the current default and compare to the bound device. If
-//!    unchanged, treat the listener event as spurious (don't restart).
-//! 3. If the restart does rebind to the same device anyway
-//!    ([`RestartReport::same_device`](crate::manager::RestartReport)),
-//!    skip the cooldown and retry on the next poll; cap at
-//!    `STREAM_RESTART_MAX_ATTEMPTS`.
-//!
-//! We also subscribe to `kAudioHardwarePropertyDevices` (device-list
-//! change) because it fires earlier than the default-output property on
-//! some macOS versions during Bluetooth handshake.
+//! The mitigation lives one layer up in the Tauri-side
+//! `device_broker`: events are coalesced in a 250 ms debounce window
+//! and the resulting restart is gated on
+//! [`crate::device::device_liveness`] for the new default's UID, with
+//! one re-check at +250 ms before falling through. We also subscribe
+//! to `kAudioHardwarePropertyDevices` (device-list change) because it
+//! fires earlier than the default-device properties on some macOS
+//! versions during a Bluetooth handshake.
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use crate::error::AudioError;
+
+/// Runtime-agnostic device-change event. The audio crate emits these
+/// without taking a dependency on tokio, async runtimes, or Tauri types.
+/// Consumers (the Tauri-side broker, tests) provide a [`DeviceEventSink`]
+/// closure to receive them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceEvent {
+    /// Hardware device list changed (added or removed). Fires on
+    /// `kAudioHardwarePropertyDevices`.
+    DeviceListChanged,
+    /// Default input device changed.
+    DefaultInputChanged,
+    /// Default *media* output device changed.
+    DefaultOutputChanged,
+    /// Default *alerts/UI* output device changed
+    /// (`kAudioHardwarePropertyDefaultSystemOutputDevice`). Distinct from
+    /// `DefaultOutputChanged`; consumers typically coalesce both into one
+    /// system-audio restart attempt.
+    DefaultSystemOutputChanged,
+}
+
+/// Closure invoked on the Core Audio listener thread whenever a watched
+/// property changes. Must be cheap and non-blocking — typical
+/// implementations only forward the event into a channel and return.
+pub type DeviceEventSink = Arc<dyn Fn(DeviceEvent) + Send + Sync>;
+
+/// Internal slot for a sink that may be attached after the watcher is
+/// constructed. Cloned into the C-callback payload so the listener thread
+/// reads through the same `Arc` the manager writes into.
+pub(crate) type SharedSinkSlot = Arc<RwLock<Option<DeviceEventSink>>>;
 
 /// Which CoreAudio system property a `DefaultDeviceWatcher` is observing.
 ///
@@ -75,11 +100,32 @@ use crate::error::AudioError;
 /// versions the device-list notification precedes the default-device
 /// notification during AirPods handshake, so it serves as an earlier
 /// trigger for rebind.
+///
+/// `DefaultSystemOutput` subscribes to
+/// `kAudioHardwarePropertyDefaultSystemOutputDevice`, which is distinct
+/// from `Output` (`kAudioHardwarePropertyDefaultOutputDevice`): the former
+/// is the route for system alerts and UI sounds, the latter for media.
+/// Both can change independently; covering both is necessary to keep
+/// system-audio loopback bound to whatever the user actually means by
+/// "system output." See Hammerspoon's `hs.audiodevice.watcher` for prior
+/// art covering all four selectors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DefaultDeviceKind {
     Input,
     Output,
+    DefaultSystemOutput,
     Devices,
+}
+
+impl DefaultDeviceKind {
+    pub(crate) fn to_event(self) -> DeviceEvent {
+        match self {
+            Self::Input => DeviceEvent::DefaultInputChanged,
+            Self::Output => DeviceEvent::DefaultOutputChanged,
+            Self::DefaultSystemOutput => DeviceEvent::DefaultSystemOutputChanged,
+            Self::Devices => DeviceEvent::DeviceListChanged,
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -87,27 +133,32 @@ mod imp {
     use super::*;
     use coreaudio_sys::{
         kAudioHardwarePropertyDefaultInputDevice, kAudioHardwarePropertyDefaultOutputDevice,
-        kAudioHardwarePropertyDevices, kAudioObjectPropertyElementMaster,
-        kAudioObjectPropertyScopeGlobal, kAudioObjectSystemObject, noErr,
-        AudioObjectAddPropertyListener, AudioObjectID, AudioObjectPropertyAddress,
+        kAudioHardwarePropertyDefaultSystemOutputDevice, kAudioHardwarePropertyDevices,
+        kAudioObjectPropertyElementMain, kAudioObjectPropertyScopeGlobal, kAudioObjectSystemObject,
+        noErr, AudioObjectAddPropertyListener, AudioObjectID, AudioObjectPropertyAddress,
         AudioObjectPropertySelector, AudioObjectRemovePropertyListener,
     };
     use std::ffi::c_void;
     use tracing::{info, warn};
 
+    pub(super) struct CallbackPayload {
+        pub sink: SharedSinkSlot,
+        pub kind: DefaultDeviceKind,
+    }
+
     pub(super) struct WatcherInner {
-        // Box'd to give the listener callback a stable pointer for the lifetime of
-        // the watcher. The `Arc<AtomicBool>` is cloned into the box so the callback
-        // can flip it without touching the watcher's public Arc.
-        flag_box: *mut Arc<AtomicBool>,
+        // Box'd to give the listener callback a stable pointer for the lifetime
+        // of the watcher. The payload owns a clone of the `SharedSinkSlot` so
+        // the callback can read through it without dereferencing the watcher
+        // itself.
+        payload_box: *mut CallbackPayload,
         property: AudioObjectPropertyAddress,
     }
 
-    // SAFETY: the `flag_box` pointer is only accessed from the Core Audio
-    // listener thread via `listener_proc`, which reads an `Arc<AtomicBool>` and
-    // stores to it atomically. The watcher's owning thread never dereferences
-    // the raw pointer — only `Box::from_raw` on drop, after the listener is
-    // unregistered.
+    // SAFETY: the `payload_box` pointer is only accessed from the Core Audio
+    // listener thread via `listener_proc`, which reads through `Arc`s. The
+    // watcher's owning thread never dereferences the raw pointer — only
+    // `Box::from_raw` on drop, after the listener is unregistered.
     unsafe impl Send for WatcherInner {}
     unsafe impl Sync for WatcherInner {}
 
@@ -120,8 +171,13 @@ mod imp {
         if client_data.is_null() {
             return 0;
         }
-        let flag = &*(client_data as *const Arc<AtomicBool>);
-        flag.store(true, Ordering::Release);
+        let payload = &*(client_data as *const CallbackPayload);
+        // Snapshot the sink under read lock and release it before invoking,
+        // so a panicking sink can't poison the lock for future events.
+        let snapshot = payload.sink.read().ok().and_then(|guard| guard.clone());
+        if let Some(sink) = snapshot {
+            sink(payload.kind.to_event());
+        }
         0 // noErr
     }
 
@@ -129,38 +185,42 @@ mod imp {
         match kind {
             DefaultDeviceKind::Input => kAudioHardwarePropertyDefaultInputDevice,
             DefaultDeviceKind::Output => kAudioHardwarePropertyDefaultOutputDevice,
+            DefaultDeviceKind::DefaultSystemOutput => {
+                kAudioHardwarePropertyDefaultSystemOutputDevice
+            }
             DefaultDeviceKind::Devices => kAudioHardwarePropertyDevices,
         }
     }
 
     pub(super) fn register(
         kind: DefaultDeviceKind,
-        flag: Arc<AtomicBool>,
+        sink: SharedSinkSlot,
     ) -> Result<WatcherInner, AudioError> {
         let property = AudioObjectPropertyAddress {
             mSelector: selector_for(kind),
             mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMaster,
+            mElement: kAudioObjectPropertyElementMain,
         };
 
-        // Box the Arc so the listener proc has a stable pointer for its lifetime.
-        let flag_box: *mut Arc<AtomicBool> = Box::into_raw(Box::new(flag));
+        // Box the payload so the listener proc has a stable pointer for its lifetime.
+        let payload_box: *mut CallbackPayload =
+            Box::into_raw(Box::new(CallbackPayload { sink, kind }));
 
-        // SAFETY: `flag_box` is a valid `*mut Arc<AtomicBool>` that outlives the
-        // listener because we unregister the listener before dropping the box
-        // in `Drop for WatcherInner`.
+        // SAFETY: `payload_box` is a valid `*mut CallbackPayload` that outlives
+        // the listener because we unregister the listener before dropping the
+        // box in `Drop for WatcherInner`.
         let status = unsafe {
             AudioObjectAddPropertyListener(
                 kAudioObjectSystemObject,
                 &property,
                 Some(listener_proc),
-                flag_box as *mut c_void,
+                payload_box as *mut c_void,
             )
         };
 
         if status != noErr as i32 {
             // Reclaim the box so we don't leak on the error path.
-            let _ = unsafe { Box::from_raw(flag_box) };
+            let _ = unsafe { Box::from_raw(payload_box) };
             warn!(
                 "CoreAudio default-{:?} listener registration failed: OSStatus={}",
                 kind, status
@@ -172,7 +232,10 @@ mod imp {
             "CoreAudio default-{:?} device change listener registered",
             kind
         );
-        Ok(WatcherInner { flag_box, property })
+        Ok(WatcherInner {
+            payload_box,
+            property,
+        })
     }
 
     impl Drop for WatcherInner {
@@ -183,7 +246,7 @@ mod imp {
                     kAudioObjectSystemObject,
                     &self.property,
                     Some(listener_proc),
-                    self.flag_box as *mut c_void,
+                    self.payload_box as *mut c_void,
                 )
             };
             if status != noErr as i32 {
@@ -193,37 +256,37 @@ mod imp {
                 );
             }
             // SAFETY: the listener is unregistered; no thread can still be
-            // reading through `flag_box`.
-            let _ = unsafe { Box::from_raw(self.flag_box) };
+            // reading through `payload_box`.
+            let _ = unsafe { Box::from_raw(self.payload_box) };
         }
     }
 }
 
 /// Watches for default-device changes on macOS for a single direction
-/// (input or output). On other platforms this is a no-op stub that always
-/// reports "no change".
+/// (input or output). On other platforms this is a no-op stub that never
+/// invokes the sink.
 pub struct DefaultDeviceWatcher {
-    flag: Arc<AtomicBool>,
     kind: DefaultDeviceKind,
+    sink: SharedSinkSlot,
     #[cfg(target_os = "macos")]
     _inner: imp::WatcherInner,
 }
 
 impl DefaultDeviceWatcher {
     pub fn new(kind: DefaultDeviceKind) -> Result<Self, AudioError> {
-        let flag = Arc::new(AtomicBool::new(false));
+        let sink: SharedSinkSlot = Arc::new(RwLock::new(None));
         #[cfg(target_os = "macos")]
         {
-            let inner = imp::register(kind, Arc::clone(&flag))?;
+            let inner = imp::register(kind, Arc::clone(&sink))?;
             Ok(Self {
-                flag,
                 kind,
+                sink,
                 _inner: inner,
             })
         }
         #[cfg(not(target_os = "macos"))]
         {
-            Ok(Self { flag, kind })
+            Ok(Self { kind, sink })
         }
     }
 
@@ -231,62 +294,75 @@ impl DefaultDeviceWatcher {
         self.kind
     }
 
-    /// Atomically consumes the pending change flag. Returns `true` if the
-    /// default device has changed since the last call to `take_change`.
-    pub fn take_change(&self) -> bool {
-        self.flag.swap(false, Ordering::AcqRel)
+    /// Attach (or detach with `None`) a sink that the listener thread will
+    /// invoke on every event. Replaces any previously attached sink. Safe
+    /// to call from any thread; the watcher's listener thread snapshots
+    /// the sink under a brief read lock per event.
+    pub fn set_sink(&self, sink: Option<DeviceEventSink>) {
+        match self.sink.write() {
+            Ok(mut guard) => *guard = sink,
+            Err(poisoned) => {
+                // A previous panicking writer poisoned the lock. Forge ahead —
+                // the listener uses `read().ok()` so a poisoned slot just
+                // suppresses event delivery; recovering the inner allows
+                // future events to flow again.
+                let mut guard = poisoned.into_inner();
+                *guard = sink;
+            }
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
-    fn take_change_starts_false_for_output() {
-        let w = DefaultDeviceWatcher::new(DefaultDeviceKind::Output).expect("watcher registers");
-        assert!(!w.take_change());
+    fn watcher_registers_for_each_kind() {
+        for kind in [
+            DefaultDeviceKind::Input,
+            DefaultDeviceKind::Output,
+            DefaultDeviceKind::DefaultSystemOutput,
+            DefaultDeviceKind::Devices,
+        ] {
+            let w = DefaultDeviceWatcher::new(kind).expect("watcher registers");
+            assert_eq!(w.kind(), kind);
+        }
     }
 
     #[test]
-    fn take_change_starts_false_for_input() {
-        let w = DefaultDeviceWatcher::new(DefaultDeviceKind::Input).expect("watcher registers");
-        assert!(!w.take_change());
+    fn set_sink_attaches_and_detaches_without_panicking() {
+        let w = DefaultDeviceWatcher::new(DefaultDeviceKind::Input).expect("input registers");
+        let counter = Arc::new(AtomicUsize::new(0));
+        let counter_clone = Arc::clone(&counter);
+        let sink: DeviceEventSink = Arc::new(move |_| {
+            counter_clone.fetch_add(1, Ordering::Relaxed);
+        });
+        w.set_sink(Some(sink));
+        w.set_sink(None);
+        // We can't synthesize a real Core Audio event in a unit test,
+        // but the sink lock has been written to twice without panicking.
+        assert_eq!(counter.load(Ordering::Relaxed), 0);
     }
 
     #[test]
-    fn take_change_consumes_flag() {
-        let w = DefaultDeviceWatcher::new(DefaultDeviceKind::Output).expect("watcher registers");
-        w.flag.store(true, Ordering::Release);
-        assert!(w.take_change());
-        assert!(!w.take_change());
-    }
-
-    #[test]
-    fn input_and_output_flags_are_independent() {
-        let input = DefaultDeviceWatcher::new(DefaultDeviceKind::Input).expect("input registers");
-        let output =
-            DefaultDeviceWatcher::new(DefaultDeviceKind::Output).expect("output registers");
-        output.flag.store(true, Ordering::Release);
-        assert!(!input.take_change());
-        assert!(output.take_change());
-    }
-
-    #[test]
-    fn take_change_starts_false_for_devices() {
-        let w =
-            DefaultDeviceWatcher::new(DefaultDeviceKind::Devices).expect("devices kind registers");
-        assert!(!w.take_change());
-    }
-
-    #[test]
-    fn devices_flag_is_independent_from_default_flags() {
-        let default_out =
-            DefaultDeviceWatcher::new(DefaultDeviceKind::Output).expect("output registers");
-        let devices =
-            DefaultDeviceWatcher::new(DefaultDeviceKind::Devices).expect("devices registers");
-        devices.flag.store(true, Ordering::Release);
-        assert!(!default_out.take_change());
-        assert!(devices.take_change());
+    fn kind_to_event_mapping_is_total() {
+        assert_eq!(
+            DefaultDeviceKind::Input.to_event(),
+            DeviceEvent::DefaultInputChanged
+        );
+        assert_eq!(
+            DefaultDeviceKind::Output.to_event(),
+            DeviceEvent::DefaultOutputChanged
+        );
+        assert_eq!(
+            DefaultDeviceKind::DefaultSystemOutput.to_event(),
+            DeviceEvent::DefaultSystemOutputChanged
+        );
+        assert_eq!(
+            DefaultDeviceKind::Devices.to_event(),
+            DeviceEvent::DeviceListChanged
+        );
     }
 }

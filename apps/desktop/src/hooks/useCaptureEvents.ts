@@ -8,6 +8,7 @@ import { EVENTS, listenEvent } from "@/lib/events";
 export function useCaptureEvents() {
   const setCaptureStatus = useAppStore((s) => s.setCaptureStatus);
   const setBufferInfo = useAppStore((s) => s.setBufferInfo);
+  const applyDeviceList = useAppStore((s) => s.applyDeviceList);
 
   useEffect(() => {
     const unlisten = Promise.all([
@@ -24,6 +25,11 @@ export function useCaptureEvents() {
       listenEvent(EVENTS.BUFFER_INFO, (payload) => {
         setBufferInfo(payload);
       }),
+      // Hot-plug + default-device reaction. The device broker emits this
+      // after a 250 ms debounce; we just apply the payload directly.
+      listenEvent(EVENTS.DEVICES_CHANGED, (payload) => {
+        applyDeviceList(payload);
+      }),
     ]);
 
     // Eager fetch — closes the race window between mount and first event
@@ -37,5 +43,5 @@ export function useCaptureEvents() {
     return () => {
       unlisten.then((fns) => fns.forEach((fn) => fn()));
     };
-  }, [setCaptureStatus, setBufferInfo]);
+  }, [setCaptureStatus, setBufferInfo, applyDeviceList]);
 }

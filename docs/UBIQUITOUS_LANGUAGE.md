@@ -13,8 +13,10 @@ The shared vocabulary for YapStack. Use these terms verbatim in code, docs, PRDs
 | **Ring buffer**     | The lock-free SPSC in-memory rolling audio store, sized by `capture_history_seconds`.                                     | Audio buffer, queue               |
 | **Capture history** | The rolling window of audio retained in the ring buffer (default 300 s frontend / 180 s Rust).                            | Buffer window                     |
 | **Stream**          | A single cpal input stream bound to one device. A capture may own a mic stream and/or a system stream.                    | Audio stream                      |
-| **Stream restart**  | Recovering a failed cpal stream in place, reusing the existing ring buffer so no audio is lost.                           | Reconnect, reset                  |
+| **Stream restart**  | Recovering a cpal stream in place, reusing the existing ring buffer so no audio is lost. May rebind to the previously bound device (e.g. on a same-device retry) or to a different device (auto-failover); the resulting `bound_device_name` is surfaced on `stream-health`. | Reconnect, reset                  |
 | **Stream health**   | The frontend-visible status of stream supervision: `restarted`, `restart_failed`, `restart_abandoned`.                    | Stream state                      |
+| **Auto-failover**   | A **Stream restart** triggered by an OS device-change event (default-device change or a previously bound device leaving the device list), which re-binds the affected **Source** to the new system default. Drives the "Switched to {name}" toast on the FE. | Failover, hot-swap                |
+| **Device broker**   | The always-on Tauri-side task that owns the receiving end of the audio crate's runtime-agnostic device-event sink. Debounces bursty Core Audio listener events in a 250 ms window, emits `devices-changed` to the FE, and dispatches **Auto-failover** restart intents through the live-transcription loop (or directly to `AudioManager` when no live session is active). | Device manager                    |
 
 ## Sessions and segments
 
