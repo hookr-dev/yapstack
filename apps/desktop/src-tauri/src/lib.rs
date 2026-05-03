@@ -635,7 +635,7 @@ pub fn run() {
 
             // Always-on device-change broker. Owns the receiving end of
             // the audio crate's runtime-agnostic device-event sink,
-            // emits `devices-changed` / `default-device-changed`, and
+            // emits `devices-changed`, and
             // routes auto-failover restart intents through the live
             // transcription loop (or directly to AudioManager when no
             // live session is running).

@@ -52,27 +52,14 @@ export type StreamHealthEvent = {
 };
 
 /**
- * Emitted by the device broker after a Core Audio device-list change
- * (`kAudioHardwarePropertyDevices`) has settled. Payload is the freshly
- * enumerated device list — input devices first, then output. Subscribers
- * should refresh any cached device list and reconcile the user's
- * persisted selection if the chosen device is no longer present.
+ * Emitted by the device broker whenever the device list changes or any
+ * system default flips. Payload is the freshly enumerated device list
+ * — input devices first, then output, with `is_default` flags
+ * recomputed against the current OS state. Subscribers should replace
+ * their cached device list and reconcile the user's persisted
+ * selection if the chosen device is no longer present.
  */
 export type DevicesChangedEvent = AudioDeviceInfoDto[];
-
-/**
- * Emitted by the device broker when a system default device changes:
- * `input` is the default input device, `output` is the default media
- * output, `system-output` is the alerts/UI route
- * (`kAudioHardwarePropertyDefaultSystemOutputDevice`). The latter two
- * can change independently on macOS; the broker emits one event per
- * kind that fired within the debounce window.
- */
-export type DefaultDeviceChangedEvent = {
-  kind: "input" | "output" | "system-output";
-  device_id: string | null;
-  device_name: string | null;
-};
 
 /**
  * Emitted right after a transcription client successfully initializes,
@@ -156,7 +143,6 @@ export const EVENTS = {
   SESSION_WAV_WARNING: "session-wav-warning",
   STREAM_HEALTH: "stream-health",
   DEVICES_CHANGED: "devices-changed",
-  DEFAULT_DEVICE_CHANGED: "default-device-changed",
 
   // Model
   MODEL_DOWNLOAD_PROGRESS: "model-download-progress",
@@ -191,7 +177,6 @@ type EventPayloadMap = {
   [EVENTS.SESSION_WAV_WARNING]: SessionWavWarningEvent;
   [EVENTS.STREAM_HEALTH]: StreamHealthEvent;
   [EVENTS.DEVICES_CHANGED]: DevicesChangedEvent;
-  [EVENTS.DEFAULT_DEVICE_CHANGED]: DefaultDeviceChangedEvent;
   [EVENTS.MODEL_DOWNLOAD_PROGRESS]: ModelDownloadProgress;
   [EVENTS.TRAY_NEW_SESSION]: number;
   [EVENTS.TRAY_NEW_SESSION_ALL]: void;

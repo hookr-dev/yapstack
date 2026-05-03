@@ -1952,8 +1952,9 @@ async fn check_stream_health(
 
         // OS-driven default-device changes are handled by the device
         // broker, which routes a `RestartIntent` into the live loop's
-        // inbox (Phase 6). The remaining symptom-based watchdog
-        // (Layers 1-2: cpal error flag + write-pos stall) lives here.
+        // inbox. The remaining symptom-based watchdog (cpal error flag
+        // + write-pos stall) lives here as a backup for stream deaths
+        // the broker can't see.
         let in_cooldown = source
             .last_restart_at
             .is_some_and(|t| t.elapsed() < Duration::from_secs_f32(STREAM_RESTART_COOLDOWN_SECS));

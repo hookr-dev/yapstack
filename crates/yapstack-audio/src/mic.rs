@@ -113,13 +113,13 @@ impl MicrophoneCapture {
         self.bound_is_default
     }
 
-    /// Overrides the `bound_is_default` flag. Used by `restart_mic` to
-    /// preserve the caller's original tracking intent when a restart
-    /// falls through candidates — without this, restarting via the stored
-    /// device-id path (even when that device *is* currently the OS default)
-    /// would flip the flag off and silently disable the drift check for
-    /// the remainder of the session.
-    pub fn set_bound_is_default(&mut self, value: bool) {
+    /// Overrides the `bound_is_default` flag. `restart_mic` writes the
+    /// flag derived by `derive_bound_is_default` through this setter at
+    /// the end of a successful restart, so the post-restart flag
+    /// reflects whether the new binding actually tracks the system
+    /// default (rather than getting frozen at the original `start`-time
+    /// value).
+    pub(crate) fn set_bound_is_default(&mut self, value: bool) {
         self.bound_is_default = value;
     }
 

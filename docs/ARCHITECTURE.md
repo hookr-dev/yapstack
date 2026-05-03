@@ -366,15 +366,15 @@ Two coordinated paths recover from a Stream that's gone bad: a *symptom-based* i
 - Owns the receiving end of `yapstack_audio::system::device_watcher::DeviceEventSink`. The audio crate stays sync and runtime-agnostic; the broker lives in the Tauri layer because it needs `tokio` and `AppHandle`.
 - Listens on four Core Audio properties: `kAudioHardwarePropertyDevices`, `kAudioHardwarePropertyDefaultInputDevice`, `kAudioHardwarePropertyDefaultOutputDevice`, `kAudioHardwarePropertyDefaultSystemOutputDevice`.
 - Coalesces bursty events in a 250 ms debounce window. On flush:
-  - `DeviceListChanged` → re-enumerate, emit `devices-changed` (FE replaces its device list and reconciles `selectedMicDeviceId` if its device disappeared).
-  - `DefaultInputChanged` → emit `default-device-changed` (kind `"input"`); if Mic is following the system default OR the explicit pick is no longer alive, dispatch a Mic restart. Otherwise the explicit pick stays.
-  - `DefaultOutputChanged` / `DefaultSystemOutputChanged` → emit one `default-device-changed` per kind; coalesce both into one System audio restart.
+  - `DeviceListChanged` *or any default-* kind → re-enumerate, emit `devices-changed` (FE replaces its device list, reconciles `selectedMicDeviceId` if its device disappeared, and picks up refreshed `is_default` flags).
+  - `DefaultInputChanged` → if Mic is following the system default OR the explicit pick is no longer alive, dispatch a Mic restart. Otherwise the explicit pick stays.
+  - `DefaultOutputChanged` / `DefaultSystemOutputChanged` → coalesce both into one System audio restart.
 - Dispatch is `kAudioDevicePropertyDeviceIsAlive`-gated (one re-check at +250 ms) to absorb the AirPods/Bluetooth revert window — replaces the previous unconditional 200 ms `thread::sleep` workaround.
 - Routing: prefers a `RestartIntent` channel into the live-transcription loop when a session is active, so `SourceVadState.cursor`, Silero stream state, and the session-WAV flush position are reset by the loop's existing bookkeeping. Falls back to `AudioManager::restart_*` directly when no live loop is running but a non-live Capture is.
 
 **Restart behavior**: up to `STREAM_RESTART_MAX_ATTEMPTS` (3) attempts per Source. `AudioManager::restart_mic()` / `restart_system_audio()` stop the old stream and start a new one on the same ring buffer when format matches — no audio data is lost. On `Mixed` Capture, terminal restart-failed on either Source stops both Sources fail-fast.
 
-**Events**: emits `"stream-health"` (`StreamHealthEvent { source, status, message, bound_device_name? }`), `"devices-changed"` (`AudioDeviceInfoDto[]`), and `"default-device-changed"` (`{ kind, device_id, device_name }`). Status values: `"restarted"` (success), `"restart_failed"` (will retry), `"restart_abandoned"` (max attempts reached). The FE turns successful restarts into "Switched to {bound_device_name}" toasts.
+**Events**: emits `"stream-health"` (`StreamHealthEvent { source, status, message, bound_device_name? }`) and `"devices-changed"` (`AudioDeviceInfoDto[]`). Status values: `"restarted"` (success), `"restart_failed"` (will retry), `"restart_abandoned"` (max attempts reached). The FE turns successful restarts into "Switched to {bound_device_name}" toasts.
 
 ## State Management
 

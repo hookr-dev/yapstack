@@ -1022,8 +1022,7 @@ impl AudioManager {
     }
 
     /// Returns the device name the system audio stream is currently bound to,
-    /// or `None` if not running / identity unknown. Used by the defensive
-    /// device-identity drift poll.
+    /// or `None` if not running / identity unknown.
     pub fn system_audio_bound_device(&self) -> Option<&str> {
         self.system.last_device_name()
     }

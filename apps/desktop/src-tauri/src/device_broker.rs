@@ -12,22 +12,20 @@
 //! * `kAudioHardwarePropertyDevices` (hardware add/remove) →
 //!   re-enumerate, emit `devices-changed`.
 //! * Default-input / default-output / default-system-output changes →
-//!   emit one `default-device-changed` per kind that fired within the
-//!   debounce window.
+//!   re-enumerate (so `is_default` flags refresh) and emit
+//!   `devices-changed`. Per-kind events are not surfaced — the
+//!   re-emitted device list is the single FE-facing signal.
 //!
 //! Events arriving in a 250 ms window are coalesced — a bluetooth
 //! handshake typically fires `Devices`, then `DefaultOutput`, then
 //! sometimes `DefaultSystemOutput` in rapid succession; the broker
-//! emits one consolidated set of FE events at the trailing edge.
-//!
-//! Phase 4: emits FE events. Phase 6 adds restart routing.
+//! emits one consolidated set of FE events at the trailing edge and
+//! dispatches at most one restart per Source per debounce window.
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
-use serde::Serialize;
-use specta::Type;
 use tauri::{AppHandle, Emitter};
 use tokio::sync::{mpsc, watch};
 use tokio::time::Instant;
@@ -43,25 +41,6 @@ use crate::commands::live_transcription::{LiveSessionPresent, RestartIntent, Res
 /// long enough to absorb the typical bluetooth-handshake event burst
 /// (Devices → DefaultOutput → DefaultSystemOutput within ~50 ms).
 const DEBOUNCE_MS: u64 = 250;
-
-/// Which OS default the [`DefaultDeviceChangedPayload`] describes.
-/// `Output` is the media route; `SystemOutput` is the alerts/UI route
-/// (`kAudioHardwarePropertyDefaultSystemOutputDevice`). They can change
-/// independently on macOS.
-#[derive(Debug, Clone, Copy, Serialize, Type)]
-#[serde(rename_all = "kebab-case")]
-pub enum DefaultDeviceKindDto {
-    Input,
-    Output,
-    SystemOutput,
-}
-
-#[derive(Debug, Clone, Serialize, Type)]
-pub struct DefaultDeviceChangedPayload {
-    pub kind: DefaultDeviceKindDto,
-    pub device_id: Option<String>,
-    pub device_name: Option<String>,
-}
 
 /// Spawn the device-change broker on the Tauri async runtime. Returns
 /// immediately; the broker runs until the shutdown signal flips to
@@ -180,23 +159,16 @@ async fn flush(
     state: CollapsedEvents,
 ) {
     // FE event emission. Re-enumerate the device list whenever any
-    // default-* kind changed, not only when DeviceListChanged fires —
-    // `is_default` flags on the existing dtos go stale otherwise and
-    // the FE store falls behind reality. (Even cheap on macOS: a
-    // single Core Audio enumeration round-trip.)
+    // kind fired, not only on `DeviceListChanged`: a default-only
+    // change updates `is_default` flags on the existing dtos, and we
+    // need the FE store to see the new flags. (Cheap on macOS: a
+    // single Core Audio enumeration round-trip.) Per-kind events are
+    // intentionally not surfaced — there's no FE consumer and the
+    // re-emitted device list carries everything the UI needs.
     let any_default_changed =
         state.default_input || state.default_output || state.default_system_output;
     if state.device_list || any_default_changed {
         emit_devices_changed(app_handle);
-    }
-    if state.default_input {
-        emit_default_changed(app_handle, DefaultDeviceKindDto::Input);
-    }
-    if state.default_output {
-        emit_default_changed(app_handle, DefaultDeviceKindDto::Output);
-    }
-    if state.default_system_output {
-        emit_default_changed(app_handle, DefaultDeviceKindDto::SystemOutput);
     }
 
     // Restart dispatch — Output and SystemOutput coalesce into one
@@ -515,39 +487,6 @@ fn emit_devices_changed(app_handle: &AppHandle) {
     let payload: Vec<AudioDeviceInfoDto> = all.into_iter().map(AudioDeviceInfoDto::from).collect();
     if let Err(e) = app_handle.emit("devices-changed", payload) {
         warn!("device broker: emit devices-changed failed: {}", e);
-    }
-}
-
-fn emit_default_changed(app_handle: &AppHandle, kind: DefaultDeviceKindDto) {
-    let resolved = match kind {
-        DefaultDeviceKindDto::Input => yapstack_audio::device::default_input_device(),
-        // The cpal host has one notion of "default output"; the alerts
-        // route (`kAudioHardwarePropertyDefaultSystemOutputDevice`) isn't
-        // exposed separately. We surface the kind distinctly so the FE
-        // can show *what* the user changed, even though both resolve
-        // through the same cpal call.
-        DefaultDeviceKindDto::Output | DefaultDeviceKindDto::SystemOutput => {
-            yapstack_audio::device::default_output_device()
-        }
-    };
-    let (device_id, device_name) = match resolved {
-        Ok(info) => (info.id, Some(info.name)),
-        Err(e) => {
-            warn!("device broker: resolving default {:?} failed: {}", kind, e);
-            (None, None)
-        }
-    };
-    info!(
-        "device broker: default-device-changed kind={:?} device={:?}",
-        kind, device_name
-    );
-    let payload = DefaultDeviceChangedPayload {
-        kind,
-        device_id,
-        device_name,
-    };
-    if let Err(e) = app_handle.emit("default-device-changed", payload) {
-        warn!("device broker: emit default-device-changed failed: {}", e);
     }
 }
 
