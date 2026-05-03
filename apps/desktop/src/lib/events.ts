@@ -1,5 +1,6 @@
 import { listen, emit } from "@tauri-apps/api/event";
 import type {
+  AudioDeviceInfoDto,
   CaptureStatusDto,
   BufferStatusDto,
   EngineKindDto,
@@ -41,7 +42,24 @@ export type StreamHealthEvent = {
   source: "Mic" | "System";
   status: "restarted" | "restart_failed" | "restart_abandoned";
   message: string;
+  /**
+   * Human-readable name of the device the Stream is bound to after the
+   * event. Set on successful auto-failover so the UI can render
+   * "Switched to {name}" toasts. `null` for failures or when the underlying
+   * capture didn't report a device name.
+   */
+  bound_device_name?: string | null;
 };
+
+/**
+ * Emitted by the device broker whenever the device list changes or any
+ * system default flips. Payload is the freshly enumerated device list
+ * — input devices first, then output, with `is_default` flags
+ * recomputed against the current OS state. Subscribers should replace
+ * their cached device list and reconcile the user's persisted
+ * selection if the chosen device is no longer present.
+ */
+export type DevicesChangedEvent = AudioDeviceInfoDto[];
 
 /**
  * Emitted right after a transcription client successfully initializes,
@@ -124,6 +142,7 @@ export const EVENTS = {
   SESSION_WAV_ERROR: "session-wav-error",
   SESSION_WAV_WARNING: "session-wav-warning",
   STREAM_HEALTH: "stream-health",
+  DEVICES_CHANGED: "devices-changed",
 
   // Model
   MODEL_DOWNLOAD_PROGRESS: "model-download-progress",
@@ -157,6 +176,7 @@ type EventPayloadMap = {
   [EVENTS.SESSION_WAV_ERROR]: SessionWavErrorEvent;
   [EVENTS.SESSION_WAV_WARNING]: SessionWavWarningEvent;
   [EVENTS.STREAM_HEALTH]: StreamHealthEvent;
+  [EVENTS.DEVICES_CHANGED]: DevicesChangedEvent;
   [EVENTS.MODEL_DOWNLOAD_PROGRESS]: ModelDownloadProgress;
   [EVENTS.TRAY_NEW_SESSION]: number;
   [EVENTS.TRAY_NEW_SESSION_ALL]: void;

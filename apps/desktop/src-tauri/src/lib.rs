@@ -1,5 +1,6 @@
 mod commands;
 mod db;
+mod device_broker;
 mod logging;
 mod system_volume;
 
@@ -12,6 +13,7 @@ const WINDOW_RECORDING_INDICATOR: &str = "recording-indicator";
 use std::collections::HashSet;
 use std::io::{Read as _, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
@@ -485,6 +487,8 @@ pub fn run() {
         .manage(Arc::new(Mutex::new(AudioManager::new())) as commands::audio::AudioManagerState)
         .manage(Arc::new(Mutex::new(None::<TrayIcon>)) as TrayState)
         .manage(Arc::new(Mutex::new(None)) as commands::live_transcription::LiveTranscriptionState)
+        .manage(Arc::new(StdMutex::new(None)) as commands::live_transcription::RestartIntentInbox)
+        .manage(Arc::new(AtomicBool::new(false)) as commands::live_transcription::LiveSessionPresent)
         .manage(Arc::new(StdMutex::new(HashSet::<PathBuf>::new())) as TrustedAudioDirs)
         .manage({
             let (tx, _) = watch::channel(false);
@@ -628,6 +632,24 @@ pub fn run() {
                 let mut guard = tray_state_clone.lock().await;
                 *guard = Some(tray);
             });
+
+            // Always-on device-change broker. Owns the receiving end of
+            // the audio crate's runtime-agnostic device-event sink,
+            // emits `devices-changed`, and
+            // routes auto-failover restart intents through the live
+            // transcription loop (or directly to AudioManager when no
+            // live session is running).
+            device_broker::spawn(
+                app.handle().clone(),
+                app.state::<AudioManagerState>().inner().clone(),
+                app.state::<commands::live_transcription::RestartIntentInbox>()
+                    .inner()
+                    .clone(),
+                app.state::<commands::live_transcription::LiveSessionPresent>()
+                    .inner()
+                    .clone(),
+                app.state::<ShutdownSignal>().subscribe(),
+            );
 
             // Spawn background event emitter for capture status + buffer info + tray updates
             // Only emits when values actually change to avoid flooding the webview.

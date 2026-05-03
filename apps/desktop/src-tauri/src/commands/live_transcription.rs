@@ -250,6 +250,12 @@ pub struct StreamHealthEvent {
     /// "restarted" | "restart_failed" | "restart_abandoned"
     pub status: String,
     pub message: String,
+    /// Human-readable name of the device the Stream is bound to after the
+    /// event. Set on successful auto-failover so the FE can render
+    /// "Switched to {name}" toasts. `None` for failures or when the
+    /// underlying capture didn't report a device name.
+    #[serde(default)]
+    pub bound_device_name: Option<String>,
 }
 
 /// Per-chunk timing telemetry. Emitted after every transcribe attempt (success
@@ -515,6 +521,45 @@ pub struct LiveTranscriptionRuntime {
 
 pub type LiveTranscriptionState = Arc<Mutex<Option<LiveTranscriptionRuntime>>>;
 
+/// Inbox for cross-thread "please restart this Source" requests, used by
+/// the device broker (`device_broker` module) when a Core Audio default
+/// device change requires re-binding a Stream. Set to `Some(sender)` for
+/// the lifetime of an active live-transcription session, `None`
+/// otherwise. The broker checks the inbox before deciding whether to
+/// route a restart through the live loop (which knows how to reset
+/// `SourceVadState`) or to call `AudioManager::restart_*` directly.
+pub type RestartIntentSender = tokio::sync::mpsc::UnboundedSender<RestartIntent>;
+pub type RestartIntentInbox = Arc<StdMutex<Option<RestartIntentSender>>>;
+
+/// Cross-task signal: `true` while a live transcription loop is running
+/// or in its stop-bounded final-flush tail; `false` only when no live
+/// loop owns audio cursors / ring buffers.
+///
+/// The device broker reads this to decide whether a device-change event
+/// should route through the [`RestartIntentInbox`] (when `true`) or be
+/// dispatched directly via `AudioManager::restart_*` (when `false`).
+/// Inbox-presence alone is not sufficient because `stop_live_transcription`
+/// clears the inbox before the loop has finished its final flush; a
+/// device-change event in that window would otherwise see "no inbox" and
+/// race the loop's snapshotted stop positions by replacing the ring
+/// buffer mid-finalize.
+///
+/// The flag is set `true` by `start_live_transcription` before spawning
+/// the loop and cleared `false` by the spawned task itself once the loop
+/// has fully returned (after scheduler shutdown). This bridges the
+/// stop/finalize window.
+pub type LiveSessionPresent = Arc<AtomicBool>;
+
+/// What the broker is asking the live loop to do. Narrow on purpose —
+/// the loop doesn't need a "target device id" because it always rebinds
+/// to the current OS default (the broker has already debounced and
+/// confirmed liveness via `device_liveness`).
+#[derive(Debug, Clone, Copy)]
+pub enum RestartIntent {
+    Mic,
+    System,
+}
+
 struct StopRequest {
     positions: BufferPositions,
 }
@@ -552,10 +597,6 @@ struct SourceVadState {
     restart_attempts: u32,
     /// When the last restart was attempted (for cooldown).
     last_restart_at: Option<Instant>,
-    /// When the defensive device-identity drift poll last ran. Throttled to
-    /// a few seconds so the `cpal::default_host()` call isn't made on every
-    /// ~100–300 ms loop tick.
-    last_device_check_at: Option<Instant>,
     /// True while a background chunk task is running for this source. VAD
     /// state keeps updating (so second-utterance-during-in-flight is still
     /// captured) but dispatch and idle-cursor advance are gated off.
@@ -602,7 +643,6 @@ impl SourceVadState {
             last_write_pos_advance: Instant::now(),
             restart_attempts: 0,
             last_restart_at: None,
-            last_device_check_at: None,
             silero: SileroSource::new(initial_pos),
             force_drain: false,
         }
@@ -1378,12 +1418,6 @@ const STREAM_STALL_THRESHOLD_SECS: f32 = 2.0;
 const STREAM_RESTART_MAX_ATTEMPTS: u32 = 3;
 /// Minimum seconds between restart attempts for the same source.
 const STREAM_RESTART_COOLDOWN_SECS: f32 = 5.0;
-/// Throttle for the defensive device-identity drift poll. Primary detection
-/// is the push-based CoreAudio property listener (Layer 0); this poll only
-/// covers the rare case where listener registration fails or the OS drops
-/// an event. A short throttle caps the cost of the periodic
-/// `cpal::default_host()` lookup.
-const DEVICE_IDENTITY_POLL_INTERVAL_SECS: f32 = 3.0;
 /// Maximum audio duration for one backfill job submitted to the scheduler.
 /// Sidecar work is not preemptible once started, so keeping historical jobs
 /// short bounds how long newly-arrived live speech can wait behind one.
@@ -1437,18 +1471,7 @@ async fn preflight_stream_health(
     // change notification. Consuming the flag here means a listener event
     // fired between sessions still triggers a rebind on preflight, before
     // first extraction reads stale audio.
-    let (
-        mic_initial,
-        sys_initial,
-        mic_err,
-        sys_err,
-        has_mic_buf,
-        has_sys_buf,
-        mic_default_changed,
-        sys_default_changed,
-        mic_drift,
-        sys_drift,
-    ) = {
+    let (mic_initial, sys_initial, mic_err, sys_err, has_mic_buf, has_sys_buf) = {
         let m = audio_state.lock().await;
         (
             m.mic_write_pos(),
@@ -1457,10 +1480,6 @@ async fn preflight_stream_health(
             m.system_has_stream_error(),
             m.mic_buffer().is_some(),
             m.system_buffer().is_some(),
-            m.mic_default_changed(),
-            m.system_audio_default_changed(),
-            m.mic_input_drifted(),
-            m.system_audio_output_drifted(),
         )
     };
 
@@ -1479,13 +1498,15 @@ async fn preflight_stream_health(
     if check_mic {
         let mic_now = manager.mic_write_pos();
         let stalled = mic_now == mic_initial && should_stall_restart(&AudioSourceLabel::Mic);
-        let device_changed = mic_default_changed || mic_drift.is_some();
-        if mic_err || stalled || device_changed {
+        // Default-device-change preflight is now handled by the device
+        // broker's `RestartIntent` path; preflight only catches stream
+        // errors and write-position stalls left over from idle time.
+        if mic_err || stalled {
             warn!(
-                "preflight: mic stream needs restart (error={}, stalled={}, device_changed={})",
-                mic_err, stalled, device_changed
+                "preflight: mic stream needs restart (error={}, stalled={})",
+                mic_err, stalled
             );
-            match manager.restart_mic() {
+            match manager.restart_mic(yapstack_audio::manager::RestartTarget::PreserveBinding) {
                 Ok(_) => restarted.push(AudioSourceLabel::Mic),
                 Err(e) => {
                     error!("preflight: mic restart failed: {}", e);
@@ -1498,11 +1519,10 @@ async fn preflight_stream_health(
     if check_system {
         let sys_now = manager.system_write_pos();
         let stalled = sys_now == sys_initial && should_stall_restart(&AudioSourceLabel::System);
-        let device_changed = sys_default_changed || sys_drift.is_some();
-        if sys_err || stalled || device_changed {
+        if sys_err || stalled {
             warn!(
-                "preflight: system stream needs restart (error={}, stalled={}, device_changed={})",
-                sys_err, stalled, device_changed
+                "preflight: system stream needs restart (error={}, stalled={})",
+                sys_err, stalled
             );
             match manager.restart_system_audio() {
                 Ok(_) => restarted.push(AudioSourceLabel::System),
@@ -1518,6 +1538,7 @@ async fn preflight_stream_health(
                             source: AudioSourceLabel::System,
                             status: "restart_failed".into(),
                             message: format!("preflight system restart failed: {e}"),
+                            bound_device_name: None,
                         },
                     );
                 }
@@ -1529,12 +1550,22 @@ async fn preflight_stream_health(
 
     for label in restarted {
         let name = source_display_name(&label);
+        let bound_device_name = {
+            let manager = audio_state.lock().await;
+            match label {
+                AudioSourceLabel::Mic => manager.mic_bound_device().map(|s| s.to_string()),
+                AudioSourceLabel::System => {
+                    manager.system_audio_bound_device().map(|s| s.to_string())
+                }
+            }
+        };
         let _ = app_handle.emit(
             "stream-health",
             StreamHealthEvent {
                 source: label,
                 status: "restarted".into(),
                 message: format!("{name} stream restarted (preflight)"),
+                bound_device_name,
             },
         );
     }
@@ -1912,110 +1943,60 @@ async fn check_stream_health(
     audio_state: &AudioManagerState,
     app_handle: &AppHandle,
     mut session_wav_state: Option<&mut SessionWavState>,
-) {
+    is_mixed: bool,
+) -> bool {
     for source in sources.iter_mut() {
         if source.restart_attempts >= STREAM_RESTART_MAX_ATTEMPTS {
             continue;
         }
 
-        let mut reason = evaluate_listener_signal(source, audio_state).await;
-
-        if reason.is_none() {
-            let in_cooldown = source.last_restart_at.is_some_and(|t| {
-                t.elapsed() < Duration::from_secs_f32(STREAM_RESTART_COOLDOWN_SECS)
-            });
-            if !in_cooldown {
-                reason = evaluate_speculative_signals(source, audio_state).await;
-            }
+        // OS-driven default-device changes are handled by the device
+        // broker, which routes a `RestartIntent` into the live loop's
+        // inbox. The remaining symptom-based watchdog (cpal error flag
+        // + write-pos stall) lives here as a backup for stream deaths
+        // the broker can't see.
+        let in_cooldown = source
+            .last_restart_at
+            .is_some_and(|t| t.elapsed() < Duration::from_secs_f32(STREAM_RESTART_COOLDOWN_SECS));
+        if in_cooldown {
+            continue;
         }
-
-        let Some(reason) = reason else { continue };
+        let Some(reason) = evaluate_speculative_signals(source, audio_state).await else {
+            continue;
+        };
         // `as_deref_mut` reborrows the `Option<&mut _>` so each loop
         // iteration gets a fresh mutable view without consuming the slot.
         #[allow(clippy::needless_option_as_deref)]
         let ws_borrow = session_wav_state.as_deref_mut();
-        attempt_source_restart(source, audio_state, app_handle, ws_borrow, &reason).await;
+        // Watchdog-driven restart: cpal error or write-pos stall. The
+        // bound device is presumed still correct; just the stream died.
+        attempt_source_restart(
+            source,
+            audio_state,
+            app_handle,
+            ws_borrow,
+            &reason,
+            yapstack_audio::manager::RestartTarget::PreserveBinding,
+        )
+        .await;
     }
+
+    // Mixed mid-capture fail-fast. The user's intent with Mixed is
+    // "capture both", not "limp along on the surviving Source", so a
+    // terminal restart failure on either side ends the whole Capture.
+    // The per-source `restart_abandoned` toast was already emitted from
+    // inside `attempt_source_restart`; no extra event needed here.
+    is_mixed
+        && sources
+            .iter()
+            .any(|s| s.restart_attempts >= STREAM_RESTART_MAX_ATTEMPTS)
 }
 
-/// Layer 0: OS-authoritative rebind signal. Returns `Some(reason)` only when
-/// the CoreAudio listener fired AND a re-query after a 200 ms settle confirms
-/// the default device is genuinely different from what's bound — macOS can
-/// momentarily revert the default during a Bluetooth handshake (cpal#1175),
-/// so the settle-and-recheck is what keeps us from rebinding to a still-dead
-/// device. Listener signals bypass the speculative-restart cooldown because
-/// they're a real OS push, not a guess.
-async fn evaluate_listener_signal(
-    source: &SourceVadState,
-    audio_state: &AudioManagerState,
-) -> Option<String> {
-    let listener_fired = {
-        let manager = audio_state.lock().await;
-        let default_changed = match source.label {
-            AudioSourceLabel::Mic => manager.mic_default_changed(),
-            AudioSourceLabel::System => manager.system_audio_default_changed(),
-        };
-        // Device-list change is a shared signal consumed once per tick; fold
-        // it into the listener-fired decision for the first source that
-        // inspects it.
-        let devices_changed = manager.device_list_changed();
-        default_changed || devices_changed
-    };
-    if !listener_fired {
-        return None;
-    }
-
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
-    let manager = audio_state.lock().await;
-    let bound = match source.label {
-        AudioSourceLabel::Mic => manager.mic_bound_device(),
-        AudioSourceLabel::System => manager.system_audio_bound_device(),
-    }
-    .map(str::to_string);
-    let current_default = match source.label {
-        AudioSourceLabel::Mic => yapstack_audio::manager::live_default_input_name(),
-        AudioSourceLabel::System => yapstack_audio::manager::live_default_output_name(),
-    };
-    let direction = match source.label {
-        AudioSourceLabel::Mic => "input",
-        AudioSourceLabel::System => "output",
-    };
-    match (bound.as_deref(), current_default.as_deref()) {
-        (Some(b), Some(c)) if b != c => {
-            info!(
-                "default {} device change confirmed after settle: '{}' → '{}', rebinding",
-                direction, b, c
-            );
-            Some("default device changed".into())
-        }
-        (Some(b), Some(c)) => {
-            // Listener fired but the default unchanged once the OS finished
-            // settling — spurious / transient signal. Let the stall watchdog
-            // catch a real disconnect.
-            debug!(
-                "listener fired for {} but default unchanged after settle (still '{}' ≈ '{}') — skipping restart",
-                direction, b, c
-            );
-            None
-        }
-        _ => {
-            // Bound name unavailable (stream never started or no device
-            // resolved). Trust the listener and rebind.
-            info!(
-                "default {} device changed (bound='{:?}', current='{:?}'), rebinding",
-                direction, bound, current_default
-            );
-            Some("default device changed".into())
-        }
-    }
-}
-
-/// Layers 1–3: symptom-based detection, gated by the speculative-restart
+/// Symptom-based stream-failure detection, gated by the speculative-restart
 /// cooldown in the caller. Layer 1 is the cpal error-callback flag (instant);
-/// Layer 2 is the write-position stall watchdog (~2 s); Layer 3 is the
-/// defensive device-identity drift poll that catches a missed Layer-0 event.
-/// Returns the first reason that fires, or `None` if none do.
+/// Layer 2 is the write-position stall watchdog (~2 s). Default-device
+/// changes are handled by the device broker, not here. Returns the first
+/// reason that fires, or `None` if none do.
 async fn evaluate_speculative_signals(
     source: &mut SourceVadState,
     audio_state: &AudioManagerState,
@@ -2045,31 +2026,6 @@ async fn evaluate_speculative_signals(
         return Some("write position stalled".into());
     }
 
-    // Layer 3: defensive device-identity drift poll. Throttled.
-    let should_check = source
-        .last_device_check_at
-        .is_none_or(|t| t.elapsed() > Duration::from_secs_f32(DEVICE_IDENTITY_POLL_INTERVAL_SECS));
-    if should_check {
-        source.last_device_check_at = Some(Instant::now());
-        let drift = match source.label {
-            AudioSourceLabel::Mic => manager.mic_input_drifted(),
-            AudioSourceLabel::System => manager.system_audio_output_drifted(),
-        };
-        if let Some(new_name) = drift {
-            let bound = match source.label {
-                AudioSourceLabel::Mic => manager.mic_bound_device(),
-                AudioSourceLabel::System => manager.system_audio_bound_device(),
-            }
-            .map(str::to_string)
-            .unwrap_or_else(|| "<unknown>".into());
-            warn!(
-                "device identity drift without listener event: '{}' → '{}' (rebinding)",
-                bound, new_name
-            );
-            return Some("device identity drift (listener missed)".into());
-        }
-    }
-
     None
 }
 
@@ -2086,12 +2042,14 @@ async fn attempt_source_restart(
     app_handle: &AppHandle,
     mut session_wav_state: Option<&mut SessionWavState>,
     reason: &str,
+    target: yapstack_audio::manager::RestartTarget,
 ) {
     let source_name = source_display_name(&source.label);
     warn!(
-        "stream health: {} needs restart ({}), attempt {}/{}",
+        "stream health: {} needs restart ({}, target={:?}), attempt {}/{}",
         source_name,
         reason,
+        target,
         source.restart_attempts + 1,
         STREAM_RESTART_MAX_ATTEMPTS
     );
@@ -2101,7 +2059,10 @@ async fn attempt_source_restart(
     let restart_result = {
         let mut manager = audio_state.lock().await;
         match source.label {
-            AudioSourceLabel::Mic => manager.restart_mic(),
+            AudioSourceLabel::Mic => manager.restart_mic(target),
+            // System audio always uses cpal's default output — there is
+            // no explicit-output picking to preserve, so the target
+            // parameter is structurally a no-op for this path.
             AudioSourceLabel::System => manager.restart_system_audio(),
         }
     };
@@ -2148,6 +2109,7 @@ async fn attempt_source_restart(
                     source: source.label,
                     status: "restarted".into(),
                     message: format!("{} stream restarted ({})", source_name, reason),
+                    bound_device_name: report.bound_device_name.clone(),
                 },
             );
         }
@@ -2171,6 +2133,7 @@ async fn attempt_source_restart(
                         "{} stream restart failed: {} (attempt {}/{})",
                         source_name, e, source.restart_attempts, STREAM_RESTART_MAX_ATTEMPTS
                     ),
+                    bound_device_name: None,
                 },
             );
         }
@@ -2227,6 +2190,7 @@ async fn live_transcription_loop(
     ctx: TranscriptionContext,
     mut stop_rx: oneshot::Receiver<StopRequest>,
     stop_requested: Arc<AtomicBool>,
+    mut restart_intent_rx: tokio::sync::mpsc::UnboundedReceiver<RestartIntent>,
     mut session_wav_state: Option<SessionWavState>,
     counters: Arc<StdMutex<SessionCounters>>,
 ) {
@@ -2384,6 +2348,37 @@ async fn live_transcription_loop(
                 }
                 None
             }
+            // Device broker is asking us to fail over a Source. We
+            // honor it by calling the existing `attempt_source_restart`
+            // path (which resets `SourceVadState` cursor + Silero state
+            // and updates the session-WAV flush position). The broker
+            // has already debounced and `device_liveness`-gated, so we
+            // don't re-check those here. Returning `None` signals "not
+            // a stop", so the loop continues normally on the next tick.
+            Some(intent) = restart_intent_rx.recv() => {
+                let target_label = match intent {
+                    RestartIntent::Mic => AudioSourceLabel::Mic,
+                    RestartIntent::System => AudioSourceLabel::System,
+                };
+                if let Some(source) = sources.iter_mut().find(|s| s.label == target_label) {
+                    let ws_borrow = session_wav_state.as_mut();
+                    // Broker-driven restart: the OS just told us the
+                    // default device changed. We *want* the new default,
+                    // not the previously-bound one — probe the new
+                    // default first and let `restart_mic` fall through
+                    // to stored id/name only if the OS hasn't settled.
+                    attempt_source_restart(
+                        source,
+                        &audio_state,
+                        &ctx.app_handle,
+                        ws_borrow,
+                        "device-change",
+                        yapstack_audio::manager::RestartTarget::FollowDefault,
+                    )
+                    .await;
+                }
+                None
+            }
             req = &mut stop_rx => req.ok(),
         };
 
@@ -2502,13 +2497,26 @@ async fn live_transcription_loop(
         // Triggers auto-restart if a stream has died silently.
         // restart_mic() tries the previously stored device first, then falls back to
         // the provided name (None = system default).
-        check_stream_health(
+        let mixed_fail_fast = check_stream_health(
             &mut sources,
             &audio_state,
             &ctx.app_handle,
             session_wav_state.as_mut(),
+            matches!(source, CaptureSource::Mixed),
         )
         .await;
+
+        // Mixed mid-capture fail-fast: stop both Sources and exit. The
+        // per-Source `restart_abandoned` toast was already emitted; the
+        // session naturally winds down through the standard cleanup
+        // path (drain in-flight chunks, finalize WAV, etc.).
+        if mixed_fail_fast {
+            warn!("Mixed capture: terminal restart failure on a Source — ending session");
+            let mut manager = audio_state.lock().await;
+            let _ = manager.stop_all();
+            drop(manager);
+            break;
+        }
 
         if !prompt_seeded_from_backfill
             && seed_prompt_from_backfill(&ctx, &prompt, &mut sources).await
@@ -3955,6 +3963,8 @@ pub async fn start_live_transcription(
     audio_state: tauri::State<'_, AudioManagerState>,
     transcription_state: tauri::State<'_, TranscriptionClientState>,
     live_state: tauri::State<'_, LiveTranscriptionState>,
+    restart_intent_inbox: tauri::State<'_, RestartIntentInbox>,
+    live_session_present: tauri::State<'_, LiveSessionPresent>,
     app_handle: AppHandle,
     mut config: LiveTranscriptionConfig,
 ) -> Result<LiveTranscriptionStartResult, CommandError> {
@@ -4193,6 +4203,21 @@ pub async fn start_live_transcription(
     let (stop_tx, stop_rx) = oneshot::channel();
     let stop_requested = Arc::new(AtomicBool::new(false));
 
+    // Channel for RestartIntents from the device broker. The sender is
+    // installed in the managed inbox so the broker can find it; the
+    // receiver is consumed by the live loop. Replaces any prior sender
+    // (which would only exist if a previous session crashed without
+    // clearing the inbox in stop_live_transcription).
+    let (restart_intent_tx, restart_intent_rx) =
+        tokio::sync::mpsc::unbounded_channel::<RestartIntent>();
+    {
+        let mut inbox_guard = restart_intent_inbox
+            .inner()
+            .lock()
+            .expect("restart-intent inbox poisoned");
+        *inbox_guard = Some(restart_intent_tx);
+    }
+
     let audio_state_clone = audio_state.inner().clone();
     let transcription_state_clone = transcription_state.inner().clone();
 
@@ -4279,6 +4304,16 @@ pub async fn start_live_transcription(
         latest_completed_audio_offset_seconds: None,
     }));
 
+    // Mark the live session as present *before* spawning the loop. The
+    // device broker reads this to decide whether a device-change event
+    // should route through the inbox (live loop will handle it) or
+    // direct-restart through `AudioManager` (no live loop owns audio
+    // state). The spawned task clears the flag in its tail so the
+    // signal stays `true` across the entire stop/finalize window —
+    // including after `stop_live_transcription` clears the inbox.
+    live_session_present.inner().store(true, Ordering::Release);
+    let live_session_present_for_task = Arc::clone(live_session_present.inner());
+
     let task_handle = tokio::spawn({
         let ctx_guard = ctx.clone();
         let counters_for_loop = counters.clone();
@@ -4289,6 +4324,7 @@ pub async fn start_live_transcription(
                 ctx,
                 stop_rx,
                 stop_requested_for_loop,
+                restart_intent_rx,
                 session_wav_state,
                 counters_for_loop,
             ))
@@ -4329,6 +4365,15 @@ pub async fn start_live_transcription(
                     },
                 );
             }
+
+            // Final step: signal the broker that no live session owns
+            // audio state any more, so a device-change event arriving
+            // after this point is safe to dispatch directly via
+            // `AudioManager`. Held until *after* scheduler shutdown and
+            // any panic-handler emit so the flag bridges the entire
+            // teardown — that's the whole reason we don't piggyback on
+            // inbox-presence.
+            live_session_present_for_task.store(false, Ordering::Release);
         }
     });
 
@@ -4356,8 +4401,21 @@ pub async fn start_live_transcription(
 pub async fn stop_live_transcription(
     live_state: tauri::State<'_, LiveTranscriptionState>,
     audio_state: tauri::State<'_, AudioManagerState>,
+    restart_intent_inbox: tauri::State<'_, RestartIntentInbox>,
 ) -> Result<(), CommandError> {
     let mut guard = live_state.lock().await;
+
+    // Clear the restart-intent inbox first so the broker can't post into
+    // a soon-to-be-dropped receiver. The loop's select! will hit the
+    // stop_rx branch and exit; any drained-but-unprocessed intent is
+    // discarded along with the receiver.
+    {
+        let mut inbox_guard = restart_intent_inbox
+            .inner()
+            .lock()
+            .expect("restart-intent inbox poisoned");
+        *inbox_guard = None;
+    }
 
     match guard.take() {
         Some(mut runtime) => {
