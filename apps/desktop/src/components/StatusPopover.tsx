@@ -344,7 +344,7 @@ export function StatusPopover() {
             liveStatus.lag_seconds == null
               ? "—"
               : `${liveStatus.lag_seconds.toFixed(1)}s`
-          }   Cap fired: ${liveStatus.cap_fired_total}×`
+          }   Drain backlog: ${liveStatus.live_drain_backlog_chunks}× / ${liveStatus.live_drain_backlog_seconds.toFixed(1)}s`
         : `Chunks: n/a`,
       engineError ? `Engine error: ${engineError}` : "",
       captureStatus?.error_message
@@ -539,13 +539,17 @@ export function StatusPopover() {
                           : `${liveStatus.lag_seconds.toFixed(1)}s`}
                       </span>
                     </div>
-                    {(liveStatus?.cap_fired_total ?? 0) > 0 && (
+                    {(liveStatus?.live_drain_backlog_chunks ?? 0) > 0 && (
                       <div className="col-span-2 flex items-center justify-between">
                         <span className="text-amber-700 dark:text-amber-400">
-                          Audio dropped (cap)
+                          Live drain backlog
                         </span>
                         <span className="font-mono tabular-nums text-amber-700 dark:text-amber-400">
-                          {liveStatus?.cap_fired_total ?? 0}×
+                          {liveStatus?.live_drain_backlog_chunks ?? 0}× ·{" "}
+                          {(
+                            liveStatus?.live_drain_backlog_seconds ?? 0
+                          ).toFixed(1)}
+                          s
                         </span>
                       </div>
                     )}

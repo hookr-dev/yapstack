@@ -59,12 +59,12 @@ jobs:
         # tauri.conf.json declares an externalBin (sidecar) and a
         # macOS framework dylib (libwebgpu_dawn.dylib for parakeet-rs's
         # WebGPU EP). The Tauri build script validates both paths
-        # exist before linking. Locally `scripts/build-sidecar.sh`
+        # exist before linking. Locally `scripts/build-transcription-sidecar.sh`
         # copies them from target/<triple>/<profile>/; in CI we just
         # need the files to exist so cargo check / clippy / test pass.
         run: |
           mkdir -p apps/desktop/src-tauri/binaries
-          touch apps/desktop/src-tauri/binaries/yapstack-sidecar-aarch64-apple-darwin
+          touch apps/desktop/src-tauri/binaries/yapstack-transcription-sidecar-aarch64-apple-darwin
           touch apps/desktop/src-tauri/binaries/libwebgpu_dawn.dylib
 
       - name: Clippy

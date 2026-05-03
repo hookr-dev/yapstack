@@ -6,7 +6,7 @@ Design, testing, and coding posture for YapStack. Short and opinionated. When yo
 
 ## Design
 
-**DTO boundary at the Tauri layer.** Library crates (`yapstack-common`, `yapstack-audio`, `yapstack-transcription`, `yapstack-sidecar`) use `serde` only. `specta::Type` lives in `apps/desktop/src-tauri/src/commands/` — each command defines a DTO with a `From<DomainType>` impl. Do not pull `specta` or `tauri` into the `yapstack-*` crates; it couples business logic to the command shell and bloats compile times.
+**DTO boundary at the Tauri layer.** Library crates (`yapstack-common`, `yapstack-audio`, `yapstack-transcription`, `yapstack-transcription-sidecar`) use `serde` only. `specta::Type` lives in `apps/desktop/src-tauri/src/commands/` — each command defines a DTO with a `From<DomainType>` impl. Do not pull `specta` or `tauri` into the `yapstack-*` crates; it couples business logic to the command shell and bloats compile times.
 
 **Lock-free audio path.** The capture hot path (mic / system) writes into an SPSC ring buffer with `Release`/`Acquire` orderings on a monotonic `write_pos`. Never introduce a mutex on this path. Consumers read via `snapshot_since(pos)` — if you need coordination, add a position counter, not a lock.
 
@@ -59,6 +59,33 @@ Design, testing, and coding posture for YapStack. Short and opinionated. When yo
 **Branch posture: merge before cleanup.** For cleanup passes that span open PRs, merge the in-flight PRs first, branch off `main`, apply simplifications in one commit, and open one follow-up PR. Splitting a cleanup across three branches-of-branches always hurts more than it helps.
 
 **Commits: create new, don't amend.** If a pre-commit hook fails, the commit didn't happen — `--amend` would modify the *previous* commit. Fix, re-stage, create a new commit. Don't `--no-verify` to bypass a failing hook; fix the underlying issue.
+
+---
+
+## Documentation
+
+**Docs earn their place by capturing what code cannot.** Intent, invariants, design rationale, terminology, and orientation. Code is the source of truth for *what* the system is; docs explain *why* it is that way and *what must remain true* across implementations.
+
+**Do not mirror code structure.** If a paragraph would need to be updated every time a struct gains or loses a field — or every time a function is renamed — it has drifted into capturing structure. Push that content to the type definition (rustdoc, JSDoc, TS types) and link from prose.
+
+**Specifically, keep out of prose Markdown:**
+- Field-by-field struct / interface listings.
+- Function signatures and full type definitions in code blocks.
+- Step-by-step procedures that mirror function bodies.
+- "Files Changed" rows that restate the diff line-by-line.
+
+**Specifically, keep in prose Markdown:**
+- The *contract* a component provides — inputs, outputs, ordering guarantees, ownership rules.
+- The reason a design exists at all — what was rejected and why.
+- Invariants that must survive any reasonable refactor.
+- Domain terms (Glossary). The names we use in tickets and conversations.
+- Routing — "to understand X, read this file; to use it, see this rustdoc."
+
+**The smell test.** Before saving a doc edit, re-read it and ask: *would this still be true and useful if someone refactored the implementation without changing observable behaviour?* If no, you're capturing code structure instead of intent — trim or push to code.
+
+**API_REFERENCE.md is contracts, not signatures.** Name a type, describe its behavioural contract in 1–3 sentences, link to the source. The rustdoc on the type is the source of truth for fields and methods.
+
+**IMPLEMENTATION_LOG.md is ADR-flavoured, not changelog-flavoured.** Each phase entry captures what bug or need motivated the work, what decisions were considered and rejected, what was learned. Append-only — if a later phase supersedes an earlier one, add a forward-pointer rather than rewriting. If an entry describes work that never actually merged, fix it; don't leave aspirational claims as historical record.
 
 ---
 

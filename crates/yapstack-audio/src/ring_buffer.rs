@@ -24,6 +24,19 @@ pub struct AudioRingBuffer {
 
 pub type SharedAudioRingBuffer = Arc<AudioRingBuffer>;
 
+/// Result of reading a bounded cursor range from the ring buffer.
+#[derive(Debug, Clone)]
+pub struct AudioRangeSnapshot {
+    pub samples: Vec<f32>,
+    /// First monotonic cursor position represented by `samples`.
+    pub start_pos: usize,
+    /// One-past-the-end monotonic cursor position represented by `samples`.
+    pub end_pos: usize,
+    /// True when `start_pos` had to be advanced because older samples were
+    /// already overwritten by the ring buffer.
+    pub overrun: bool,
+}
+
 /// Diagnostic information about a ring buffer's state.
 #[derive(Debug, Clone, Serialize)]
 pub struct RingBufferInfo {
@@ -274,6 +287,62 @@ impl AudioRingBuffer {
         }
 
         (result, write_pos)
+    }
+
+    /// Returns samples in the half-open monotonic cursor range
+    /// `[from_pos, until_pos)`, capped to committed data. Unlike
+    /// [`snapshot_since_with_pos`], this never reads past `until_pos`, which
+    /// lets callers enforce a hard stop boundary even while capture continues.
+    pub fn snapshot_range(&self, from_pos: usize, until_pos: usize) -> AudioRangeSnapshot {
+        let write_pos = self.write_pos.load(Ordering::Acquire);
+        let end_pos = until_pos.min(write_pos);
+
+        if end_pos <= from_pos {
+            return AudioRangeSnapshot {
+                samples: Vec::new(),
+                start_pos: from_pos,
+                end_pos: from_pos,
+                overrun: false,
+            };
+        }
+
+        let earliest_pos = write_pos.saturating_sub(self.capacity);
+        let start_pos = from_pos.max(earliest_pos);
+        let overrun = start_pos > from_pos;
+
+        if end_pos <= start_pos {
+            return AudioRangeSnapshot {
+                samples: Vec::new(),
+                start_pos,
+                end_pos: start_pos,
+                overrun,
+            };
+        }
+
+        let to_read = end_pos - start_pos;
+        let mut result = vec![0.0f32; to_read];
+        let start_offset = start_pos % self.capacity;
+
+        if start_offset + to_read <= self.capacity {
+            for (i, sample) in result.iter_mut().enumerate() {
+                *sample = f32::from_bits(self.buffer[start_offset + i].load(Ordering::Relaxed));
+            }
+        } else {
+            let first = self.capacity - start_offset;
+            for (i, sample) in result[..first].iter_mut().enumerate() {
+                *sample = f32::from_bits(self.buffer[start_offset + i].load(Ordering::Relaxed));
+            }
+            for (i, sample) in result[first..].iter_mut().enumerate() {
+                *sample = f32::from_bits(self.buffer[i].load(Ordering::Relaxed));
+            }
+        }
+
+        AudioRangeSnapshot {
+            samples: result,
+            start_pos,
+            end_pos,
+            overrun,
+        }
     }
 
     /// Computes the RMS energy of committed samples since `since_pos` without allocating.
@@ -641,6 +710,34 @@ mod tests {
         // Should be the last 10: 10..20
         assert_eq!(snap[0], 10.0);
         assert_eq!(snap[9], 19.0);
+    }
+
+    #[test]
+    fn test_snapshot_range_stops_at_bound_even_when_newer_samples_exist() {
+        let buf = AudioRingBuffer::new(100, 16000, 1);
+        let data: Vec<f32> = (0..30).map(|i| i as f32).collect();
+        buf.write(&data);
+
+        let snap = buf.snapshot_range(10, 20);
+
+        assert_eq!(snap.start_pos, 10);
+        assert_eq!(snap.end_pos, 20);
+        assert!(!snap.overrun);
+        assert_eq!(snap.samples, (10..20).map(|i| i as f32).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn test_snapshot_range_reports_overrun() {
+        let buf = AudioRingBuffer::new(10, 16000, 1);
+        let data: Vec<f32> = (0..25).map(|i| i as f32).collect();
+        buf.write(&data);
+
+        let snap = buf.snapshot_range(0, 20);
+
+        assert_eq!(snap.start_pos, 15);
+        assert_eq!(snap.end_pos, 20);
+        assert!(snap.overrun);
+        assert_eq!(snap.samples, (15..20).map(|i| i as f32).collect::<Vec<_>>());
     }
 
     #[test]

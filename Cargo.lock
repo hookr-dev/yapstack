@@ -7942,9 +7942,10 @@ dependencies = [
 
 [[package]]
 name = "yapstack-desktop"
-version = "1.0.0-alpha.7"
+version = "1.0.0-alpha.8"
 dependencies = [
  "chrono",
+ "coreaudio-sys",
  "futures-util",
  "hound",
  "percent-encoding",
@@ -7970,6 +7971,7 @@ dependencies = [
  "tauri-plugin-updater",
  "tauri-specta",
  "tempfile",
+ "thiserror 2.0.18",
  "tokio",
  "tracing",
  "tracing-appender",
@@ -7977,21 +7979,6 @@ dependencies = [
  "yapstack-audio",
  "yapstack-common",
  "yapstack-transcription",
-]
-
-[[package]]
-name = "yapstack-sidecar"
-version = "0.1.0"
-dependencies = [
- "hound",
- "parakeet-rs",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "whisper-rs",
- "yapstack-common",
 ]
 
 [[package]]
@@ -8007,6 +7994,21 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "whisper-rs",
+ "yapstack-common",
+]
+
+[[package]]
+name = "yapstack-transcription-sidecar"
+version = "0.1.0"
+dependencies = [
+ "hound",
+ "parakeet-rs",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
  "whisper-rs",
  "yapstack-common",
 ]

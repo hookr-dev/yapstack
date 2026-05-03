@@ -2,6 +2,7 @@ mod commands;
 mod db;
 mod device_broker;
 mod logging;
+mod system_volume;
 
 const WINDOW_MAIN: &str = "main";
 #[cfg(target_os = "macos")]
@@ -295,6 +296,8 @@ pub fn run() {
             commands::live_transcription::get_live_transcription_status,
             commands::live_transcription::update_vocabulary_hints,
             commands::dictation::clipboard_paste,
+            commands::system_volume::apply_volume_duck,
+            commands::system_volume::restore_volume,
             commands::permissions::check_screen_capture_permission,
             commands::permissions::request_screen_capture_permission,
             commands::get_autostart_enabled,
@@ -745,6 +748,11 @@ pub fn run() {
                 // The aptabase plugin's own on_event handler calls flush_blocking()
                 // on exit, which now uses tauri::async_runtime::block_on (fork fix).
                 // No manual flush needed here.
+
+                // Safety net for the dictation duck feature: if the app
+                // exits while a recording is still ducked, put the user's
+                // volume back. No-op if no snapshot is held.
+                let _ = system_volume::restore();
             }
             _ => {}
         });

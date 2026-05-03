@@ -67,22 +67,22 @@ pnpm check
 
 ## Feature Flags
 
-### yapstack-sidecar
+### yapstack-transcription-sidecar
 ```bash
 # Single engines
-cargo build -p yapstack-sidecar --features whisper                # Whisper only (requires cmake)
-cargo build -p yapstack-sidecar --features parakeet               # Parakeet only (no cmake needed; pulls ort + parakeet-rs)
+cargo build -p yapstack-transcription-sidecar --features whisper                # Whisper only (requires cmake)
+cargo build -p yapstack-transcription-sidecar --features parakeet               # Parakeet only (no cmake needed; pulls ort + parakeet-rs)
 
 # Add accelerators
-cargo build -p yapstack-sidecar --features whisper,metal          # Whisper + Metal
-cargo build -p yapstack-sidecar --features parakeet,coreml        # Parakeet + ORT-CoreML EP (Apple)
-cargo build -p yapstack-sidecar --features parakeet,webgpu        # Parakeet + ORT-WebGPU EP
+cargo build -p yapstack-transcription-sidecar --features whisper,metal          # Whisper + Metal
+cargo build -p yapstack-transcription-sidecar --features parakeet,coreml        # Parakeet + ORT-CoreML EP (Apple)
+cargo build -p yapstack-transcription-sidecar --features parakeet,webgpu        # Parakeet + ORT-WebGPU EP
 
-# Standard apple build (what scripts/build-sidecar.sh produces on macOS)
-cargo build -p yapstack-sidecar --features whisper,parakeet,metal,coreml,webgpu
+# Standard apple build (what scripts/build-transcription-sidecar.sh produces on macOS)
+cargo build -p yapstack-transcription-sidecar --features whisper,parakeet,metal,coreml,webgpu
 
 # Default features
-cargo build -p yapstack-sidecar                                   # = whisper + parakeet
+cargo build -p yapstack-transcription-sidecar                                   # = whisper + parakeet
 ```
 
 | Feature | Purpose |
@@ -99,7 +99,7 @@ If the engine the sidecar was spawned with isn't compiled in (e.g. `--engine par
 ### Runtime env vars (sidecar)
 
 - **`YAPSTACK_PARAKEET_ACCEL=auto|cpu|coreml|webgpu`** — selects the Parakeet ORT execution provider. Default `auto`: uses CoreML when compiled in *and* the model has no external `.onnx.data` initializers, otherwise CPU. Empirical RTFx on Apple Silicon for Parakeet TDT v3, 2-13 s chunks: CPU 4-8×, WebGPU 4-9× (similar mean, higher variance). CoreML doesn't load for TDT v3 (external-data bug); use Auto to silently fall through.
-- **`RUST_LOG`** — standard tracing override. Default sidecar filter is `info,yapstack_sidecar=debug`; default desktop filter is `info` for our crates + `warn` for noisy upstream deps. Example: `RUST_LOG=debug,ort=warn npm run dev`.
+- **`RUST_LOG`** — standard tracing override. Default sidecar filter is `info,yapstack_transcription_sidecar=debug`; default desktop filter is `info` for our crates + `warn` for noisy upstream deps. Example: `RUST_LOG=debug,ort=warn npm run dev`.
 
 System audio capture is always compiled in via cpal loopback — no feature flag needed. Available on macOS (CoreAudio) and Windows (WASAPI). On Linux, `SystemAudioCapture::is_available()` returns false at runtime. On Windows, WASAPI loopback delivers zero packets during system silence (no audio playing) — this is normal and handled by the stream health watchdog.
 
@@ -108,16 +108,16 @@ System audio capture is always compiled in via cpal loopback — no feature flag
 The sidecar is a standalone binary that must be built separately and placed in `apps/desktop/src-tauri/binaries/` for Tauri to bundle it.
 
 ```bash
-# Build for current platform
-./scripts/build-sidecar.sh
+# Build every sidecar worker for the current platform
+./scripts/build-sidecars.sh
 
-# Build for specific targets
-./scripts/build-sidecar.sh aarch64-apple-darwin x86_64-apple-darwin
+# Build only the transcription sidecar for specific targets
+./scripts/build-transcription-sidecar.sh aarch64-apple-darwin x86_64-apple-darwin
 ```
 
-This builds with `--release --features whisper` and copies the binary to the binaries directory with the Tauri naming convention: `yapstack-sidecar-{target-triple}`.
+This builds with `--release --features whisper` and copies the binary to the binaries directory with the Tauri naming convention: `yapstack-transcription-sidecar-{target-triple}`.
 
-The `tauri.conf.json` has `externalBin` configured to bundle `binaries/yapstack-sidecar`.
+The `tauri.conf.json` has `externalBin` configured to bundle `binaries/yapstack-transcription-sidecar`.
 
 ## Building the DMG
 

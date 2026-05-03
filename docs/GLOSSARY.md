@@ -15,10 +15,13 @@ Canonical names for things in YapStack. Use these in code, commits, and tickets 
 ## Transcription
 
 - **Engine** — `Whisper | Parakeet`. User-selectable in settings; backed by separate sidecar features.
-- **Sidecar** — `yapstack-sidecar` binary. Spawned by the desktop app; communicates over JSON-line IPC on stdin/stdout. Logs to stderr.
+- **Sidecar** — `yapstack-transcription-sidecar` binary. Spawned by the desktop app; communicates over JSON-line IPC on stdin/stdout. Logs to stderr.
 - **IPC protocol** — tagged JSON unions (`SidecarRequest::Transcribe`, `SidecarResponse::Transcription`, etc.). One `id: u64` per request for correlation.
 - **VAD (voice activity detection)** — Silero V5 ONNX model, shared singleton. Per-source state machines emit speech/silence transitions.
-- **Backfill** — historical audio from before recording started, transcribed concurrently with the live stream. Segments emitted with `is_backfill: true`.
+- **Backfill** — historical audio from before recording started, transcribed concurrently with the live stream. Segments carry `origin: "backfill"`. The scheduler drains backfill at the lowest priority, behind FinalFlush and Live.
+- **Scheduler** — `TranscriptionScheduler`. Single-worker priority queue in front of the sidecar lane (`commands/transcription_scheduler.rs`). Priorities: `FinalFlush > Live > Backfill`, with mic/system round-robin at the live tier. Sole caller of `transcribe_with` during a session.
+- **Final flush** — closing-words chunks emitted at session stop. Submitted at `FinalFlush` priority so they outrank pending Live and Backfill work and survive the stop path even if backfill is still draining.
+- **Job origin** — `JobOrigin::Live | Backfill | FinalFlush`. Mirrored on the wire as `SegmentOrigin` in `LiveSegmentEvent.origin`.
 - **Prompt context** — Whisper-only feature: prior text fed into the next inference window for continuity. Decays after silence.
 - **Diarization** — speaker labelling. Parakeet + Sortformer post-pass only. Produces `speaker_id: Some(u8)` on segments.
 - **Hallucination filter** — drops empty / token-only / known-pattern segments (e.g., `"thank you"`) at low confidence.
@@ -33,6 +36,7 @@ Canonical names for things in YapStack. Use these in code, commits, and tickets 
 - **Tag** — flat metadata applied by AI during summarization. Lighter than folders.
 - **Dictation** — short voice-to-text utterance, processed via a per-slot system prompt and routed to paste/copy/note. Distinct from sessions; persisted in `dictation_history`.
 - **Slot** — named dictation configuration with its own keybind, mode (hold/toggle), AI prompt, and output action.
+- **Volume duck** — temporarily lowering the system output volume during a dictation so you can hear yourself over earphone playback. Snapshots `(device_id, prior_level)` so the *original* device is restored even if the default output changes mid-duck. macOS only; no-op elsewhere. Mechanism in `apps/desktop/src-tauri/src/system_volume.rs`; Tauri surface in `commands/system_volume.rs`.
 
 ## Auto-updater & release
 

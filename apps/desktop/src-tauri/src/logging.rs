@@ -3,11 +3,11 @@
 //! The desktop app is the single sink for all logs. The sidecar's stderr is
 //! already forwarded into this subscriber via
 //! `yapstack_transcription::client::stderr_reader_task` (as tracing events with
-//! target `yapstack_sidecar`), so we do not need a separate appender in the
-//! sidecar process.
+//! target `yapstack_transcription_sidecar`), so we do not need a separate
+//! appender in the sidecar process.
 //!
 //! PII contract: log call sites must never include transcript text. Filter
-//! call sites in `crates/yapstack-sidecar/src/engines/*` already log only
+//! call sites in `crates/yapstack-transcription-sidecar/src/engines/*` already log only
 //! lengths. If you add new call sites, follow the same rule.
 
 use std::collections::VecDeque;
@@ -198,7 +198,7 @@ const DEFAULT_FILTER: &str = "info,\
     yapstack_desktop=debug,\
     yapstack_audio=info,\
     yapstack_transcription=debug,\
-    yapstack_sidecar=debug,\
+    yapstack_transcription_sidecar=debug,\
     tao=warn,\
     wry=warn,\
     hyper=warn,\

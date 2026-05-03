@@ -113,12 +113,12 @@ Whisper exposes 99 ISO-639 codes; Parakeet TDT v3 exposes 25 European codes.
 ### Re-exports (`lib.rs`)
 
 ```rust
-pub use capture::{BufferPositions, SeparateExtraction};
+pub use capture::{BoundedExtraction, BufferPositions, SeparateExtraction};
 pub use error::AudioError;
 pub use export::SessionWavWriter;
 pub use manager::AudioManager;
 pub use mixer::MixConfig;
-pub use ring_buffer::{AudioRingBuffer, RingBufferInfo, SharedAudioRingBuffer};
+pub use ring_buffer::{AudioRangeSnapshot, AudioRingBuffer, RingBufferInfo, SharedAudioRingBuffer};
 
 /// The actual stream configuration used by a device after negotiation.
 pub struct DeviceStreamConfig {
@@ -156,6 +156,7 @@ impl AudioRingBuffer {
     pub fn snapshot_samples(&self, num_samples: usize) -> Vec<f32>;
     pub fn snapshot_all(&self) -> Vec<f32>;
     pub fn snapshot_since(&self, since_pos: usize) -> Vec<f32>;  // clamped to capacity
+    pub fn snapshot_range(&self, from_pos: usize, until_pos: usize) -> AudioRangeSnapshot;  // bounded, reports overrun
 
     // Energy (zero-allocation RMS computation directly on ring buffer)
     pub fn rms_energy_since(&self, since_pos: usize, max_samples: usize) -> Option<f32>;
@@ -172,6 +173,13 @@ pub struct RingBufferInfo {
     pub available_seconds: f32,
     pub sample_rate: u32,
     pub channels: u16,
+}
+
+pub struct AudioRangeSnapshot {
+    pub samples: Vec<f32>,
+    pub start_pos: usize,
+    pub end_pos: usize,
+    pub overrun: bool,
 }
 ```
 
@@ -213,7 +221,9 @@ impl AudioManager {
     pub fn buffer_positions(&self) -> BufferPositions;  // current write positions for both buffers
     pub fn mic_write_pos(&self) -> usize;   // current mic buffer write position (0 if no buffer)
     pub fn system_write_pos(&self) -> usize; // current system buffer write position (0 if no buffer)
+    pub fn output_sample_rate_for(&self, source: CaptureSource) -> u32;
     pub fn extract_since(&self, positions: &BufferPositions, source: CaptureSource, mix_config: Option<&MixConfig>) -> Option<(Vec<f32>, u32, BufferPositions)>;
+    pub fn extract_since_until(&self, positions: &BufferPositions, limits: &BufferPositions, source: CaptureSource, mix_config: Option<&MixConfig>) -> Option<BoundedExtraction>;  // bounded to stop_positions, reports overrun
     pub fn extract_sources_since(&self, positions: &BufferPositions) -> Option<SeparateExtraction>;  // per-source extraction (no mixing)
     pub fn peek_energy_rms(&self, positions: &BufferPositions, duration_secs: f32) -> (Option<f32>, Option<f32>);  // zero-alloc RMS via ring_buffer.rms_energy_since()
 
@@ -325,6 +335,15 @@ pub struct SeparateExtraction {
     pub mic: Option<(Vec<f32>, u32)>,      // (mono_samples, sample_rate)
     pub system: Option<(Vec<f32>, u32)>,   // (mono_samples, sample_rate)
     pub new_positions: BufferPositions,
+}
+
+/// Stop-safe bounded extraction result. Samples never include audio written
+/// after the supplied limit positions.
+pub struct BoundedExtraction {
+    pub samples: Vec<f32>,
+    pub sample_rate: u32,
+    pub new_positions: BufferPositions,
+    pub overrun: bool,
 }
 ```
 
@@ -474,13 +493,13 @@ pub enum TranscriptionError {
 
 ---
 
-## yapstack-sidecar
+## yapstack-transcription-sidecar
 
 Binary. No public API. Communicates via JSON-line IPC.
 
 **CLI**:
 ```
-yapstack-sidecar
+yapstack-transcription-sidecar
     [--engine whisper|parakeet]                # default: whisper (preserves prior CLI behavior)
     [--model /path/to/model[/dir]]              # ggml file for Whisper, model dir for Parakeet
     [--vad-model /path/to/silero.bin]           # Whisper only
@@ -490,7 +509,7 @@ yapstack-sidecar
 
 **Env vars**:
 - `YAPSTACK_PARAKEET_ACCEL=auto|cpu|coreml|webgpu` — selects the ORT execution provider for Parakeet (`auto` = CoreML when no external `.onnx.data` files, else CPU)
-- `RUST_LOG` — standard tracing override; default is `info,yapstack_sidecar=debug`
+- `RUST_LOG` — standard tracing override; default is `info,yapstack_transcription_sidecar=debug`
 
 **Feature flags**:
 - `whisper` — Whisper transcription via whisper-rs (requires cmake)
@@ -625,7 +644,11 @@ All `download_*` commands emit `"model-download-progress"` events to the window 
 | `stop_live_transcription` | — | `()` |
 | `get_live_transcription_status` | — | `LiveTranscriptionStatus` |
 
-Emits `"live-transcription-segment"` events with `LiveSegmentEvent { session_id?: string, chunk_index, source, segments, audio_offset_seconds, chunk_duration_seconds, accumulated_text, is_backfill }`. The `session_id` mirrors `LiveTranscriptionConfig.session_id` so multi-session listeners (dictation hook + main view) can route events without stale-state guards. `LiveTranscriptionConfig` carries an optional `diarization: bool` (default false) — honored only when the active engine is Parakeet *and* the sidecar was spawned with a Sortformer model. Each `TranscriptSegmentDto` in `segments` carries `speaker_id: number | null`.
+Emits `"live-transcription-segment"` events with `LiveSegmentEvent` (full shape: see `commands/live_transcription.rs`). Notable contract points: `session_id` mirrors `LiveTranscriptionConfig.session_id` so multi-session listeners (dictation hook + main view) can route events without stale-state guards; `origin: "live" | "backfill" | "final_flush"` is set by the scheduler at emit time and tells the frontend which priority tier produced the chunk. `LiveTranscriptionConfig.diarization` (optional, default false) is honored only when the active engine is Parakeet *and* the sidecar was spawned with a Sortformer model. Each `TranscriptSegmentDto` in `segments` carries `speaker_id: number | null`.
+
+`stop_live_transcription` remains a no-argument frontend command, but internally snapshots `AudioManager::buffer_positions()` plus a short tail grace into a `StopRequest`. After that point, the live loop skips normal VAD polling, idle cursor advancement, stream-health restarts, and unbounded WAV flushing. Final live chunks and the session WAV tail are read only up to that bounded stop position; later samples are ignored for the stopped session.
+
+`LiveTranscriptionStatus` includes `lag_seconds`, `live_drain_backlog_chunks`, and `live_drain_backlog_seconds`. The backlog fields replace the old head-drop cap counter: non-zero values mean live audio is being preserved and drained because inference fell behind real time. `LiveTranscriptionPressureEvent` also carries `drain_backlog_seconds` per chunk.
 
 Emits `"backfill-complete"` event (empty payload) when backfill processing finishes.
 
@@ -637,16 +660,22 @@ Emits `"stream-health"` events with `StreamHealthEvent { source: AudioSourceLabe
 
 Emits `"live-transcription-warning"` event with `{ message }` when the sidecar is auto-restarted mid-session after a transcription failure (transient); the loop continues.
 
+Emits `"transcription-engine-dropped"` event (empty payload) from the cleanup path when the scheduler hit its shutdown timeout and had to drop the transcription client instead of returning it to shared state. Listeners should treat the engine as un-initialized — `enginePhase` should reset to `idle` and re-init should run before the next session start. Without this signal, a wedged-sidecar shutdown would leave the FE thinking the engine is ready while shared state is empty, and the next session would fail with `NotInitialized`.
+
 **`LiveTranscriptionConfig`**: `silence_duration_ms` (default 800; Whisper-only — Parakeet uses a fixed 200 ms), `max_chunk_seconds` (default 30), `backfill_seconds` (default 0), `source`, `mix_config?`, `language?`, `prompt_context_chars?` (default 350), `prompt_decay_silence_seconds?` (default 5.0, set to 0 to disable — seconds of all-source silence before clearing prompt context to prevent hallucination from stale context), `session_id?` (enables streaming session audio recording into a new part), `persist_audio_part?: bool` (default `true`; set to `false` for dictation so finalize skips the `session_audio_parts` insert that would FK-orphan against the synthetic id), `audio_save_location?` (override the default `$APP_DATA_DIR/audio/` dir), `audio_export_format?: AudioExportFormatDto` (`"wav"` or `"mp3"`, default `"mp3"`; typed end-to-end so unknown values are rejected at deserialization), `mp3_bitrate?` (kbps, validated against the LAME-supported set; default 64), `diarization?`, `vocabulary_hints?` (folder/tag names ≥4 chars, comma-separated, ~80 char budget — Whisper-only), `resume?: ResumeConfig` (carries the prior cumulative duration that becomes `session_offset_base_seconds`, plus the next `part_index` so segments and audio parts continue numbering from where the prior run left off).
 
 **`LiveTranscriptionPhase`**: `Running`, `Stopped`, `Error`.
 
-**Internal types** (not exported via Tauri):
-- `TranscriptionContext` — Immutable shared context: `transcription_client` (private `Arc<Mutex<Option<Arc<TranscriptionClient>>>>`), `shared_transcription_state` (handle for returning the client on exit), `app_handle`, `config`, `bridged_prompt`, `vocabulary_hints`, `session_offset_base_seconds`
-- `SessionWavState` — Streaming WAV state: `writer`, `flush_positions`, `source`, `mix_config`, `session_id`
-- `SourceVadState` — Per-source VAD: `is_speaking`, `speech_start_pos`, `cursor`, `speech_start_time`, `silence_since`, `chunk_index`, `accumulated_text`, `total_audio_seconds`, `last_seen_write_pos`, `last_write_pos_advance`, `restart_attempts`
-- `VadAction` — `None`, `Chunk` (silence detected), `ForceChunk` (max duration exceeded)
-- `ChunkResult` — `event: LiveSegmentEvent`, `chunk_duration: f32`
+**Internal types** (not exported via Tauri): `TranscriptionContext`, `SessionWavState`, `SourceVadState`, `VadAction`, `ChunkResult`, `SegmentOrigin`. Field-level shape lives with the Rust definitions in `commands/live_transcription.rs` — see those rustdoc comments for the source of truth. `TranscriptionContext` now holds `Arc<TranscriptionScheduler>` for the duration of a session (replacing the prior `transcription_client + shared_transcription_state` pair). `SegmentOrigin` is the IPC mirror of the scheduler's `JobOrigin`.
+
+### Transcription Scheduler (`commands/transcription_scheduler.rs`)
+
+Internal module — not exported via Tauri. See ARCHITECTURE.md § "Transcription Scheduler" for the design rationale, and the rustdoc on `TranscriptionScheduler` / `JobRequest` / `JobOutcome` / `SchedulerError` for current type shapes. The behavioural contract is small and worth stating once here:
+
+- One worker, three priority tiers (`FinalFlush > Live > Backfill`), mic/system round-robin at the Live tier.
+- `Backfill` jobs are admitted only when no `FinalFlush`/`Live` job is queued and the live loop's busy gate is clear.
+- Sole caller of `TranscriptionClient::transcribe_with` during a session, which makes sidecar respawn race-free.
+- `shutdown_and_return(timeout) -> bool` finishes whichever single chunk is in-flight at the scheduler when called and *attempts* to return the client to `TranscriptionClientState`. Returns `true` only when the client was actually placed back into shared state; returns `false` for any non-clean path — worker timeout (aborted; an in-flight clone may still be live), worker panic (e.g. the `Arc::try_unwrap` invariant panic inside `respawn_client`, which takes the client *before* panicking and leaves shared state empty), or any other non-clean exit. The cleanup path in `commands/live_transcription.rs` emits `transcription-engine-dropped` on `false` so the frontend can re-init. The timeout caps a wedged-sidecar worst case; default is 5 minutes, generous enough for a typical 5-minute backfill window to finish on a slow sidecar.
 
 ### Dictation Commands (`commands/dictation.rs`)
 | Command | Args | Returns |
@@ -654,6 +683,14 @@ Emits `"live-transcription-warning"` event with `{ message }` when the sidecar i
 | `clipboard_paste` | `text: String, auto_paste: bool` | `()` |
 
 Writes `text` to system clipboard via `pbcopy` (macOS) or `clip` (Windows). If `auto_paste` is true, waits 50ms then simulates Cmd+V via `osascript` (macOS only).
+
+### System Volume Commands (`commands/system_volume.rs`)
+| Command | Args | Returns |
+|---------|------|---------|
+| `apply_volume_duck` | `target: f32` (0.0..=1.0) | `()` |
+| `restore_volume` | — | `()` |
+
+Generic ducking surface — the commands know nothing about dictation; callers decide policy. `apply_volume_duck` lowers the default output to `target`, snapshotting `(device_id, prior_level)` on the first apply of a duck cycle. No-op when the current level is already at or below `target` (no snapshot is taken — restore stays a no-op). `restore_volume` puts the snapshotted device back to its prior level even if the system default has since changed; it's also a no-op if no snapshot is held. Both commands swallow platform errors and return `()` because volume control is a UX nicety, not load-bearing for the caller. macOS only today; Windows / Linux are no-op stubs.
 
 ### Overlay Panel Commands (`commands/mod.rs`)
 | Command | Args | Returns |

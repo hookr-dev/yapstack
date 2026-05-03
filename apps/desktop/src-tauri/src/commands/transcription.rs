@@ -639,7 +639,7 @@ fn find_sidecar_path() -> Result<PathBuf, CommandError> {
     } else {
         ""
     };
-    let sidecar_name = format!("yapstack-sidecar-{target_triple}{ext}");
+    let sidecar_name = format!("yapstack-transcription-sidecar-{target_triple}{ext}");
 
     let path = exe_dir.join(&sidecar_name);
     if path.exists() {
@@ -647,7 +647,7 @@ fn find_sidecar_path() -> Result<PathBuf, CommandError> {
     }
 
     // Fallback: try without target triple (development mode)
-    let fallback_name = format!("yapstack-sidecar{ext}");
+    let fallback_name = format!("yapstack-transcription-sidecar{ext}");
     let path = exe_dir.join(&fallback_name);
     if path.exists() {
         return Ok(path);

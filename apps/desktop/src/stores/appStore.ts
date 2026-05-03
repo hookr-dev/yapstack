@@ -263,6 +263,13 @@ export interface Settings {
   mp3Bitrate: number;
   dictation: DictationSettings;
   showRecordingIndicator: boolean;
+  /// Lower the system output volume during the recording phase of a
+  /// dictation, so the user can hear themselves over earphone playback.
+  /// Restored as soon as recording ends. Only ever lowers — never raises.
+  /// macOS only (no-op on other platforms).
+  dictationDuckEnabled: boolean;
+  /// Target volume to duck to, in [0, 1]. Default 0.2.
+  dictationDuckTarget: number;
   onboarding: OnboardingState;
 }
 
@@ -328,6 +335,13 @@ interface AppState {
   liveTranscriptionActive: boolean;
   livePhase: LiveTranscriptionPhase | null;
   backfillActive: boolean;
+  /// Audio offset (seconds) where backfill ends and live audio begins, used to
+  /// position the "Processing prior audio" indicator between old and new
+  /// segments in the chat. Seeded from the requested backfill duration, then
+  /// expanded as backfill chunks land so the boundary tracks effective
+  /// (clamped) backfill rather than requested. Null when no backfill is
+  /// active for this session.
+  backfillBoundarySeconds: number | null;
   // True from when the user clicks Stop until the backend's Stopped/Error
   // event fires. Lets the UI show a pulsing "Finalizing…" state immediately
   // while the engine drains the current chunk + finalizes the WAV.
@@ -574,6 +588,8 @@ const defaultSettings: Settings = {
   mp3Bitrate: 64,
   dictation: DEFAULT_DICTATION_SETTINGS,
   showRecordingIndicator: true,
+  dictationDuckEnabled: false,
+  dictationDuckTarget: 0.2,
   onboarding: { completedFlows: {} },
 };
 
@@ -646,6 +662,7 @@ function createAppStore() {
       liveTranscriptionActive: false,
       livePhase: null,
       backfillActive: false,
+      backfillBoundarySeconds: null,
       sessionStopping: false,
       noteRefreshCounter: 0,
       playbackTime: 0,
@@ -707,6 +724,7 @@ function createAppStore() {
                 liveTranscriptionActive: false,
                 livePhase: null,
                 backfillActive: false,
+                backfillBoundarySeconds: null,
                 sessionStopping: false,
               });
 
@@ -748,7 +766,7 @@ function createAppStore() {
               `offset=${event.audio_offset_seconds.toFixed(2)}s ` +
               `duration=${event.chunk_duration_seconds.toFixed(2)}s ` +
               `segments=${event.segments.length} ` +
-              `backfill=${event.is_backfill}`,
+              `origin=${event.origin}`,
           );
 
           // Prefer the session_id carried on the event so late-arriving
@@ -787,6 +805,21 @@ function createAppStore() {
               hidden: 0,
               speaker_id: seg.speaker_id ?? null,
             });
+          }
+
+          // Track the highest end-offset seen from a backfill chunk so the
+          // chat indicator can sit at the actual backfill→live boundary.
+          // Stays null until the first backfill chunk lands — using the
+          // requested duration as a placeholder would over-shoot the
+          // effective (clamped) boundary and mis-classify early live
+          // segments as backfill. Updated even for empty chunks (silence
+          // still advances the rewind cursor).
+          if (event.origin === "backfill" && targetSessionId === get().activeSessionId) {
+            const chunkEnd = event.audio_offset_seconds + event.chunk_duration_seconds;
+            const current = get().backfillBoundarySeconds;
+            if (current == null || chunkEnd > current) {
+              set({ backfillBoundarySeconds: chunkEnd });
+            }
           }
 
           if (newSegments.length === 0) return;
@@ -1060,10 +1093,22 @@ function createAppStore() {
           vocabulary_hints: vocabHints,
         };
 
+        // Pre-set `backfillActive` before the await so any `backfill-complete`
+        // event emitted by the spawned live task during the await transitions
+        // it cleanly to false. If we set it post-await instead, a fast or
+        // empty-branch backfill-complete could fire before our set, the
+        // listener would clear it to false, and our subsequent set would
+        // overwrite it back to true — leaving the UI affordance stuck on.
+        const requestedBackfill = (backfillSeconds ?? 0) > 0;
+        if (requestedBackfill) {
+          set({ backfillActive: true });
+        }
+
         const result = await commands.startLiveTranscription(config);
         if (result.status === "error") {
           // Clean up the DB row we just created
           await dbDeleteSession(sessionId).catch(() => {});
+          if (requestedBackfill) set({ backfillActive: false });
           throw new Error(result.error.message);
         }
 
@@ -1073,6 +1118,9 @@ function createAppStore() {
           trigger: trigger ?? "unknown",
         });
 
+        // Note: `backfillActive` deliberately omitted — the pre-await set
+        // above plus the `backfill-complete` listener are the source of
+        // truth. Re-asserting it here would re-introduce the race.
         set({
           activeSessionId: sessionId,
           activeSessionSegments: [],
@@ -1082,7 +1130,10 @@ function createAppStore() {
           livePhase: "Running",
           currentView: "note-detail",
           selectedSessionId: sessionId,
-          backfillActive: (backfillSeconds ?? 0) > 0,
+          // backfillActive intentionally omitted — pre-set before the await
+          // (and listener-driven thereafter) so a fast `backfill-complete`
+          // event arriving during the await isn't overwritten back to true.
+          backfillBoundarySeconds: null,
         });
 
         // Reload sidebar
@@ -1200,6 +1251,7 @@ function createAppStore() {
           selectedSessionId: sessionId,
           sessionStopping: false,
           backfillActive: false,
+          backfillBoundarySeconds: null,
         });
       },
 
@@ -2383,7 +2435,7 @@ function createAppStore() {
     }),
     {
       name: "yapstack-settings",
-      version: 23,
+      version: 24,
       partialize: (state) => ({
         settings: state.settings,
       }),
@@ -2563,6 +2615,13 @@ function createAppStore() {
           // the broken behavior in the meantime.
           const old = state.settings as Record<string, unknown>;
           old.diarizationEnabled = false;
+        }
+        if (version < 24 && state.settings) {
+          const old = state.settings as Record<string, unknown>;
+          if (old.dictationDuckEnabled === undefined)
+            old.dictationDuckEnabled = false;
+          if (old.dictationDuckTarget === undefined)
+            old.dictationDuckTarget = 0.2;
         }
         return state as unknown as { settings: Settings };
       },

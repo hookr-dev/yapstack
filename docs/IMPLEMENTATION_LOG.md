@@ -986,22 +986,18 @@ For comparison, FluidAudio (Swift + CoreML + ANE) reportedly hits 155-237× real
 
 ---
 
-## Phase 25 — Live Transcription Pipeline Overhaul: Silero VAD + Scheduler + Parakeet Tuning
+## Phase 25 — Silero VAD + Parakeet Tuning
 
-Three tightly related changes, each on its own branch:
-1. `feat/transcription-scheduler` — priority scheduler in front of the sidecar lane.
-2. `feat/silero-vad-parakeet` — replaces RMS energy detector with Silero V5 VAD for both engines; tightens Parakeet chunk cadence.
+Replaces the RMS energy detector with Silero V5 VAD for both engines and tightens Parakeet's chunk cadence to fit its low-RTFx, non-autoregressive decoder. Branch: `feat/silero-vad-parakeet`.
+
+> Note: an earlier draft of this phase also bundled a sidecar priority scheduler from `feat/transcription-scheduler`, but that branch never merged into main. The scheduler eventually landed independently — see Phase 32.
 
 ### What was built
 
 | File | Change |
 |---|---|
-| `apps/desktop/src-tauri/src/commands/transcription_scheduler.rs` | New. `TranscriptionScheduler` wraps the `TranscriptionClient` and serves jobs through three priority queues (`FinalFlush > Live > Backfill`) with mic/system round-robin at the Live tier. Single worker task feeds the sidecar serially so priority ordering isn't defeated by the sidecar's FIFO stdin queue. Retries once after sidecar respawn; drains cleanly on shutdown and hands the raw client back to shared state. |
 | `apps/desktop/src-tauri/src/commands/silero_vad.rs` | New. `SileroVad` (shared `silero::Session`, V5 ONNX bundled in-binary via the `silero` crate, ~2 MB) + `SileroSource` (per-source `StreamState` + VAD-only read cursor + sticky `last_probability` for empty polls). `score_stream` returns every 32 ms frame's probability — not just the last — so intra-poll speech (onset+offset inside one batch) isn't lost. `score_all` for backfill batch-scoring. Resampling delegates to `yapstack_common::audio::resample` (rubato sinc). |
-| `apps/desktop/src-tauri/src/commands/live_transcription.rs` | Replaced RMS (`peek_energy_rms`) with Silero per-source scoring. `VadTuning.silence_threshold` (RMS) renamed → `speech_threshold` (probability). Parakeet tuning: 200 ms silence / 10 s max chunk / 100 ms poll / 250 ms pre-roll. Whisper keeps the user's `silence_duration_ms` (300 ms poll, no pre-roll). `vad_chunk_historical_audio` now batch-scores through Silero and walks a pure state machine (`backfill_chunks_from_probabilities`) over the probability stream; `prev_chunk_end` clamp prevents pre-roll from rewinding into a previous chunk. Backfill-to-live handoff now resets all per-source Silero state (`read_pos`, `stream`, `last_probability`, `earliest_next_chunk_pos`) to the post-backfill write position. Added `LiveSegmentEvent.event_sequence` + `origin` for stable frontend ordering. Removed the stop-time `chunk_aborts.abort()` loop — final chunks are submitted as `FinalFlush` priority and drained with a bounded timeout instead. |
-| `apps/desktop/src/stores/appStore.ts` | `activeSessionBackfillSegments` bucket — backfill chunks live here until `backfill-complete` merges them into `activeSessionSegments`, so a late backfill chunk can't shove already-rendered live rows downward. `stableInsertSegments` replaces the per-event full-array sort; existing segments never reorder. Exports `awaitLiveTranscriptSettled(sessionId)` that drains the in-memory segment write queue before returning the current transcript. |
-| `apps/desktop/src/lib/ai-context.ts` | Session transcript / tool context now use `awaitLiveTranscriptSettled` so AI chat sees the latest spoken sentence instead of a stale SQLite snapshot. |
-| `apps/desktop/src/lib/db.ts` | `getSessionSegments` ORDER BY made deterministic (`audio_offset, chunk_index, source, created_at, id`) to match the in-memory comparator. |
+| `apps/desktop/src-tauri/src/commands/live_transcription.rs` | Replaced RMS (`peek_energy_rms`) with Silero per-source scoring. `VadTuning.silence_threshold` (RMS) renamed → `speech_threshold` (probability). Parakeet tuning: dialogue-aggressive defaults (100 ms poll, 250 ms pre-roll, 0.7 offset-hysteresis ratio); Parakeet's silence window has since been raised to 500 ms (`6d66b24`) to relieve queue pressure. Whisper keeps the user's `silence_duration_ms` (300 ms poll, no pre-roll). `vad_chunk_historical_audio` now batch-scores through Silero and walks a pure state machine (`backfill_chunks_from_probabilities`) over the probability stream; `prev_chunk_end` clamp prevents pre-roll from rewinding into a previous chunk. Backfill-to-live handoff resets all per-source Silero state (`read_pos`, `stream`, `last_probability`, `earliest_next_chunk_pos`) to the post-backfill write position. |
 
 ### Key decisions
 
@@ -1009,22 +1005,19 @@ Three tightly related changes, each on its own branch:
 - **Silero replaces RMS for both engines, but only the detector changes**. Whisper keeps its tuned timing values (`silence_duration_ms`, 300 ms poll, no pre-roll); only the speech signal is different. This was an explicit memory rule: don't retune Whisper when tuning Parakeet.
 - **Thresholds are V5 defaults**. `speech_threshold = 0.5`, `offset_threshold_ratio = 0.7` (→ 0.35 end threshold). Matches the upstream Python silero-vad reference.
 - **Reuse the canonical resampler**. `silero_vad.rs` calls `yapstack_common::audio::resample` (the same rubato-backed sinc path used by `yapstack-sidecar` and `yapstack-audio::mixer`) rather than shipping a hand-rolled decimator. Silero is robust to mild aliasing but consistency with the workspace idiom is worth the line count.
-- **Backfill bucket in the frontend, not just a stripe**. Keeping backfill out of `activeSessionSegments` until `backfill-complete` is the only way to prevent the "live row jumps down" visual churn when a late backfill chunk arrives with a smaller `audio_offset_seconds`.
 - **Pure state-machine helper for tests**. `backfill_chunks_from_probabilities` is extracted from `vad_chunk_historical_audio` so unit tests can feed hand-crafted probability sequences without loading the ONNX model — particularly important for the pre-roll-clamp regression test, since Silero won't classify synthetic tones as speech.
 
 ### What was learned
 
 - **Intra-poll speech events are real**. A 100 ms Parakeet poll can contain an entire short utterance; if `score_stream` returns only the trailing probability (silence), the VAD state machine never sees the onset. The fix is straightforward — return `Vec<f32>` and iterate `poll_vad` per frame — but the bug is easy to miss in review.
-- **The sidecar's stdin queue is FIFO**. Multiple concurrent `transcribe_with` calls don't pipeline on the model side; they queue in order received. That made "parallel" mic/system dispatch useless for prioritization and necessitated the scheduler.
+- **The sidecar's stdin queue is FIFO**. Multiple concurrent `transcribe_with` calls don't pipeline on the model side; they queue in order received. That made "parallel" mic/system dispatch useless for prioritization and motivated the eventual scheduler in Phase 32.
 - **Backfill-to-live handoff is more than just the extraction cursor**. Resetting `cursor` + `speech_start_pos` isn't enough; the Silero read cursor, the LSTM stream state, the sticky last_probability, and `earliest_next_chunk_pos` all have to move with them or the live detector replays the backfill window.
 - **Pre-roll needs the same clamp in backfill as in live**. The live loop already bounded pre-roll by `earliest_next_chunk_pos`; the backfill chunker didn't, so two utterances separated by less than ~250 ms could produce overlapping chunks.
 
 ### Test coverage
 
-- `commands::transcription_scheduler::tests` — priority ordering, mic/system round-robin, single-source drain, final-flush preemption, cancel-all.
 - `commands::silero_vad::tests` — bundled ONNX session loads and returns valid probabilities for silence; 32 ms frame cadence (512 samples × N → N probabilities).
 - `commands::live_transcription::tests` — Silero-era `poll_vad` state-machine tests (thresholds are now probabilities); intra-poll speech onset regression; backfill-reset structural guard; no-overlap regression for the `prev_chunk_end` clamp.
-- Frontend: `stableInsertSegments` tests for stable merge behavior under late-arriving backfill.
 
 ### Not yet done
 
@@ -1265,6 +1258,135 @@ A behavior-preserving cleanup pass that removed accumulated dead code, decompose
 | `docs/plans/tree-shake-cleanup.md` | New plan tracking the refactor |
 
 ---
+
+## Phase 32 — Transcription Scheduler (Backfill Durability)
+
+### What was built
+
+A single-worker priority queue in front of the sidecar lane that fixes a class of bugs where backfill audio could be silently dropped on session stop, especially under sustained live dictation. New module `commands/transcription_scheduler.rs` (~600 lines including 6 unit tests). Live transcription pipeline rewired to submit jobs through the scheduler instead of calling `TranscriptionClient::transcribe_with` directly.
+
+### The bug being fixed
+
+Before this phase, on session stop the live loop set a `backfill_cancel` flag that broke the backfill submitter loop at the next chunk boundary. Every backfill chunk past the cancel point was dropped without being transcribed — its audio (alive in memory as `Vec<f32>` inside the submitter task) was simply freed. Combined with no priority scheduling between live and backfill at the sidecar, sustained live dictation would starve backfill, and stop would then guarantee whatever hadn't drained got abandoned.
+
+### Key decisions
+
+- **Priorities `FinalFlush > Live > Backfill`, mic/system round-robin at Live.** Live work always preempts backfill at the sidecar; closing-words at stop preempt everything. Round-robin within Live keeps mic and system from starving each other in mixed-source sessions.
+- **Single-owner client.** The scheduler holds the sole `Arc<TranscriptionClient>` clone for the session, and is the only task that calls `transcribe_with`. This makes sidecar respawn race-free: when a transcribe call fails, the worker drops its in-call clone and `Arc::try_unwrap` always succeeds. The previous design had to fall back to "another task still holds the Arc" branches; that's deleted along with `recover_from_chunk_failure`.
+- **Backfill is no longer cancelled on stop.** The submitter walks its in-memory chunk list and submits each at `Backfill` priority. The submitter awaits each chunk's scheduler response before submitting the next (per-chunk prompt context and in-order segment emission both depend on this serial wait), so the submitter — not the scheduler — is what's actually doing the draining post-stop. On stop, the live loop awaits the submitter's join (capped at 5 min); chunks not yet submitted at that timeout are lost (they live in the submitter's stack as `Vec<f32>`, not on any durable queue). The "scheduler keeps draining backfill" framing in earlier drafts of this entry was wrong on that point. Phase 33 keeps this lifecycle and corrects the wording.
+- **5-minute shutdown timeout.** Generous enough to drain a typical 5-minute backfill window on a slow sidecar; bounded so a wedged sidecar can't hang the stop path forever. If the worker timeout fires after submitter exit, the worker is aborted and the transcription client is dropped rather than returned to shared state — an aborted worker may still hold an in-flight `Arc<TranscriptionClient>` clone, so handing the same client to a new session would race the sidecar's response routing. The next session re-initializes the engine.
+- **`LiveSegmentEvent` and `LiveTranscriptionPressureEvent` carry `origin: SegmentOrigin`.** Replaces the earlier `is_backfill: bool` outright — the desktop app and its sidecar deploy atomically, so there's no version skew to bridge, and `origin` is a strict superset (distinguishes `live` from `final_flush`, where the boolean could not).
+- **Frontend rendering not changed in this phase.** The new fields are emitted but unconsumed by the UI; the priority change happens entirely at the backend so `pnpm check` is the only verification needed for this branch. Bucketed rendering is a separate UX concern.
+- **Parakeet engine tuning untouched.** An earlier draft of this work (on a feature branch that never merged) bundled a Parakeet retuning pass (200 ms silence / 10 s max chunk). Main has since moved to 500 ms silence (`6d66b24`) and that's deliberately preserved here — engine-specific tuning is its own concern, validated independently.
+
+### Files Changed
+
+| File | Change |
+|------|--------|
+| `apps/desktop/src-tauri/src/commands/transcription_scheduler.rs` | New module — see ARCHITECTURE.md § "Transcription Scheduler" for the design. Includes 6 unit tests for priority ordering, round-robin, cancel, drain. |
+| `apps/desktop/src-tauri/src/commands/live_transcription.rs` | Pipeline rewired around the scheduler. `TranscriptionContext` simplified, `recover_from_chunk_failure` removed (respawn moved into scheduler), backfill cancel flag deleted, stop path waits for backfill submitter then calls `scheduler.shutdown_and_return`. `LiveSegmentEvent` gains `origin`; the prior `is_backfill: bool` is removed in favour of it. |
+| `apps/desktop/src/lib/tauri.ts` | `LiveSegmentEvent` typing updated for the new fields. |
+| `apps/desktop/src-tauri/src/commands/mod.rs` | Register the new module. |
+
+---
+
+## Phase 33 — Live-Stop Hardening and Live-Tier Protection
+
+### What was built
+
+A second pass on the scheduler-driven pipeline that closes the remaining "audio outlives the session boundary" and "backfill starves live" cases that Phase 32 didn't fully resolve. Branch: `feat/backfill-scheduler` (the same branch that landed Phase 32; this work was layered on before merge).
+
+### The bugs being fixed
+
+- **Soft stop boundary.** Phase 32 made backfill durable across stop, but the *live* path had no hard endpoint — `extract_since` and the WAV flush both read to the current ring-buffer write head, so any audio captured between the user pressing stop and the loop noticing the signal ended up in the final transcript and the session WAV. Final transcripts and final files therefore varied by host load.
+- **Backfill head-of-line blocking.** The scheduler honored priority *between* jobs, but a single backfill chunk that started executing was non-preemptible — sidecar inference can't be interrupted — so a 30-second backfill chunk would block live for ~30 s of wall time even with `Live > Backfill` priority.
+- **Head-drop on live overrun.** When inference fell behind real time and the live extraction window exceeded the per-chunk cap, the loop dropped the head of the extraction (the oldest audio) and re-anchored to the cap window. Audio was silently lost; pressure was reported as a "head-drop cap" counter that conflated lost audio with slow inference.
+- **WAV sample-rate mismatch.** Session WAV creation always preferred whichever ring buffer happened to exist (mic-first), so a `SystemOnly` capture wrote a WAV at the mic device's nominal rate and played back too fast or too slow.
+- **Lag metric clobbered backwards.** `SessionCounters::latest_completed_audio_offset_seconds` was overwritten on every successful chunk regardless of audio-time ordering; a backfill chunk for older audio landing after a live chunk for newer audio reset the counter, and the lag display reported `now − backfill_offset` instead of the true near-zero lag.
+
+### Key decisions
+
+- **Stop snapshots `BufferPositions` plus a short tail grace.** `stop_live_transcription` builds a `StopRequest { stop_positions, deadline }` from the ring buffer's current write positions extended by a brief tail window. Final live extraction, the WAV flush, and stream-health restarts are all bounded to that snapshot — samples written after the snapshot are ignored for the stopped session. The tail grace exists so a sentence ending in flight at the moment of stop still gets transcribed.
+- **Dual stop-signal kept on purpose.** The oneshot `stop_request` payload (carrying the bounded `BufferPositions`) and a separate atomic checkpoint flag are *both* set on stop. The oneshot delivers the bounded positions to the loop body; the atomic is what cooperative paths (poll loop, drain sites) check. They are intentionally separate — unifying them would either lose the carried positions or force every checkpoint site to await the oneshot.
+- **Backfill split into 5 s quanta before submission.** Every backfill chunk is sliced into ≤5 s pieces before going on the scheduler queue. A backfill job that has started executing at the sidecar still runs to completion (sidecar inference is not preemptible), but the worst-case delay a fresh `Live` job sees while a `Backfill` job is in-flight is now bounded by one quantum instead of by the full chunk.
+- **Live-busy gate.** The scheduler grows an explicit `live_busy` flag the live loop sets while speech is active, live/final chunks are in flight, a force-drain backlog exists, or the stop path is dispatching bounded live tails. `Backfill` jobs queue normally during that window but only dispatch when the gate clears; `FinalFlush` and `Live` jobs ignore the gate and dispatch by priority.
+- **Replace head-drop with preserved-drain.** When the extracted live audio exceeds the per-chunk cap, the loop now extracts the oldest contiguous max-size range, preserves the remaining cursor, and force-drains one chunk per source per tick without growing the scheduler queue. The chunks reach the sidecar in order and no audio is dropped. The `live_drain_backlog_chunks` / `live_drain_backlog_seconds` fields on `LiveTranscriptionStatus` and the `drain_backlog_seconds` field on the pressure event surface this catch-up state.
+- **`lag_seconds` and `live_drain_backlog_seconds` are not the same thing.** Both can appear non-zero, both can be zero independently, and they answer different questions — `lag_seconds` is wall-clock minus latest committed audio offset (folds in chunking, queueing, and inference); `live_drain_backlog_seconds` is the source-local already-captured audio still queued for the live tier. ARCHITECTURE.md § "Transcription Scheduler" documents the distinction so a future maintainer doesn't unify them.
+- **Session WAV sample rate keyed off `CaptureSource`.** New `AudioManager::output_sample_rate_for(source)` consults the buffer matching the configured source (`MicOnly` → mic, `SystemOnly` → system, `Mixed` → mic when present, system otherwise). The live-transcription path passes its config rather than relying on whichever buffer exists.
+- **`latest_completed_audio_offset_seconds` is monotonic in audio time.** The counter is now updated with `max`, not `=`, so a late backfill chunk for older audio cannot clobber the live tier's high-water mark. The field's rustdoc states the invariant.
+- **Bounded reads in `yapstack-audio`.** `AudioRingBuffer::snapshot_range(from, until)` and `AudioManager::extract_since_until(positions, limits, ...)` were added so the stop path doesn't read implicitly to the live write head. Both report `overrun: bool` when the requested start has already been overwritten.
+
+### Files Changed
+
+| File | Change |
+|------|--------|
+| `apps/desktop/src-tauri/src/commands/live_transcription.rs` | Stop request now carries bounded positions + tail grace; final live extraction, WAV flush, and stream-health work are gated on the stop boundary. Live overrun replaced with preserved-drain. Backfill submitter slices into 5 s quanta and submits behind a live-busy gate. WAV creation uses `output_sample_rate_for(source)`. `SessionCounters::latest_completed_audio_offset_seconds` writes via `max`. |
+| `apps/desktop/src-tauri/src/commands/transcription_scheduler.rs` | New `live_busy` gate at the scheduler level. |
+| `crates/yapstack-audio/src/ring_buffer.rs` | New `snapshot_range(from, until) -> AudioRangeSnapshot { samples, start_pos, end_pos, overrun }`. |
+| `crates/yapstack-audio/src/manager.rs` | New `output_sample_rate_for(source)` and `extract_since_until(positions, limits, source, mix_config) -> Option<BoundedExtraction>`. |
+| `crates/yapstack-audio/src/capture.rs` | New `BoundedExtraction { samples, sample_rate, new_positions, overrun }`. |
+| `crates/yapstack-audio/src/lib.rs` | Re-export the new types. |
+| `crates/yapstack-audio/src/export.rs` | LAME `set_output_sample_rate` pinned to the input WAV's rate; new `test_mp3_output_sample_rate_matches_input_at_low_bitrate` regression. |
+| `apps/desktop/src/lib/types.ts`, `lib/events.ts`, `components/StatusPopover.tsx`, `stores/appStore.ts`, `test/tauri-mocks.ts` | Status surface swapped from head-drop cap counter to drain-backlog fields. |
+| `.github/ISSUE_TEMPLATE/_drafts/chronic_drain_backlog.md` | Drafts a follow-up ticket: under sustained slow inference the drain backlog grows unbounded; needs a chronic-drain response policy (graceful warning, eventual stop, or queue cap). Out of scope for this phase. |
+
+### What was learned
+
+- **A "stop" signal is two things.** A *boundary* (where in the audio stream the session ends) and a *deadline* (when the loop should stop doing work). Earlier code conflated them — the loop "stopped" by exiting, and the boundary was wherever the ring buffer happened to be at exit time. Splitting them out (the oneshot carries the boundary, the atomic carries the deadline) is what made stop deterministic.
+- **Sidecar inference being non-preemptible has consequences past the scheduler queue.** Phase 32 fixed the queue ordering; Phase 33 added time-slicing because once a job dispatches, priority no longer matters until it finishes. Five seconds was picked empirically as the sweet spot — short enough to bound live delay, long enough that VAD-aligned chunk boundaries still dominate.
+- **Pressure metrics that conflate two phenomena are worse than two metrics that can each be zero.** The old "drops" counter mixed "audio was lost" with "inference is slow" — both were rare individually, but the combined symptom was indecipherable. Splitting into `lag_seconds` (end-to-end delay) and `live_drain_backlog_seconds` (live-tier-specific catch-up) made each interpretable.
+
+---
+
+## Phase 34 — Dictation Volume Ducking (macOS) + Sidecar Crate Restructure
+
+### What was built
+
+Two unrelated changes that landed together in the alpha.8 cycle.
+
+1. **Dictation volume ducking.** Opt-in setting on the Dictation tab that lowers the system output volume to a configured target while a dictation is recording, then restores it the instant the user releases the key. Settings: `dictationDuckEnabled: bool` (default false), `dictationDuckTarget: number` in `[0, 1]` (default 0.2). New backend module `apps/desktop/src-tauri/src/system_volume.rs` (mechanism, ~590 lines incl. tests) plus `commands/system_volume.rs` (Tauri surface, ~40 lines).
+2. **`yapstack-sidecar` → `yapstack-transcription-sidecar` rename.** Behaviour-preserving repackaging that makes room for additional sidecar workers (e.g. an embedding sidecar) without naming ambiguity. Crate, binary, build script, and tracing target all renamed; a wrapper `scripts/build-sidecars.sh` now fans out to per-worker scripts.
+
+### Bugs / needs being addressed
+
+- **Ducking:** users on earphone playback have no clean way to talk over a podcast or call to dictate a quick note. Pausing media is often inconvenient, and reaching for the volume keys mid-sentence doesn't work well with hold-to-talk. Ducking gives them an automatic "duck while talking, restore on release" loop.
+- **Sidecar rename:** the project now anticipates a second sidecar worker (embeddings for semantic search). Naming the existing one `yapstack-sidecar` would have made the new one's name awkward (`yapstack-embedding-sidecar` next to a generic `yapstack-sidecar`). The rename was the cheapest moment to do this — before any external integration depends on the binary name.
+
+### Key decisions
+
+- **Mechanism / policy split.** The `system_volume` module knows nothing about dictation; it exposes generic `apply_duck(target)` / `restore()` and a `(device_id, level)` snapshot. Dictation is the only caller today, but a future feature (e.g. duck during meetings) can reuse the mechanism without entangling the volume code with dictation state. Reflected in module names: `system_volume::apply_duck` (mechanism) vs. `apply_volume_duck` (Tauri command, also generic).
+- **Snapshot the *device*, not just the level.** macOS users routinely change default output mid-session (Bluetooth headphone connect, wired DAC unplug). Restoring "the system default to level X" would silently leave the *originally* ducked device stuck at the ducked level forever. The snapshot is `(device_id, prior_level)` and restore explicitly targets that device.
+- **Never raises.** If the user's current level is already at or below the target, `apply_duck` is a no-op and no snapshot is captured. Without this guard, a user dictating with the volume already at 5% would have it bumped to the 20% target on apply and *stay there* on restore.
+- **Apply / restore hold the snapshot mutex across the volume set.** Concurrent ops can't interleave into a state where the snapshot is updated but the volume isn't (or vice versa) — that would either leak the ducked level forever or strand a snapshot of an already-ducked level as if it were the user's prior choice.
+- **Frontend serializes apply/restore across cycles via two pending-promise refs.** A fast stop-then-start cycle (release key, immediately re-press) could otherwise interleave a `restore` and the next `apply` at the backend and strand the volume — the second `apply` would snapshot the ducked level as if it were the user's choice. The hook awaits any pending duck before invoking restore, and any pending restore before invoking duck. Restore is also awaited on the post-duck-error and slot-disappeared paths *before* `setIdle` so a rapid retry can't start a new duck on top of an unresolved restore.
+- **`RunEvent::Exit` calls `restore` as a final safety net.** If the app crashes or quits while ducked, the user shouldn't have to reboot to get their volume back. Belt-and-braces in addition to the per-cycle restore in the dictation hook.
+- **Errors are swallowed at the command boundary.** Volume control is a UX nicety, not load-bearing for the dictation flow — a CoreAudio failure shouldn't surface as a toast or block the recording. The mechanism still returns `Result` so internal callers can log; the Tauri surface just `warn!`s and returns `()`.
+- **`build-sidecars.sh` is a wrapper, not a replacement.** Per-worker scripts (`build-transcription-sidecar.sh` today) keep their own concerns; the wrapper is for callers that want "build everything" without knowing the worker list. Existing npm scripts (`build:sidecar[:dev]`) kept as compat aliases pointing at the per-worker script.
+
+### Files Changed
+
+| File | Change |
+|------|--------|
+| `apps/desktop/src-tauri/src/system_volume.rs` | New — `apply_duck`, `restore`, `(device_id, level)` snapshot, macOS CoreAudio FFI, no-op stubs for non-macOS, with property test–style coverage of the snapshot/restore lifecycle (device-swap mid-duck, already-quieter no-op, repeated-apply behaviour, restore without snapshot). |
+| `apps/desktop/src-tauri/src/commands/system_volume.rs` | New — Tauri surface (`apply_volume_duck`, `restore_volume`); error-swallowing wrappers. |
+| `apps/desktop/src-tauri/src/lib.rs` | Register the new module + commands; add `RunEvent::Exit` safety-net restore. |
+| `apps/desktop/src-tauri/src/logging.rs` | Update tracing target name for the renamed sidecar crate. |
+| `apps/desktop/src/components/settings/DictationTab.tsx` | New "Lower system volume during dictation" toggle + target slider. |
+| `apps/desktop/src/hooks/useDictation.ts` | Apply/restore at the recording-phase boundaries; cycle serialization via `pendingDuckRef` / `pendingRestoreRef`; restore on error and slot-disappeared paths awaited before `setIdle`. |
+| `apps/desktop/src/stores/appStore.ts` | New persisted settings: `dictationDuckEnabled`, `dictationDuckTarget`. |
+| `apps/desktop/src/lib/types.ts`, `apps/desktop/src/lib/tauri.ts` | Generated bindings for the new commands. |
+| `crates/yapstack-sidecar/` → `crates/yapstack-transcription-sidecar/` | Crate renamed; binary name follows. |
+| `scripts/build-sidecar.sh` → `scripts/build-transcription-sidecar.sh` | Per-worker build script renamed. |
+| `scripts/build-sidecars.sh` | New wrapper that fans out to per-worker build scripts. |
+| `apps/desktop/src-tauri/tauri.conf.json` | `externalBin` updated for the renamed binary. |
+| `.github/workflows/ci-checks.yml`, `.github/workflows/release.yml`, `scripts/build-dmg.sh` | Updated for the renamed crate / script. |
+| `crates/yapstack-transcription/src/client.rs` | Tracing target renamed to `yapstack_transcription_sidecar`. |
+| `README.md`, `AGENTS.md`, `docs/ARCHITECTURE.md`, `docs/API_REFERENCE.md`, `docs/AGENT_GUIDE.md`, `docs/DEVELOPMENT.md`, `docs/GLOSSARY.md`, `docs/UBIQUITOUS_LANGUAGE.md`, `docs/PRINCIPLES.md`, `docs/adr/0001-adopt-agents-md.md` | Sidecar references updated; ARCHITECTURE/API_REFERENCE/GLOSSARY also gain ducking surface; README alpha warning made generic. |
+
+### What was learned
+
+- **Ducking is an interaction problem, not just a system call.** The CoreAudio side is two FFI calls; the hard parts were all in the lifecycle: device swap mid-duck, hold-to-talk press/release storms, app crash mid-duck, post-restore retry races. Most of `system_volume.rs`'s test coverage and the dictation hook's promise refs exist to handle those, not the volume change itself.
+- **Generic command surface paid for itself in 24 hours.** The `apply_volume_duck` / `restore_volume` commands were written generic from the start (they take `target: f32`, not `dictation_settings: ...`). When a follow-up came up about ducking during full sessions too, no backend change was needed — same commands, different policy caller.
 
 ## What's Not Yet Built
 

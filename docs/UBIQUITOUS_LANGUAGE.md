@@ -24,7 +24,7 @@ The shared vocabulary for YapStack. Use these terms verbatim in code, docs, PRDs
 | --------------------- | --------------------------------------------------------------------------------------------------------------------- | ------------------------- |
 | **Session**           | A bounded recording with its captured audio and ordered list of segments, persisted in SQLite.                        | Recording, take           |
 | **Segment**           | A single transcribed utterance with start/end timestamps, text, confidence, and optional speaker ID.                  | Chunk, transcript line    |
-| **Backfill**          | Re-transcription of audio captured *before* live transcription started, emitted as `is_backfill: true` segments.      | History, replay, prefill  |
+| **Backfill**          | Re-transcription of audio captured *before* live transcription started, emitted as `origin: "backfill"` segments.     | History, replay, prefill  |
 | **Session audio**       | The umbrella term for a session's persisted audio. A session's audio is composed of one or more **Session audio parts**; each part is one file in the user's chosen format. | Audio file, recording file |
 | **Session audio part**  | One ordered slice of a session's audio (`part_index = 0, 1, 2…`), persisted as one file at `{audio_dir}/{session_id}.{part_index}.{wav\|mp3}` and recorded as one row in `session_audio_parts`. A fresh session has `part_index = 0`; resuming appends `part_index = N`. The DB row is the durable source of truth — written from Rust at finalize time before any FE event. | Audio chunk, segment audio |
 | **Resume**              | Continuing a paused/stopped session by appending a new **Session audio part** rather than overwriting. Segments and parts both continue numbering from where the prior run left off. | Re-open, re-record         |
@@ -42,7 +42,9 @@ The shared vocabulary for YapStack. Use these terms verbatim in code, docs, PRDs
 | **Engine**          | A transcription backend the sidecar can run: `Whisper` or `Parakeet`. Selected per session.                         | Backend, model type, provider   |
 | **Variant**         | A specific weights bundle for an engine, e.g. a Parakeet TDT v3 directory.                                          | Model size, flavor              |
 | **Model**           | The downloaded weights on disk: a single ggml file (Whisper) or a multi-file ONNX directory (Parakeet, Sortformer). | Weights, checkpoint             |
-| **Sidecar**         | The standalone `yapstack-sidecar` process that hosts the chosen engine and speaks JSON-line IPC.                    | Worker, helper process          |
+| **Sidecar**         | A standalone worker process spawned by the desktop app that speaks JSON-line IPC. Generic pattern; today the only sidecar is the transcription sidecar. | Worker, helper process          |
+| **Transcription sidecar** | The `yapstack-transcription-sidecar` binary that hosts Whisper or Parakeet for one session.                   | Whisper sidecar, ASR worker     |
+| **Embedding sidecar** | Reserved name (`yapstack-embedding-sidecar`) for the planned embedding worker. Not yet implemented.              | Vectorizer, embedder            |
 | **Execution provider** | The ORT runtime backend for Parakeet: `cpu`, `coreml`, or `webgpu`. Chosen per spawn via `YAPSTACK_PARAKEET_ACCEL`. | Accelerator, EP only            |
 | **Transcription client** | The Rust-side handle that owns the sidecar process and sends transcribe/load/shutdown requests.                | Whisper client (legacy alias)   |
 
@@ -78,6 +80,8 @@ The shared vocabulary for YapStack. Use these terms verbatim in code, docs, PRDs
 | **Dictation activation mode** | How a slot's hotkey behaves: `hold` (push-to-talk, recording while held) or `toggle` (press to start/stop).          | Trigger mode              |
 | **Output action**          | What to do with a finished dictation: `paste` into the focused field, `clipboard`, or `new-note` (create a session).    | Insertion mode, sink      |
 | **Dictation history**      | Persisted log of past dictation outputs, distinct from sessions and exposed in the sidebar's `dictation` list filter.   | Recents                   |
+| **Volume duck**            | Temporarily lowering the system output volume during a dictation so the user can hear themselves over earphone playback. Snapshots `(device_id, prior_level)` at apply and restores that *original* device on release, so a default-output change mid-duck (AirPods connect, USB DAC unplug) doesn't strand the original device at the ducked level. Only ever lowers — never raises. macOS only; no-op elsewhere. | Volume lowering, attenuation |
+| **Duck target**            | The volume level (0.0–1.0) the system output is reduced to during a **Volume duck**. Persisted as `dictationDuckTarget`. | Duck level, ducked volume |
 
 ## Shortcuts and permissions
 
@@ -163,7 +167,7 @@ The shared vocabulary for YapStack. Use these terms verbatim in code, docs, PRDs
 
 > **Dev:** "And **backfill** segments — do they go through the same path?"
 
-> **Domain expert:** "Same transcribe call, just flagged `is_backfill: true`. Backfill seeds the prompt context once at start; after that, **prompt decay** can clear it like any other run."
+> **Domain expert:** "Same transcribe call, just submitted to the **scheduler** at `Backfill` priority and emitted with `origin: \"backfill\"`. Backfill seeds the prompt context once at start; after that, **prompt decay** can clear it like any other run."
 
 > **Dev:** "When a **Session** finalizes, what determines whether we end up with a WAV or an MP3?"
 

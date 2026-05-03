@@ -4,7 +4,7 @@ use tracing::{debug, error, warn};
 use yapstack_common::config::AudioConfig;
 use yapstack_common::types::{CaptureSource, CaptureState, CaptureStatus, PermissionStatus};
 
-use crate::capture::{BufferPositions, SeparateExtraction};
+use crate::capture::{BoundedExtraction, BufferPositions, SeparateExtraction};
 use crate::error::AudioError;
 use crate::mic::MicrophoneCapture;
 use crate::mixer::{self, MixConfig};
@@ -329,6 +329,29 @@ impl AudioManager {
             .unwrap_or(yapstack_common::config::DEFAULT_SAMPLE_RATE)
     }
 
+    /// Returns the output sample rate callers should use for persisted audio
+    /// generated from the configured capture source.
+    pub fn output_sample_rate_for(&self, source: CaptureSource) -> u32 {
+        match source {
+            CaptureSource::MicOnly => self
+                .mic_buffer
+                .as_ref()
+                .map(|b| b.sample_rate())
+                .unwrap_or_else(|| self.active_sample_rate()),
+            CaptureSource::SystemOnly => self
+                .system_buffer
+                .as_ref()
+                .map(|b| b.sample_rate())
+                .unwrap_or_else(|| self.active_sample_rate()),
+            CaptureSource::Mixed => self
+                .mic_buffer
+                .as_ref()
+                .map(|b| b.sample_rate())
+                .or_else(|| self.system_buffer.as_ref().map(|b| b.sample_rate()))
+                .unwrap_or_else(|| self.active_sample_rate()),
+        }
+    }
+
     /// Resample system audio to match mic rate (if different) and mix to mono.
     /// Used by `extract_since`. On resample failure, logs the error and falls
     /// back to mic-only audio.
@@ -513,6 +536,117 @@ impl AudioManager {
             system_pos: sys_new_pos,
         };
         Some((samples, sample_rate, new_positions))
+    }
+
+    /// Extracts mono audio from active buffers within a bounded cursor range.
+    ///
+    /// This is the stop-safe sibling of [`extract_since`]: returned samples
+    /// never include audio written after `limits`, even if capture continues
+    /// while the caller is finalizing a session.
+    ///
+    /// In `Mixed` mode, if one source has more mono duration than the other,
+    /// the returned `new_positions` give the longer source's surplus back so
+    /// paired streams stay time-aligned. Callers that loop with those returned
+    /// positions may re-read that surplus later; stop/final-flush callers
+    /// should treat the result as a single bounded drain.
+    pub fn extract_since_until(
+        &self,
+        positions: &BufferPositions,
+        limits: &BufferPositions,
+        source: CaptureSource,
+        mix_config: Option<&MixConfig>,
+    ) -> Option<BoundedExtraction> {
+        let (mic_mono, mut mic_new_pos, mic_overrun) = self
+            .mic_buffer
+            .as_ref()
+            .map(|b| {
+                let snap = b.snapshot_range(positions.mic_pos, limits.mic_pos);
+                let mono = mixer::deinterleave_to_mono(&snap.samples, b.channels()).into_owned();
+                (Some(mono), snap.end_pos, snap.overrun)
+            })
+            .unwrap_or((None, positions.mic_pos, false));
+
+        let (system_mono, mut sys_new_pos, sys_overrun) = self
+            .system_buffer
+            .as_ref()
+            .map(|b| {
+                let snap = b.snapshot_range(positions.system_pos, limits.system_pos);
+                let mono = mixer::deinterleave_to_mono(&snap.samples, b.channels()).into_owned();
+                (Some(mono), snap.end_pos, snap.overrun)
+            })
+            .unwrap_or((None, positions.system_pos, false));
+
+        let sample_rate = self.output_sample_rate_for(source);
+
+        let samples = match source {
+            CaptureSource::MicOnly => {
+                let m = mic_mono.unwrap_or_default();
+                if m.is_empty() {
+                    return None;
+                }
+                m
+            }
+            CaptureSource::SystemOnly => {
+                let s = system_mono.unwrap_or_default();
+                if s.is_empty() {
+                    return None;
+                }
+                s
+            }
+            CaptureSource::Mixed => {
+                let m = mic_mono.unwrap_or_default();
+                let s = system_mono.unwrap_or_default();
+                if m.is_empty() && s.is_empty() {
+                    return None;
+                }
+                if !m.is_empty() && !s.is_empty() {
+                    let (mic_buf, sys_buf) =
+                        match (self.mic_buffer.as_ref(), self.system_buffer.as_ref()) {
+                            (Some(mb), Some(sb)) => (mb, sb),
+                            _ => return None,
+                        };
+                    let mic_sr = mic_buf.sample_rate() as f64;
+                    let sys_sr = sys_buf.sample_rate() as f64;
+
+                    if mic_sr != sys_sr || m.len() != s.len() {
+                        let mic_time = m.len() as f64 / mic_sr;
+                        let sys_time = s.len() as f64 / sys_sr;
+                        let min_time = mic_time.min(sys_time);
+
+                        let mic_keep = ((min_time * mic_sr) as usize).min(m.len());
+                        let sys_keep = ((min_time * sys_sr) as usize).min(s.len());
+
+                        let mic_surplus = m.len() - mic_keep;
+                        let sys_surplus = s.len() - sys_keep;
+
+                        mic_new_pos =
+                            mic_new_pos.saturating_sub(mic_surplus * mic_buf.channels() as usize);
+                        sys_new_pos =
+                            sys_new_pos.saturating_sub(sys_surplus * sys_buf.channels() as usize);
+
+                        self.resample_and_mix(&m[..mic_keep], &s[..sys_keep], mix_config)
+                    } else {
+                        self.resample_and_mix(&m, &s, mix_config)
+                    }
+                } else {
+                    self.resample_and_mix(&m, &s, mix_config)
+                }
+            }
+        };
+
+        if samples.is_empty() {
+            return None;
+        }
+
+        Some(BoundedExtraction {
+            samples,
+            sample_rate,
+            new_positions: BufferPositions {
+                mic_pos: mic_new_pos,
+                system_pos: sys_new_pos,
+            },
+            overrun: mic_overrun || sys_overrun,
+        })
     }
 
     // --- Separate extraction API ---
@@ -996,6 +1130,81 @@ mod tests {
         assert_eq!(samples.len(), 4);
         assert_eq!(sample_rate, 16000);
         assert_eq!(new_pos.mic_pos, 4);
+    }
+
+    #[test]
+    fn test_extract_since_until_excludes_post_limit_samples() {
+        let mut manager = AudioManager::new();
+        let buffer = Arc::new(AudioRingBuffer::new(100, 16000, 1));
+        manager.mic_buffer = Some(Arc::clone(&buffer));
+
+        buffer.write(&(0..10).map(|i| i as f32).collect::<Vec<_>>());
+        let stop_positions = manager.buffer_positions();
+        buffer.write(&(10..20).map(|i| i as f32).collect::<Vec<_>>());
+
+        let result = manager
+            .extract_since_until(
+                &BufferPositions {
+                    mic_pos: 0,
+                    system_pos: 0,
+                },
+                &stop_positions,
+                CaptureSource::MicOnly,
+                None,
+            )
+            .expect("bounded extraction should return pre-stop samples");
+
+        assert_eq!(
+            result.samples,
+            (0..10).map(|i| i as f32).collect::<Vec<_>>()
+        );
+        assert_eq!(result.sample_rate, 16000);
+        assert_eq!(result.new_positions.mic_pos, stop_positions.mic_pos);
+        assert!(!result.overrun);
+    }
+
+    #[test]
+    fn test_extract_since_until_reports_overrun() {
+        let mut manager = AudioManager::new();
+        let buffer = Arc::new(AudioRingBuffer::new(5, 16000, 1));
+        manager.mic_buffer = Some(Arc::clone(&buffer));
+
+        buffer.write(&(0..10).map(|i| i as f32).collect::<Vec<_>>());
+        let result = manager
+            .extract_since_until(
+                &BufferPositions {
+                    mic_pos: 0,
+                    system_pos: 0,
+                },
+                &BufferPositions {
+                    mic_pos: 8,
+                    system_pos: 0,
+                },
+                CaptureSource::MicOnly,
+                None,
+            )
+            .expect("bounded extraction should return retained samples");
+
+        assert_eq!(result.samples, vec![5.0, 6.0, 7.0]);
+        assert_eq!(result.new_positions.mic_pos, 8);
+        assert!(result.overrun);
+    }
+
+    #[test]
+    fn test_output_sample_rate_for_source_prefers_requested_source() {
+        let mut manager = AudioManager::new();
+        manager.mic_buffer = Some(Arc::new(AudioRingBuffer::with_duration(10.0, 16000, 1)));
+        manager.system_buffer = Some(Arc::new(AudioRingBuffer::with_duration(10.0, 48000, 2)));
+
+        assert_eq!(
+            manager.output_sample_rate_for(CaptureSource::MicOnly),
+            16000
+        );
+        assert_eq!(
+            manager.output_sample_rate_for(CaptureSource::SystemOnly),
+            48000
+        );
+        assert_eq!(manager.output_sample_rate_for(CaptureSource::Mixed), 16000);
     }
 
     #[test]

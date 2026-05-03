@@ -19,7 +19,7 @@ Files affected:
 - `.github/copilot-instructions.md` — stub: "see AGENTS.md".
 - `.cursor/rules/main.mdc` — stub with `alwaysApply: true` pointing to AGENTS.md.
 
-Nested `AGENTS.md` files are allowed when subsystem-specific rules genuinely differ (e.g., a future `crates/yapstack-sidecar/AGENTS.md` covering the feature-flag matrix). They override the root for files within their scope per the agents.md spec.
+Nested `AGENTS.md` files are allowed when subsystem-specific rules genuinely differ (e.g., a future `crates/yapstack-transcription-sidecar/AGENTS.md` covering the feature-flag matrix). They override the root for files within their scope per the agents.md spec.
 
 ## Consequences
 

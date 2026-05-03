@@ -103,9 +103,13 @@ export type LiveTranscriptionPressureEvent = {
   /** Null when the transcribe call failed or wall_ms was 0. */
   rtfx: number | null;
   engine: "Whisper" | "Parakeet";
-  is_backfill: boolean;
+  /** Priority tier the scheduler ran this chunk at. Distinguishes live
+   *  throughput from backfill drain rate in pressure telemetry. */
+  origin: "live" | "backfill" | "final_flush";
   /** Null when the chunk did not produce a successful transcription. */
   lag_seconds: number | null;
+  /** Source-local preserved audio backlog after this live chunk dispatch. */
+  drain_backlog_seconds: number;
   /** Resolved accelerator (e.g. "webgpu", "coreml", "cpu", "metal", "cuda")
    *  captured at session start. Null if the sidecar didn't report one. */
   accel: string | null;
@@ -145,6 +149,7 @@ export const EVENTS = {
   LIVE_TRANSCRIPTION_WARNING: "live-transcription-warning",
   LIVE_TRANSCRIPTION_PRESSURE: "live-transcription-pressure",
   TRANSCRIPTION_ENGINE_LOADED: "transcription-engine-loaded",
+  TRANSCRIPTION_ENGINE_DROPPED: "transcription-engine-dropped",
   BACKFILL_COMPLETE: "backfill-complete",
   SESSION_PART_READY: "session-part-ready",
   SESSION_WAV_ERROR: "session-wav-error",
@@ -179,6 +184,7 @@ type EventPayloadMap = {
   [EVENTS.LIVE_TRANSCRIPTION_WARNING]: LiveTranscriptionWarningEvent;
   [EVENTS.LIVE_TRANSCRIPTION_PRESSURE]: LiveTranscriptionPressureEvent;
   [EVENTS.TRANSCRIPTION_ENGINE_LOADED]: TranscriptionEngineLoadedEvent;
+  [EVENTS.TRANSCRIPTION_ENGINE_DROPPED]: void;
   [EVENTS.BACKFILL_COMPLETE]: void;
   [EVENTS.SESSION_PART_READY]: SessionPartReadyEvent;
   [EVENTS.SESSION_WAV_ERROR]: SessionWavErrorEvent;

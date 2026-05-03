@@ -293,6 +293,24 @@ async clipboardPaste(text: string, autoPaste: boolean) : Promise<Result<null, Co
     else return { status: "error", error: e  as any };
 }
 },
+/**
+ * Lower the system output volume to `target` (0.0..=1.0). No-op if the
+ * current volume is already at or below `target`. Snapshots the prior
+ * value so `restore_volume` can put it back. Always succeeds from the
+ * frontend's perspective: any platform-level error is logged and
+ * swallowed because volume control is a UX nicety, not load-bearing for
+ * the caller.
+ */
+async applyVolumeDuck(target: number) : Promise<void> {
+    await TAURI_INVOKE("apply_volume_duck", { target });
+},
+/**
+ * Restore the volume snapshotted at the most recent `apply_volume_duck`
+ * call. No-op if no snapshot is held.
+ */
+async restoreVolume() : Promise<void> {
+    await TAURI_INVOKE("restore_volume");
+},
 async checkScreenCapturePermission() : Promise<Result<ScreenCapturePermissionDto, CommandError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("check_screen_capture_permission") };
@@ -453,7 +471,8 @@ backfill_seconds: number;
  */
 source: CaptureSourceDto; 
 /**
- * Mix config for Mixed source (kept for backward compat).
+ * Mix config for `Mixed` source. `None` for `MicOnly` / `SystemOnly`,
+ * where mixing is undefined.
  */
 mix_config: MixConfigDto | null; 
 /**
@@ -537,12 +556,16 @@ export type LiveTranscriptionStatus = { phase: LiveTranscriptionPhase; chunks_pr
  */
 lag_seconds: number | null; 
 /**
- * Cumulative count of times the Stage-3 head-drop cap fired this
- * session. Stays 0 in normal operation — any non-zero value indicates
- * audio was discarded to keep the inference queue bounded. Removed in
- * Stage 3 when cap-and-drop is replaced with queue-and-drain.
+ * Count of live chunks that left already-captured audio to drain after
+ * dispatching one max-duration slice. Non-zero means the sidecar fell
+ * behind real time, but audio is being preserved rather than dropped.
  */
-cap_fired_total: number }
+live_drain_backlog_chunks: number; 
+/**
+ * Latest backlog depth after a live max-duration slice was dispatched.
+ * Returns to 0.0 once the live force-drain path catches up.
+ */
+live_drain_backlog_seconds: number }
 /**
  * One log line visible to the frontend. `ts_ms` is unix-epoch milliseconds.
  */

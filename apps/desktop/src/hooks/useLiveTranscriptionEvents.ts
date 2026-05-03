@@ -38,6 +38,24 @@ export function useLiveTranscriptionEvents() {
           },
         });
       }),
+      listenEvent(EVENTS.TRANSCRIPTION_ENGINE_DROPPED, () => {
+        // The scheduler timed out on shutdown and dropped the transcription
+        // client rather than handing it back to shared state (the aborted
+        // worker may still hold an in-flight clone). Without this signal
+        // `enginePhase` would stay `ready` while shared state is empty, and
+        // the next session start would pass the FE readiness check only to
+        // fail with `NotInitialized` in the backend. Reset and re-run
+        // autoSetup so the next user action finds a healthy engine.
+        useAppStore.setState({
+          enginePhase: "idle",
+          engineError: null,
+          loadedEngineInfo: null,
+        });
+        toast.warning("Transcription engine restarting…", {
+          id: "engine-restart",
+        });
+        useAppStore.getState().autoSetup();
+      }),
       listenEvent(EVENTS.LIVE_TRANSCRIPTION_WARNING, (payload) => {
         toast.warning(payload.message, { id: "transcription-warning" });
       }),

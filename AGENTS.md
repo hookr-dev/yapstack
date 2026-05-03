@@ -51,16 +51,16 @@ cargo test -p yapstack-audio -- --ignored          # hardware-dependent
 pnpm lint                                  # cargo fmt + clippy + ESLint
 pnpm typecheck                             # tsc
 
-# Feature-flag sidecar builds
-cargo build -p yapstack-sidecar --features whisper                                # whisper-rs (needs cmake)
-cargo build -p yapstack-sidecar --features parakeet                               # parakeet-rs + ort + Sortformer
-cargo build -p yapstack-sidecar --features parakeet,coreml                        # + ORT-CoreML EP
-cargo build -p yapstack-sidecar --features parakeet,webgpu                        # + ORT-WebGPU EP
-cargo build -p yapstack-sidecar --features whisper,parakeet,metal,coreml,webgpu   # full Apple
+# Feature-flag transcription sidecar builds
+cargo build -p yapstack-transcription-sidecar --features whisper                                # whisper-rs (needs cmake)
+cargo build -p yapstack-transcription-sidecar --features parakeet                               # parakeet-rs + ort + Sortformer
+cargo build -p yapstack-transcription-sidecar --features parakeet,coreml                        # + ORT-CoreML EP
+cargo build -p yapstack-transcription-sidecar --features parakeet,webgpu                        # + ORT-WebGPU EP
+cargo build -p yapstack-transcription-sidecar --features whisper,parakeet,metal,coreml,webgpu   # full Apple
 
 # Sidecar release/dev build (copies into apps/desktop/src-tauri/binaries/ + mirrors target/debug/)
-./scripts/build-sidecar.sh
-./scripts/build-sidecar.sh --dev
+./scripts/build-sidecars.sh
+./scripts/build-sidecars.sh --dev
 
 # Force a Parakeet ORT EP at runtime (overrides Auto)
 YAPSTACK_PARAKEET_ACCEL=cpu|coreml|webgpu pnpm tauri dev
