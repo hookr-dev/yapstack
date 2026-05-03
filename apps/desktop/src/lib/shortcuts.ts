@@ -10,6 +10,8 @@ export interface ShortcutDefinition {
   isGlobal?: boolean;
   /** Dictation shortcuts use hold-to-talk (Pressed/Released). */
   isDictation?: boolean;
+  /** When true, the shortcut still fires while focus is in an input or editor. */
+  allowInEditor?: boolean;
 }
 
 export const SHORTCUT_CATEGORIES: ShortcutCategory[] = [
@@ -61,13 +63,15 @@ export const SHORTCUTS: ShortcutDefinition[] = [
     description: "Open search / command palette",
     category: "Navigation",
     defaultBinding: "mod+k",
+    allowInEditor: true,
   },
   {
     id: "toggle-sidebar",
     label: "Toggle Sidebar",
     description: "Show or hide the sidebar",
     category: "Navigation",
-    defaultBinding: "mod+b",
+    defaultBinding: "mod+\\",
+    allowInEditor: true,
   },
   {
     id: "open-settings",
@@ -75,6 +79,7 @@ export const SHORTCUTS: ShortcutDefinition[] = [
     description: "Open settings panel",
     category: "Navigation",
     defaultBinding: "mod+,",
+    allowInEditor: true,
   },
   {
     id: "go-back",
@@ -82,6 +87,7 @@ export const SHORTCUTS: ShortcutDefinition[] = [
     description: "Return to note list",
     category: "Navigation",
     defaultBinding: "escape",
+    // No allowInEditor: Escape dismisses menus / clears selection in the editor.
   },
   {
     id: "filter-all",
@@ -89,6 +95,7 @@ export const SHORTCUTS: ShortcutDefinition[] = [
     description: "Show all sessions",
     category: "Navigation",
     defaultBinding: "mod+1",
+    allowInEditor: true,
   },
   {
     id: "filter-pinned",
@@ -96,6 +103,7 @@ export const SHORTCUTS: ShortcutDefinition[] = [
     description: "Show pinned notes",
     category: "Navigation",
     defaultBinding: "mod+2",
+    allowInEditor: true,
   },
   {
     id: "new-note",
@@ -103,6 +111,7 @@ export const SHORTCUTS: ShortcutDefinition[] = [
     description: "Create a new manual note",
     category: "Editor",
     defaultBinding: "mod+n",
+    allowInEditor: true,
   },
   {
     id: "stop-recording",
@@ -110,6 +119,7 @@ export const SHORTCUTS: ShortcutDefinition[] = [
     description: "Stop active recording (in-app)",
     category: "Recording",
     defaultBinding: "mod+.",
+    allowInEditor: true,
   },
   {
     id: "toggle-chat",
@@ -117,6 +127,7 @@ export const SHORTCUTS: ShortcutDefinition[] = [
     description: "Open or close AI chat bar",
     category: "Editor",
     defaultBinding: "mod+j",
+    allowInEditor: true,
   },
   {
     id: "pin-session",
@@ -124,6 +135,7 @@ export const SHORTCUTS: ShortcutDefinition[] = [
     description: "Pin or unpin current session",
     category: "Editor",
     defaultBinding: "mod+d",
+    allowInEditor: true,
   },
   {
     id: "delete-session",
@@ -131,6 +143,7 @@ export const SHORTCUTS: ShortcutDefinition[] = [
     description: "Delete the current session",
     category: "Editor",
     defaultBinding: "mod+backspace",
+    // No allowInEditor: mod+backspace deletes to line start in the editor.
   },
 ];
 

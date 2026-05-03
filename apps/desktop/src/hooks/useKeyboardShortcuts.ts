@@ -1,6 +1,6 @@
 import { useEffect } from "react";
 import { useAppStore } from "@/stores/appStore";
-import { SHORTCUTS, getBinding, eventToBinding, shortcutCaptureActive } from "@/lib/shortcuts";
+import { SHORTCUTS, SHORTCUT_MAP, getBinding, eventToBinding, shortcutCaptureActive } from "@/lib/shortcuts";
 import { trackShortcutUsed } from "@/lib/analytics";
 
 /** Returns true if focus is in an input, textarea, or contenteditable element. */
@@ -37,8 +37,6 @@ export function useKeyboardShortcuts() {
     function handler(e: KeyboardEvent) {
       // Skip when shortcut capture is active (rebinding in settings)
       if (shortcutCaptureActive.current) return;
-      // Skip all shortcuts when typing in inputs
-      if (isInputFocused()) return;
 
       const binding = eventToBinding(e);
       if (!binding) return;
@@ -46,69 +44,77 @@ export function useKeyboardShortcuts() {
       const id = bindingMap.get(binding);
       if (!id) return;
 
+      if (isInputFocused() && !SHORTCUT_MAP.get(id)?.allowInEditor) return;
+
       trackShortcutUsed({ shortcut_id: id });
       const s = useAppStore.getState();
 
+      // stopPropagation also prevents TipTap's keymap from firing on the same key.
+      const consume = () => {
+        e.preventDefault();
+        e.stopPropagation();
+      };
+
       switch (id) {
         case "command-palette":
-          e.preventDefault();
+          consume();
           window.dispatchEvent(new CustomEvent("yapstack:toggle-search"));
           break;
 
         case "toggle-sidebar":
-          e.preventDefault();
+          consume();
           s.toggleSidebar();
           break;
 
         case "open-settings":
-          e.preventDefault();
+          consume();
           s.navigateTo("settings");
           break;
 
         case "go-back":
           // Only go back from detail or settings
           if (s.currentView === "note-detail" || s.currentView === "settings") {
-            e.preventDefault();
+            consume();
             s.navigateTo("note-list");
           }
           break;
 
         case "filter-all":
-          e.preventDefault();
+          consume();
           s.setListFilter({ type: "all" });
           s.navigateTo("note-list");
           break;
 
         case "filter-pinned":
-          e.preventDefault();
+          consume();
           s.setListFilter({ type: "pinned" });
           s.navigateTo("note-list");
           break;
 
         case "new-note":
-          e.preventDefault();
+          consume();
           s.createManualNote();
           break;
 
         case "stop-recording":
-          e.preventDefault();
+          consume();
           s.stopActiveSession();
           break;
 
         case "toggle-chat":
-          e.preventDefault();
+          consume();
           window.dispatchEvent(new CustomEvent("yapstack:toggle-chat"));
           break;
 
         case "pin-session":
-          e.preventDefault();
+          consume();
           if (s.currentView === "note-detail" && s.selectedSessionId) {
             s.togglePin(s.selectedSessionId);
           }
           break;
 
         case "delete-session":
-          e.preventDefault();
+          consume();
           if (s.currentView === "note-detail" && s.selectedSessionId) {
             window.dispatchEvent(new CustomEvent("yapstack:confirm-delete-session"));
           }
