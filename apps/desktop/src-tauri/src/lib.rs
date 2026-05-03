@@ -13,6 +13,7 @@ const WINDOW_RECORDING_INDICATOR: &str = "recording-indicator";
 use std::collections::HashSet;
 use std::io::{Read as _, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
@@ -487,6 +488,7 @@ pub fn run() {
         .manage(Arc::new(Mutex::new(None::<TrayIcon>)) as TrayState)
         .manage(Arc::new(Mutex::new(None)) as commands::live_transcription::LiveTranscriptionState)
         .manage(Arc::new(StdMutex::new(None)) as commands::live_transcription::RestartIntentInbox)
+        .manage(Arc::new(AtomicBool::new(false)) as commands::live_transcription::LiveSessionPresent)
         .manage(Arc::new(StdMutex::new(HashSet::<PathBuf>::new())) as TrustedAudioDirs)
         .manage({
             let (tx, _) = watch::channel(false);
@@ -641,6 +643,9 @@ pub fn run() {
                 app.handle().clone(),
                 app.state::<AudioManagerState>().inner().clone(),
                 app.state::<commands::live_transcription::RestartIntentInbox>()
+                    .inner()
+                    .clone(),
+                app.state::<commands::live_transcription::LiveSessionPresent>()
                     .inner()
                     .clone(),
                 app.state::<ShutdownSignal>().subscribe(),

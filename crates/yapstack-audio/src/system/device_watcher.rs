@@ -52,7 +52,7 @@
 //! The mitigation lives one layer up in the Tauri-side
 //! `device_broker`: events are coalesced in a 250 ms debounce window
 //! and the resulting restart is gated on
-//! [`crate::device::is_device_alive`] for the new default's UID, with
+//! [`crate::device::device_liveness`] for the new default's UID, with
 //! one re-check at +250 ms before falling through. We also subscribe
 //! to `kAudioHardwarePropertyDevices` (device-list change) because it
 //! fires earlier than the default-device properties on some macOS
@@ -134,9 +134,9 @@ mod imp {
     use coreaudio_sys::{
         kAudioHardwarePropertyDefaultInputDevice, kAudioHardwarePropertyDefaultOutputDevice,
         kAudioHardwarePropertyDefaultSystemOutputDevice, kAudioHardwarePropertyDevices,
-        kAudioObjectPropertyElementMain, kAudioObjectPropertyScopeGlobal,
-        kAudioObjectSystemObject, noErr, AudioObjectAddPropertyListener, AudioObjectID,
-        AudioObjectPropertyAddress, AudioObjectPropertySelector, AudioObjectRemovePropertyListener,
+        kAudioObjectPropertyElementMain, kAudioObjectPropertyScopeGlobal, kAudioObjectSystemObject,
+        noErr, AudioObjectAddPropertyListener, AudioObjectID, AudioObjectPropertyAddress,
+        AudioObjectPropertySelector, AudioObjectRemovePropertyListener,
     };
     use std::ffi::c_void;
     use tracing::{info, warn};
@@ -365,5 +365,4 @@ mod tests {
             DeviceEvent::DeviceListChanged
         );
     }
-
 }

@@ -9,9 +9,7 @@ use crate::error::AudioError;
 use crate::mic::MicrophoneCapture;
 use crate::mixer::{self, MixConfig};
 use crate::ring_buffer::{AudioRingBuffer, RingBufferInfo, SharedAudioRingBuffer};
-use crate::system::device_watcher::{
-    DefaultDeviceKind, DefaultDeviceWatcher, DeviceEventSink,
-};
+use crate::system::device_watcher::{DefaultDeviceKind, DefaultDeviceWatcher, DeviceEventSink};
 use crate::system::SystemAudioCapture;
 use crate::DeviceStreamConfig;
 
@@ -70,6 +68,37 @@ pub struct RestartReport {
     pub bound_device_name: Option<String>,
 }
 
+/// Compute the post-restart `bound_is_default` flag. Pure for testability.
+///
+/// * `PreserveBinding`: the bind intent did not shift (e.g. watchdog
+///   reboot of a known-correct binding) → preserve the prior flag.
+/// * `FollowDefault`: the caller asked to track the current default →
+///   set `true` iff the post-restart bound id matches the resolved
+///   default-input id. A stored-id/name fallback that isn't currently
+///   the default keeps explicit semantics so future
+///   `DefaultInputChanged` events are honored.
+///
+/// `resolve_default` is a closure so the helper stays unit-testable
+/// without touching cpal — production calls pass
+/// `device::default_input_device`.
+fn derive_bound_is_default<F>(
+    target: RestartTarget,
+    prior: bool,
+    resolve_default: F,
+    new_device_id: Option<&str>,
+) -> bool
+where
+    F: FnOnce() -> Option<String>,
+{
+    match target {
+        RestartTarget::PreserveBinding => prior,
+        RestartTarget::FollowDefault => match (resolve_default(), new_device_id) {
+            (Some(d), Some(n)) => d == n,
+            _ => false,
+        },
+    }
+}
+
 pub struct AudioManager {
     config: AudioConfig,
     mic: MicrophoneCapture,
@@ -114,9 +143,10 @@ impl AudioManager {
         let output_watcher = DefaultDeviceWatcher::new(DefaultDeviceKind::Output)
             .map_err(|e| warn!("output default-device listener unavailable: {}", e))
             .ok();
-        let system_output_watcher = DefaultDeviceWatcher::new(DefaultDeviceKind::DefaultSystemOutput)
-            .map_err(|e| warn!("default-system-output listener unavailable: {}", e))
-            .ok();
+        let system_output_watcher =
+            DefaultDeviceWatcher::new(DefaultDeviceKind::DefaultSystemOutput)
+                .map_err(|e| warn!("default-system-output listener unavailable: {}", e))
+                .ok();
         let devices_watcher = DefaultDeviceWatcher::new(DefaultDeviceKind::Devices)
             .map_err(|e| warn!("device-list listener unavailable: {}", e))
             .ok();
@@ -807,10 +837,18 @@ impl AudioManager {
         let stored_id = self.mic.last_device_id().map(|s| s.to_string());
         let stored_name = self.mic.last_device_name().map(|s| s.to_string());
         let old_device_id = stored_id.clone();
-        // Preserve the original bind intent: if the session started in
-        // default-tracking mode, restarts via the stored-id fallback should
-        // not quietly flip us into explicit-device mode.
-        let preserve_bound_is_default = self.mic.bound_is_default();
+        // For `PreserveBinding` the bind intent hasn't shifted (the
+        // watchdog is just rebooting a known-correct binding), so we
+        // restore the prior flag verbatim. For `FollowDefault` the
+        // caller has explicitly asked to track the default; we derive
+        // the flag from "did we actually land on the current default?"
+        // — a stored-id fallback that isn't currently the default keeps
+        // explicit semantics so a future `DefaultInputChanged` is acted
+        // on. Without this, an explicit-mic disappearance that fell
+        // over to the system default would still report `bound_is_default
+        // = false`, and subsequent default changes would be silently
+        // ignored (the broker's explicit-pick branch would skip failover).
+        let prior_bound_is_default = self.mic.bound_is_default();
 
         // Stop the old stream (ignore errors — it may already be dead)
         let _ = self.mic.stop();
@@ -851,8 +889,18 @@ impl AudioManager {
             match self.mic.start(candidate, Arc::clone(&buffer)) {
                 Ok(()) => {
                     self.mic_buffer = Some(buffer);
-                    self.mic.set_bound_is_default(preserve_bound_is_default);
                     let new_device_id = self.mic.last_device_id().map(|s| s.to_string());
+                    let bound_is_default = derive_bound_is_default(
+                        target,
+                        prior_bound_is_default,
+                        || {
+                            crate::device::default_input_device()
+                                .ok()
+                                .and_then(|info| info.id)
+                        },
+                        new_device_id.as_deref(),
+                    );
+                    self.mic.set_bound_is_default(bound_is_default);
                     let same_device = old_device_id.is_some() && old_device_id == new_device_id;
                     let bound_device_name = self.mic.last_device_name().map(|s| s.to_string());
                     return Ok(RestartReport {
@@ -985,7 +1033,6 @@ impl AudioManager {
     pub fn mic_bound_device(&self) -> Option<&str> {
         self.mic.last_device_name()
     }
-
 }
 
 impl Default for AudioManager {
@@ -1379,8 +1426,9 @@ mod tests {
 
     #[test]
     fn test_mic_set_bound_is_default_setter() {
-        // Used by restart_mic to preserve the original bind intent through
-        // a candidate fallback — verify the setter round-trips.
+        // `restart_mic` writes the derived flag through this setter at
+        // the end of a successful restart (`derive_bound_is_default`
+        // computes the value); the setter must round-trip both states.
         let mut manager = AudioManager::new();
         manager.mic.set_bound_is_default(true);
         assert!(manager.mic.bound_is_default());
@@ -1491,14 +1539,78 @@ mod tests {
         // priority, not coverage.
         let preserve_labels: Vec<&str> = preserve_order.iter().map(|(_, l)| *l).collect();
         let follow_labels: Vec<&str> = follow_order.iter().map(|(_, l)| *l).collect();
-        for label in [
-            "original device id",
-            "stored device name",
-            "system default",
-        ] {
+        for label in ["original device id", "stored device name", "system default"] {
             assert!(preserve_labels.contains(&label));
             assert!(follow_labels.contains(&label));
         }
+    }
+
+    #[test]
+    fn derive_bound_is_default_preserve_binding_keeps_prior_flag() {
+        // Watchdog/stream-error path: stay explicit if we were explicit,
+        // stay default-tracking if we were default-tracking. The bind
+        // intent has not shifted under PreserveBinding.
+        assert!(derive_bound_is_default(
+            RestartTarget::PreserveBinding,
+            true,
+            || Some("ignored".into()),
+            Some("dev-A"),
+        ));
+        assert!(!derive_bound_is_default(
+            RestartTarget::PreserveBinding,
+            false,
+            || Some("dev-A".into()),
+            Some("dev-A"),
+        ));
+    }
+
+    #[test]
+    fn derive_bound_is_default_follow_default_landed_on_default() {
+        // Broker-driven failover: an explicit pick disappeared, restart
+        // bound to the new system default. We must mark
+        // bound_is_default=true so subsequent DefaultInputChanged events
+        // are honored — this is the regression fix for the case the
+        // ultrareview flagged.
+        assert!(derive_bound_is_default(
+            RestartTarget::FollowDefault,
+            false, // was explicit before disappearance
+            || Some("default-id".into()),
+            Some("default-id"),
+        ));
+    }
+
+    #[test]
+    fn derive_bound_is_default_follow_default_fell_through_to_stored() {
+        // FollowDefault probed the new default first but it was
+        // unresolvable, so the restart fell through to the stored-id
+        // candidate which happens not to be the current default. Keep
+        // explicit semantics so the next DefaultInputChanged still
+        // triggers a failover attempt.
+        assert!(!derive_bound_is_default(
+            RestartTarget::FollowDefault,
+            true,
+            || Some("default-id".into()),
+            Some("stored-id"),
+        ));
+    }
+
+    #[test]
+    fn derive_bound_is_default_follow_default_default_unresolvable() {
+        // default_input_device() failed (no devices available) — be
+        // conservative and report explicit (false), so a future
+        // DefaultInputChanged event still gets a chance to act.
+        assert!(!derive_bound_is_default(
+            RestartTarget::FollowDefault,
+            true,
+            || None,
+            Some("any-id"),
+        ));
+        assert!(!derive_bound_is_default(
+            RestartTarget::FollowDefault,
+            true,
+            || Some("default-id".into()),
+            None,
+        ));
     }
 
     #[test]

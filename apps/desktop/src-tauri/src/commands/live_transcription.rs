@@ -531,10 +531,29 @@ pub type LiveTranscriptionState = Arc<Mutex<Option<LiveTranscriptionRuntime>>>;
 pub type RestartIntentSender = tokio::sync::mpsc::UnboundedSender<RestartIntent>;
 pub type RestartIntentInbox = Arc<StdMutex<Option<RestartIntentSender>>>;
 
+/// Cross-task signal: `true` while a live transcription loop is running
+/// or in its stop-bounded final-flush tail; `false` only when no live
+/// loop owns audio cursors / ring buffers.
+///
+/// The device broker reads this to decide whether a device-change event
+/// should route through the [`RestartIntentInbox`] (when `true`) or be
+/// dispatched directly via `AudioManager::restart_*` (when `false`).
+/// Inbox-presence alone is not sufficient because `stop_live_transcription`
+/// clears the inbox before the loop has finished its final flush; a
+/// device-change event in that window would otherwise see "no inbox" and
+/// race the loop's snapshotted stop positions by replacing the ring
+/// buffer mid-finalize.
+///
+/// The flag is set `true` by `start_live_transcription` before spawning
+/// the loop and cleared `false` by the spawned task itself once the loop
+/// has fully returned (after scheduler shutdown). This bridges the
+/// stop/finalize window.
+pub type LiveSessionPresent = Arc<AtomicBool>;
+
 /// What the broker is asking the live loop to do. Narrow on purpose —
 /// the loop doesn't need a "target device id" because it always rebinds
 /// to the current OS default (the broker has already debounced and
-/// confirmed `is_device_alive`).
+/// confirmed liveness via `device_liveness`).
 #[derive(Debug, Clone, Copy)]
 pub enum RestartIntent {
     Mic,
@@ -1935,9 +1954,9 @@ async fn check_stream_health(
         // broker, which routes a `RestartIntent` into the live loop's
         // inbox (Phase 6). The remaining symptom-based watchdog
         // (Layers 1-2: cpal error flag + write-pos stall) lives here.
-        let in_cooldown = source.last_restart_at.is_some_and(|t| {
-            t.elapsed() < Duration::from_secs_f32(STREAM_RESTART_COOLDOWN_SECS)
-        });
+        let in_cooldown = source
+            .last_restart_at
+            .is_some_and(|t| t.elapsed() < Duration::from_secs_f32(STREAM_RESTART_COOLDOWN_SECS));
         if in_cooldown {
             continue;
         }
@@ -2332,7 +2351,7 @@ async fn live_transcription_loop(
             // honor it by calling the existing `attempt_source_restart`
             // path (which resets `SourceVadState` cursor + Silero state
             // and updates the session-WAV flush position). The broker
-            // has already debounced and `is_device_alive`-gated, so we
+            // has already debounced and `device_liveness`-gated, so we
             // don't re-check those here. Returning `None` signals "not
             // a stop", so the loop continues normally on the next tick.
             Some(intent) = restart_intent_rx.recv() => {
@@ -2491,9 +2510,7 @@ async fn live_transcription_loop(
         // session naturally winds down through the standard cleanup
         // path (drain in-flight chunks, finalize WAV, etc.).
         if mixed_fail_fast {
-            warn!(
-                "Mixed capture: terminal restart failure on a Source — ending session"
-            );
+            warn!("Mixed capture: terminal restart failure on a Source — ending session");
             let mut manager = audio_state.lock().await;
             let _ = manager.stop_all();
             drop(manager);
@@ -3946,6 +3963,7 @@ pub async fn start_live_transcription(
     transcription_state: tauri::State<'_, TranscriptionClientState>,
     live_state: tauri::State<'_, LiveTranscriptionState>,
     restart_intent_inbox: tauri::State<'_, RestartIntentInbox>,
+    live_session_present: tauri::State<'_, LiveSessionPresent>,
     app_handle: AppHandle,
     mut config: LiveTranscriptionConfig,
 ) -> Result<LiveTranscriptionStartResult, CommandError> {
@@ -4285,6 +4303,16 @@ pub async fn start_live_transcription(
         latest_completed_audio_offset_seconds: None,
     }));
 
+    // Mark the live session as present *before* spawning the loop. The
+    // device broker reads this to decide whether a device-change event
+    // should route through the inbox (live loop will handle it) or
+    // direct-restart through `AudioManager` (no live loop owns audio
+    // state). The spawned task clears the flag in its tail so the
+    // signal stays `true` across the entire stop/finalize window —
+    // including after `stop_live_transcription` clears the inbox.
+    live_session_present.inner().store(true, Ordering::Release);
+    let live_session_present_for_task = Arc::clone(live_session_present.inner());
+
     let task_handle = tokio::spawn({
         let ctx_guard = ctx.clone();
         let counters_for_loop = counters.clone();
@@ -4336,6 +4364,15 @@ pub async fn start_live_transcription(
                     },
                 );
             }
+
+            // Final step: signal the broker that no live session owns
+            // audio state any more, so a device-change event arriving
+            // after this point is safe to dispatch directly via
+            // `AudioManager`. Held until *after* scheduler shutdown and
+            // any panic-handler emit so the flag bridges the entire
+            // teardown — that's the whole reason we don't piggyback on
+            // inbox-presence.
+            live_session_present_for_task.store(false, Ordering::Release);
         }
     });
 

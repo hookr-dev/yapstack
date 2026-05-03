@@ -275,18 +275,47 @@ pub(crate) fn resolve_input_device(id: Option<&str>, name: Option<&str>) -> Resu
         .ok_or(AudioError::NoDevicesAvailable)
 }
 
-/// Returns `true` if a device with the given Core Audio UID is currently
-/// alive on the system. Returns `true` (fail-open) on non-macOS, when the
-/// UID is not present, or when any Core Audio call fails — a stale "yes"
-/// is harmless because the actual restart attempt will surface the error
-/// via the existing stream-health path.
+/// Tri-state liveness result. Distinguishes "the UID is genuinely missing
+/// from the system" from "we couldn't tell" so callers can apply the right
+/// policy. The two real call sites differ:
 ///
-/// `uid` is the bare `kAudioDevicePropertyDeviceUID` string. cpal's
-/// `device.id().to_string()` returns the form `"CoreAudio:<uid>"`; callers
-/// passing that form should strip the `CoreAudio:` prefix first. A
-/// non-matching string falls into the fail-open path.
+/// * The debounce/alive-gate (used to absorb the AirPods/Bluetooth revert
+///   window) wants the lenient policy: proceed on `Alive` or `Unknown`,
+///   wait+retry on `Dead`/`Absent`. A genuine "couldn't tell" should not
+///   stall a restart that the actual cpal `start` call will validate
+///   anyway.
+/// * The explicit-pick liveness check (used to decide whether to skip
+///   failover when the user picked a non-default mic) wants the strict
+///   policy: only skip failover on `Alive`. `Absent`/`Dead`/`Unknown`
+///   should all fail over to the new default — uncertainty about whether
+///   an explicit device disappeared is safer to resolve as "fail over".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceLiveness {
+    /// The UID was found in `kAudioHardwarePropertyDevices` and
+    /// `kAudioDevicePropertyDeviceIsAlive` reported true.
+    Alive,
+    /// The UID was found but `IsAlive` reported false. Rare on macOS but
+    /// the API permits it.
+    Dead,
+    /// Device list enumeration succeeded and no device with this UID was
+    /// present. The device is genuinely gone.
+    Absent,
+    /// Could not determine liveness — Core Audio enumeration or per-device
+    /// query failed, the UID is empty, or this is a non-macOS build.
+    Unknown,
+}
+
+/// Probe the Core Audio liveness of a device by its `kAudioDevicePropertyDeviceUID`.
+///
+/// `uid` is the bare UID string (NOT cpal's `"coreaudio:<uid>"` form —
+/// callers must strip that prefix first; an unstripped id falls into
+/// `Absent`).
+///
+/// Returns [`DeviceLiveness::Unknown`] on non-macOS or when any Core
+/// Audio call fails. See [`DeviceLiveness`] for the distinction between
+/// `Absent` and `Unknown`.
 #[cfg(target_os = "macos")]
-pub fn is_device_alive(uid: &str) -> bool {
+pub fn device_liveness(uid: &str) -> DeviceLiveness {
     use coreaudio_sys::{
         kAudioDevicePropertyDeviceIsAlive, kAudioDevicePropertyDeviceUID,
         kAudioHardwarePropertyDevices, kAudioObjectPropertyElementMain,
@@ -297,6 +326,10 @@ pub fn is_device_alive(uid: &str) -> bool {
     };
     use std::ffi::c_void;
     use std::mem::size_of;
+
+    if uid.is_empty() {
+        return DeviceLiveness::Unknown;
+    }
 
     unsafe {
         // Step 1: enumerate all device IDs.
@@ -314,7 +347,7 @@ pub fn is_device_alive(uid: &str) -> bool {
             &mut size,
         );
         if status != noErr as i32 || size == 0 {
-            return true;
+            return DeviceLiveness::Unknown;
         }
         let count = (size as usize) / size_of::<AudioObjectID>();
         let mut device_ids: Vec<AudioObjectID> = vec![0; count];
@@ -328,7 +361,7 @@ pub fn is_device_alive(uid: &str) -> bool {
             device_ids.as_mut_ptr() as *mut c_void,
         );
         if status != noErr as i32 {
-            return true;
+            return DeviceLiveness::Unknown;
         }
 
         // Step 2: scan for a device whose UID matches.
@@ -368,8 +401,7 @@ pub fn is_device_alive(uid: &str) -> bool {
                 continue;
             }
             let nul = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
-            let bytes: &[u8] =
-                std::slice::from_raw_parts(buf.as_ptr() as *const u8, nul);
+            let bytes: &[u8] = std::slice::from_raw_parts(buf.as_ptr() as *const u8, nul);
             let device_uid = match std::str::from_utf8(bytes) {
                 Ok(s) => s,
                 Err(_) => continue,
@@ -395,21 +427,23 @@ pub fn is_device_alive(uid: &str) -> bool {
                 &mut alive as *mut u32 as *mut c_void,
             );
             if s != noErr as i32 {
-                return true;
+                return DeviceLiveness::Unknown;
             }
-            return alive != 0;
+            return if alive != 0 {
+                DeviceLiveness::Alive
+            } else {
+                DeviceLiveness::Dead
+            };
         }
 
-        // UID not present in the system's device list — fail-open. The actual
-        // restart attempt will surface a real error if the caller tries to
-        // bind to it.
-        true
+        // Enumeration succeeded but no device with this UID exists.
+        DeviceLiveness::Absent
     }
 }
 
 #[cfg(not(target_os = "macos"))]
-pub fn is_device_alive(_uid: &str) -> bool {
-    true
+pub fn device_liveness(_uid: &str) -> DeviceLiveness {
+    DeviceLiveness::Unknown
 }
 
 #[cfg(test)]
@@ -495,34 +529,43 @@ mod tests {
     }
 
     #[test]
-    fn is_device_alive_returns_true_for_unknown_uid() {
-        // Fail-open contract: unknown UID returns true. The actual restart
-        // attempt is the authoritative check.
-        assert!(is_device_alive("definitely-not-a-real-device-uid-zzzz"));
+    #[cfg_attr(not(target_os = "macos"), ignore)] // Non-macOS stub: always Unknown.
+    fn device_liveness_unknown_uid_is_absent_on_macos() {
+        // On macOS, enumeration succeeds and the UID is genuinely missing.
+        // This is the bug fix for the prior fail-open behavior: the
+        // explicit-pick branch in the broker depends on Absent ≠ Alive
+        // so an unplugged USB mic actually triggers failover.
+        assert_eq!(
+            device_liveness("definitely-not-a-real-device-uid-zzzz"),
+            DeviceLiveness::Absent
+        );
     }
 
     #[test]
-    fn is_device_alive_returns_true_for_empty_uid() {
-        assert!(is_device_alive(""));
+    fn device_liveness_empty_uid_is_unknown() {
+        // An empty UID is a caller bug, not a real query — surface it
+        // as Unknown so the lenient policy proceeds and the strict
+        // policy fails over (both safer than asserting Absent).
+        assert_eq!(device_liveness(""), DeviceLiveness::Unknown);
     }
 
     #[test]
-    #[cfg_attr(not(target_os = "macos"), ignore)] // Non-macOS: trivially true.
-    #[ignore] // Requires hardware to assert true on a known UID.
-    fn is_device_alive_returns_true_for_default_input() {
+    #[cfg_attr(not(target_os = "macos"), ignore)] // Non-macOS stub: always Unknown.
+    #[ignore] // Requires hardware to assert Alive on a known UID.
+    fn device_liveness_alive_for_default_input() {
         let host = cpal::default_host();
         let dev = host.default_input_device().expect("need default input");
         let id = device_id(&dev).expect("default input has an id");
-        // cpal's `HostId::Display` lowercases the host name, so the
-        // formatted id looks like `"coreaudio:<uid>"`. Strip the
-        // lowercase prefix to get the bare UID kAudioDevicePropertyDeviceUID
-        // returns. (Regression note: this test was previously stripping
-        // the CamelCase form and silently no-op'd on the real cpal output;
-        // the fix in strip_cpal_prefix kept this assertion accurate.)
         let uid = id
             .strip_prefix("coreaudio:")
             .expect("macOS device id format is 'coreaudio:<uid>'");
-        assert!(is_device_alive(uid));
+        assert_eq!(device_liveness(uid), DeviceLiveness::Alive);
+    }
+
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn device_liveness_non_macos_is_unknown() {
+        assert_eq!(device_liveness("anything"), DeviceLiveness::Unknown);
     }
 
     #[test]

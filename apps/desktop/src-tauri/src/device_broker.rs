@@ -22,6 +22,7 @@
 //!
 //! Phase 4: emits FE events. Phase 6 adds restart routing.
 
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -35,7 +36,7 @@ use yapstack_audio::system::device_watcher::{DeviceEvent, DeviceEventSink};
 
 use crate::commands::audio::AudioDeviceInfoDto;
 use crate::commands::audio::AudioManagerState;
-use crate::commands::live_transcription::{RestartIntent, RestartIntentInbox};
+use crate::commands::live_transcription::{LiveSessionPresent, RestartIntent, RestartIntentInbox};
 
 /// Coalescing window for bursty Core Audio listener events. 250 ms is
 /// short enough that the FE sees device changes almost instantly and
@@ -69,6 +70,7 @@ pub fn spawn(
     app_handle: AppHandle,
     audio_state: AudioManagerState,
     restart_intent_inbox: RestartIntentInbox,
+    live_session_present: LiveSessionPresent,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
     tauri::async_runtime::spawn(async move {
@@ -121,7 +123,14 @@ pub fn spawn(
                             state.default_output,
                             state.default_system_output,
                         );
-                        flush(&app_handle, &audio_state, &restart_intent_inbox, state).await;
+                        flush(
+                            &app_handle,
+                            &audio_state,
+                            &restart_intent_inbox,
+                            &live_session_present,
+                            state,
+                        )
+                        .await;
                     }
                     None => {
                         info!("device broker: sink detached, exiting");
@@ -167,11 +176,17 @@ async fn flush(
     app_handle: &AppHandle,
     audio_state: &AudioManagerState,
     inbox: &RestartIntentInbox,
+    live_session_present: &LiveSessionPresent,
     state: CollapsedEvents,
 ) {
-    // FE event emission — distinct kinds so the UI can show what
-    // actually changed.
-    if state.device_list {
+    // FE event emission. Re-enumerate the device list whenever any
+    // default-* kind changed, not only when DeviceListChanged fires —
+    // `is_default` flags on the existing dtos go stale otherwise and
+    // the FE store falls behind reality. (Even cheap on macOS: a
+    // single Core Audio enumeration round-trip.)
+    let any_default_changed =
+        state.default_input || state.default_output || state.default_system_output;
+    if state.device_list || any_default_changed {
         emit_devices_changed(app_handle);
     }
     if state.default_input {
@@ -188,14 +203,14 @@ async fn flush(
     // System restart. Each dispatch is `IsAlive`-gated to absorb the
     // AirPods/Bluetooth revert window.
     if state.default_input {
-        dispatch_mic_restart(audio_state, inbox).await;
+        dispatch_mic_restart(audio_state, inbox, live_session_present).await;
     }
     if state.default_output || state.default_system_output {
-        dispatch_system_restart(audio_state, inbox).await;
+        dispatch_system_restart(audio_state, inbox, live_session_present).await;
     }
 }
 
-/// Resolve the current default-input UID, gate on `is_device_alive`
+/// Resolve the current default-input UID, gate on `device_liveness`
 /// (one re-check at +250 ms if the device isn't yet alive), then route
 /// the restart through the live-transcription inbox if a session is
 /// running, or call `AudioManager::restart_mic` directly if a non-live
@@ -207,7 +222,11 @@ async fn flush(
 /// `DeviceListChanged` instead and is handled by FE reconciliation
 /// resetting `selectedMicDeviceId` to follow-default. No-op when no
 /// Capture is active.
-async fn dispatch_mic_restart(audio_state: &AudioManagerState, inbox: &RestartIntentInbox) {
+async fn dispatch_mic_restart(
+    audio_state: &AudioManagerState,
+    inbox: &RestartIntentInbox,
+    live_session_present: &LiveSessionPresent,
+) {
     // Snapshot bound state under the lock; release before doing any
     // sleep/gate work so we don't block other async actors.
     let (bound_is_default, bound_uid, mic_active) = {
@@ -221,13 +240,19 @@ async fn dispatch_mic_restart(audio_state: &AudioManagerState, inbox: &RestartIn
     };
 
     if !bound_is_default {
-        // Explicit pick. Honor it as long as the device is still alive.
-        let still_alive = bound_uid
+        // Explicit pick — strict policy. Honor the pick *only* when we
+        // can confirm Alive. `Absent` (genuinely unplugged), `Dead`, and
+        // `Unknown` (couldn't tell) all fall through to failover, since
+        // it is safer to bind to the new default than to silently keep
+        // a stale binding when an explicit pick may have disappeared.
+        // See `DeviceLiveness` docs in the audio crate for the policy
+        // split between this call site and `alive_gate`.
+        let liveness = bound_uid
             .as_deref()
             .map(strip_cpal_prefix)
-            .map(yapstack_audio::device::is_device_alive)
-            .unwrap_or(false);
-        if still_alive {
+            .map(yapstack_audio::device::device_liveness)
+            .unwrap_or(yapstack_audio::device::DeviceLiveness::Unknown);
+        if liveness == yapstack_audio::device::DeviceLiveness::Alive {
             info!(
                 "device broker: explicit Mic ({:?}) still alive — ignoring DefaultInputChanged",
                 bound_uid
@@ -235,8 +260,8 @@ async fn dispatch_mic_restart(audio_state: &AudioManagerState, inbox: &RestartIn
             return;
         }
         info!(
-            "device broker: explicit Mic ({:?}) is gone — falling over to system default",
-            bound_uid
+            "device broker: explicit Mic ({:?}) liveness={:?} — falling over to system default",
+            bound_uid, liveness
         );
     }
 
@@ -246,18 +271,33 @@ async fn dispatch_mic_restart(audio_state: &AudioManagerState, inbox: &RestartIn
     alive_gate(default_uid.as_deref()).await;
 
     let sent = try_send_intent(inbox, RestartIntent::Mic);
-    if sent {
-        info!(
-            "device broker: routing Mic failover to live loop (from={:?} → to={:?})",
-            bound_uid, default_name
-        );
-        return;
+    let decision = decide_routing(
+        sent,
+        live_session_present.load(Ordering::Acquire),
+        mic_active,
+    );
+    match decision {
+        RoutingDecision::SentThroughInbox => {
+            info!(
+                "device broker: routing Mic failover to live loop (from={:?} → to={:?})",
+                bound_uid, default_name
+            );
+            return;
+        }
+        RoutingDecision::SkipMidStop => {
+            debug!(
+                "device broker: live session in teardown — skipping direct Mic restart \
+                 (event arrived after inbox close, before loop exit)"
+            );
+            return;
+        }
+        RoutingDecision::SkipNoActiveCapture => {
+            debug!("device broker: no live loop and Mic not active — skipping restart");
+            return;
+        }
+        RoutingDecision::DirectRestart => {}
     }
 
-    if !mic_active {
-        debug!("device broker: no live loop and Mic not active — skipping restart");
-        return;
-    }
     let mut manager = audio_state.lock().await;
     match manager.restart_mic(yapstack_audio::manager::RestartTarget::FollowDefault) {
         Ok(report) => {
@@ -278,31 +318,49 @@ async fn dispatch_mic_restart(audio_state: &AudioManagerState, inbox: &RestartIn
     }
 }
 
-async fn dispatch_system_restart(audio_state: &AudioManagerState, inbox: &RestartIntentInbox) {
+async fn dispatch_system_restart(
+    audio_state: &AudioManagerState,
+    inbox: &RestartIntentInbox,
+    live_session_present: &LiveSessionPresent,
+) {
     let new_default = yapstack_audio::device::default_output_device().ok();
     let default_uid = new_default.as_ref().and_then(|info| info.id.clone());
     let default_name = new_default.as_ref().map(|info| info.name.clone());
-    let bound_name = {
+    let (bound_name, system_active) = {
         let manager = audio_state.lock().await;
-        manager.system_audio_bound_device().map(|s| s.to_string())
+        (
+            manager.system_audio_bound_device().map(|s| s.to_string()),
+            manager.status().system_audio_active,
+        )
     };
     alive_gate(default_uid.as_deref()).await;
 
     let sent = try_send_intent(inbox, RestartIntent::System);
-    if sent {
-        info!(
-            "device broker: routing System failover to live loop (from={:?} → to={:?})",
-            bound_name, default_name
-        );
-        return;
+    let decision = decide_routing(
+        sent,
+        live_session_present.load(Ordering::Acquire),
+        system_active,
+    );
+    match decision {
+        RoutingDecision::SentThroughInbox => {
+            info!(
+                "device broker: routing System failover to live loop (from={:?} → to={:?})",
+                bound_name, default_name
+            );
+            return;
+        }
+        RoutingDecision::SkipMidStop => {
+            debug!("device broker: live session in teardown — skipping direct System restart");
+            return;
+        }
+        RoutingDecision::SkipNoActiveCapture => {
+            debug!("device broker: no live loop and System audio not active — skipping restart");
+            return;
+        }
+        RoutingDecision::DirectRestart => {}
     }
 
     let mut manager = audio_state.lock().await;
-    let status = manager.status();
-    if !status.system_audio_active {
-        debug!("device broker: no live loop and System audio not active — skipping restart");
-        return;
-    }
     match manager.restart_system_audio() {
         Ok(report) => {
             if report.same_device {
@@ -322,10 +380,52 @@ async fn dispatch_system_restart(audio_state: &AudioManagerState, inbox: &Restar
     }
 }
 
+/// Outcome of `decide_routing` — the four mutually exclusive choices
+/// the broker can make once it has tried the live-loop inbox.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RoutingDecision {
+    /// Intent was queued through the inbox; the live loop will handle it.
+    SentThroughInbox,
+    /// Inbox is empty but a live session is mid-stop. Skip — a direct
+    /// restart would race the loop's snapshotted final-flush positions.
+    SkipMidStop,
+    /// Inbox empty, no live session, and the relevant capture stream
+    /// is not active either. Nothing to restart.
+    SkipNoActiveCapture,
+    /// Inbox empty, no live session, capture is active. Direct restart
+    /// via `AudioManager::restart_*` is safe.
+    DirectRestart,
+}
+
+/// Pure routing decision used by `dispatch_mic_restart` /
+/// `dispatch_system_restart`. Extracted so the four-way branching is
+/// unit-testable without a real `AudioManager` or `AppHandle`.
+fn decide_routing(
+    intent_sent: bool,
+    live_session_present: bool,
+    capture_active: bool,
+) -> RoutingDecision {
+    if intent_sent {
+        return RoutingDecision::SentThroughInbox;
+    }
+    if live_session_present {
+        // See `LiveSessionPresent` docs: stop_live_transcription clears
+        // the inbox before the loop's final flush, so an empty inbox
+        // with the flag still set means we're inside the teardown
+        // window and a direct restart would replace the ring buffer
+        // mid-finalize.
+        return RoutingDecision::SkipMidStop;
+    }
+    if !capture_active {
+        return RoutingDecision::SkipNoActiveCapture;
+    }
+    RoutingDecision::DirectRestart
+}
+
 /// Best-effort send into the live-loop's restart-intent inbox. Returns
 /// `true` if a sender was present and the send queued; `false` if no
-/// session is running or the receiver has been dropped (caller falls
-/// back to `AudioManager::restart_*`).
+/// session is running or the receiver has been dropped (caller routes
+/// the decision through `decide_routing`).
 fn try_send_intent(inbox: &RestartIntentInbox, intent: RestartIntent) -> bool {
     let guard = match inbox.lock() {
         Ok(g) => g,
@@ -342,7 +442,7 @@ fn try_send_intent(inbox: &RestartIntentInbox, intent: RestartIntent) -> bool {
 
 /// Strip cpal's macOS `DeviceId` prefix (`"coreaudio:"`) so the bare
 /// `kAudioDevicePropertyDeviceUID` string can be passed to
-/// `yapstack_audio::device::is_device_alive`. cpal's `HostId::Display`
+/// `yapstack_audio::device::device_liveness`. cpal's `HostId::Display`
 /// lowercases the host name (see `cpal/src/platform/mod.rs`), so the
 /// real prefix is lowercase — `CoreAudio:` (CamelCase) never appears
 /// in `device.id().to_string()`. The match is case-insensitive
@@ -355,6 +455,100 @@ fn strip_cpal_prefix(uid: &str) -> &str {
         return rest;
     }
     uid
+}
+
+/// Bluetooth/AirPods absorbs the default-device change before the route
+/// is fully alive. Lenient policy: `Alive` and `Unknown` (couldn't tell)
+/// proceed immediately — a genuine "couldn't tell" must not stall a
+/// restart that the actual cpal `start` will validate anyway. `Dead` and
+/// `Absent` get one more debounce window to settle, then fall through;
+/// the restart attempt itself surfaces a real failure via `stream-health`
+/// if it doesn't recover.
+async fn alive_gate(uid: Option<&str>) {
+    use yapstack_audio::device::DeviceLiveness;
+
+    let Some(uid) = uid else {
+        return;
+    };
+    let bare = strip_cpal_prefix(uid);
+    match yapstack_audio::device::device_liveness(bare) {
+        DeviceLiveness::Alive | DeviceLiveness::Unknown => return,
+        DeviceLiveness::Dead | DeviceLiveness::Absent => {}
+    }
+    debug!(
+        "device broker: target {} not yet alive — waiting {}ms before restart",
+        bare, DEBOUNCE_MS
+    );
+    tokio::time::sleep(Duration::from_millis(DEBOUNCE_MS)).await;
+}
+
+fn emit_devices_changed(app_handle: &AppHandle) {
+    let inputs = match yapstack_audio::device::list_input_devices() {
+        Ok(v) => v,
+        Err(e) => {
+            warn!("device broker: list_input_devices failed: {}", e);
+            return;
+        }
+    };
+    let outputs = match yapstack_audio::device::list_output_devices() {
+        Ok(v) => v,
+        Err(e) => {
+            warn!("device broker: list_output_devices failed: {}", e);
+            return;
+        }
+    };
+    let input_summary: Vec<String> = inputs
+        .iter()
+        .map(|d| format!("{}{}", d.name, if d.is_default { " (default)" } else { "" }))
+        .collect();
+    let output_summary: Vec<String> = outputs
+        .iter()
+        .map(|d| format!("{}{}", d.name, if d.is_default { " (default)" } else { "" }))
+        .collect();
+    info!(
+        "device broker: devices-changed — inputs=[{}], outputs=[{}]",
+        input_summary.join(", "),
+        output_summary.join(", ")
+    );
+    let mut all = inputs;
+    all.extend(outputs);
+    let payload: Vec<AudioDeviceInfoDto> = all.into_iter().map(AudioDeviceInfoDto::from).collect();
+    if let Err(e) = app_handle.emit("devices-changed", payload) {
+        warn!("device broker: emit devices-changed failed: {}", e);
+    }
+}
+
+fn emit_default_changed(app_handle: &AppHandle, kind: DefaultDeviceKindDto) {
+    let resolved = match kind {
+        DefaultDeviceKindDto::Input => yapstack_audio::device::default_input_device(),
+        // The cpal host has one notion of "default output"; the alerts
+        // route (`kAudioHardwarePropertyDefaultSystemOutputDevice`) isn't
+        // exposed separately. We surface the kind distinctly so the FE
+        // can show *what* the user changed, even though both resolve
+        // through the same cpal call.
+        DefaultDeviceKindDto::Output | DefaultDeviceKindDto::SystemOutput => {
+            yapstack_audio::device::default_output_device()
+        }
+    };
+    let (device_id, device_name) = match resolved {
+        Ok(info) => (info.id, Some(info.name)),
+        Err(e) => {
+            warn!("device broker: resolving default {:?} failed: {}", kind, e);
+            (None, None)
+        }
+    };
+    info!(
+        "device broker: default-device-changed kind={:?} device={:?}",
+        kind, device_name
+    );
+    let payload = DefaultDeviceChangedPayload {
+        kind,
+        device_id,
+        device_name,
+    };
+    if let Err(e) = app_handle.emit("default-device-changed", payload) {
+        warn!("device broker: emit default-device-changed failed: {}", e);
+    }
 }
 
 #[cfg(test)]
@@ -434,12 +628,11 @@ mod tests {
     fn strip_cpal_prefix_leaves_other_strings_alone() {
         // Non-cpal-format strings (raw UID, empty, foreign prefix) must
         // pass through unchanged so callers can pipe them straight into
-        // is_device_alive's fail-open path.
+        // device_liveness's lookup path.
         assert_eq!(strip_cpal_prefix("BuiltInMic"), "BuiltInMic");
         assert_eq!(strip_cpal_prefix(""), "");
         assert_eq!(strip_cpal_prefix("wasapi:something"), "wasapi:something");
     }
-
 
     #[test]
     fn try_send_intent_returns_false_for_empty_inbox() {
@@ -464,6 +657,58 @@ mod tests {
     }
 
     #[test]
+    fn decide_routing_sends_through_inbox_when_intent_queued() {
+        // The inbox accepted the intent — that's authoritative; the
+        // other inputs are ignored.
+        assert_eq!(
+            decide_routing(true, true, true),
+            RoutingDecision::SentThroughInbox
+        );
+        assert_eq!(
+            decide_routing(true, false, false),
+            RoutingDecision::SentThroughInbox
+        );
+    }
+
+    #[test]
+    fn decide_routing_skips_when_live_session_in_teardown() {
+        // Inbox empty (`stop_live_transcription` cleared it) but the
+        // spawned task hasn't cleared the presence flag yet — the loop
+        // is still running its final flush. Direct-restart here would
+        // race the snapshotted stop positions, so skip. This is the
+        // P2 ultrareview fix.
+        assert_eq!(
+            decide_routing(false, true, true),
+            RoutingDecision::SkipMidStop
+        );
+        assert_eq!(
+            decide_routing(false, true, false),
+            RoutingDecision::SkipMidStop
+        );
+    }
+
+    #[test]
+    fn decide_routing_skips_when_no_active_capture() {
+        // No live session, no capture stream — nothing for a restart
+        // to act on.
+        assert_eq!(
+            decide_routing(false, false, false),
+            RoutingDecision::SkipNoActiveCapture
+        );
+    }
+
+    #[test]
+    fn decide_routing_direct_restart_when_idle_capture_active() {
+        // No live loop owns audio state and the capture stream is
+        // active (e.g. legacy `start_capture` without
+        // `start_live_transcription`). Direct restart is safe.
+        assert_eq!(
+            decide_routing(false, false, true),
+            RoutingDecision::DirectRestart
+        );
+    }
+
+    #[test]
     fn try_send_intent_returns_false_when_receiver_was_dropped() {
         // The live loop ended (receiver dropped) but the inbox still
         // holds a stale sender. send() returns Err, broker falls back
@@ -473,107 +718,5 @@ mod tests {
         let inbox: RestartIntentInbox = Arc::new(StdMutex::new(Some(tx)));
 
         assert!(!try_send_intent(&inbox, RestartIntent::Mic));
-    }
-}
-
-/// Bluetooth/AirPods absorbs the default-device change before the route
-/// is fully alive. If `is_device_alive` reports false, give macOS one
-/// more debounce window to settle, then fall through. We don't block
-/// indefinitely — if the device still isn't alive after the second
-/// check, the restart attempt itself surfaces the failure via
-/// `stream-health`.
-async fn alive_gate(uid: Option<&str>) {
-    let Some(uid) = uid else {
-        return;
-    };
-    let bare = strip_cpal_prefix(uid);
-    if yapstack_audio::device::is_device_alive(bare) {
-        return;
-    }
-    debug!(
-        "device broker: target {} not yet alive — waiting {}ms before restart",
-        bare, DEBOUNCE_MS
-    );
-    tokio::time::sleep(Duration::from_millis(DEBOUNCE_MS)).await;
-}
-
-fn emit_devices_changed(app_handle: &AppHandle) {
-    let inputs = match yapstack_audio::device::list_input_devices() {
-        Ok(v) => v,
-        Err(e) => {
-            warn!("device broker: list_input_devices failed: {}", e);
-            return;
-        }
-    };
-    let outputs = match yapstack_audio::device::list_output_devices() {
-        Ok(v) => v,
-        Err(e) => {
-            warn!("device broker: list_output_devices failed: {}", e);
-            return;
-        }
-    };
-    let input_summary: Vec<String> = inputs
-        .iter()
-        .map(|d| {
-            format!(
-                "{}{}",
-                d.name,
-                if d.is_default { " (default)" } else { "" }
-            )
-        })
-        .collect();
-    let output_summary: Vec<String> = outputs
-        .iter()
-        .map(|d| {
-            format!(
-                "{}{}",
-                d.name,
-                if d.is_default { " (default)" } else { "" }
-            )
-        })
-        .collect();
-    info!(
-        "device broker: devices-changed — inputs=[{}], outputs=[{}]",
-        input_summary.join(", "),
-        output_summary.join(", ")
-    );
-    let mut all = inputs;
-    all.extend(outputs);
-    let payload: Vec<AudioDeviceInfoDto> = all.into_iter().map(AudioDeviceInfoDto::from).collect();
-    if let Err(e) = app_handle.emit("devices-changed", payload) {
-        warn!("device broker: emit devices-changed failed: {}", e);
-    }
-}
-
-fn emit_default_changed(app_handle: &AppHandle, kind: DefaultDeviceKindDto) {
-    let resolved = match kind {
-        DefaultDeviceKindDto::Input => yapstack_audio::device::default_input_device(),
-        // The cpal host has one notion of "default output"; the alerts
-        // route (`kAudioHardwarePropertyDefaultSystemOutputDevice`) isn't
-        // exposed separately. We surface the kind distinctly so the FE
-        // can show *what* the user changed, even though both resolve
-        // through the same cpal call.
-        DefaultDeviceKindDto::Output | DefaultDeviceKindDto::SystemOutput => {
-            yapstack_audio::device::default_output_device()
-        }
-    };
-    let (device_id, device_name) = match resolved {
-        Ok(info) => (info.id, Some(info.name)),
-        Err(e) => {
-            warn!("device broker: resolving default {:?} failed: {}", kind, e);
-            (None, None)
-        }
-    };
-    info!(
-        "device broker: default-device-changed kind={:?} device={:?}",
-        kind, device_name
-    );
-    let payload = DefaultDeviceChangedPayload {
-        kind,
-        device_id,
-        device_name,
-    };
-    if let Err(e) = app_handle.emit("default-device-changed", payload) {
-        warn!("device broker: emit default-device-changed failed: {}", e);
     }
 }
