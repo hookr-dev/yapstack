@@ -1,5 +1,25 @@
 # Shared Scheduler: Concurrent Dictation + Live Session
 
+> **Status: Superseded.** Landing 1 of this plan was implemented on the
+> `feat/active-session-dictation` branch with two material deviations:
+>
+> 1. **Priority order is `FinalFlush > Dictation > Live > Backfill`** —
+>    not `Live > Dictation > Backfill` as proposed below. Dictation
+>    pre-empts queued live chunks (it still can't pre-empt an in-flight
+>    sidecar job; the scheduler is non-preemptive by design).
+> 2. **De-duplication is mic-ownership, not just segment-id filtering.**
+>    Open question #3 ("auto-pause session while dictating?") was
+>    answered yes — the session's mic-side live loop suspends while
+>    `DictationOwnsMic.flag` is set, with a rising-edge flush of pending
+>    session speech up to the acquisition boundary so the partial word
+>    the user spoke before triggering the hotkey isn't lost, and a
+>    falling-edge full reset so dictation-window samples never become
+>    session transcript.
+>
+> See `CHANGELOG.md` (Unreleased) and `docs/ARCHITECTURE.md` for the
+> shipping behavior. The original plan body is retained below for
+> historical context.
+
 ## Context
 
 Today, starting dictation while a session is recording fails — the

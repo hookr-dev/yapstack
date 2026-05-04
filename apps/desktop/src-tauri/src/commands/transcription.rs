@@ -190,13 +190,63 @@ impl From<yapstack_transcription::ModelInfo> for ModelInfoDto {
 // --- State types ---
 
 pub type ModelManagerState = Arc<Mutex<ModelManager>>;
-/// The transcription client is wrapped in `Arc` so the live-transcription
-/// loop can clone a handle out of the state and drop the outer mutex guard
-/// before awaiting the sidecar round-trip. `TranscriptionClient` serializes
-/// stdin writes internally and demuxes responses via per-request oneshots,
-/// so multiple concurrent `&self` calls are safe — the outer mutex only
-/// guards initialization and teardown.
-pub type TranscriptionClientState = Arc<Mutex<Option<Arc<TranscriptionClient>>>>;
+
+/// What engine + variant + diarization config the currently-initialized
+/// scheduler was constructed for. `init_transcription_client` is idempotent
+/// when called with a matching config and rejects with an explicit
+/// "shut down first" error when called with a different one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EngineConfig {
+    pub kind: EngineKind,
+    pub whisper_model: Option<ModelSize>,
+    pub parakeet_variant: Option<ParakeetVariant>,
+    pub diarization: bool,
+}
+
+/// Both pieces of "the engine is initialized" state, paired so the config
+/// is always kept in sync with the live scheduler.
+pub struct InitializedEngine {
+    pub config: EngineConfig,
+    pub scheduler: Arc<super::transcription_scheduler::TranscriptionScheduler>,
+}
+
+/// The single source of truth for engine initialization. The scheduler owns
+/// the `TranscriptionClient` for its full lifetime; both the session live
+/// loop and the dictation live loop clone `Arc<TranscriptionScheduler>` from
+/// this state. `None` means engine is not initialized; `Some` means a
+/// scheduler is live (running or shutting down — the scheduler's own state
+/// machine handles the in-between).
+pub type TranscriptionSchedulerState = Arc<Mutex<Option<InitializedEngine>>>;
+
+/// Shared mic-ownership coordination between the session and dictation live
+/// loops. While `flag` is true the session's mic-side processing is
+/// suspended; the dictation runtime owns the mic. `acquired_at` records the
+/// mic ring-buffer write position at the moment dictation acquired ownership
+/// — the session's mic loop uses this on the rising edge to flush any
+/// pending session speech up to that boundary before suspending, so the
+/// final word the user spoke before hitting the dictation hotkey is not
+/// lost.
+pub struct DictationOwnsMic {
+    pub flag: std::sync::atomic::AtomicBool,
+    pub acquired_at: std::sync::atomic::AtomicU64,
+}
+
+impl DictationOwnsMic {
+    pub fn new() -> Self {
+        Self {
+            flag: std::sync::atomic::AtomicBool::new(false),
+            acquired_at: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+}
+
+impl Default for DictationOwnsMic {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub type DictationOwnsMicState = Arc<DictationOwnsMic>;
 
 // --- Commands ---
 
@@ -270,20 +320,34 @@ pub async fn delete_model(
 #[tauri::command]
 #[specta::specta]
 pub async fn shutdown_transcription_client(
-    state: tauri::State<'_, TranscriptionClientState>,
+    scheduler_state: tauri::State<'_, TranscriptionSchedulerState>,
+    live_state: tauri::State<'_, super::live_transcription::LiveTranscriptionState>,
 ) -> Result<(), CommandError> {
     info!("shutting down transcription client");
-    // Take the Arc out of the state, then request graceful shutdown.
-    // `shutdown` takes `&self` (it writes a shutdown request through the
-    // internal tokio mutex on stdin), so any concurrent handle held by an
-    // in-flight live-transcription chunk still sees a clean sidecar
-    // wind-down rather than a hard process kill.
-    let arc_client = {
-        let mut client_guard = state.lock().await;
-        client_guard.take()
+    // Refuse to shut the engine down while a live runtime (session OR
+    // dictation) is still attached.
+    {
+        let live_guard = live_state.lock().await;
+        if live_guard.any_active() {
+            return Err(CommandError::InvalidInput {
+                message: "live transcription is running; stop it before \
+                          shutting down the engine"
+                    .into(),
+            });
+        }
+    }
+    let initialized = {
+        let mut guard = scheduler_state.lock().await;
+        guard.take()
     };
-    if let Some(client) = arc_client {
-        client.shutdown().await.map_err(CommandError::from)?;
+    if let Some(InitializedEngine { scheduler, .. }) = initialized {
+        let timeout = std::time::Duration::from_secs(
+            super::transcription_scheduler::DEFAULT_SHUTDOWN_TIMEOUT_SECS,
+        );
+        scheduler
+            .shutdown_client(timeout)
+            .await
+            .map_err(|e| CommandError::Internal { message: e })?;
     }
     Ok(())
 }
@@ -303,11 +367,11 @@ pub struct TranscriptionStatusDto {
 #[tauri::command]
 #[specta::specta]
 pub async fn get_transcription_status(
-    state: tauri::State<'_, TranscriptionClientState>,
+    state: tauri::State<'_, TranscriptionSchedulerState>,
 ) -> Result<TranscriptionStatusDto, CommandError> {
-    let client_guard = state.lock().await;
+    let guard = state.lock().await;
     Ok(TranscriptionStatusDto {
-        initialized: client_guard.is_some(),
+        initialized: guard.is_some(),
     })
 }
 
@@ -481,13 +545,22 @@ pub async fn delete_sortformer_model(
 /// Spawn the sidecar with the requested engine. Whisper requires
 /// `whisper_model`; Parakeet requires `parakeet_variant` and may optionally
 /// enable Sortformer diarization.
+///
+/// Re-init semantics:
+/// - If the engine is uninitialized, build the client + scheduler.
+/// - If the engine is already initialized with a *matching* config (same
+///   kind + variant + diarization), return OK (idempotent — covers HMR
+///   remounts that re-call init).
+/// - If the engine is already initialized with a *different* config, return
+///   an explicit error directing the caller to `shutdown_transcription_client`
+///   first. Engine swap is an explicit two-step operation; no implicit drain.
 #[tauri::command]
 #[specta::specta]
 #[allow(clippy::too_many_arguments)]
 pub async fn init_transcription_client(
     app_handle: tauri::AppHandle,
     model_manager_state: tauri::State<'_, ModelManagerState>,
-    transcription_state: tauri::State<'_, TranscriptionClientState>,
+    scheduler_state: tauri::State<'_, TranscriptionSchedulerState>,
     engine: EngineKindDto,
     whisper_model: Option<ModelSizeDto>,
     parakeet_variant: Option<ParakeetVariantDto>,
@@ -501,11 +574,25 @@ pub async fn init_transcription_client(
         "initializing transcription client"
     );
 
+    let requested = EngineConfig {
+        kind: engine.into(),
+        whisper_model: whisper_model.clone().map(Into::into),
+        parakeet_variant: parakeet_variant.map(Into::into),
+        diarization: enable_diarization,
+    };
+
     {
-        let guard = transcription_state.lock().await;
-        if guard.is_some() {
-            info!("transcription client already initialized, skipping respawn");
-            return Ok(());
+        let guard = scheduler_state.lock().await;
+        if let Some(existing) = guard.as_ref() {
+            if existing.config == requested {
+                info!("transcription client already initialized with matching config, skipping respawn");
+                return Ok(());
+            }
+            return Err(CommandError::InvalidInput {
+                message: "engine already initialized with a different config; \
+                     call shutdown_transcription_client first"
+                    .into(),
+            });
         }
     }
 
@@ -593,8 +680,31 @@ pub async fn init_transcription_client(
         }
     };
 
-    let mut guard = transcription_state.lock().await;
-    *guard = Some(Arc::new(client));
+    // Hand the client to a long-lived scheduler. The scheduler is the
+    // single source of truth for engine readiness from this point on.
+    let scheduler = super::transcription_scheduler::TranscriptionScheduler::new(Arc::new(client));
+    {
+        let mut guard = scheduler_state.lock().await;
+        // Race-handling: if another init landed concurrently with the same
+        // config we'd reach here twice. The earlier guard read above is
+        // best-effort; tolerate a duplicate by replacing only if still None.
+        if guard.is_none() {
+            *guard = Some(InitializedEngine {
+                config: requested,
+                scheduler,
+            });
+        } else {
+            // Drop the freshly-constructed scheduler; another init won.
+            // shutdown_client cleans up the orphaned client.
+            let timeout = std::time::Duration::from_secs(
+                super::transcription_scheduler::DEFAULT_SHUTDOWN_TIMEOUT_SECS,
+            );
+            if let Err(e) = scheduler.shutdown_client(timeout).await {
+                tracing::warn!("orphaned-scheduler shutdown error: {e}");
+            }
+            return Ok(());
+        }
+    }
     info!(
         "transcription client initialized: engine={}",
         engine_kind.as_str()

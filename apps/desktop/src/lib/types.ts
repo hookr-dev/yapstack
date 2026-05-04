@@ -140,6 +140,15 @@ async deleteModel(size: ModelSizeDto) : Promise<Result<null, CommandError>> {
  * Spawn the sidecar with the requested engine. Whisper requires
  * `whisper_model`; Parakeet requires `parakeet_variant` and may optionally
  * enable Sortformer diarization.
+ * 
+ * Re-init semantics:
+ * - If the engine is uninitialized, build the client + scheduler.
+ * - If the engine is already initialized with a *matching* config (same
+ * kind + variant + diarization), return OK (idempotent — covers HMR
+ * remounts that re-call init).
+ * - If the engine is already initialized with a *different* config, return
+ * an explicit error directing the caller to `shutdown_transcription_client`
+ * first. Engine swap is an explicit two-step operation; no implicit drain.
  */
 async initTranscriptionClient(engine: EngineKindDto, whisperModel: ModelSizeDto | null, parakeetVariant: ParakeetVariantDto | null, enableDiarization: boolean) : Promise<Result<null, CommandError>> {
     try {
@@ -261,17 +270,17 @@ async startLiveTranscription(config: LiveTranscriptionConfig) : Promise<Result<L
     else return { status: "error", error: e  as any };
 }
 },
-async stopLiveTranscription() : Promise<Result<null, CommandError>> {
+async stopLiveTranscription(kind: LiveSourceKind | null) : Promise<Result<null, CommandError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("stop_live_transcription") };
+    return { status: "ok", data: await TAURI_INVOKE("stop_live_transcription", { kind }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
-async getLiveTranscriptionStatus() : Promise<Result<LiveTranscriptionStatus, CommandError>> {
+async getLiveTranscriptionStatus(kind: LiveSourceKind | null) : Promise<Result<LiveTranscriptionStatus, CommandError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("get_live_transcription_status") };
+    return { status: "ok", data: await TAURI_INVOKE("get_live_transcription_status", { kind }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -453,6 +462,21 @@ export type EngineDescriptorDto = { kind: EngineKindDto; display_name: string; l
  */
 export type EngineKindDto = "Whisper" | "Parakeet"
 export type HealthStatus = { status: string; version: string }
+/**
+ * Routing identity of a live-transcription runtime. `Session` is the
+ * long-running recording flow that writes session audio parts; `Dictation`
+ * is the user-triggered, mic-only utterance flow whose segments must not
+ * land in any session transcript. The frontend filters all live-
+ * transcription events (segments, status, backfill-complete, etc.) on this
+ * field rather than string-matching session ids.
+ * 
+ * This is *routing identity*, separate from `JobOrigin` which is the
+ * scheduler's *priority class* (a dictation runtime can still emit
+ * `FinalFlush`-class jobs at stop time). Frontend code that needs to know
+ * "is this segment for the session transcript or the dictation history"
+ * must read `source_kind`, never `origin`.
+ */
+export type LiveSourceKind = "session" | "dictation"
 export type LiveTranscriptionConfig = { 
 /**
  * Milliseconds of continuous silence before triggering a chunk. Default: 800.
@@ -544,7 +568,13 @@ vocabulary_hints: string | null;
  * recording becomes a fresh audio part appended after the existing parts;
  * no prior file is read or modified. Backfill is forced to 0.
  */
-resume?: ResumeConfig | null }
+resume?: ResumeConfig | null; 
+/**
+ * Routing identity of this runtime. Defaults to `Session` so existing
+ * callers keep working without TS-side changes during a transitional
+ * build; the dictation hook must pass `Dictation` explicitly.
+ */
+source_kind?: LiveSourceKind }
 export type LiveTranscriptionPhase = "Running" | "Stopped" | "Error"
 export type LiveTranscriptionStartResult = { effective_start_epoch_ms: number }
 export type LiveTranscriptionStatus = { phase: LiveTranscriptionPhase; chunks_processed: number; total_audio_seconds: number; error_message: string | null; session_id: string | null; effective_start_epoch_ms: number | null; 
@@ -565,7 +595,13 @@ live_drain_backlog_chunks: number;
  * Latest backlog depth after a live max-duration slice was dispatched.
  * Returns to 0.0 once the live force-drain path catches up.
  */
-live_drain_backlog_seconds: number }
+live_drain_backlog_seconds: number; 
+/**
+ * Routing identity of the runtime that emitted this status. Listeners
+ * in the frontend filter by this so a dictation runtime's `Stopped`
+ * or `Error` does not flow into the session UI's phase machine.
+ */
+source_kind: LiveSourceKind }
 /**
  * One log line visible to the frontend. `ts_ms` is unix-epoch milliseconds.
  */

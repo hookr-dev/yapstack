@@ -30,7 +30,7 @@ use yapstack_transcription::ModelManager;
 
 // Lock ordering (acquire in this order to prevent deadlocks):
 //   1. AudioManagerState
-//   2. TranscriptionClientState
+//   2. TranscriptionSchedulerState
 //   3. LiveTranscriptionState
 //   4. ModelManagerState
 //   5. TrayState
@@ -486,7 +486,10 @@ pub fn run() {
         })
         .manage(Arc::new(Mutex::new(AudioManager::new())) as commands::audio::AudioManagerState)
         .manage(Arc::new(Mutex::new(None::<TrayIcon>)) as TrayState)
-        .manage(Arc::new(Mutex::new(None)) as commands::live_transcription::LiveTranscriptionState)
+        .manage(
+            Arc::new(Mutex::new(commands::live_transcription::LiveTranscriptionSlots::new()))
+                as commands::live_transcription::LiveTranscriptionState,
+        )
         .manage(Arc::new(StdMutex::new(None)) as commands::live_transcription::RestartIntentInbox)
         .manage(Arc::new(AtomicBool::new(false)) as commands::live_transcription::LiveSessionPresent)
         .manage(Arc::new(StdMutex::new(HashSet::<PathBuf>::new())) as TrustedAudioDirs)
@@ -546,10 +549,18 @@ pub fn run() {
                 Arc::new(Mutex::new(model_manager)) as commands::transcription::ModelManagerState
             );
 
-            // Initialize transcription client state (starts as None)
+            // Initialize transcription scheduler state (starts as None — the
+            // long-lived scheduler is constructed on first
+            // `init_transcription_client` and lives until shutdown).
             app.manage(
-                Arc::new(Mutex::new(None)) as commands::transcription::TranscriptionClientState
+                Arc::new(Mutex::new(None))
+                    as commands::transcription::TranscriptionSchedulerState,
             );
+
+            // Mic-ownership coordination shared between the session and
+            // dictation live loops. Always present; the flag flips at runtime.
+            app.manage(Arc::new(commands::transcription::DictationOwnsMic::new())
+                as commands::transcription::DictationOwnsMicState);
 
             let menu = build_tray_menu(app.handle(), false, false)?;
 
@@ -685,7 +696,13 @@ pub fn run() {
                         matches!(status.state, commands::audio::CaptureStateDto::Capturing);
                     let is_recording = {
                         let guard = live_state.lock().await;
-                        guard.as_ref().is_some_and(|r| r.controller.is_running())
+                        // Tray "recording" indicator reflects the session
+                        // slot only — dictation is short-lived and shouldn't
+                        // flip the menu state.
+                        guard
+                            .session
+                            .runtime()
+                            .is_some_and(|r| r.controller.is_running())
                     };
 
                     if prev_status.as_ref() != Some(&status) {

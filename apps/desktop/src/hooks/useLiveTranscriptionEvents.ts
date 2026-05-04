@@ -16,9 +16,27 @@ export function useLiveTranscriptionEvents() {
   useEffect(() => {
     const unlisten = Promise.all([
       listenEvent(EVENTS.LIVE_TRANSCRIPTION_SEGMENT, (payload) => {
+        // Filter on source kind — dictation segments are routed by
+        // useDictation.ts, not the session pipeline.
+        if (payload.source_kind === "dictation") return;
         onLiveSegment(payload);
       }),
       listenEvent(EVENTS.LIVE_TRANSCRIPTION_STATUS, (payload) => {
+        // Two-prong filter: source_kind AND matching active session_id.
+        // Without source_kind, a concurrent dictation's `Stopped` would
+        // flip the session UI's phase machine and finalize the wrong
+        // recording. Without session_id, a stale event from a previous
+        // session (after recovery/restart) could clobber the freshly-
+        // active session.
+        if (payload.source_kind === "dictation") return;
+        const activeId = useAppStore.getState().activeSessionId;
+        if (
+          payload.session_id != null &&
+          activeId != null &&
+          payload.session_id !== activeId
+        ) {
+          return;
+        }
         setLivePhase(payload.phase);
 
         // Show toast for Error phase
@@ -94,8 +112,9 @@ export function useLiveTranscriptionEvents() {
       }),
     ]);
 
-    // Eager fetch — recover state on mount/reload
-    commands.getLiveTranscriptionStatus().then((r) => {
+    // Eager fetch — recover state on mount/reload (session slot only;
+    // dictation lifecycle is owned by useDictation).
+    commands.getLiveTranscriptionStatus("session").then((r) => {
       if (r.status === "ok") {
         setLivePhase(r.data.phase);
         // If backend is still running with a session, recover frontend state

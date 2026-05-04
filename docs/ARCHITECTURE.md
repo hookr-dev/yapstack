@@ -93,8 +93,8 @@ Tauri commands layer. Thin wrappers that convert between domain types and DTOs (
 - `commands/audio.rs` — Device listing, capture start/stop, capture status, buffer info, `peek_capture_energy` (RMS readout used by the recording beacon). `MixConfigDto::sanitized()` validates gain values at the command boundary.
 - `commands/capture.rs` — Audio cleanup commands only (`delete_audio_files` for per-part cleanup, `delete_session_wav` for legacy session-glob cleanup). Session lifecycle and audio finalization are owned by `commands/live_transcription.rs`.
 - `commands/transcription.rs` — Model management, transcription, sidecar lifecycle. Locks released before async I/O.
-- `commands/live_transcription.rs` — Real-time transcription controller with per-source VAD (`SourceVadState`), concurrent backfill processing (Silero-driven `vad_chunk_historical_audio` shares boundary choices with the live loop), prompt context windowing, prompt decay, stream health monitoring with auto-restart. Shared `TranscriptionContext` struct for immutable config passing. Extracts the `TranscriptionClient` from shared state at session start and hands it to a `TranscriptionScheduler` that owns it for the duration of the session. Streams session WAV incrementally via `SessionWavWriter`.
-- `commands/transcription_scheduler.rs` — Single-worker priority queue in front of the sidecar lane (`FinalFlush > Live > Backfill`, mic/system round-robin at the live tier, backfill gated while live is busy). Sole caller of `TranscriptionClient::transcribe_with` during a session, which makes sidecar respawn race-free. See "Transcription Scheduler" below.
+- `commands/live_transcription.rs` — Real-time transcription controller with per-source VAD (`SourceVadState`), concurrent backfill processing (Silero-driven `vad_chunk_historical_audio` shares boundary choices with the live loop), prompt context windowing, prompt decay, stream health monitoring with auto-restart. Shared `TranscriptionContext` struct for immutable config passing. Clones an `Arc<TranscriptionScheduler>` from app-level state at session start; the scheduler outlives every session. Each runtime carries a `LiveSourceKind` (`Session` or `Dictation`) that's threaded onto every emitted event so the frontend routes by source kind, not by string-matching session ids. Two-slot runtime state (`session`, `dictation`) with `Idle | Starting | Running | Stopping` lifecycle so the same kind can't double-start during finalization. Streams session WAV incrementally via `SessionWavWriter`.
+- `commands/transcription_scheduler.rs` — Long-lived single-worker priority queue in front of the sidecar lane (`FinalFlush > Dictation > Live (mic/system round-robin) > Backfill`, backfill gated while *any* producer bit in `{LiveMic, LiveSystem, Dictation}` is set). Constructed once at engine init and shared by every live runtime. Sole caller of `TranscriptionClient::transcribe_with`, which makes sidecar respawn race-free. `submit()` returns `Result<Receiver, SchedulerError>` and rejects with `Shutdown` once terminal so racing `Arc<Scheduler>` clones can't enqueue into a dead worker. See "Transcription Scheduler" below.
 - `commands/dictation.rs` — `clipboard_paste` command for voice dictation output. Writes text to system clipboard via `pbcopy` (macOS) or `clip` (Windows), optionally triggers auto-paste via `osascript` keystroke simulation.
 - `commands/system_volume.rs` — `apply_volume_duck`, `restore_volume`. Generic system-output volume control wrapping the `system_volume` mechanism module. Policy of *when* to duck lives in callers (currently dictation only); the commands themselves know nothing about dictation.
 - `system_volume.rs` (mechanism, not a command module) — Snapshots `(device_id, level)` on first apply so restore targets the *originally* ducked device even if the default output changes mid-session (AirPods connect, USB DAC unplug). Only ever lowers — never raises — so a user already below the target is left alone. macOS uses CoreAudio FFI against `kAudioHardwareServiceDeviceProperty_VirtualMainVolume`; Windows / Linux are no-op `Unsupported` stubs behind the same trait.
@@ -180,13 +180,19 @@ Live transcription loop (one chunk):
 
 ### Live Transcription
 ```
-Frontend: start_live_transcription(config)
-    → Extracts the TranscriptionClient from shared state and hands it to a
-      fresh TranscriptionScheduler (single-worker priority queue, see
-      "Transcription Scheduler" below). The scheduler is the sole caller of
-      `transcribe_with` for the duration of the session; on shutdown it
-      returns the client to TranscriptionClientState.
-    → Creates TranscriptionContext (immutable: scheduler handle, app_handle, config, start time)
+Frontend: start_live_transcription(config)  // config.source_kind selects slot
+    → Validates source-kind invariants (Dictation must be MicOnly,
+      backfill_seconds=0, persist_audio_part=false) and same-kind double-
+      start is rejected unless the target slot is Idle.
+    → Clones Arc<TranscriptionScheduler> from app-level TranscriptionSchedulerState
+      (the scheduler is constructed once at init_transcription_client
+      and outlives every session — see "Transcription Scheduler" below).
+    → If source_kind == Dictation: snapshots the current mic write_pos into
+      DictationOwnsMic.acquired_at, then sets DictationOwnsMic.flag = true.
+      The session's mic-side live loop reads this on its next tick, flushes
+      any pending session speech up to acquired_at as a Live chunk (rising
+      edge), then suspends mic processing for the dictation window.
+    → Creates TranscriptionContext (immutable: scheduler handle, app_handle, config, start time, dictation_owns_mic)
     → If config.session_id set: creates SessionWavWriter at $AUDIO_DIR/{session_id}.{part_index}.wav
       (audioSaveLocation if set, else $APP_DATA_DIR/audio/; part_index resumes from existing parts)
     → Spawns async task with two concurrent tracks:

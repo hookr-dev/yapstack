@@ -5,56 +5,56 @@
 //! `transcribe_with` calls both land in the sidecar's stdin queue in FIFO
 //! order, with no way to prefer fresh live speech over historical backfill.
 //! The scheduler fixes that: every transcription is submitted as a `Job` with
-//! a priority (`FinalFlush > Live > Backfill`). A single worker task picks
-//! the highest-priority job available, calls `transcribe_with`, and responds
-//! via a per-job oneshot. Within the `Live` priority, mic/system sources
-//! alternate in strict round-robin so neither can starve the other during a
-//! sustained dual-source session. Backfill is also gated by the live loop's
-//! busy signal so historical work only enters the non-preemptible sidecar lane
-//! while live ingestion is idle.
+//! a priority (`FinalFlush > Dictation > Live > Backfill`). A single worker
+//! task picks the highest-priority job available, calls `transcribe_with`,
+//! and responds via a per-job oneshot. Within the `Live` priority, mic/system
+//! sources alternate in strict round-robin so neither can starve the other
+//! during a sustained dual-source session. Backfill is also gated by the
+//! per-producer busy bitmask so historical work only enters the non-
+//! preemptible sidecar lane while every live producer (session mic, session
+//! system, dictation) is idle.
+//!
+//! Lifetime: the scheduler is constructed once at engine init and lives until
+//! engine shutdown. Multiple live runtimes (one session, one dictation) clone
+//! `Arc<Scheduler>` and submit into the same worker. `submit` rejects with
+//! `SchedulerError::Shutdown` once `shutdown_client` has begun, so racing
+//! callers that hold a stale clone don't enqueue work into a dead worker.
 //!
 //! Sidecar liveness: because the worker is the *sole* caller of
 //! `transcribe_with`, a transient sidecar error can be resolved cleanly — the
 //! worker owns the only live `Arc<TranscriptionClient>` clone outside of its
 //! own brief in-call clone, so `Arc::try_unwrap` succeeds at `respawn()` time.
 //!
-//! Backfill on stop: the live loop submits any in-flight speech as
+//! Backfill on stop: the session live loop submits any in-flight speech as
 //! `FinalFlush` jobs, then awaits the *backfill submitter task* (the one
 //! spawned in `live_transcription.rs::process_backfill`). The submitter
 //! awaits each chunk's scheduler response before submitting the next — per-
 //! chunk prompt context and in-order segment emission both depend on this
 //! serial wait — so the submitter, not the scheduler, is what's actually
-//! draining backfill post-stop. Chunks not yet submitted at submitter abort
-//! time live in the submitter's stack as `Vec<f32>` and are lost; the
-//! scheduler holds no durable queue of unsubmitted chunks. The 5-min
-//! submitter-join timeout in the live loop is the real ceiling on backfill
-//! drain; `shutdown_and_return`'s timeout only governs whatever single chunk
-//! is in flight at the scheduler when the submitter exits.
-//!
-//! Worker-timeout safety: if `shutdown_and_return`'s timeout fires, the
-//! worker is aborted *and the transcription client is dropped* rather than
-//! returned to shared state. The aborted worker may still hold an in-flight
-//! Arc clone of the client; handing the same client to a new session would
-//! race the sidecar's response routing. Callers that observe a `false`
-//! return value should treat the engine as un-initialized.
+//! draining backfill post-stop. The session-level shutdown timeout in the
+//! live loop is the real ceiling on backfill drain; `shutdown_client`'s
+//! timeout only fires at engine shutdown, not at session end.
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use tokio::sync::{oneshot, Mutex as TokioMutex, Notify};
 use tokio::task::JoinHandle;
-use tracing::{debug, error, info, warn};
-
-use super::transcription::TranscriptionClientState;
+use tracing::{error, info, warn};
 
 /// Origin of a transcription job — mirrors the `origin` field emitted on
-/// `LiveSegmentEvent` so the frontend can bucket segments by priority class.
+/// `LiveSegmentEvent`. This is the *priority class* of the job (which lane
+/// it occupies in the scheduler), not the *routing identity* of the runtime
+/// it came from. Dictation runtimes submit `Dictation`-class jobs from their
+/// mic chunks but may still emit `FinalFlush`-class jobs at stop time;
+/// frontends must route by `source_kind`, never by `origin`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum JobOrigin {
     Live,
+    Dictation,
     Backfill,
     FinalFlush,
 }
@@ -63,8 +63,50 @@ impl JobOrigin {
     pub fn as_str(self) -> &'static str {
         match self {
             JobOrigin::Live => "live",
+            JobOrigin::Dictation => "dictation",
             JobOrigin::Backfill => "backfill",
             JobOrigin::FinalFlush => "final_flush",
+        }
+    }
+}
+
+/// Producer kind for the multi-producer busy bitmask. Backfill is gated
+/// while *any* producer's bit is set. Each producer (session mic loop,
+/// session system loop, dictation loop) toggles its own bit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BusyKind {
+    LiveMic,
+    LiveSystem,
+    Dictation,
+}
+
+impl BusyKind {
+    fn bit(self) -> u8 {
+        match self {
+            BusyKind::LiveMic => 1 << 0,
+            BusyKind::LiveSystem => 1 << 1,
+            BusyKind::Dictation => 1 << 2,
+        }
+    }
+}
+
+/// Scheduler lifecycle state. Used both for the worker loop and to reject
+/// late `submit()` calls from `Arc<Scheduler>` clones held by racing callers
+/// (e.g. a session-stop path racing engine shutdown).
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SchedulerState {
+    Running = 0,
+    ShuttingDown = 1,
+    Terminal = 2,
+}
+
+impl SchedulerState {
+    fn from_u8(v: u8) -> Self {
+        match v {
+            0 => SchedulerState::Running,
+            1 => SchedulerState::ShuttingDown,
+            _ => SchedulerState::Terminal,
         }
     }
 }
@@ -91,6 +133,7 @@ pub struct JobRequest {
 #[derive(Debug)]
 pub enum SchedulerError {
     Cancelled,
+    Shutdown,
     SidecarDead,
     Transcription(String),
 }
@@ -99,6 +142,7 @@ impl std::fmt::Display for SchedulerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             SchedulerError::Cancelled => write!(f, "scheduler shut down before job completed"),
+            SchedulerError::Shutdown => write!(f, "scheduler is shut down; submit refused"),
             SchedulerError::SidecarDead => write!(f, "sidecar died and could not be restarted"),
             SchedulerError::Transcription(msg) => write!(f, "transcription failed: {msg}"),
         }
@@ -123,6 +167,7 @@ struct JobEnvelope {
 
 struct SchedulerQueues {
     final_flush: VecDeque<JobEnvelope>,
+    live_dictation: VecDeque<JobEnvelope>,
     live_mic: VecDeque<JobEnvelope>,
     live_system: VecDeque<JobEnvelope>,
     backfill: VecDeque<JobEnvelope>,
@@ -134,6 +179,7 @@ impl SchedulerQueues {
     fn new() -> Self {
         Self {
             final_flush: VecDeque::new(),
+            live_dictation: VecDeque::new(),
             live_mic: VecDeque::new(),
             live_system: VecDeque::new(),
             backfill: VecDeque::new(),
@@ -141,10 +187,14 @@ impl SchedulerQueues {
         }
     }
 
-    /// Pick the next job in priority order, applying mic/system round-robin
-    /// at the `Live` tier.
-    fn pick_next(&mut self, live_busy: bool) -> Option<JobEnvelope> {
+    /// Pick the next job in priority order. Order:
+    /// `FinalFlush > Dictation > Live(mic/system round-robin) > Backfill`.
+    /// Backfill is gated while any producer bit is set in `producers_busy`.
+    fn pick_next(&mut self, producers_busy: bool) -> Option<JobEnvelope> {
         if let Some(job) = self.final_flush.pop_front() {
+            return Some(job);
+        }
+        if let Some(job) = self.live_dictation.pop_front() {
             return Some(job);
         }
         let try_order = match self.last_live_source {
@@ -161,7 +211,7 @@ impl SchedulerQueues {
                 return Some(job);
             }
         }
-        if !live_busy {
+        if !producers_busy {
             if let Some(job) = self.backfill.pop_front() {
                 return Some(job);
             }
@@ -172,6 +222,7 @@ impl SchedulerQueues {
     fn push(&mut self, env: JobEnvelope) {
         match (env.request.origin, env.request.source) {
             (JobOrigin::FinalFlush, _) => self.final_flush.push_back(env),
+            (JobOrigin::Dictation, _) => self.live_dictation.push_back(env),
             (JobOrigin::Live, JobSource::Mic) => self.live_mic.push_back(env),
             (JobOrigin::Live, JobSource::System) => self.live_system.push_back(env),
             (JobOrigin::Backfill, _) => self.backfill.push_back(env),
@@ -189,6 +240,7 @@ impl SchedulerQueues {
             }
         };
         drain(&mut self.final_flush);
+        drain(&mut self.live_dictation);
         drain(&mut self.live_mic);
         drain(&mut self.live_system);
         drain(&mut self.backfill);
@@ -199,13 +251,20 @@ struct SchedulerInner {
     queues: StdMutex<SchedulerQueues>,
     notify: Notify,
     /// The exclusive client held by the scheduler worker. `None` only during
-    /// transient respawn windows. The worker is the sole caller of
-    /// `transcribe_with`, so Arc uniqueness is guaranteed at `respawn` time.
+    /// transient respawn windows and after `shutdown_client` has taken it.
+    /// The worker is the sole caller of `transcribe_with`, so Arc uniqueness
+    /// is guaranteed at `respawn` time.
     client: TokioMutex<Option<Arc<yapstack_transcription::TranscriptionClient>>>,
-    /// Shared state we return the client to when the scheduler shuts down.
-    shared_state: TranscriptionClientState,
     shutdown: AtomicBool,
-    live_busy: AtomicBool,
+    /// Lifecycle state; gates `submit`. Stores `SchedulerState as u8`.
+    state: AtomicU8,
+    /// Per-producer busy bitmask. Backfill is gated while any bit is set.
+    /// Bits indexed by `BusyKind::bit()`.
+    busy_bits: AtomicU8,
+    /// Cached engine kind — populated at construction time from the inner
+    /// client and exposed via `engine()` so callers don't need to unwrap the
+    /// client to read it. The kind is immutable after construction.
+    engine: yapstack_common::types::EngineKind,
 }
 
 /// Priority-queue scheduler in front of a single sidecar lane.
@@ -214,29 +273,27 @@ pub struct TranscriptionScheduler {
     worker: TokioMutex<Option<JoinHandle<()>>>,
 }
 
-/// Default upper bound on how long `shutdown_and_return` waits for the worker
+/// Default upper bound on how long `shutdown_client` waits for the worker
 /// to drain remaining jobs. Large enough to absorb a 5-minute backfill window
 /// transcribing on a slow sidecar; bounded so a wedged sidecar can't hang the
-/// stop path forever. The worker exits as soon as the queue is empty, so the
-/// typical drain finishes well under this cap.
+/// shutdown path forever. The worker exits as soon as the queue is empty, so
+/// the typical drain finishes well under this cap.
 pub const DEFAULT_SHUTDOWN_TIMEOUT_SECS: u64 = 300;
 
 impl TranscriptionScheduler {
-    /// Create a new scheduler that owns `client` until `shutdown_and_return`
-    /// is called. `shared_state` is the `TranscriptionClientState` the client
-    /// was extracted from — the scheduler hands the client back to that
-    /// state on shutdown so the next session/dictation finds it.
-    pub fn new(
-        client: Arc<yapstack_transcription::TranscriptionClient>,
-        shared_state: TranscriptionClientState,
-    ) -> Arc<Self> {
+    /// Create a new scheduler that owns `client` for the rest of the engine's
+    /// lifetime. Use `shutdown_client` to drain the worker, take the client
+    /// out, and shut it down.
+    pub fn new(client: Arc<yapstack_transcription::TranscriptionClient>) -> Arc<Self> {
+        let engine = client.engine();
         let inner = Arc::new(SchedulerInner {
             queues: StdMutex::new(SchedulerQueues::new()),
             notify: Notify::new(),
             client: TokioMutex::new(Some(client)),
-            shared_state,
             shutdown: AtomicBool::new(false),
-            live_busy: AtomicBool::new(false),
+            state: AtomicU8::new(SchedulerState::Running as u8),
+            busy_bits: AtomicU8::new(0),
+            engine,
         });
 
         let worker_inner = inner.clone();
@@ -250,9 +307,34 @@ impl TranscriptionScheduler {
         })
     }
 
+    /// Engine kind the scheduler's client was constructed for. Cached at
+    /// construction so callers don't need to unwrap the client.
+    pub fn engine(&self) -> yapstack_common::types::EngineKind {
+        self.inner.engine
+    }
+
+    /// Snapshot of the most-recent `EngineInfo` from the inner client.
+    /// Returns `None` if the client hasn't loaded a model yet or if the
+    /// scheduler is past its shutdown drain (client taken).
+    pub async fn engine_info(&self) -> Option<yapstack_transcription::EngineInfo> {
+        let guard = self.inner.client.lock().await;
+        guard.as_ref().and_then(|c| c.engine_info())
+    }
+
     /// Submit a job to the scheduler. Returns a receiver that resolves when
-    /// the worker completes the job (or fails / is cancelled on shutdown).
-    pub fn submit(&self, request: JobRequest) -> oneshot::Receiver<JobOutcome> {
+    /// the worker completes the job. Returns `Err(SchedulerError::Shutdown)`
+    /// immediately if the scheduler has begun shutting down — protects
+    /// `Arc<Scheduler>` clones held by racing callers (e.g. a session-stop
+    /// path racing engine shutdown) from enqueueing into a dead worker.
+    pub fn submit(
+        &self,
+        request: JobRequest,
+    ) -> Result<oneshot::Receiver<JobOutcome>, SchedulerError> {
+        if SchedulerState::from_u8(self.inner.state.load(Ordering::Acquire))
+            != SchedulerState::Running
+        {
+            return Err(SchedulerError::Shutdown);
+        }
         let (tx, rx) = oneshot::channel();
         let env = JobEnvelope {
             request,
@@ -262,85 +344,72 @@ impl TranscriptionScheduler {
         queues.push(env);
         drop(queues);
         self.inner.notify.notify_one();
-        rx
+        Ok(rx)
     }
 
-    /// Set whether live ingestion currently needs the sidecar lane protected
-    /// from new backfill work.
-    pub fn set_live_busy(&self, busy: bool) {
-        let previous = self.inner.live_busy.swap(busy, Ordering::AcqRel);
-        if previous != busy {
+    /// Toggle a producer's busy bit. Backfill is gated while *any* bit is
+    /// set. Each producer (session mic loop, session system loop, dictation
+    /// loop) toggles its own bit independently.
+    pub fn set_busy(&self, kind: BusyKind, busy: bool) {
+        let bit = kind.bit();
+        let previous = if busy {
+            self.inner.busy_bits.fetch_or(bit, Ordering::AcqRel)
+        } else {
+            self.inner.busy_bits.fetch_and(!bit, Ordering::AcqRel)
+        };
+        let was_busy = previous != 0;
+        let now_busy = if busy { true } else { (previous & !bit) != 0 };
+        if was_busy != now_busy {
+            // The "any-producer-busy" gate flipped; wake the worker so it
+            // re-evaluates whether backfill is now eligible.
             self.inner.notify.notify_one();
         }
     }
 
-    /// Shut down the worker, drain remaining jobs (FinalFlush + Live +
-    /// Backfill in priority order), and return the client to the shared
-    /// state it was extracted from. Safe to call multiple times.
-    ///
-    /// `timeout` caps how long we wait for the worker to drain — beyond it,
-    /// any unfinished jobs are cancelled and the worker is aborted. Use
-    /// `DEFAULT_SHUTDOWN_TIMEOUT_SECS` unless you have a reason to differ.
-    ///
-    /// Returns `true` only if the transcription client was actually placed
-    /// back into shared state. Returns `false` for any path where shared
-    /// state is left empty: worker timeout (aborted; in-flight clone may
-    /// still be live), worker panic (e.g. the `Arc::try_unwrap` invariant
-    /// panic inside `respawn_client`, which leaves `inner.client = None`),
-    /// or any other non-clean exit. On `false`, callers must treat the
-    /// engine as un-initialized and re-init before the next session.
-    pub async fn shutdown_and_return(&self, timeout: Duration) -> bool {
+    /// Backward-compat shim: legacy session live-loops call `set_live_busy`
+    /// when they enter / exit ingestion. The session live loop covers both
+    /// mic and system sources, so this sets/clears both bits at once.
+    /// Prefer per-source `set_busy(BusyKind::LiveMic | LiveSystem, ..)`
+    /// in new code.
+    pub fn set_live_busy(&self, busy: bool) {
+        self.set_busy(BusyKind::LiveMic, busy);
+        self.set_busy(BusyKind::LiveSystem, busy);
+    }
+
+    /// App-level shutdown: drain the worker, take the inner client, and call
+    /// `client.shutdown().await`. The scheduler becomes terminal and any
+    /// further `submit` from cloned handles is rejected. Safe to call
+    /// multiple times; subsequent calls return `Ok`.
+    pub async fn shutdown_client(&self, timeout: Duration) -> Result<(), String> {
         if self.inner.shutdown.swap(true, Ordering::AcqRel) {
-            // A previous call already ran the take/return path. Whether
-            // the client was returned then is no longer observable here;
-            // the first caller is responsible for acting on the prior
-            // return value.
-            return true;
+            return Ok(());
         }
-        // Wake the worker so it notices the shutdown flag. `notify_one`
-        // (not `notify_waiters`) is the correct primitive: it stores a
-        // permit if the worker isn't currently inside `notified().await`.
-        // Otherwise a shutdown set in the gap between the worker's
-        // `shutdown.load()` and its `notified().await` would be silently
-        // dropped, and the worker would sleep on an empty queue until
-        // the timeout aborts it — dropping the transcription client
-        // even though there was nothing to drain.
+        self.inner
+            .state
+            .store(SchedulerState::ShuttingDown as u8, Ordering::Release);
         self.inner.notify.notify_one();
 
         let worker = {
             let mut guard = self.worker.lock().await;
             guard.take()
         };
-        // Track whether the worker exited cleanly. Anything else — abort,
-        // panic, cancellation — means we cannot trust that no in-flight
-        // clone of the client is still live, and we must drop our own.
         let mut worker_clean = true;
         if let Some(worker) = worker {
-            // Capture the abort handle *before* `worker` is consumed by the
-            // timeout future. If the timeout fires we need to forcibly stop
-            // the worker — dropping the JoinHandle alone only detaches it,
-            // leaving the worker free to continue holding an in-flight clone
-            // of the transcription client.
             let abort_handle = worker.abort_handle();
             match tokio::time::timeout(timeout, worker).await {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => {
-                    // JoinError covers both panic and cancellation. The
-                    // worker may have panicked mid-`respawn_client`, which
-                    // takes `inner.client` *before* the panic — so the
-                    // client is already gone, and shared state must stay
-                    // empty.
                     warn!(
-                        "scheduler worker joined with error: {} — \
-                         treating as engine drop",
+                        "scheduler worker joined with error during shutdown_client: {} — \
+                         dropping client without graceful shutdown",
                         e
                     );
                     worker_clean = false;
                 }
                 Err(_) => {
                     warn!(
-                        "scheduler worker did not exit within {}s — aborting; \
-                         transcription client will not be returned to shared state",
+                        "scheduler worker did not exit within {}s during shutdown_client — \
+                         aborting; dropping client without graceful shutdown",
                         timeout.as_secs()
                     );
                     abort_handle.abort();
@@ -349,49 +418,52 @@ impl TranscriptionScheduler {
             }
         }
 
-        // Cancel any jobs the worker didn't get to (only non-empty if the
-        // shutdown timeout fired before drain completed).
         {
             let mut queues = self.inner.queues.lock().expect("queue mutex poisoned");
             queues.cancel_all();
         }
 
         let arc_client = self.inner.client.lock().await.take();
-
-        // The client is returned to shared state ONLY on the clean path:
-        // worker exited cleanly AND we still hold the client. Every other
-        // combination — worker non-clean, or client missing because a
-        // panic in `respawn_client` already dropped it — is an engine
-        // drop, and the caller must observe `false` to re-init.
+        let mut shutdown_err: Option<String> = None;
         if worker_clean {
             if let Some(arc_client) = arc_client {
-                let mut shared = self.inner.shared_state.lock().await;
-                *shared = Some(arc_client);
-                debug!("returned transcription client to shared state");
-                return true;
+                match Arc::try_unwrap(arc_client) {
+                    Ok(client) => {
+                        if let Err(e) = client.shutdown().await {
+                            shutdown_err = Some(format!("client shutdown failed: {e}"));
+                        }
+                    }
+                    Err(_) => {
+                        // Worker exited "cleanly" but a clone is still held
+                        // somewhere — should not happen if the scheduler is
+                        // the sole long-lived owner. Drop our reference and
+                        // log.
+                        warn!(
+                            "shutdown_client: worker exited cleanly but client Arc still has \
+                             other holders; dropping our reference"
+                        );
+                    }
+                }
+            } else {
+                warn!(
+                    "shutdown_client: worker exited cleanly but no client to shut down \
+                     (already taken upstream?)"
+                );
             }
-            // Reachable only if something outside this scheduler took the
-            // client — defensive, not expected in normal operation.
-            warn!(
-                "scheduler worker exited cleanly but no client to return; \
-                 next session will need to re-initialize the engine"
-            );
-            return false;
-        }
-
-        if arc_client.is_some() {
-            error!(
-                "scheduler shutdown aborted worker; dropping transcription client \
-                 (next session will need to re-initialize the engine)"
-            );
         } else {
             error!(
-                "scheduler worker exited unexpectedly with no client retained \
-                 (next session will need to re-initialize the engine)"
+                "shutdown_client: worker did not exit cleanly; dropping client without \
+                 graceful sidecar shutdown"
             );
+            drop(arc_client);
         }
-        drop(arc_client);
-        false
+        self.inner
+            .state
+            .store(SchedulerState::Terminal as u8, Ordering::Release);
+        match shutdown_err {
+            None => Ok(()),
+            Some(e) => Err(e),
+        }
     }
 }
 
@@ -399,9 +471,9 @@ async fn scheduler_worker(inner: Arc<SchedulerInner>) {
     loop {
         let env = {
             let mut queues = inner.queues.lock().expect("queue mutex poisoned");
-            let live_busy =
-                inner.live_busy.load(Ordering::Acquire) && !inner.shutdown.load(Ordering::Acquire);
-            queues.pick_next(live_busy)
+            let producers_busy = inner.busy_bits.load(Ordering::Acquire) != 0
+                && !inner.shutdown.load(Ordering::Acquire);
+            queues.pick_next(producers_busy)
         };
 
         let Some(env) = env else {
@@ -559,22 +631,51 @@ mod tests {
     }
 
     #[test]
-    fn priority_final_before_live_before_backfill() {
+    fn priority_final_before_dictation_before_live_before_backfill() {
         let mut q = SchedulerQueues::new();
         let (backfill, _rx_b) = fake_env(JobOrigin::Backfill, JobSource::Mic);
         let (live, _rx_l) = fake_env(JobOrigin::Live, JobSource::Mic);
+        let (dictation, _rx_d) = fake_env(JobOrigin::Dictation, JobSource::Mic);
         let (final_flush, _rx_f) = fake_env(JobOrigin::FinalFlush, JobSource::Mic);
         q.push(backfill);
         q.push(live);
+        q.push(dictation);
         q.push(final_flush);
 
         let first = q.pick_next(false).unwrap();
         assert!(matches!(first.request.origin, JobOrigin::FinalFlush));
         let second = q.pick_next(false).unwrap();
-        assert!(matches!(second.request.origin, JobOrigin::Live));
+        assert!(matches!(second.request.origin, JobOrigin::Dictation));
         let third = q.pick_next(false).unwrap();
-        assert!(matches!(third.request.origin, JobOrigin::Backfill));
+        assert!(matches!(third.request.origin, JobOrigin::Live));
+        let fourth = q.pick_next(false).unwrap();
+        assert!(matches!(fourth.request.origin, JobOrigin::Backfill));
         assert!(q.pick_next(false).is_none());
+    }
+
+    #[test]
+    fn dictation_jumps_an_already_queued_live_job() {
+        let mut q = SchedulerQueues::new();
+        let (live, _) = fake_env(JobOrigin::Live, JobSource::Mic);
+        q.push(live);
+        let (dictation, _) = fake_env(JobOrigin::Dictation, JobSource::Mic);
+        q.push(dictation);
+
+        let first = q.pick_next(false).unwrap();
+        assert!(matches!(first.request.origin, JobOrigin::Dictation));
+        let second = q.pick_next(false).unwrap();
+        assert!(matches!(second.request.origin, JobOrigin::Live));
+    }
+
+    #[test]
+    fn dictation_ignores_busy_gate() {
+        let mut q = SchedulerQueues::new();
+        let (dictation, _) = fake_env(JobOrigin::Dictation, JobSource::Mic);
+        q.push(dictation);
+        // Even with producers busy, dictation is eligible (it bypasses the
+        // backfill-only gate the same way live and final_flush do).
+        let first = q.pick_next(true).unwrap();
+        assert!(matches!(first.request.origin, JobOrigin::Dictation));
     }
 
     #[test]
@@ -701,15 +802,17 @@ mod tests {
     fn cancel_all_drains_every_bucket() {
         let mut q = SchedulerQueues::new();
         let (final_flush, mut rx_f) = fake_env(JobOrigin::FinalFlush, JobSource::Mic);
+        let (dictation, mut rx_d) = fake_env(JobOrigin::Dictation, JobSource::Mic);
         let (live, mut rx_l) = fake_env(JobOrigin::Live, JobSource::System);
         let (backfill, mut rx_b) = fake_env(JobOrigin::Backfill, JobSource::Mic);
         q.push(final_flush);
+        q.push(dictation);
         q.push(live);
         q.push(backfill);
 
         q.cancel_all();
 
-        for rx in [&mut rx_f, &mut rx_l, &mut rx_b] {
+        for rx in [&mut rx_f, &mut rx_d, &mut rx_l, &mut rx_b] {
             let out = rx.try_recv().expect("waiter should have a value");
             assert!(matches!(out.result, Err(SchedulerError::Cancelled)));
         }
