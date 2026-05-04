@@ -308,6 +308,11 @@ export function ChatView({
 
   const handleContainerPointerDown = (e: React.PointerEvent) => {
     if (e.button !== 0) return;
+    // React routes synthetic events through the component tree, so a click
+    // on a Radix portal child (e.g. an open ContextMenu item) bubbles here
+    // even though its DOM lives in document.body. Without this bail we'd
+    // preventDefault that pointerdown and swallow the menu item's click.
+    if (!e.currentTarget.contains(e.target as Node)) return;
     const target = e.target as HTMLElement;
     // Bubbles handle their own clicks (incl. shift/cmd modifiers) and
     // right-click ContextMenu; the marquee only starts on whitespace.
