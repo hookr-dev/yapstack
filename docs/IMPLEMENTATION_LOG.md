@@ -1439,6 +1439,38 @@ Two unrelated landings folded into the alpha.9 cycle.
 - **A "couldn't tell" boolean fails open in exactly the wrong direction.** The original `is_device_alive → bool` reported `true` on lookup failure because that was the conservative default for the watchdog path (don't restart a working stream). For the explicit-pick failover branch the conservative default is the opposite (the device might be gone — let the failover proceed). The tri-state forces the call site to make that choice explicitly.
 - **Tiptap's bubble menu is a UX trap when it duplicates the toolbar.** Users got into states where toggling bold from the bubble disagreed with the toolbar's active state because the toolbar wasn't subscribing to selection updates. The fix — `useEditorState` + scope split — is small once you know the convention; the trap is shipping the bubble with everything in it because Tiptap's example shows that.
 
+## Phase 36 — Marquee/Portal Click Swallow + Footer Rebrand
+
+### What was built
+
+Two small landings folded into the alpha.10 cycle.
+
+1. **Stop the transcript marquee from swallowing context-menu clicks (#28).** The whitespace-marquee `onPointerDown` on `ChatView`'s container now bails when the synthetic event came from outside the container's actual DOM subtree (`!currentTarget.contains(target)`). One guard clause.
+2. **Settings → General footer rebrand (#29).** Two-character copy/link change.
+
+### Bugs / needs being addressed
+
+- Right-clicking a transcription segment opened the context menu correctly, but every action item — Edit, Copy, Insert into Notes, Hide, Delete — silently no-op'd. Menu stayed open; only the focus ring on the hovered item flickered off. The bug had been in main since `76c7b4e` (drag-select WIP) and only surfaced as user-visible when right-click actions started getting used — none of the previous "fixes" landed because they were diagnosing the wrong layer (we kept reaching for the `appStore` action paths when the actions were never being called at all).
+
+### Key decisions
+
+- **One-line guard, not a refactor.** The architecturally-correct fix is to attach the marquee listeners with native `addEventListener` on a ref'd DOM node — DOM-tree event flow naturally avoids portal cross-talk because portal children whose DOM lives in `document.body` aren't ancestors of the container in the DOM tree. Punted that to a follow-up; the guard unblocks users today and doesn't make the eventual extraction harder (the bail becomes dead code and gets deleted in the same change).
+- **Why `currentTarget.contains(target)` is the right discriminator.** For a normal event bubbling within the React/DOM tree, `currentTarget` always contains `target`. For a React synthetic event originating in a portal, `target` is the actual DOM node (in `document.body`) and `currentTarget` is wherever the listener is registered (in `#root`); `contains` returns false. No allowlist of Radix selectors needed.
+
+### Files Changed
+
+| File | Change |
+|------|--------|
+| `apps/desktop/src/components/ChatView.tsx` | New early-return in `handleContainerPointerDown` for synthetic events whose DOM target lives outside the container subtree (portal children). |
+| `apps/desktop/src/components/settings/GeneralTab.tsx` | Footer attribution + link rebranded. |
+| `CHANGELOG.md` | `[1.0.0-alpha.10] - 2026-05-04` block. |
+| `apps/desktop/src-tauri/Cargo.toml`, `apps/desktop/src-tauri/tauri.conf.json`, `Cargo.lock` | Version bumped to `1.0.0-alpha.10`. |
+
+### What was learned
+
+- **React's portal events route through the component tree, not the DOM tree.** Any pointer/mouse handler attached as a React prop on a container that *transitively* owns a `<ContextMenu>` / `<DropdownMenu>` / `<Tooltip>` will receive synthetic events from those portals' children. If the handler's contract is "this gesture started inside my DOM subtree" — as drag-select handlers usually are — it needs an explicit `currentTarget.contains(target)` check, or it needs to be wired via native `addEventListener` instead. The latter is the pattern the rest of this codebase already uses (`useClickOutside`, the Settings/Onboarding mousedown listeners) and is the longer-term correct shape for ChatView's marquee logic.
+- **`preventDefault` on a `pointerdown` for a mouse pointer suppresses the corresponding mousedown / mouseup / click events.** This is per W3C spec and is exactly why the menu items lost their click delivery: once the marquee handler called `preventDefault`, the click event Radix's MenuItem composes its `onSelect` onto never fired. Easy to forget when reading just the marquee code in isolation.
+
 ## What's Not Yet Built
 
 - **End-to-end integration tests** — capture audio, transcribe, verify text (unit + component tests now exist; integration tests still needed)

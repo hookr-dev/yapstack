@@ -6,6 +6,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+## [1.0.0-alpha.10] - 2026-05-04
+
+### Fixed
+- **Right-click context-menu actions on transcription segments now fire.** Edit / Copy / Insert into Notes / Hide / Delete had been silently no-op'ing — the transcript's drag-select handler was treating menu-item clicks as marquee starts and swallowing the click (#28).
+
+### Changed
+- **Settings → General footer rebranded** (#29).
+
 ## [1.0.0-alpha.9] - 2026-05-03
 
 ### Added
