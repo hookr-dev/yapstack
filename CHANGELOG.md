@@ -6,6 +6,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+## [1.0.0-alpha.10] - 2026-05-04
+
+### Fixed
+- **Right-click context-menu actions on transcription segments now fire.** Edit / Copy / Insert into Notes / Hide / Delete had been silently no-op'ing because the transcript's whitespace-marquee pointerdown handler was treating menu-item clicks as drag-select starts. React routes synthetic events through the component tree, so a click on a Radix-portal child (rendered into `document.body`) still bubbled into the marquee handler, which `setPointerCapture`'d the container, blurred the menu item, and `preventDefault`'d the pointerdown — suppressing the corresponding mousedown / mouseup / click and stopping Radix from firing the action. Marquee handler now bails when the synthetic event came from outside the container's actual DOM subtree (#28).
+
+### Changed
+- **Settings → General footer rebranded** (#29).
+
 ## [1.0.0-alpha.9] - 2026-05-03
 
 ### Added
