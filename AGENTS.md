@@ -28,6 +28,7 @@ If you have one question, the answer is probably here. If not, follow the doc ro
 - [`docs/GLOSSARY.md`](docs/GLOSSARY.md) — domain terms (session, segment, part, dictation, diarization).
 - [`docs/AGENT_GUIDE.md`](docs/AGENT_GUIDE.md) — navigation and common task recipes for agents.
 - [`docs/LINEAR_TICKETS.md`](docs/LINEAR_TICKETS.md) — ticket structure for agent pickup.
+- [`docs/RELEASE.md`](docs/RELEASE.md) — release runbook (version-bump locations, CHANGELOG roll, tag/push, signing, hotfix path).
 - [`docs/adr/`](docs/adr/) — architecture decision records (append-only).
 
 ## Build & test commands

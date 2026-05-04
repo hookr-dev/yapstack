@@ -24,6 +24,7 @@ Fast router for humans and AI agents. One line per doc — load this file first 
 - [`PRINCIPLES.md`](PRINCIPLES.md) — design, testing, and coding posture. Read before refactoring.
 - [`AGENT_GUIDE.md`](AGENT_GUIDE.md) — navigation tips and common task recipes for AI agents.
 - [`LINEAR_TICKETS.md`](LINEAR_TICKETS.md) — ticket structure for agent pickup.
+- [`RELEASE.md`](RELEASE.md) — release runbook: version bump locations, CHANGELOG roll, tag/push, signing, draft publish, hotfix path.
 
 ## Subsystems & integrations
 

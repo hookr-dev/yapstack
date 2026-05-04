@@ -89,8 +89,16 @@ All 25 shadcn-style primitives live under [`apps/desktop/src/components/ui/`](..
 
 Rich-text styling lives in `@layer components` of `index.css`:
 
-- `.tiptap-editor` — headings, lists, blockquotes, code, task lists, segment-ref pills (`span[data-segment-ref]`), link hover, highlight `<mark>`. Used by `NoteEditor`.
+- `.tiptap-editor` — headings, lists, blockquotes, code, task lists, segment-ref pills (`span[data-segment-ref]`), link hover, highlight `<mark>`. Themed checklist checkboxes (accent fill, contrast checkmark, focus-visible ring, first-line alignment) and a 5-color highlight palette (yellow/green/blue/purple/red) stored as CSS variable references so highlights re-theme automatically across light/dark. Used by `NoteEditor`.
 - `.ai-chat-markdown` — smaller type scale, compact margins. Used by the chat response bubble. Headings are intentionally demoted in size (`h1` → `0.875rem`) and the system prompts tell the model to prefer `**bold**` over `#` headings.
+
+**Toolbar / bubble-menu split** mirrors Notion / Linear / Novel:
+
+- **Static toolbar** holds block-level formatting — heading dropdown (shows the active level: H1 / H2 / Normal), lists, blockquote, code block, link.
+- **Selection bubble menu** is scoped to inline marks — bold, italic, underline, strike, code, highlight, link. Floating UI's `flip` / `shift` use the editor's contenteditable as the boundary so the bubble can't land on the toolbar above or the floating chat bar below; renders at `z-50` so it sits above other floating UI.
+- Both surfaces re-render on selection changes via `useEditorState` and gain an accent underline when their mark/block is active, so cases like "bold persists on a new line" are visible.
+
+**In-editor shortcuts.** Command palette (⌘K), sidebar (⌘\\), settings (⌘,), filter switches (⌘1/⌘2), new note (⌘N), stop recording (⌘.), toggle chat (⌘J), and pin (⌘D) fire while the editor has focus. Escape and ⌘⌫ still defer to the editor. The default sidebar binding is **⌘\\** (not ⌘B) so it doesn't fight Tiptap's bold binding inside notes.
 
 ---
 
