@@ -2281,10 +2281,17 @@ function createAppStore() {
 
       refreshViewSessionSegments: async () => {
         const { selectedSessionId, activeSessionId } = get();
-        if (!selectedSessionId || selectedSessionId === activeSessionId) return;
+        if (!selectedSessionId) return;
         try {
           const segments = await getSessionSegments(selectedSessionId);
-          set({ viewSessionSegments: segments });
+          // When the selected session is the live one, NoteDetailView reads
+          // from activeSessionSegments — refresh that array so context-menu
+          // edits/deletes/hides take effect immediately during recording.
+          if (selectedSessionId === activeSessionId) {
+            set({ activeSessionSegments: segments });
+          } else {
+            set({ viewSessionSegments: segments });
+          }
         } catch (e) {
           console.error("Failed to refresh segments:", e);
         }
