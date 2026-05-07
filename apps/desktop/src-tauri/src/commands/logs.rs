@@ -5,11 +5,26 @@
 
 use std::sync::Arc;
 
+use serde::Deserialize;
+use specta::Type;
 use tauri::{AppHandle, Manager, State};
 use tauri_plugin_opener::OpenerExt;
 
 use super::error::CommandError;
 use crate::logging::{LogBuffer, LogEntry};
+
+/// Level passed by the frontend logger. Mirrors `tracing::Level` so the
+/// in-process subscriber can route the event identically to a native call.
+/// Lowercase serde matches the JS-side string literals.
+#[derive(Debug, Clone, Copy, Deserialize, Type)]
+#[serde(rename_all = "lowercase")]
+pub enum FrontendLogLevel {
+    Error,
+    Warn,
+    Info,
+    Debug,
+    Trace,
+}
 
 /// Snapshot of recent entries from the in-memory ring buffer.
 /// `limit` caps the number returned (default 500 = the full buffer).
@@ -41,6 +56,53 @@ pub async fn get_log_dir(app: AppHandle) -> Result<String, CommandError> {
             message: format!("failed to resolve log dir: {e}"),
         })?;
     Ok(dir.to_string_lossy().into_owned())
+}
+
+/// Forward a frontend log event into the unified `tracing` subscriber so it
+/// lands on stderr, the rolling daily log file, AND the in-memory ring
+/// buffer (and therefore the LogsPanel + any saved-machine-log archive).
+///
+/// `module` is an optional sub-target (e.g. "console", "window.error",
+/// "heap"); it is rendered as a bracketed prefix on the message. We keep
+/// `target` fixed at `frontend` so the subscriber filter (`frontend=debug`)
+/// is a single knob.
+///
+/// Best-effort by contract — the JS caller fires-and-forgets and we never
+/// surface a failure that would itself produce an error during error
+/// reporting. Capping the message length prevents a runaway stack trace
+/// from blowing past the ring buffer's per-entry budget.
+#[tauri::command]
+#[specta::specta]
+pub async fn log_frontend(
+    level: FrontendLogLevel,
+    module: Option<String>,
+    message: String,
+) -> Result<(), CommandError> {
+    const MAX_MESSAGE_LEN: usize = 8 * 1024;
+    let trimmed = if message.len() > MAX_MESSAGE_LEN {
+        let mut s = message;
+        s.truncate(MAX_MESSAGE_LEN);
+        s.push_str("…[truncated]");
+        s
+    } else {
+        message
+    };
+    let formatted = match module.as_deref() {
+        Some(m) if !m.is_empty() => format!("[{m}] {trimmed}"),
+        _ => trimmed,
+    };
+    // One arm per level: `tracing::event!` requires a const level at the
+    // call site so each level gets its own static metadata. A runtime-
+    // dispatched form would lose per-level filtering — this match is the
+    // canonical idiom in `tracing`-using codebases.
+    match level {
+        FrontendLogLevel::Error => tracing::error!(target: "frontend", "{formatted}"),
+        FrontendLogLevel::Warn => tracing::warn!(target: "frontend", "{formatted}"),
+        FrontendLogLevel::Info => tracing::info!(target: "frontend", "{formatted}"),
+        FrontendLogLevel::Debug => tracing::debug!(target: "frontend", "{formatted}"),
+        FrontendLogLevel::Trace => tracing::trace!(target: "frontend", "{formatted}"),
+    }
+    Ok(())
 }
 
 /// Open Finder / Explorer to the log directory so the user can grab the files

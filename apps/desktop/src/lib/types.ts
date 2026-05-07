@@ -409,6 +409,29 @@ async revealLogDir() : Promise<Result<null, CommandError>> {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
+},
+/**
+ * Forward a frontend log event into the unified `tracing` subscriber so it
+ * lands on stderr, the rolling daily log file, AND the in-memory ring
+ * buffer (and therefore the LogsPanel + any saved-machine-log archive).
+ * 
+ * `module` is an optional sub-target (e.g. "console", "window.error",
+ * "heap"); it is rendered as a bracketed prefix on the message. We keep
+ * `target` fixed at `frontend` so the subscriber filter (`frontend=debug`)
+ * is a single knob.
+ * 
+ * Best-effort by contract — the JS caller fires-and-forgets and we never
+ * surface a failure that would itself produce an error during error
+ * reporting. Capping the message length prevents a runaway stack trace
+ * from blowing past the ring buffer's per-entry budget.
+ */
+async logFrontend(level: FrontendLogLevel, module: string | null, message: string) : Promise<Result<null, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("log_frontend", { level, module, message }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
 }
 }
 
@@ -452,6 +475,12 @@ export type EngineDescriptorDto = { kind: EngineKindDto; display_name: string; l
  * Which transcription engine the frontend has selected.
  */
 export type EngineKindDto = "Whisper" | "Parakeet"
+/**
+ * Level passed by the frontend logger. Mirrors `tracing::Level` so the
+ * in-process subscriber can route the event identically to a native call.
+ * Lowercase serde matches the JS-side string literals.
+ */
+export type FrontendLogLevel = "error" | "warn" | "info" | "debug" | "trace"
 export type HealthStatus = { status: string; version: string }
 export type LiveTranscriptionConfig = { 
 /**

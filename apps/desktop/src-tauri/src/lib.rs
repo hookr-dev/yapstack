@@ -309,6 +309,7 @@ pub fn run() {
             commands::logs::clear_logs,
             commands::logs::get_log_dir,
             commands::logs::reveal_log_dir,
+            commands::logs::log_frontend,
         ]);
 
     #[cfg(debug_assertions)]
@@ -510,6 +511,13 @@ pub fn run() {
             let (log_buffer, log_guard) = logging::init(&log_dir, app.handle().clone());
             app.manage(log_buffer);
             app.manage(log_guard);
+
+            // Periodic process-memory sampling. Runs forever in a daemon
+            // thread; gives us a historical RSS/VSZ trace in the rolling
+            // log so we can correlate growth with crashes / lockups. The
+            // FE-side `performance.memory` sampler is complementary —
+            // captures JS-heap on Chromium webviews, no-ops on WKWebView.
+            let _ = logging::spawn_memory_sampler();
 
             // Initialize model manager with app data directory
             let app_data_dir = app

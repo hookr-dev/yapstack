@@ -2,7 +2,14 @@ import React from "react";
 import ReactDOM from "react-dom/client";
 import App from "./App";
 import { Toaster } from "@/components/ui/sonner";
+import { installFrontendLogger } from "@/lib/logger";
 import "./index.css";
+
+// Install before any other module can throw — captures errors during the
+// rest of bootstrap, plus any subsequent `console.error`, `window.onerror`,
+// and `unhandledrejection`. Routes everything into the same Rust tracing
+// subscriber that owns the rolling log file under `app_log_dir()`.
+installFrontendLogger();
 
 // Suppress the WebView's native right-click menu (Reload / Inspect Element
 // in dev, Save Image As / Look Up / etc. in production) so the app feels
