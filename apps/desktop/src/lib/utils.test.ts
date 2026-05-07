@@ -79,6 +79,18 @@ describe("formatTime", () => {
   it("formats 10 minutes", () => {
     expect(formatTime(600)).toBe("10:00");
   });
+
+  it("wraps at 60 minutes into hours bucket", () => {
+    expect(formatTime(3600)).toBe("1:00:00");
+  });
+
+  it("formats hours, minutes, and seconds together", () => {
+    expect(formatTime(3725)).toBe("1:02:05");
+  });
+
+  it("formats values past two hours", () => {
+    expect(formatTime(7384)).toBe("2:03:04");
+  });
 });
 
 describe("formatElapsed", () => {
@@ -94,8 +106,16 @@ describe("formatElapsed", () => {
     expect(formatElapsed(150000)).toBe("02:30");
   });
 
-  it("formats 60 minutes", () => {
-    expect(formatElapsed(3600000)).toBe("60:00");
+  it("wraps at 60 minutes into hours bucket", () => {
+    expect(formatElapsed(3600000)).toBe("01:00:00");
+  });
+
+  it("formats hours, minutes, and seconds together", () => {
+    expect(formatElapsed(3725000)).toBe("01:02:05");
+  });
+
+  it("formats values past two hours", () => {
+    expect(formatElapsed(7384000)).toBe("02:03:04");
   });
 });
 
