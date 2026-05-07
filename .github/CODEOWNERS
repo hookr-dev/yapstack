@@ -1,2 +1,4 @@
-# Require review from project maintainers for workflow and CI changes
-/.github/ @Claytonn
+# Every change to this repository requires review from @Claytonn.
+# See: https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+
+* @Claytonn
