@@ -15,8 +15,13 @@ use tracing::{error, info};
 use yapstack_common::types::{EngineKind, SidecarRequest, SidecarResponse};
 
 #[cfg(any(feature = "whisper", feature = "parakeet"))]
-use crate::engines::{TranscribeOpts, TranscriptionBackend, TranscriptionOutput};
+use crate::diarization::{apply_diarization, DiarizationContext};
+#[cfg(any(feature = "whisper", feature = "parakeet"))]
+use crate::engines::{
+    read_wav_as_mono_16k, TranscribeOpts, TranscriptionBackend, TranscriptionOutput,
+};
 
+mod diarization;
 mod engines;
 
 #[derive(Debug)]
@@ -93,13 +98,11 @@ fn parse_args() -> CliArgs {
 fn build_backend(
     engine: EngineKind,
     vad_model_path: Option<PathBuf>,
-    sortformer_model_path: Option<PathBuf>,
     coreml_cache_dir: Option<PathBuf>,
 ) -> Option<Box<dyn TranscriptionBackend>> {
     match engine {
         EngineKind::Whisper => {
-            // Whisper ignores Sortformer + CoreML cache; they're parakeet-only.
-            let _ = sortformer_model_path;
+            // CoreML cache is parakeet-only.
             let _ = coreml_cache_dir;
             #[cfg(feature = "whisper")]
             {
@@ -120,13 +123,11 @@ fn build_backend(
             #[cfg(feature = "parakeet")]
             {
                 Some(Box::new(engines::parakeet::ParakeetBackend::new(
-                    sortformer_model_path,
                     coreml_cache_dir,
                 )))
             }
             #[cfg(not(feature = "parakeet"))]
             {
-                let _ = sortformer_model_path;
                 let _ = coreml_cache_dir;
                 None
             }
@@ -181,9 +182,14 @@ async fn main() {
     let mut backend: Option<Box<dyn TranscriptionBackend>> = build_backend(
         cli.engine,
         cli.vad_model_path.clone(),
-        cli.sortformer_model_path.clone(),
         cli.coreml_cache_dir.clone(),
     );
+
+    // Sortformer runs as a shared post-pass after either backend
+    // transcribes. Lives at process scope so its streaming state (FIFO +
+    // speaker cache) carries across chunks for the whole session.
+    #[cfg(any(feature = "whisper", feature = "parakeet"))]
+    let mut diarization_ctx = DiarizationContext::new(cli.sortformer_model_path.clone());
 
     #[cfg(any(feature = "whisper", feature = "parakeet"))]
     if let (Some(b), Some(model_path)) = (backend.as_mut(), cli.initial_model_path.as_ref()) {
@@ -327,13 +333,33 @@ async fn main() {
                         single_segment,
                         diarization,
                     };
+                    // Read the WAV once: the same buffer feeds the
+                    // transcription backend AND the diarization post-pass.
+                    let samples = match read_wav_as_mono_16k(&audio_path) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            send_error(id, format!("failed to read audio: {e}")).await;
+                            continue;
+                        }
+                    };
                     match backend.as_mut() {
-                        Some(b) => match b.transcribe(&audio_path, opts) {
+                        Some(b) => match b.transcribe(&samples, opts) {
                             Ok(TranscriptionOutput {
                                 text,
-                                segments,
+                                mut segments,
                                 duration_ms,
                             }) => {
+                                // Engine-agnostic diarization post-pass.
+                                // `apply_diarization` is a no-op when the
+                                // sidecar wasn't given a Sortformer model
+                                // path or when the request opted out.
+                                if diarization {
+                                    apply_diarization(
+                                        &mut diarization_ctx,
+                                        &samples,
+                                        &mut segments,
+                                    );
+                                }
                                 let response = SidecarResponse::Transcription {
                                     id,
                                     text,

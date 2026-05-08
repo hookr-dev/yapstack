@@ -9,8 +9,8 @@ use whisper_rs::{
 use yapstack_common::types::TranscriptSegment;
 
 use crate::engines::{
-    normalize_spacing, read_wav_as_mono_16k, sanitize_text, should_include_segment, EngineInfo,
-    TranscribeOpts, TranscriptionBackend, TranscriptionOutput,
+    normalize_spacing, sanitize_text, should_include_segment, EngineInfo, TranscribeOpts,
+    TranscriptionBackend, TranscriptionOutput,
 };
 
 pub struct WhisperBackend {
@@ -71,12 +71,10 @@ impl TranscriptionBackend for WhisperBackend {
 
     fn transcribe(
         &mut self,
-        audio_path: &Path,
+        samples: &[f32],
         opts: TranscribeOpts<'_>,
     ) -> Result<TranscriptionOutput, String> {
         let ctx = self.ctx.as_ref().ok_or("no model loaded")?;
-
-        let samples = read_wav_as_mono_16k(audio_path)?;
 
         let start = std::time::Instant::now();
 
@@ -154,7 +152,7 @@ impl TranscriptionBackend for WhisperBackend {
             .map_err(|e| format!("failed to create state: {e}"))?;
 
         state
-            .full(params, &samples)
+            .full(params, samples)
             .map_err(|e| format!("transcription failed: {e}"))?;
 
         let num_segments = state.full_n_segments();

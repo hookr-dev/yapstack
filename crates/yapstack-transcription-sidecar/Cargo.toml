@@ -10,9 +10,10 @@ default = ["whisper", "parakeet"]
 whisper = ["dep:whisper-rs"]
 metal = ["whisper-rs/metal"]
 cuda = ["whisper-rs/cuda"]
-# Sortformer (speaker diarization) ships under the same parakeet feature
-# so it travels with the engine that needs it.
-parakeet = ["dep:parakeet-rs"]
+# `parakeet` toggles the Parakeet TDT *transcription* backend in
+# `engines/parakeet.rs`. Sortformer diarization lives in `diarization.rs`
+# and uses parakeet-rs unconditionally so Whisper builds can diarize too.
+parakeet = []
 # Apple-only CoreML execution provider for Parakeet. Strict superset of
 # `parakeet`. Adds ~Metal/ANE acceleration via ort-coreml; CPU is kept as
 # automatic fallback by parakeet-rs (`error_on_failure()`).
@@ -32,4 +33,7 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 hound = { workspace = true }
 whisper-rs = { version = "0.15", optional = true }
-parakeet-rs = { version = "=0.3.5", optional = true, features = ["sortformer"] }
+# parakeet-rs is always present: Sortformer diarization runs as a shared
+# post-pass after whichever engine transcribed. The `sortformer` feature
+# gates the diarization module specifically.
+parakeet-rs = { version = "=0.3.5", features = ["sortformer"] }

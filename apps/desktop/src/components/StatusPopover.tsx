@@ -301,9 +301,7 @@ export function StatusPopover() {
     const lines = [
       `Phase: ${headerTitle} — ${headerSub}`,
       `Engine: ${selectedEngine} / ${modelLabel}${
-        selectedEngine === "Parakeet" && diarizationEnabled
-          ? " + Diarization"
-          : ""
+        diarizationEnabled ? " + Diarization" : ""
       }${
         loadedEngineInfo?.accel
           ? `   Accel: ${loadedEngineInfo.accel}${
@@ -412,7 +410,7 @@ export function StatusPopover() {
               <div className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5 text-[11px]">
                 <span className="font-medium">{selectedEngine}</span>
                 <span className="text-muted-foreground">{modelLabel}</span>
-                {selectedEngine === "Parakeet" && diarizationEnabled && (
+                {diarizationEnabled && (
                   <span className="text-amber-600 dark:text-amber-400">+ Diarization</span>
                 )}
               </div>

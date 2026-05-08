@@ -94,12 +94,15 @@ pub trait TranscriptionBackend: Send {
         None
     }
 
-    /// Transcribe the WAV file at `audio_path`. The backend is responsible
-    /// for any required resampling/channel conversion. Takes `&mut self`
-    /// because some backends (Parakeet) mutate decoder state per call.
+    /// Transcribe `samples` (16 kHz, mono, f32). The dispatcher in
+    /// `main.rs` reads the WAV once via [`read_wav_as_mono_16k`] and hands
+    /// the same buffer to both this method and the diarization post-pass,
+    /// so backends no longer touch the filesystem per request. Takes
+    /// `&mut self` because some backends (Parakeet) mutate decoder state
+    /// per call.
     fn transcribe(
         &mut self,
-        audio_path: &Path,
+        samples: &[f32],
         opts: TranscribeOpts<'_>,
     ) -> Result<TranscriptionOutput, String>;
 }

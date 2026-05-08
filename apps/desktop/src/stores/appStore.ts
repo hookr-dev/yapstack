@@ -570,7 +570,11 @@ const defaultSettings: Settings = {
   selectedEngine: "Parakeet",
   selectedModelSize: "Small",
   selectedParakeetVariant: "TdtV3",
-  diarizationEnabled: false,
+  // Permanently on now that Sortformer's streaming API gives session-stable
+  // speaker IDs. Kept as a settings field so the existing call sites
+  // compile, but the user can no longer toggle it; dictation suppresses
+  // the per-call flag at the Tauri command boundary.
+  diarizationEnabled: true,
   speakerNames: {},
   language: "en",
   mixConfig: { mic_gain: 1.0, system_gain: 1.0, normalize: false },
@@ -1088,8 +1092,7 @@ function createAppStore() {
           audio_save_location: settings.audioSaveLocation,
           audio_export_format: settings.audioExportFormat,
           mp3_bitrate: settings.audioExportFormat === "mp3" ? settings.mp3Bitrate : null,
-          diarization:
-            settings.selectedEngine === "Parakeet" && settings.diarizationEnabled,
+          diarization: settings.diarizationEnabled,
           vocabulary_hints: vocabHints,
         };
 
@@ -1214,8 +1217,7 @@ function createAppStore() {
           audio_export_format: settings.audioExportFormat,
           mp3_bitrate:
             settings.audioExportFormat === "mp3" ? settings.mp3Bitrate : null,
-          diarization:
-            settings.selectedEngine === "Parakeet" && settings.diarizationEnabled,
+          diarization: settings.diarizationEnabled,
           vocabulary_hints: vocabHints,
           resume: {
             part_index: nextPartIndex,
@@ -1788,6 +1790,24 @@ function createAppStore() {
               set({ modelDownloadProgress: null });
               await get().refreshModels();
             }
+            // Sortformer diarization runs on both engines now; mirror the
+            // Parakeet branch's lazy download so Whisper users also get
+            // speaker IDs without a manual install step.
+            if (settings.diarizationEnabled) {
+              await get().refreshSortformerStatus();
+              if (!get().sortformerStatus?.downloaded) {
+                set({ modelDownloadProgress: 0 });
+                const dl = await commands.downloadSortformerModel("V2_1");
+                if (dl.status === "error") {
+                  console.error(
+                    "sortformer download failed; continuing without diarization:",
+                    dl.error.message,
+                  );
+                }
+                set({ modelDownloadProgress: null });
+                await get().refreshSortformerStatus();
+              }
+            }
           }
 
           set({ enginePhase: "initializing" });
@@ -1798,7 +1818,7 @@ function createAppStore() {
             engine,
             engine === "Whisper" ? settings.selectedModelSize : null,
             engine === "Parakeet" ? settings.selectedParakeetVariant : null,
-            engine === "Parakeet" ? settings.diarizationEnabled : false,
+            settings.diarizationEnabled,
           );
           if (initResult.status === "error") {
             throw new Error(initResult.error.message);
@@ -1857,48 +1877,15 @@ function createAppStore() {
         await get().refreshParakeetModels();
       },
 
-      setDiarizationEnabled: async (enabled: boolean) => {
-        // Diarization is intentionally locked off pending session-stable
-        // speaker IDs. Sortformer::diarize() resets state per call, so the
-        // speaker_id values it returns are chunk-local — the same person
-        // can flip between Speaker 0 / Speaker 1 across chunk boundaries,
-        // and the transcript UI groups + renames by that numeric id. The
-        // entire IPC + sidecar + DB plumbing stays in place so re-enabling
-        // is a one-line change once the chunk-local issue is resolved
-        // (streaming Sortformer state, post-session pass on the full WAV,
-        // or an embedding-based session registry — see the doc comment on
-        // ParakeetBackend::run_diarization).
-        //
-        // Force enabled = false. We never persist `true` from this path.
-        // Any caller that explicitly tries to enable gets a clear error.
-        if (enabled) {
-          throw new Error(
-            "Speaker diarization is currently disabled — chunk-local speaker " +
-              "IDs cause unstable labels across the session. Re-enable will " +
-              "land once session-stable IDs are wired up.",
-          );
-        }
-        const settings = get().settings;
-        if (!settings.diarizationEnabled) return;
-
-        get().updateSettings({ diarizationEnabled: false });
-
-        if (settings.selectedEngine === "Parakeet") {
-          set({ enginePhase: "initializing" });
-          set({ loadedEngineInfo: null });
-          await commands.shutdownTranscriptionClient();
-          const r = await commands.initTranscriptionClient(
-            "Parakeet",
-            null,
-            settings.selectedParakeetVariant,
-            false,
-          );
-          if (r.status === "error") {
-            set({ enginePhase: "error", engineError: r.error.message });
-            throw new Error(r.error.message);
-          }
-          set({ enginePhase: "ready", engineError: null });
-        }
+      setDiarizationEnabled: async (_enabled: boolean) => {
+        // Diarization is permanently on for both engines now that
+        // Sortformer's streaming API (`diarize_chunk`) preserves speaker
+        // identity across chunk boundaries. The setter is kept on the
+        // store contract so existing callers compile, but it is a no-op:
+        // the persisted `diarizationEnabled` flag stays `true` regardless
+        // of the input. Disabling diarization for a specific *call site*
+        // (e.g. dictation) is enforced at the Tauri command boundary, not
+        // through this user setting.
       },
 
       updateSettings: (partial) => {
@@ -2442,7 +2429,7 @@ function createAppStore() {
     }),
     {
       name: "yapstack-settings",
-      version: 24,
+      version: 25,
       partialize: (state) => ({
         settings: state.settings,
       }),
@@ -2629,6 +2616,16 @@ function createAppStore() {
             old.dictationDuckEnabled = false;
           if (old.dictationDuckTarget === undefined)
             old.dictationDuckTarget = 0.2;
+        }
+        if (version < 25 && state.settings) {
+          // Re-enable diarization for everyone. The v23 force-off was tied
+          // to chunk-local speaker IDs; switching to Sortformer's streaming
+          // diarize_chunk API gives session-stable IDs by construction, and
+          // the toggle is now permanently on for both engines (Whisper +
+          // Parakeet). Dictation suppresses diarization separately at the
+          // Tauri command boundary so this flag isn't a dictation knob.
+          const old = state.settings as Record<string, unknown>;
+          old.diarizationEnabled = true;
         }
         return state as unknown as { settings: Settings };
       },

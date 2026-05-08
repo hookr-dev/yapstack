@@ -15,13 +15,6 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { Switch } from "@/components/ui/switch";
-import {
-  Tooltip,
-  TooltipContent,
-  TooltipProvider,
-  TooltipTrigger,
-} from "@/components/ui/tooltip";
 import { ChevronsUpDown } from "lucide-react";
 import { toast } from "sonner";
 import type { EngineKindDto } from "@/lib/tauri";
@@ -136,11 +129,6 @@ function ButtonGroupSetting({
 export function TranscriptionTab() {
   const language = useAppStore((s) => s.settings.language);
   const selectedEngine = useAppStore((s) => s.settings.selectedEngine);
-  // diarizationEnabled is intentionally not read here — the Speaker
-  // diarization toggle is hard-locked to off pending session-stable
-  // speaker IDs (see setDiarizationEnabled). The persisted value is still
-  // forced to false on upgrade via migration v23, and the store action
-  // throws if anything tries to enable it.
   const engineCatalogue = useAppStore((s) => s.engineCatalogue);
   const maxChunkSeconds = useAppStore((s) => s.settings.maxChunkSeconds);
   const silenceDurationMs = useAppStore((s) => s.settings.silenceDurationMs);
@@ -148,9 +136,10 @@ export function TranscriptionTab() {
   const promptDecaySilenceSeconds = useAppStore(
     (s) => s.settings.promptDecaySilenceSeconds,
   );
+  const sortformerStatus = useAppStore((s) => s.sortformerStatus);
+  const modelDownloadProgress = useAppStore((s) => s.modelDownloadProgress);
   const updateSettings = useAppStore((s) => s.updateSettings);
   const switchEngine = useAppStore((s) => s.switchEngine);
-  const setDiarizationEnabled = useAppStore((s) => s.setDiarizationEnabled);
   const [showAdvanced, setShowAdvanced] = useState(false);
 
   // Derive available languages from the current engine's catalogue entry.
@@ -168,7 +157,12 @@ export function TranscriptionTab() {
     }));
   }, [activeDescriptor, language]);
 
-  const supportsDiarization = activeDescriptor?.supports_diarization ?? false;
+  // Both engines now diarize via the shared Sortformer post-pass; this is
+  // kept in case a future engine opts out.
+  const supportsDiarization = activeDescriptor?.supports_diarization ?? true;
+  const sortformerDownloaded = sortformerStatus?.downloaded ?? false;
+  const isDownloadingSortformer =
+    modelDownloadProgress !== null && !sortformerDownloaded;
 
   const handleEngineChange = async (engine: EngineKindDto) => {
     if (engine === selectedEngine) return;
@@ -257,48 +251,28 @@ export function TranscriptionTab() {
 
       <Separator />
 
-      {/* Diarization toggle — currently locked off because Sortformer's
-          per-chunk reset produces unstable speaker IDs across the session.
-          Plumbing stays so re-enable is a one-line change once session-
-          stable IDs land. The toggle is shown (not removed) so users can
-          see the feature exists and that it's coming, with a tooltip
-          explaining why it's disabled. */}
+      {/* Speaker diarization is permanently on for both Whisper and
+          Parakeet. The model lifecycle (download + delete) lives here
+          so users can see what's running and recover storage if needed. */}
       <div className="space-y-2">
         <div className="flex items-center justify-between">
           <Label className="text-xs text-muted-foreground">
             Speaker diarization
           </Label>
-          <TooltipProvider delayDuration={300}>
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <span>
-                  <Switch
-                    checked={false}
-                    disabled
-                    onCheckedChange={async (checked) => {
-                      try {
-                        await setDiarizationEnabled(checked);
-                      } catch (e) {
-                        toast.error(
-                          e instanceof Error ? e.message : String(e),
-                        );
-                      }
-                    }}
-                  />
-                </span>
-              </TooltipTrigger>
-              <TooltipContent side="left">
-                {!supportsDiarization
-                  ? "Diarization requires the Parakeet engine"
-                  : "Coming soon — currently disabled while we ship session-stable speaker IDs"}
-              </TooltipContent>
-            </Tooltip>
-          </TooltipProvider>
+          <span className="text-[10px] font-medium">
+            {!supportsDiarization
+              ? "Unavailable"
+              : isDownloadingSortformer
+                ? `Downloading ${Math.round(modelDownloadProgress ?? 0)}%`
+                : sortformerDownloaded
+                  ? "Active"
+                  : "Will download on next session"}
+          </span>
         </div>
         <p className="text-[10px] text-muted-foreground/60">
-          Will identify distinct speakers in mixed-source recordings.
-          Temporarily disabled — chunk-local speaker IDs cause unstable
-          labels across long sessions.
+          {supportsDiarization
+            ? "Identifies distinct speakers in your recordings using NVIDIA Sortformer (~50 MB). Always on; dictation skips it automatically."
+            : "The selected engine doesn't support speaker diarization."}
         </p>
       </div>
 
