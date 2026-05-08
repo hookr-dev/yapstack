@@ -117,7 +117,7 @@ impl ParakeetVariant {
         }
     }
 
-    /// Subdirectory under `$APP_DATA_DIR/models/` where this variant's files live.
+    /// Subdirectory under `$APP_DATA_DIR/models/transcription/` where this variant's files live.
     pub fn dir_name(&self) -> &'static str {
         match self {
             ParakeetVariant::TdtV3 => "parakeet-tdt-v3",
@@ -303,7 +303,12 @@ pub struct ModelManager {
 
 impl ModelManager {
     pub fn new(app_data_dir: PathBuf) -> Self {
-        let models_dir = app_data_dir.join("models");
+        // Whisper, VAD, Parakeet, and Sortformer all live under
+        // `models/transcription/` — alongside `models/embedding/`, which
+        // the embedding sidecar manages independently. Keeping the two
+        // model families in disjoint subtrees prevents a future cleanup
+        // pass for one from accidentally clobbering the other.
+        let models_dir = app_data_dir.join("models").join("transcription");
         Self { models_dir }
     }
 
@@ -576,6 +581,102 @@ impl ModelManager {
     }
 }
 
+/// One-time cleanup of the pre-`models/transcription/` layout. Removes the
+/// legacy files `ModelManager` used to create directly under
+/// `$APP_DATA_DIR/models/`, leaving sibling subtrees like
+/// `models/embedding/` and `models/transcription/` untouched.
+///
+/// Safe to call on every startup: after the first successful run the
+/// legacy paths are gone and subsequent calls are no-ops. We do **not**
+/// move files into the new location — re-downloading is acceptable and
+/// is cheaper to maintain than a relocation path that has to handle
+/// partial transfers, in-progress `.download` temp files, and
+/// permission edge cases.
+pub fn migrate_legacy_layout(app_data_dir: &Path) {
+    let legacy_root = app_data_dir.join("models");
+    if !legacy_root.is_dir() {
+        return;
+    }
+
+    let mut removed_any = false;
+
+    // Whisper ggml binaries + their `.download` temp siblings.
+    for size in ModelSize::all() {
+        let final_path = legacy_root.join(size.filename());
+        let temp_path = final_path.with_extension("download");
+        for path in [&final_path, &temp_path] {
+            if path.is_file() {
+                match std::fs::remove_file(path) {
+                    Ok(()) => {
+                        info!("removed legacy transcription file {}", path.display());
+                        removed_any = true;
+                    }
+                    Err(e) => warn!(
+                        "failed to remove legacy transcription file {}: {}",
+                        path.display(),
+                        e
+                    ),
+                }
+            }
+        }
+    }
+
+    // Silero VAD model.
+    let vad = legacy_root.join(VAD_MODEL_FILENAME);
+    if vad.is_file() {
+        match std::fs::remove_file(&vad) {
+            Ok(()) => {
+                info!("removed legacy VAD model {}", vad.display());
+                removed_any = true;
+            }
+            Err(e) => warn!("failed to remove legacy VAD model {}: {}", vad.display(), e),
+        }
+    }
+
+    // Parakeet variant subdirectories.
+    for variant in ParakeetVariant::all() {
+        let dir = legacy_root.join(variant.dir_name());
+        if dir.is_dir() {
+            match std::fs::remove_dir_all(&dir) {
+                Ok(()) => {
+                    info!("removed legacy parakeet variant dir {}", dir.display());
+                    removed_any = true;
+                }
+                Err(e) => warn!(
+                    "failed to remove legacy parakeet variant dir {}: {}",
+                    dir.display(),
+                    e
+                ),
+            }
+        }
+    }
+
+    // Sortformer files.
+    for variant in [SortformerVariant::V2_1] {
+        let path = legacy_root.join(variant.filename());
+        if path.is_file() {
+            match std::fs::remove_file(&path) {
+                Ok(()) => {
+                    info!("removed legacy sortformer model {}", path.display());
+                    removed_any = true;
+                }
+                Err(e) => warn!(
+                    "failed to remove legacy sortformer model {}: {}",
+                    path.display(),
+                    e
+                ),
+            }
+        }
+    }
+
+    if removed_any {
+        info!(
+            "legacy transcription model layout cleaned up under {}",
+            legacy_root.display()
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -690,7 +791,7 @@ mod tests {
     #[test]
     fn test_model_manager_detects_existing() {
         let dir = tempfile::tempdir().unwrap();
-        let models_dir = dir.path().join("models");
+        let models_dir = dir.path().join("models").join("transcription");
         std::fs::create_dir_all(&models_dir).unwrap();
         std::fs::write(models_dir.join("ggml-tiny.bin"), b"fake model data").unwrap();
 
@@ -710,7 +811,7 @@ mod tests {
     #[test]
     fn test_vad_model_detects_existing() {
         let dir = tempfile::tempdir().unwrap();
-        let models_dir = dir.path().join("models");
+        let models_dir = dir.path().join("models").join("transcription");
         std::fs::create_dir_all(&models_dir).unwrap();
         std::fs::write(models_dir.join("ggml-silero-v6.2.0.bin"), b"fake vad model").unwrap();
 
@@ -721,7 +822,7 @@ mod tests {
     #[tokio::test]
     async fn test_verify_checksum_deletes_on_mismatch() {
         let dir = tempfile::tempdir().unwrap();
-        let models_dir = dir.path().join("models");
+        let models_dir = dir.path().join("models").join("transcription");
         std::fs::create_dir_all(&models_dir).unwrap();
 
         // Write fake model data
@@ -806,7 +907,7 @@ mod tests {
     #[test]
     fn test_sortformer_detects_existing() {
         let dir = tempfile::tempdir().unwrap();
-        let models_dir = dir.path().join("models");
+        let models_dir = dir.path().join("models").join("transcription");
         std::fs::create_dir_all(&models_dir).unwrap();
         std::fs::write(
             models_dir.join(SortformerVariant::V2_1.filename()),
@@ -817,5 +918,67 @@ mod tests {
         assert!(manager
             .sortformer_model_path(SortformerVariant::V2_1)
             .is_some());
+    }
+
+    #[test]
+    fn migrate_legacy_layout_is_noop_when_models_dir_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        // No `models/` directory at all — must not panic, must not create one.
+        migrate_legacy_layout(dir.path());
+        assert!(!dir.path().join("models").exists());
+    }
+
+    #[test]
+    fn migrate_legacy_layout_removes_known_legacy_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join("models");
+        std::fs::create_dir_all(&legacy).unwrap();
+
+        // Plant one file from each legacy category.
+        std::fs::write(legacy.join("ggml-tiny.bin"), b"whisper").unwrap();
+        // Legacy `download_file` builds temp paths via `with_extension`, so
+        // the in-flight name is `ggml-tiny.download` (the `.bin` is replaced).
+        std::fs::write(legacy.join("ggml-tiny.download"), b"partial").unwrap();
+        std::fs::write(legacy.join("ggml-silero-v6.2.0.bin"), b"vad").unwrap();
+        let parakeet_dir = legacy.join(ParakeetVariant::TdtV3.dir_name());
+        std::fs::create_dir_all(&parakeet_dir).unwrap();
+        std::fs::write(parakeet_dir.join("encoder-model.onnx"), b"weights").unwrap();
+        std::fs::write(
+            legacy.join(SortformerVariant::V2_1.filename()),
+            b"sortformer",
+        )
+        .unwrap();
+
+        // Sibling subtrees the embedding sidecar owns must NOT be touched.
+        let embedding_dir = legacy.join("embedding");
+        std::fs::create_dir_all(&embedding_dir).unwrap();
+        std::fs::write(embedding_dir.join("model.onnx"), b"bge-small").unwrap();
+        // An unrelated user file under `models/` is also preserved.
+        std::fs::write(legacy.join("notes.txt"), b"keep me").unwrap();
+
+        migrate_legacy_layout(dir.path());
+
+        assert!(!legacy.join("ggml-tiny.bin").exists());
+        assert!(!legacy.join("ggml-tiny.download").exists());
+        assert!(!legacy.join("ggml-silero-v6.2.0.bin").exists());
+        assert!(!parakeet_dir.exists());
+        assert!(!legacy.join(SortformerVariant::V2_1.filename()).exists());
+
+        assert!(embedding_dir.join("model.onnx").exists());
+        assert!(legacy.join("notes.txt").exists());
+    }
+
+    #[test]
+    fn migrate_legacy_layout_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join("models");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join("ggml-base.bin"), b"whisper").unwrap();
+
+        migrate_legacy_layout(dir.path());
+        // Second call has nothing to do and must still succeed.
+        migrate_legacy_layout(dir.path());
+
+        assert!(!legacy.join("ggml-base.bin").exists());
     }
 }

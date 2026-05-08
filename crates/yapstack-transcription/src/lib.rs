@@ -4,4 +4,6 @@ pub mod model;
 
 pub use client::{EngineInfo, TranscriptionClient, TranscriptionResult};
 pub use error::TranscriptionError;
-pub use model::{ModelInfo, ModelManager, ModelSize, ParakeetVariant, SortformerVariant};
+pub use model::{
+    migrate_legacy_layout, ModelInfo, ModelManager, ModelSize, ParakeetVariant, SortformerVariant,
+};

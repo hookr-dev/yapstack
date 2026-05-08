@@ -406,7 +406,7 @@ pub struct ModelInfo { /* size, downloaded, path, display_name, approximate_size
 pub struct ModelManager { /* models_dir: PathBuf */ }
 
 impl ModelManager {
-    pub fn new(app_data_dir: PathBuf) -> Self;        // stored in app_data_dir/models/
+    pub fn new(app_data_dir: PathBuf) -> Self;        // stored in app_data_dir/models/transcription/
     pub fn models_dir(&self) -> &Path;
 
     // ---- Whisper ----

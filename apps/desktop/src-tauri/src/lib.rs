@@ -24,7 +24,7 @@ use tauri::{
 use tauri_nspanel::{CollectionBehavior, PanelLevel, StyleMask, WebviewWindowExt};
 use tokio::sync::{watch, Mutex};
 use yapstack_audio::AudioManager;
-use yapstack_transcription::ModelManager;
+use yapstack_transcription::{migrate_legacy_layout, ModelManager};
 
 // Lock ordering (acquire in this order to prevent deadlocks):
 //   1. AudioManagerState
@@ -550,6 +550,11 @@ pub fn run() {
                 }
             }
             app.manage(Arc::new(db_path.clone()) as DbPath);
+
+            // Clean up the pre-`models/transcription/` layout. Idempotent
+            // and only touches files the old `ModelManager` itself created,
+            // so the embedding sidecar's `models/embedding/` cache is safe.
+            migrate_legacy_layout(&app_data_dir);
 
             let model_manager = ModelManager::new(app_data_dir.clone());
             app.manage(
