@@ -415,7 +415,7 @@ export function DictationTab() {
           <div className="space-y-3">
             <div className="flex items-center justify-between">
               <div>
-                <Label className="text-xs">Lower volume while recording</Label>
+                <Label className="text-xs">Lower volume while dictating</Label>
                 <p className="text-[11px] text-muted-foreground mt-0.5">
                   Quiets system audio so you can hear yourself.
                 </p>
