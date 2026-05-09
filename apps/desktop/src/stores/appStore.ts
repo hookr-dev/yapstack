@@ -2453,32 +2453,25 @@ function createAppStore() {
       partialize: (state) => ({
         settings: state.settings,
       }),
-      // Zustand's default merge is shallow at the root, which replaces
-      // `settings` wholesale with the persisted blob. Any new field added
-      // to DEFAULT_SETTINGS over time would be `undefined` for users whose
-      // persisted state predates it. Merging settings two levels deep
-      // backfills missing fields with their defaults on rehydrate.
-      //
-      // We also rewrite a couple of legacy fields here rather than using
-      // version-gated migrations: this runs unconditionally on every
-      // rehydrate, so it's robust to any prior version arithmetic.
+      // Custom merge does two non-obvious things:
+      // 1. Deep-merges `settings` so new fields in DEFAULT_SETTINGS backfill
+      //    for users whose persisted state predates them — Zustand's default
+      //    shallow merge would replace `settings` wholesale.
+      // 2. Hosts legacy field renames so they run unconditionally on every
+      //    rehydrate, robust to any prior persist-version arithmetic skew.
       merge: (persisted, current) => {
         const p = (persisted as { settings?: Record<string, unknown> }) ?? {};
         const persistedSettings = { ...(p.settings ?? {}) };
 
-        // Duck setting renamed `dictationDuckTarget` (reduce-TO, "set
-        // system volume to X") → `dictationDuckAmount` (reduce-BY,
-        // "reduce current volume by X"). Effective duck strength is
-        // preserved by `new = 1 - old`. Only convert when the new field
-        // is absent so we don't clobber a user-edited value.
+        // dictationDuckTarget (reduce-TO) → dictationDuckAmount (reduce-BY).
+        // `new = 1 - old` preserves effective duck strength. Guard prevents
+        // clobbering a value the user already edited under the new key.
         if (
           typeof persistedSettings.dictationDuckTarget === "number" &&
           persistedSettings.dictationDuckAmount === undefined
         ) {
-          persistedSettings.dictationDuckAmount = Math.max(
-            0,
-            Math.min(1, 1 - persistedSettings.dictationDuckTarget),
-          );
+          persistedSettings.dictationDuckAmount =
+            1 - persistedSettings.dictationDuckTarget;
         }
         delete persistedSettings.dictationDuckTarget;
 
