@@ -330,12 +330,12 @@ export function GeneralTab() {
       <p className="text-center text-[10px] text-muted-foreground/40 pt-6">
         ✨ by{" "}
         <a
-          href="https://p.alace.io"
+          href="https://hookr.dev"
           target="_blank"
           rel="noopener noreferrer"
           className="hover:text-muted-foreground transition-colors"
         >
-          palace
+          hookr.dev
         </a>
       </p>
     </>

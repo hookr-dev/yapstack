@@ -11,6 +11,7 @@ import type { ChatMessage } from "@/lib/ai";
 import type { DbSegment } from "@/lib/db";
 import { getAction } from "@/lib/ai-actions";
 import { ToolExecutionBlock } from "@/components/ToolExecutionBlock";
+import { formatTime } from "@/lib/utils";
 
 interface ToolBadge {
   tool: string;
@@ -61,12 +62,6 @@ function parseToolBadges(content: string): {
   };
 }
 
-function formatTimestamp(seconds: number): string {
-  const mins = Math.floor(seconds / 60);
-  const secs = Math.floor(seconds % 60);
-  return `${mins}:${secs.toString().padStart(2, "0")}`;
-}
-
 // Stateless pattern used for `.test()` checks. `renderTextWithCitations`
 // builds its own `g`-flagged regex from `.source` for the exec-loop, so
 // keeping this one without `g` is safe and prevents the cross-call
@@ -94,7 +89,7 @@ function renderTextWithCitations(
     const segment = segments?.find((s) => s.id === segId);
 
     if (segment && onCitationClick) {
-      const ts = formatTimestamp(segment.audio_offset_seconds);
+      const ts = formatTime(segment.audio_offset_seconds);
       const preview =
         segment.text.length > 80
           ? segment.text.slice(0, 80) + "..."

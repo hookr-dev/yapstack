@@ -1388,6 +1388,89 @@ Two unrelated changes that landed together in the alpha.8 cycle.
 - **Ducking is an interaction problem, not just a system call.** The CoreAudio side is two FFI calls; the hard parts were all in the lifecycle: device swap mid-duck, hold-to-talk press/release storms, app crash mid-duck, post-restore retry races. Most of `system_volume.rs`'s test coverage and the dictation hook's promise refs exist to handle those, not the volume change itself.
 - **Generic command surface paid for itself in 24 hours.** The `apply_volume_duck` / `restore_volume` commands were written generic from the start (they take `target: f32`, not `dictation_settings: ...`). When a follow-up came up about ducking during full sessions too, no backend change was needed — same commands, different policy caller.
 
+## Phase 35 — Event-Driven Device Tracking + Tiptap UX Overhaul
+
+### What was built
+
+Two unrelated landings folded into the alpha.9 cycle.
+
+1. **Event-driven device tracking + Capture auto-failover (#25).** The audio crate's Core Audio listener path moved off `AtomicBool` flag-polling onto a runtime-agnostic `DeviceEventSink`, consumed by an always-on Tauri-side `device_broker`. The broker debounces bursty Core Audio events in a 250 ms window, gates restarts on `kAudioDevicePropertyDeviceIsAlive`, and dispatches `RestartTarget::FollowDefault` restart intents through the live-transcription loop (or directly to `AudioManager` when no live session is active). New Tauri events: `devices-changed` (re-emitted on any device-list change *or* any system-default flip) and an enriched `stream-health` payload carrying `bound_device_name` for "Switched to {device}" toasts on the FE.
+2. **Tiptap UX overhaul (#26).** Multi-color highlight palette (yellow/green/blue/purple/red) themed via CSS variables so highlights re-theme automatically; selection bubble menu scoped to inline marks (Notion / Linear / Novel convention); static toolbar gains Link + Code Block buttons and a heading dropdown that shows the active level; in-app shortcuts (⌘K, ⌘\\, ⌘,, ⌘1/⌘2, ⌘N, ⌘., ⌘J, ⌘D) now fire while the editor has focus; sidebar shortcut moved from ⌘B → ⌘\\ to stop fighting Tiptap's bold binding; themed checklist checkboxes; pasted markdown with fenced code blocks parses as a real code block.
+
+### Bugs / needs being addressed
+
+- **Device tracking:** the previous `AtomicBool` poll-and-react path required a 200 ms `thread::sleep` workaround for the AirPods/Bluetooth revert window, missed default-device flips that didn't change the device list, and bypassed its own `IsAlive` gate due to a CamelCase / lowercase mismatch in `strip_cpal_prefix`. Plugging into a Thunderbolt dock that brought a new audio interface online silently re-bound to the previous device because the failover probe order tried the stored id first. Users on AirPods that dropped mid-session got stuck with a dead binding until they restarted capture by hand.
+- **Tiptap:** the selection bubble menu was duplicating block-level controls (headings, lists, blockquote, code block) that already lived in the toolbar, while the inline-mark controls in the toolbar didn't reflect active state — bold persisting on a new line was invisible. ⌘B couldn't be used for bold inside notes because the global "toggle sidebar" binding swallowed it. Pasting a code block out of a terminal landed as a flat line of text. Checklist checkboxes were unstyled native browser controls.
+
+### Key decisions
+
+- **Sink stays runtime-agnostic; broker owns the async surface.** The audio crate stays free of `tokio` so it remains testable headless and reusable from a non-Tauri host. The broker lives in the desktop app because it needs `AppHandle` for emitting events and a runtime to debounce. This split also means the broker can be swapped (e.g. for a Linux backend) without touching the audio crate.
+- **Tri-state `DeviceLiveness` (`Alive` / `Dead` / `Absent` / `Unknown`).** The previous boolean fail-opened on "couldn't tell" — an unplugged USB mic that was missing from the device list reported `alive=true`, and subsequent `DefaultInputChanged` events were silently dropped on the explicit-pick branch. The explicit-pick branch now only skips failover on `Alive`; everything else proceeds into the `FollowDefault` probe.
+- **`FollowDefault` probes default first; `PreserveBinding` probes stored id first.** The broker dispatches `FollowDefault` because the user's intent on a device-change event is "follow the OS." The in-loop watchdog keeps `PreserveBinding` because its intent on a stream error is "recover the device the user explicitly picked." Same restart entry point, two probe orders.
+- **`bound_is_default` is derived from the post-restart bind id**, not preserved verbatim across restart. The previous behaviour kept the explicit-pick flag on through a successful failover to the system default, and silently dropped every subsequent default-change event. Computing from the actual resolved bind id makes the flag self-correcting.
+- **Selection bubble vs. static toolbar split mirrors Notion / Linear / Novel.** Inline marks (the kind you toggle on a selection) live in the floating bubble; block formatting (the kind you apply to the whole current block) lives in the static toolbar. Avoids the "two ways to do the same thing in two places" anti-pattern and makes the bubble fast to scan.
+- **Highlights are stored as CSS variable references, not literal colors.** Switching between light and dark themes re-themes existing highlights automatically. Was tempting to store the palette index as a `data-` attribute and resolve in CSS, but Tiptap's Highlight extension only round-trips a `color` attribute, so the value *is* the variable reference.
+- **`LiveSessionPresent` flag, separate from inbox presence.** The broker's direct-restart fallback used inbox-presence to decide between routing through the live loop and calling `AudioManager::restart_*` directly. `stop_live_transcription` clears the inbox before the live loop's final flush completes, so a device-change in that window would replace the ring buffer while the loop was still extracting at snapshotted stop positions. The new flag is set by the spawned task at start and cleared only after scheduler shutdown, so routing during the stop tail correctly takes the loop path.
+
+### Files Changed
+
+| File | Change |
+|------|--------|
+| `crates/yapstack-audio/src/system/device_watcher.rs` | New `DeviceEventSink` trait + Core Audio property-listener wiring for input default, output default, system-output default, and device-list changes; emits `DeviceListChanged` / `DefaultInputChanged` / `DefaultOutputChanged` / `DefaultSystemOutputChanged`. |
+| `crates/yapstack-audio/src/lib.rs` | Removed `AudioManager::{mic_default_changed, system_audio_default_changed, device_list_changed, mic_input_drifted, system_audio_output_drifted, live_default_input_name, live_default_output_name}` and `DefaultDeviceWatcher::take_change`; added the 4-property listener on init; `device_liveness` returns the new tri-state; loopback aggregate filtered at enumeration time. |
+| `apps/desktop/src-tauri/src/device_broker.rs` | New — always-on broker. Debounces 250 ms, evaluates `DeviceLiveness`, dispatches `RestartTarget::FollowDefault`, emits `devices-changed`. |
+| `apps/desktop/src-tauri/src/live_transcription.rs` | Routes broker-driven restart intents through the live loop when `LiveSessionPresent` is set; falls back to direct `AudioManager::restart_*` otherwise. Dropped the ~30 s name-comparison drift poll. |
+| `apps/desktop/src-tauri/src/commands/audio.rs` | `start_mic` rejects the cpal loopback aggregate as defense-in-depth. |
+| `apps/desktop/src-tauri/src/lib.rs` | Spawns the broker task; wires the new event names. |
+| `crates/yapstack-common/src/types.rs` | `StreamHealthEvent` carries `bound_device_name`; `RestartTarget::FollowDefault` variant added. |
+| `apps/desktop/src/stores/appStore.ts`, `apps/desktop/src/lib/tauri.ts` | Listens for `devices-changed`, replaces the cached device list, reconciles `selectedMicDeviceId` if its device disappeared, picks up refreshed `is_default` flags. Toasts on successful auto-failover using the new `bound_device_name` field. |
+| `apps/desktop/src/components/notes/NoteEditor/extensions/MultiColorHighlight.ts` | New — extends Tiptap Highlight with a 5-color palette stored as CSS variable references. |
+| `apps/desktop/src/components/notes/NoteEditor/Toolbar.tsx`, `BubbleMenu.tsx` | Reactive active-state via `useEditorState`; bubble menu scoped to inline marks; toolbar adds Link + Code Block + heading dropdown. Floating UI flip/shift now use the editor as boundary; `z-50` so it sits above other floating UI. |
+| `apps/desktop/src/index.css` | `.tiptap-editor` themed checklist checkboxes (accent fill, contrast checkmark, focus-visible ring, first-line alignment); highlight palette CSS variables. |
+| `apps/desktop/src/hooks/useGlobalShortcuts.ts` | In-app shortcuts (⌘K, ⌘\\, ⌘,, ⌘1/⌘2, ⌘N, ⌘., ⌘J, ⌘D) fire while editor focused; Escape and ⌘⌫ still defer to the editor. Sidebar default rebound to ⌘\\. |
+| `docs/ARCHITECTURE.md`, `docs/UBIQUITOUS_LANGUAGE.md` | Already updated with broker / `DeviceEventSink` / `devices-changed` / `bound_device_name` surface in the PR. |
+| `docs/FRONTEND.md` | Tiptap notes: multicolor highlights, scoped bubble menu, themed checklists, in-editor shortcut handling. |
+| `CHANGELOG.md` | `[1.0.0-alpha.9] - 2026-05-03` block (entries cross-referenced with PR numbers). |
+| `apps/desktop/src-tauri/Cargo.toml`, `apps/desktop/src-tauri/tauri.conf.json`, `Cargo.lock` | Version bumped to `1.0.0-alpha.9`. |
+
+### What was learned
+
+- **Event sinks beat polled flags as soon as the consumer needs to debounce or reason about ordering.** The previous `AtomicBool` design was fine when "did anything change" was the only question, but it couldn't carry *which* property changed, couldn't be debounced without losing edges, and forced the consumer to re-poll system state on every tick. The sink path lets the broker batch a Bluetooth-revert burst into one decision and route it intelligently.
+- **A "couldn't tell" boolean fails open in exactly the wrong direction.** The original `is_device_alive → bool` reported `true` on lookup failure because that was the conservative default for the watchdog path (don't restart a working stream). For the explicit-pick failover branch the conservative default is the opposite (the device might be gone — let the failover proceed). The tri-state forces the call site to make that choice explicitly.
+- **Tiptap's bubble menu is a UX trap when it duplicates the toolbar.** Users got into states where toggling bold from the bubble disagreed with the toolbar's active state because the toolbar wasn't subscribing to selection updates. The fix — `useEditorState` + scope split — is small once you know the convention; the trap is shipping the bubble with everything in it because Tiptap's example shows that.
+
+## Phase 36 — Marquee/Portal Click Swallow + Footer Rebrand
+
+### What was built
+
+Two small landings folded into the alpha.10 cycle.
+
+1. **Stop the transcript marquee from swallowing context-menu clicks (#28).** The whitespace-marquee `onPointerDown` on `ChatView`'s container now bails when the synthetic event came from outside the container's actual DOM subtree (`!currentTarget.contains(target)`). One guard clause.
+2. **Settings → General footer rebrand (#29).** Two-character copy/link change.
+
+### Bugs / needs being addressed
+
+- Right-clicking a transcription segment opened the context menu correctly, but every action item — Edit, Copy, Insert into Notes, Hide, Delete — silently no-op'd. Menu stayed open; only the focus ring on the hovered item flickered off. The bug had been in main since `76c7b4e` (drag-select WIP) and only surfaced as user-visible when right-click actions started getting used — none of the previous "fixes" landed because they were diagnosing the wrong layer (we kept reaching for the `appStore` action paths when the actions were never being called at all).
+
+### Key decisions
+
+- **One-line guard, not a refactor.** The architecturally-correct fix is to attach the marquee listeners with native `addEventListener` on a ref'd DOM node — DOM-tree event flow naturally avoids portal cross-talk because portal children whose DOM lives in `document.body` aren't ancestors of the container in the DOM tree. Punted that to a follow-up; the guard unblocks users today and doesn't make the eventual extraction harder (the bail becomes dead code and gets deleted in the same change).
+- **Why `currentTarget.contains(target)` is the right discriminator.** For a normal event bubbling within the React/DOM tree, `currentTarget` always contains `target`. For a React synthetic event originating in a portal, `target` is the actual DOM node (in `document.body`) and `currentTarget` is wherever the listener is registered (in `#root`); `contains` returns false. No allowlist of Radix selectors needed.
+
+### Files Changed
+
+| File | Change |
+|------|--------|
+| `apps/desktop/src/components/ChatView.tsx` | New early-return in `handleContainerPointerDown` for synthetic events whose DOM target lives outside the container subtree (portal children). |
+| `apps/desktop/src/components/settings/GeneralTab.tsx` | Footer attribution + link rebranded. |
+| `CHANGELOG.md` | `[1.0.0-alpha.10] - 2026-05-04` block. |
+| `apps/desktop/src-tauri/Cargo.toml`, `apps/desktop/src-tauri/tauri.conf.json`, `Cargo.lock` | Version bumped to `1.0.0-alpha.10`. |
+
+### What was learned
+
+- **React's portal events route through the component tree, not the DOM tree.** Any pointer/mouse handler attached as a React prop on a container that *transitively* owns a `<ContextMenu>` / `<DropdownMenu>` / `<Tooltip>` will receive synthetic events from those portals' children. If the handler's contract is "this gesture started inside my DOM subtree" — as drag-select handlers usually are — it needs an explicit `currentTarget.contains(target)` check, or it needs to be wired via native `addEventListener` instead. The latter is the pattern the rest of this codebase already uses (`useClickOutside`, the Settings/Onboarding mousedown listeners) and is the longer-term correct shape for ChatView's marquee logic.
+- **`preventDefault` on a `pointerdown` for a mouse pointer suppresses the corresponding mousedown / mouseup / click events.** This is per W3C spec and is exactly why the menu items lost their click delivery: once the marquee handler called `preventDefault`, the click event Radix's MenuItem composes its `onSelect` onto never fired. Easy to forget when reading just the marquee code in isolation.
+
 ## What's Not Yet Built
 
 - **End-to-end integration tests** — capture audio, transcribe, verify text (unit + component tests now exist; integration tests still needed)

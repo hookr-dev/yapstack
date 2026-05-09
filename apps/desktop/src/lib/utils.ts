@@ -27,19 +27,31 @@ export function formatDuration(seconds: number): string {
   return `${mins}m ${secs}s`;
 }
 
-/** Format seconds offset to MM:SS timestamp (e.g. "1:05"). */
+/** Format seconds offset to a timestamp. Adds an hours bucket past 60min ("1:23:45"). */
 export function formatTime(offsetSeconds: number): string {
-  const mins = Math.floor(offsetSeconds / 60);
-  const secs = Math.floor(offsetSeconds % 60);
-  return `${mins}:${secs.toString().padStart(2, "0")}`;
+  const total = Math.max(0, Math.floor(offsetSeconds));
+  const hours = Math.floor(total / 3600);
+  const mins = Math.floor((total % 3600) / 60);
+  const secs = total % 60;
+  const ss = secs.toString().padStart(2, "0");
+  if (hours > 0) {
+    return `${hours}:${mins.toString().padStart(2, "0")}:${ss}`;
+  }
+  return `${mins}:${ss}`;
 }
 
-/** Format elapsed milliseconds to MM:SS (e.g. "02:30"). */
+/** Format elapsed milliseconds to a duration. Adds an hours bucket past 60min ("01:23:45"). */
 export function formatElapsed(ms: number): string {
-  const totalSeconds = Math.floor(ms / 1000);
-  const mins = Math.floor(totalSeconds / 60);
-  const secs = totalSeconds % 60;
-  return `${mins.toString().padStart(2, "0")}:${secs.toString().padStart(2, "0")}`;
+  const total = Math.max(0, Math.floor(ms / 1000));
+  const hours = Math.floor(total / 3600);
+  const mins = Math.floor((total % 3600) / 60);
+  const secs = total % 60;
+  const mm = mins.toString().padStart(2, "0");
+  const ss = secs.toString().padStart(2, "0");
+  if (hours > 0) {
+    return `${hours.toString().padStart(2, "0")}:${mm}:${ss}`;
+  }
+  return `${mm}:${ss}`;
 }
 
 /** Format a date string to a relative time label (e.g. "Just now", "5m ago", "2d ago"). */
