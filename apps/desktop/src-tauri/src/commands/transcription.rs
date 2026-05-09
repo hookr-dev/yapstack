@@ -854,34 +854,19 @@ pub async fn init_transcription_client(
         //     valued: success means the engine running matches `requested`.
         let runner_up = match guard.as_ref() {
             None => false,
-            Some(existing) => {
-                if existing.config != requested {
-                    drop(guard);
-                    let timeout = std::time::Duration::from_secs(
-                        super::transcription_scheduler::DEFAULT_SHUTDOWN_TIMEOUT_SECS,
-                    );
-                    if let Err(e) = scheduler.shutdown_client(timeout).await {
-                        tracing::warn!("orphaned-scheduler shutdown error: {e}");
-                    }
-                    return Err(CommandError::InvalidInput {
-                        message: "engine already initialized with a different config; \
-                             call shutdown_transcription_client first"
-                            .into(),
-                    });
-                }
-                true
-            }
+            Some(existing) => existing.config == requested,
         };
-        if !runner_up {
+        if guard.is_none() {
             *guard = Some(InitializedEngine {
                 config: requested,
                 scheduler,
             });
         } else {
-            // Same-config runner-up: drop the freshly-constructed scheduler;
-            // the winner's scheduler is already serving the engine the
-            // caller asked for. shutdown_client cleans up the orphaned
-            // client.
+            // Lost the race. Drop the lock first, then shut down the
+            // orphan scheduler we just built. The winner's scheduler is
+            // already serving an engine — same config means idempotent
+            // OK, different config means the caller's request is
+            // incompatible with the live state.
             drop(guard);
             let timeout = std::time::Duration::from_secs(
                 super::transcription_scheduler::DEFAULT_SHUTDOWN_TIMEOUT_SECS,
@@ -889,7 +874,15 @@ pub async fn init_transcription_client(
             if let Err(e) = scheduler.shutdown_client(timeout).await {
                 tracing::warn!("orphaned-scheduler shutdown error: {e}");
             }
-            return Ok(());
+            return if runner_up {
+                Ok(())
+            } else {
+                Err(CommandError::InvalidInput {
+                    message: "engine already initialized with a different config; \
+                         call shutdown_transcription_client first"
+                        .into(),
+                })
+            };
         }
     }
     info!(

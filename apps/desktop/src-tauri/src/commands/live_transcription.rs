@@ -57,6 +57,22 @@ impl LiveSourceKind {
             LiveSourceKind::Dictation => "dictation",
         }
     }
+
+    /// Toggle this routing identity's scheduler busy bit(s). The session
+    /// loop covers mic + system in lockstep so it sets both bits; dictation
+    /// owns only its own bit. Independent producer bits keep cross-loop
+    /// busy state out of the backfill gate.
+    fn set_scheduler_busy(
+        self,
+        scheduler: &super::transcription_scheduler::TranscriptionScheduler,
+        busy: bool,
+    ) {
+        use super::transcription_scheduler::BusyKind;
+        match self {
+            LiveSourceKind::Session => scheduler.set_live_busy(busy),
+            LiveSourceKind::Dictation => scheduler.set_busy(BusyKind::Dictation, busy),
+        }
+    }
 }
 
 fn default_source_kind() -> LiveSourceKind {
@@ -668,13 +684,12 @@ pub struct LiveTranscriptionRuntime {
 /// drained.
 pub enum RuntimeSlot {
     Idle,
-    /// `start_live_transcription` accepted and is mid-construction. We
-    /// reserve the slot here to reject racing same-kind starts before the
-    /// runtime is fully wired. (Reserved for future use; today the build
-    /// is synchronous within the command so the visible window is
-    /// vanishingly small. Kept for completeness so the state machine has
-    /// no ambiguous gaps.)
-    #[allow(dead_code)]
+    /// `start_live_transcription` accepted and is mid-construction. The
+    /// slot is held here so racing same-kind starts are rejected before
+    /// the runtime is fully wired. Today the build is synchronous within
+    /// the command so the visible window is vanishingly small; kept so
+    /// the state machine has no ambiguous gaps if construction ever moves
+    /// across an await.
     Starting,
     Running(LiveTranscriptionRuntime),
     Stopping(LiveTranscriptionRuntime),
@@ -880,6 +895,25 @@ impl SourceVadState {
             dictation_consumed_through: 0,
             flushed_open_at: None,
         }
+    }
+
+    /// Rewinds VAD progress past `new_pos`. Used when a contiguous range
+    /// up to `new_pos` should be excluded from any future session
+    /// transcription decision (today: closing a dictation mic-ownership
+    /// window). Cursors jump forward, in-flight speech state drops, and
+    /// the Silero stream is reset so the next sample is treated as
+    /// fresh. Preserves cross-window state: chunk_index, accumulated_text,
+    /// session_start_pos, source format, restart counters.
+    fn reset_vad_past(&mut self, new_pos: usize) {
+        self.cursor = new_pos;
+        self.speech_start_pos = new_pos;
+        self.earliest_next_chunk_pos = new_pos;
+        self.silero.read_pos = new_pos;
+        self.silero.reset();
+        self.is_speaking = false;
+        self.speech_start_time = None;
+        self.silence_since = None;
+        self.force_drain = false;
     }
 
     /// Resets all buffer-position, VAD, and source-format state after the
@@ -1247,24 +1281,6 @@ fn mute_dictation_window_in_wav_extraction(
     }
 }
 
-/// Mark this runtime as busy on the scheduler — used at the moment a stop
-/// is observed (before final-flush dispatch lands) and at any other site
-/// where we need to defensively block backfill from racing into the lane.
-/// Routes through `source_kind` so a dictation runtime only toggles the
-/// `Dictation` bit; a session toggles its `LiveMic + LiveSystem` bits.
-/// Without this, `stop_if_requested` and the inline stop branch in the
-/// live loop both called `set_live_busy(true)` unconditionally, leaving
-/// the LiveMic/LiveSystem bits set after a dictation finalize and
-/// blocking session backfill until a future session happened to clear them.
-fn mark_busy_for_stop(ctx: &TranscriptionContext) {
-    match ctx.config.source_kind {
-        LiveSourceKind::Session => ctx.scheduler.set_live_busy(true),
-        LiveSourceKind::Dictation => ctx
-            .scheduler
-            .set_busy(super::transcription_scheduler::BusyKind::Dictation, true),
-    }
-}
-
 fn update_scheduler_live_busy(
     ctx: &TranscriptionContext,
     sources: &[SourceVadState],
@@ -1276,17 +1292,9 @@ fn update_scheduler_live_busy(
         || sources
             .iter()
             .any(|s| s.is_speaking || s.has_in_flight_task || s.force_drain);
-    // Dictation runtimes are independent producers of "live busy" signal —
-    // setting the dictation bit (rather than reusing the legacy session
-    // mic+system bits) keeps cross-loop busy state coupling-free. A session
-    // setting `LiveMic` to false while dictation is mid-utterance must NOT
-    // unblock backfill — dictation's own bit holds the gate up.
-    match ctx.config.source_kind {
-        LiveSourceKind::Session => ctx.scheduler.set_live_busy(busy),
-        LiveSourceKind::Dictation => ctx
-            .scheduler
-            .set_busy(super::transcription_scheduler::BusyKind::Dictation, busy),
-    }
+    ctx.config
+        .source_kind
+        .set_scheduler_busy(&ctx.scheduler, busy);
 }
 
 fn record_live_drain_backlog(
@@ -1328,7 +1336,11 @@ async fn stop_if_requested(
     if !stop_requested.load(Ordering::Acquire) {
         return None;
     }
-    mark_busy_for_stop(ctx);
+    // Defensively block backfill from racing into the lane between stop
+    // observation and final-flush dispatch.
+    ctx.config
+        .source_kind
+        .set_scheduler_busy(&ctx.scheduler, true);
     Some(receive_stop_request_or_snapshot(stop_rx, audio_state).await)
 }
 
@@ -2861,7 +2873,9 @@ async fn live_transcription_loop(
         };
 
         if let Some(req) = stop_signal {
-            mark_busy_for_stop(&ctx);
+            ctx.config
+                .source_kind
+                .set_scheduler_busy(&ctx.scheduler, true);
             stop_request = Some(req);
             break;
         }
@@ -3176,18 +3190,10 @@ async fn live_transcription_loop(
                         )
                         .await;
                     }
-                    // Reset state past `window.end` — any VAD progress
-                    // accumulated during the dictation window is dictation
-                    // audio and must not become session transcript.
-                    sources[i].cursor = window_end_us;
-                    sources[i].speech_start_pos = window_end_us;
-                    sources[i].earliest_next_chunk_pos = window_end_us;
-                    sources[i].silero.read_pos = window_end_us;
-                    sources[i].silero.reset();
-                    sources[i].is_speaking = false;
-                    sources[i].speech_start_time = None;
-                    sources[i].silence_since = None;
-                    sources[i].force_drain = false;
+                    // Any VAD progress accumulated during the dictation
+                    // window is dictation audio and must not become
+                    // session transcript — rewind past `window.end`.
+                    sources[i].reset_vad_past(window_end_us);
                     sources[i].dictation_consumed_through = window.end;
                     // If the consumed window matches a previously pre-flushed
                     // open window's start, drop that marker.
@@ -3410,16 +3416,10 @@ async fn live_transcription_loop(
         }
     }
 
-    // Clear this loop's busy bits at finalize. Routed through the same
-    // per-source-kind dispatch as `update_scheduler_live_busy` so a session
-    // stop only clears the session bits and a dictation stop only clears
-    // the Dictation bit — neither affects the other live runtime's gate.
-    match ctx.config.source_kind {
-        LiveSourceKind::Session => ctx.scheduler.set_live_busy(false),
-        LiveSourceKind::Dictation => ctx
-            .scheduler
-            .set_busy(super::transcription_scheduler::BusyKind::Dictation, false),
-    }
+    // Clear this loop's busy bits at finalize so it stops gating backfill.
+    ctx.config
+        .source_kind
+        .set_scheduler_busy(&ctx.scheduler, false);
 
     if let Some(ws) = session_wav_state {
         finalize_session_wav(ws, &ctx).await;
@@ -4423,9 +4423,10 @@ async fn transcribe_chunk(
 
     // Submit to the scheduler. The scheduler owns the sole TranscriptionClient
     // Arc and serializes calls to `transcribe_with`, with priority ordering
-    // (FinalFlush > Live > Backfill) and mic/system round-robin at the live
-    // tier. Respawn on sidecar death is handled inside the scheduler — when it
-    // returns `SchedulerError::SidecarDead`, the respawn already failed.
+    // (FinalFlush > Dictation > Live > Backfill) and mic/system round-robin
+    // at the live tier. Respawn on sidecar death is handled inside the
+    // scheduler — when it returns `SchedulerError::SidecarDead`, the respawn
+    // already failed.
     let rx = match ctx.scheduler.submit(JobRequest {
         origin: input.origin,
         source: source_from_label(input.source_label),

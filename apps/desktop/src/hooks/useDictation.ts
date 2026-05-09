@@ -258,12 +258,12 @@ export function useDictation() {
       // by both `source_kind === "dictation"` AND matching dictation
       // session_id so a concurrent session's events never leak into this
       // dictation's accumulator.
-      const currentDictIdForSeg = dictationIdRef.current;
+      const currentDictId = dictationIdRef.current;
       const segmentUnlisten = await listenEvent(
         EVENTS.LIVE_TRANSCRIPTION_SEGMENT,
         (payload) => {
           if (payload.source_kind !== "dictation") return;
-          if (payload.session_id !== currentDictIdForSeg) return;
+          if (payload.session_id !== currentDictId) return;
           for (const seg of payload.segments) {
             const text = seg.text.trim();
             if (text) {
@@ -283,7 +283,6 @@ export function useDictation() {
       // Listen for the part-ready event for this dictation. Dictation always
       // produces a single part per recording, so we just stash the file
       // path/duration for the dictation_history insert below.
-      const currentDictId = dictationIdRef.current;
       const wavUnlisten = await listenEvent(
         EVENTS.SESSION_PART_READY,
         (payload) => {
@@ -301,7 +300,6 @@ export function useDictation() {
       const stoppedPromise = new Promise<void>((r) => { resolveStop = r; });
       stoppedDeferredRef.current = { promise: stoppedPromise, resolve: resolveStop };
 
-      const currentDictIdForStatus = dictationIdRef.current;
       const statusUnlisten = await listenEvent(
         EVENTS.LIVE_TRANSCRIPTION_STATUS,
         (payload) => {
@@ -309,7 +307,7 @@ export function useDictation() {
           // — without this, a concurrent session's `Stopped`/`Error` could
           // resolve our wait early. Two-prong: kind + matching session_id.
           if (payload.source_kind !== "dictation") return;
-          if (payload.session_id !== currentDictIdForStatus) return;
+          if (payload.session_id !== currentDictId) return;
           if (payload.phase === "Stopped" || payload.phase === "Error") {
             stoppedDeferredRef.current?.resolve();
           }

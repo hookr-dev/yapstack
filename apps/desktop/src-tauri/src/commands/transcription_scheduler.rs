@@ -375,11 +375,9 @@ impl TranscriptionScheduler {
         }
     }
 
-    /// Backward-compat shim: legacy session live-loops call `set_live_busy`
-    /// when they enter / exit ingestion. The session live loop covers both
-    /// mic and system sources, so this sets/clears both bits at once.
-    /// Prefer per-source `set_busy(BusyKind::LiveMic | LiveSystem, ..)`
-    /// in new code.
+    /// Toggle both session bits (`LiveMic` + `LiveSystem`) together. The
+    /// session live loop covers both sources in lockstep, so its busy
+    /// signal is naturally coarse-grained at this level.
     pub fn set_live_busy(&self, busy: bool) {
         self.set_busy(BusyKind::LiveMic, busy);
         self.set_busy(BusyKind::LiveSystem, busy);
