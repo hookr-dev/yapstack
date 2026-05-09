@@ -1059,6 +1059,7 @@ fn poll_vad(state: &mut SourceVadState, probability: Option<f32>, tuning: &VadTu
 
 // --- Helpers ---
 
+#[allow(clippy::too_many_arguments)]
 fn emit_status(
     app_handle: &AppHandle,
     source_kind: LiveSourceKind,
@@ -4384,6 +4385,7 @@ async fn transcribe_and_emit_chunk(
 
 #[tauri::command]
 #[specta::specta]
+#[allow(clippy::too_many_arguments)]
 pub async fn start_live_transcription(
     audio_state: tauri::State<'_, AudioManagerState>,
     scheduler_state: tauri::State<'_, TranscriptionSchedulerState>,
