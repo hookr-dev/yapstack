@@ -268,8 +268,10 @@ export interface Settings {
   /// Restored as soon as recording ends. Only ever lowers — never raises.
   /// macOS only (no-op on other platforms).
   dictationDuckEnabled: boolean;
-  /// Target volume to duck to, in [0, 1]. Default 0.2.
-  dictationDuckTarget: number;
+  /// Fraction by which to reduce the current system volume while ducking,
+  /// in [0, 1]. The ducked level is `current * (1 - dictationDuckAmount)`.
+  /// 0 = no reduction, 1 = mute. Default 0.8.
+  dictationDuckAmount: number;
   onboarding: OnboardingState;
 }
 
@@ -589,7 +591,7 @@ const defaultSettings: Settings = {
   dictation: DEFAULT_DICTATION_SETTINGS,
   showRecordingIndicator: true,
   dictationDuckEnabled: false,
-  dictationDuckTarget: 0.2,
+  dictationDuckAmount: 0.8,
   onboarding: { completedFlows: {} },
 };
 
@@ -2451,6 +2453,43 @@ function createAppStore() {
       partialize: (state) => ({
         settings: state.settings,
       }),
+      // Zustand's default merge is shallow at the root, which replaces
+      // `settings` wholesale with the persisted blob. Any new field added
+      // to DEFAULT_SETTINGS over time would be `undefined` for users whose
+      // persisted state predates it. Merging settings two levels deep
+      // backfills missing fields with their defaults on rehydrate.
+      //
+      // We also rewrite a couple of legacy fields here rather than using
+      // version-gated migrations: this runs unconditionally on every
+      // rehydrate, so it's robust to any prior version arithmetic.
+      merge: (persisted, current) => {
+        const p = (persisted as { settings?: Record<string, unknown> }) ?? {};
+        const persistedSettings = { ...(p.settings ?? {}) };
+
+        // Duck setting renamed `dictationDuckTarget` (reduce-TO, "set
+        // system volume to X") → `dictationDuckAmount` (reduce-BY,
+        // "reduce current volume by X"). Effective duck strength is
+        // preserved by `new = 1 - old`. Only convert when the new field
+        // is absent so we don't clobber a user-edited value.
+        if (
+          typeof persistedSettings.dictationDuckTarget === "number" &&
+          persistedSettings.dictationDuckAmount === undefined
+        ) {
+          persistedSettings.dictationDuckAmount = Math.max(
+            0,
+            Math.min(1, 1 - persistedSettings.dictationDuckTarget),
+          );
+        }
+        delete persistedSettings.dictationDuckTarget;
+
+        return {
+          ...current,
+          settings: {
+            ...current.settings,
+            ...(persistedSettings as Partial<Settings>),
+          },
+        };
+      },
       migrate: (persisted: unknown, version: number) => {
         const state = persisted as { settings?: Record<string, unknown> };
         if (version < 1 && state.settings) {
