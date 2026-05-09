@@ -5193,95 +5193,112 @@ pub async fn start_live_transcription(
     let dictation_owns_mic_for_finalizer = dictation_owns_mic.inner().clone();
     let audio_state_for_finalizer = audio_state.inner().clone();
 
-    let task_handle = tokio::spawn({
-        let ctx_guard = ctx.clone();
-        let counters_for_loop = counters.clone();
-        let stop_requested_for_loop = Arc::clone(&stop_requested);
-        async move {
-            let result = AssertUnwindSafe(live_transcription_loop(
-                audio_state_clone,
-                ctx,
-                stop_rx,
-                stop_requested_for_loop,
-                restart_intent_rx,
-                session_wav_state,
-                counters_for_loop,
-            ))
-            .catch_unwind()
-            .await;
-
-            // The scheduler is long-lived now — it outlives this session and
-            // is shared with any dictation runtime that may also be holding
-            // it. We do *not* shut it down at session end. A panic here just
-            // means this session's loop is going down; the scheduler keeps
-            // serving any other live runtime (e.g. a dictation that started
-            // mid-session). Engine-level shutdown happens via
-            // `shutdown_transcription_client`, not here.
-
-            if let Err(panic) = result {
-                error!("live transcription panicked: {:?}", panic);
-                let _ = ctx_guard.app_handle.emit(
-                    "live-transcription-status",
-                    LiveTranscriptionStatus {
-                        phase: LiveTranscriptionPhase::Error,
-                        chunks_processed: 0,
-                        total_audio_seconds: 0.0,
-                        error_message: Some("live transcription crashed unexpectedly".to_string()),
-                        session_id: ctx_guard.config.session_id.clone(),
-                        effective_start_epoch_ms: None,
-                        lag_seconds: None,
-                        live_drain_backlog_chunks: 0,
-                        live_drain_backlog_seconds: 0.0,
-                        source_kind: ctx_guard.config.source_kind,
-                    },
-                );
-            }
-
-            // Close the dictation mic-ownership window with the actual
-            // end position read from the audio manager. The closed window
-            // is then visible to the session loop on its next tick (or
-            // any future tick — closed windows are durable, so a fast
-            // dictation that opens-and-closes between two session polls
-            // can't be missed). Done BEFORE the slot transitions to Idle
-            // so the session sees the closed window before any racing
-            // same-kind dictation start could re-open one.
-            if matches!(runtime_source_kind, LiveSourceKind::Dictation) {
-                let end_pos: u64 = {
-                    let manager = audio_state_for_finalizer.lock().await;
-                    manager
-                        .mic_buffer_info()
-                        .map(|i| i.samples_written as u64)
-                        .unwrap_or(0)
-                };
-                dictation_owns_mic_for_finalizer.close(end_pos);
-            }
-
-            // Slot transition: Running/Stopping → Idle. Idempotent — if
-            // `stop_live_transcription` already moved Running → Stopping,
-            // we land on Stopping; otherwise we land on Running. Either way
-            // we drop the runtime here so a fresh same-kind start can pass
-            // the `is_idle` guard.
-            {
-                let mut slots = live_state_for_finalizer.lock().await;
-                *slots.slot_mut(runtime_source_kind) = RuntimeSlot::Idle;
-            }
-
-            // Final step: signal the broker that no live session owns audio
-            // state. Session-only — dictation runtimes don't touch this flag.
-            if let Some(flag) = live_session_present_for_task {
-                flag.store(false, Ordering::Release);
-            }
-        }
-    });
-
-    // Re-acquire the live_state lock briefly to install Running. The
-    // task was spawned outside the lock; by the time we install Running
-    // the task may already be polling its first await, but it doesn't
-    // touch live_state until its finalizer runs, so there's no race
-    // observable from this side. The slot guard above guarantees no
-    // racing same-kind start can have written anything else here.
+    // Spawn the task and install `Running` UNDER A SINGLE LOCK ACQUIRE.
+    //
+    // The race this closes: tokio::spawn returns synchronously, but the
+    // spawned future starts polling on whatever worker picks it up —
+    // potentially in parallel with the parent. If the parent spawns,
+    // releases the lock, and only then re-acquires to install `Running`,
+    // a fast-failing loop body (e.g. `SileroVad::new()` returning Err
+    // before `audio_state.lock().await` even yields the parent's slot)
+    // can run its finalizer and write `slot = Idle` BEFORE the parent's
+    // re-acquire resolves. The parent then writes `Running(dead_handle)`
+    // over Idle, leaving a slot that rejects every future same-kind start
+    // and whose `Stopping` write from `stop_live_transcription` never
+    // gets cleared (the task is already gone). Wedge until app restart.
+    //
+    // Holding the lock across `tokio::spawn` + slot assignment makes the
+    // pair atomic from the finalizer's view: the finalizer's
+    // `live_state.lock().await` can't acquire until the install commits.
+    // `tokio::spawn` is purely synchronous (queues the future + returns
+    // a JoinHandle); the install is a struct write. The total lock-hold
+    // is microseconds, comparable to any other brief mutation under
+    // live_state.
     {
         let mut guard = live_state.lock().await;
+        let task_handle = tokio::spawn({
+            let ctx_guard = ctx.clone();
+            let counters_for_loop = counters.clone();
+            let stop_requested_for_loop = Arc::clone(&stop_requested);
+            async move {
+                let result = AssertUnwindSafe(live_transcription_loop(
+                    audio_state_clone,
+                    ctx,
+                    stop_rx,
+                    stop_requested_for_loop,
+                    restart_intent_rx,
+                    session_wav_state,
+                    counters_for_loop,
+                ))
+                .catch_unwind()
+                .await;
+
+                // The scheduler is long-lived now — it outlives this session and
+                // is shared with any dictation runtime that may also be holding
+                // it. We do *not* shut it down at session end. A panic here just
+                // means this session's loop is going down; the scheduler keeps
+                // serving any other live runtime (e.g. a dictation that started
+                // mid-session). Engine-level shutdown happens via
+                // `shutdown_transcription_client`, not here.
+
+                if let Err(panic) = result {
+                    error!("live transcription panicked: {:?}", panic);
+                    let _ = ctx_guard.app_handle.emit(
+                        "live-transcription-status",
+                        LiveTranscriptionStatus {
+                            phase: LiveTranscriptionPhase::Error,
+                            chunks_processed: 0,
+                            total_audio_seconds: 0.0,
+                            error_message: Some(
+                                "live transcription crashed unexpectedly".to_string(),
+                            ),
+                            session_id: ctx_guard.config.session_id.clone(),
+                            effective_start_epoch_ms: None,
+                            lag_seconds: None,
+                            live_drain_backlog_chunks: 0,
+                            live_drain_backlog_seconds: 0.0,
+                            source_kind: ctx_guard.config.source_kind,
+                        },
+                    );
+                }
+
+                // Close the dictation mic-ownership window with the actual
+                // end position read from the audio manager. The closed window
+                // is then visible to the session loop on its next tick (or
+                // any future tick — closed windows are durable, so a fast
+                // dictation that opens-and-closes between two session polls
+                // can't be missed). Done BEFORE the slot transitions to Idle
+                // so the session sees the closed window before any racing
+                // same-kind dictation start could re-open one.
+                if matches!(runtime_source_kind, LiveSourceKind::Dictation) {
+                    let end_pos: u64 = {
+                        let manager = audio_state_for_finalizer.lock().await;
+                        manager
+                            .mic_buffer_info()
+                            .map(|i| i.samples_written as u64)
+                            .unwrap_or(0)
+                    };
+                    dictation_owns_mic_for_finalizer.close(end_pos);
+                }
+
+                // Slot transition: Running/Stopping → Idle. Idempotent — if
+                // `stop_live_transcription` already moved Running → Stopping,
+                // we land on Stopping; otherwise we land on Running. Either way
+                // we drop the runtime here so a fresh same-kind start can pass
+                // the `is_idle` guard.
+                {
+                    let mut slots = live_state_for_finalizer.lock().await;
+                    *slots.slot_mut(runtime_source_kind) = RuntimeSlot::Idle;
+                }
+
+                // Final step: signal the broker that no live session owns audio
+                // state. Session-only — dictation runtimes don't touch this flag.
+                if let Some(flag) = live_session_present_for_task {
+                    flag.store(false, Ordering::Release);
+                }
+            }
+        });
+
         *guard.slot_mut(runtime_source_kind) = RuntimeSlot::Running(LiveTranscriptionRuntime {
             controller: LiveTranscriptionController {
                 task_handle,
