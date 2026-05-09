@@ -17,7 +17,7 @@ use super::error::{validate_session_id, CommandError};
 
 use super::audio::{AudioManagerState, CaptureSourceDto, MixConfigDto};
 use super::silero_vad::{SileroSource, SileroVad, SILENCE_THRESHOLD, SPEECH_THRESHOLD};
-use super::transcription::{TranscriptSegmentDto, TranscriptionSchedulerState};
+use super::transcription::{MicWindow, TranscriptSegmentDto, TranscriptionSchedulerState};
 use super::transcription_scheduler::{
     source_from_label, JobOrigin, JobRequest, SchedulerError, TranscriptionScheduler,
     DEFAULT_SHUTDOWN_TIMEOUT_SECS,
@@ -578,6 +578,51 @@ impl LiveTranscriptionController {
     }
 }
 
+/// RAII guard that reverts a runtime slot from `Starting` back to `Idle`
+/// on Drop unless `disarm()` was called first. Lets `start_live_transcription`
+/// reserve its slot under a brief lock, drop the lock during fallible
+/// setup (preflight / audio reads / scheduler lookup), and only re-acquire
+/// the lock at the end to install `Running`. If any setup step `?`s out,
+/// the guard's Drop spawns a detached task to take the live-state lock
+/// asynchronously and revert the slot — Drop is sync, the revert needs
+/// an async lock, so spawn-detached is the only shape that works.
+///
+/// Safe against racing same-kind starts because the slot guard rejects
+/// non-`Idle` slots, including `Starting`. No racing start can install
+/// `Running` in the gap between the failing call's Drop and the spawned
+/// revert task's lock acquisition.
+struct StartingSlotRevertGuard {
+    state: LiveTranscriptionState,
+    kind: LiveSourceKind,
+    armed: bool,
+}
+
+impl StartingSlotRevertGuard {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for StartingSlotRevertGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let state = self.state.clone();
+        let kind = self.kind;
+        tokio::spawn(async move {
+            let mut slots = state.lock().await;
+            // Only revert if still Starting — defensive against a
+            // future code path that might transition Starting → some
+            // other state directly. Today nothing does, but the check
+            // costs nothing and keeps the contract narrow.
+            if matches!(slots.slot(kind), RuntimeSlot::Starting) {
+                *slots.slot_mut(kind) = RuntimeSlot::Idle;
+            }
+        });
+    }
+}
+
 /// RAII safety net for the dictation runtime's open mic-ownership window.
 /// The dictation task's finalizer is the canonical close: it reads the
 /// final mic position and calls `close(end_pos)` to record an accurate
@@ -784,15 +829,16 @@ struct SourceVadState {
     /// True when a previous dispatch intentionally sent only the oldest
     /// max-sized slice and there is more already-captured audio to drain.
     force_drain: bool,
-    /// Number of *closed* dictation windows this source has already
-    /// consumed (advanced its cursors past). Compared with
-    /// `dictation_owns_mic.snapshot().closed.len()` on each session
-    /// tick to detect any windows that opened-and-closed between two
-    /// session polls — those entries appear in `closed` even though the
-    /// session never observed an open window mid-flight, so a boolean-
-    /// flag race is impossible to miss with this counter. Always 0 for
-    /// non-Mic sources and for non-Session runtimes.
-    processed_closed_count: usize,
+    /// Mic ring-buffer position past which every dictation window this
+    /// source has seen has already been consumed (cursors advanced, VAD
+    /// reset). Compared against each closed window's `end` on every
+    /// session tick: a window with `end > dictation_consumed_through`
+    /// is new and needs processing. Position-based instead of index-
+    /// based so the closed-window list can be pruned (entries with
+    /// `end <= min_consumer_pos` are dropped from the front) without
+    /// invalidating this consumer's progress. Always 0 for non-Mic
+    /// sources and for non-Session runtimes.
+    dictation_consumed_through: u64,
     /// Start position of the *open* dictation window we've already pre-
     /// flushed for. Set when a Mic-Session source observes
     /// `snapshot.open == Some(start)` for the first time, so each open
@@ -831,7 +877,7 @@ impl SourceVadState {
             last_restart_at: None,
             silero: SileroSource::new(initial_pos),
             force_drain: false,
-            processed_closed_count: 0,
+            dictation_consumed_through: 0,
             flushed_open_at: None,
         }
     }
@@ -1178,9 +1224,9 @@ fn mute_dictation_window_in_wav_extraction(
     let frame_count = samples.len() as u64;
     let extract_end_pos = old_mic_pos + frame_count * (mic_channels as u64);
 
-    // Build the list of windows (closed + virtual open extending to the
-    // extraction's end) and zero each overlap.
-    for window in snapshot.all_windows() {
+    // Iterate windows (closed in chronological order, then the virtual
+    // open window) and zero each overlap.
+    for window in snapshot.iter_all() {
         if window.end <= old_mic_pos || window.start >= extract_end_pos {
             continue;
         }
@@ -3098,9 +3144,20 @@ async fn live_transcription_loop(
                 .iter()
                 .position(|s| matches!(s.label, AudioSourceLabel::Mic));
             if let Some(i) = mic_idx {
-                // (a) Consume newly-closed windows in order.
-                while sources[i].processed_closed_count < snapshot.closed.len() {
-                    let window = snapshot.closed[sources[i].processed_closed_count];
+                // (a) Consume any closed windows past this source's
+                //     `dictation_consumed_through`. Position-based instead
+                //     of index-based so the closed list can be pruned
+                //     (front entries dropped when both consumers have
+                //     moved past them) without invalidating progress here.
+                //     Cloning into a local Vec since `snapshot` owns the
+                //     deque and we mutate `sources[i]` in the loop body.
+                let new_windows: Vec<MicWindow> = snapshot
+                    .closed
+                    .iter()
+                    .copied()
+                    .filter(|w| w.end > sources[i].dictation_consumed_through)
+                    .collect();
+                for window in new_windows {
                     let window_start_us = window.start as usize;
                     let window_end_us = window.end as usize;
                     if sources[i].is_speaking
@@ -3131,7 +3188,7 @@ async fn live_transcription_loop(
                     sources[i].speech_start_time = None;
                     sources[i].silence_since = None;
                     sources[i].force_drain = false;
-                    sources[i].processed_closed_count += 1;
+                    sources[i].dictation_consumed_through = window.end;
                     // If the consumed window matches a previously pre-flushed
                     // open window's start, drop that marker.
                     if sources[i].flushed_open_at == Some(window.start) {
@@ -3261,6 +3318,32 @@ async fn live_transcription_loop(
         run_prompt_decay(&ctx, &prompt, &mut sources);
 
         update_scheduler_live_busy(&ctx, &sources, chunk_tasks.len(), false);
+
+        // Prune closed dictation windows that every consumer has already
+        // moved past. Keeps the closed list bounded by the number of
+        // in-flight-or-recently-finished dictations regardless of session
+        // length — without this, the list grows once per dictation for
+        // the entire session and is cloned on every poll. Only relevant
+        // for Session runtimes (the dictation runtime doesn't read the
+        // closed list and isn't a consumer here).
+        if matches!(ctx.config.source_kind, LiveSourceKind::Session) {
+            if let Some(mic) = sources
+                .iter()
+                .find(|s| matches!(s.label, AudioSourceLabel::Mic))
+            {
+                // Min consumer position is the slowest of:
+                //   - the mic VAD's `dictation_consumed_through`
+                //   - the session-WAV writer's `flush_positions.mic_pos`
+                // A window with `end <= min_pos` is past every consumer.
+                let mic_consumed = mic.dictation_consumed_through;
+                let wav_consumed = session_wav_state
+                    .as_ref()
+                    .map(|ws| ws.flush_positions.mic_pos as u64)
+                    .unwrap_or(u64::MAX);
+                let min_pos = mic_consumed.min(wav_consumed);
+                ctx.dictation_owns_mic.prune_before(min_pos);
+            }
+        }
     }
 
     if stop_request.is_some() {
@@ -4648,25 +4731,10 @@ pub async fn start_live_transcription(
     app_handle: AppHandle,
     mut config: LiveTranscriptionConfig,
 ) -> Result<LiveTranscriptionStartResult, CommandError> {
-    let mut guard = live_state.lock().await;
-
-    // Reject same-kind double-start. The slot stays non-`Idle` for the full
-    // lifetime including finalization, so this catches both "already
-    // running" and "previous run still draining" — the latter would
-    // otherwise allow a fresh start to race with the prior task's
-    // finalizer.
-    if !guard.slot(config.source_kind).is_idle() {
-        return Err(CommandError::InvalidInput {
-            message: format!(
-                "live transcription ({}) is already running or finalizing",
-                config.source_kind.as_str()
-            ),
-        });
-    }
-
-    // Dictation invariants enforced at the boundary. Failing fast here beats
-    // letting an inconsistent dictation runtime emit segments into session
-    // storage paths.
+    // Cheap config validation first — no locks held. `is_finite` alongside
+    // the sign checks because NaN comparisons all return false; raw
+    // `<= 0.0` silently admits NaN payloads which would later panic in
+    // sample-count math.
     if matches!(config.source_kind, LiveSourceKind::Dictation) {
         if !matches!(config.source, CaptureSourceDto::MicOnly) {
             return Err(CommandError::InvalidInput {
@@ -4683,66 +4751,7 @@ pub async fn start_live_transcription(
                 message: "dictation requires persist_audio_part=false".into(),
             });
         }
-    } else {
-        // Defensive clear on Session start — but ONLY when the dictation
-        // slot is genuinely Idle. If a dictation runtime is active, its
-        // open window in `dictation_owns_mic` is load-bearing for the
-        // session-mic suspension; clearing it would unwind the suspension
-        // and let the session ingest dictation audio. The clear here is
-        // only for the (rare) case where a prior dictation panic somehow
-        // escaped both the task finalizer and the RAII guard, leaving
-        // stale state behind.
-        if guard.slot(LiveSourceKind::Dictation).is_idle() {
-            dictation_owns_mic.clear_for_session();
-        }
     }
-
-    // Open the dictation mic-ownership window EARLY — immediately after
-    // the slot guard and source-kind validation pass, before any of the
-    // fallible setup work (preflight stream health, scheduler lookup,
-    // engine-info probe, audio file plumbing). If we waited until the
-    // spawn site, audio captured between the hotkey press and the spawn
-    // would either be ingested by an active session loop (the session
-    // wouldn't yet see an open window) OR dropped on the floor (the
-    // dictation runtime's own cursor would initialize at a later position
-    // and never read backward to the hotkey moment).
-    //
-    // The captured `dictation_start_pos` is also threaded into the
-    // dictation runtime's `TranscriptionContext` below so its mic VAD
-    // cursors and session-WAV flush position both initialize at the
-    // window start, capturing every sample from the hotkey forward.
-    //
-    // The RAII guard owns the open window for this stack frame's lifetime.
-    // If any setup step returns Err, the guard drops and `clear_open()`
-    // discards the window without recording it (no audio was actually
-    // transcribed). On success the guard moves into the
-    // LiveTranscriptionRuntime; the dictation task's finalizer closes
-    // the window with the real `end_pos` before the slot transitions to
-    // Idle, so the post-finalize Drop sees `open == None` and is a no-op.
-    let dictation_start_pos: Option<u64> =
-        if matches!(config.source_kind, LiveSourceKind::Dictation) {
-            let mic_pos: u64 = {
-                let manager = audio_state.lock().await;
-                manager
-                    .mic_buffer_info()
-                    .map(|i| i.samples_written as u64)
-                    .unwrap_or(0)
-            };
-            Some(dictation_owns_mic.open(mic_pos))
-        } else {
-            None
-        };
-    let mic_ownership_guard: Option<MicOwnershipGuard> = if dictation_start_pos.is_some() {
-        Some(MicOwnershipGuard {
-            state: dictation_owns_mic.inner().clone(),
-        })
-    } else {
-        None
-    };
-
-    // Validate config values. Use `is_finite` alongside the sign checks
-    // because NaN comparisons all return false — raw `<= 0.0` silently
-    // admits NaN payloads which would later panic in sample-count math.
     if config.silence_duration_ms == 0 {
         return Err(CommandError::InvalidInput {
             message: "silence_duration_ms must be > 0".into(),
@@ -4781,23 +4790,92 @@ pub async fn start_live_transcription(
         }
     }
 
+    // Pre-read mic_pos for dictation under audio_state alone, BEFORE
+    // taking live_state. Lock order is `AudioManager → ... →
+    // LiveTranscription`, so reading audio inside the live_state guard
+    // (as the prior implementation did) violated the documented order.
+    // The brief staleness between this read and the live_state
+    // reservation a few lines below is irrelevant — at most a few mic
+    // frames written in microseconds.
+    let dictation_start_pos: Option<u64> =
+        if matches!(config.source_kind, LiveSourceKind::Dictation) {
+            let manager = audio_state.lock().await;
+            Some(
+                manager
+                    .mic_buffer_info()
+                    .map(|i| i.samples_written as u64)
+                    .unwrap_or(0),
+            )
+        } else {
+            None
+        };
+
+    // Brief live_state lock: reject same-kind double-start, defensive-
+    // clear stale dictation flag (gated), open the dictation mic-
+    // ownership window, reserve the slot as `Starting`. Capture
+    // `skip_preflight` while we have the lock so the rest of this
+    // function can run without needing live_state for that decision.
+    //
+    // The slot stays non-`Idle` for the full lifetime including
+    // finalization; the slot guard rejects any racing same-kind start
+    // including starts that arrive while we're in `Starting`. The
+    // returned `StartingSlotRevertGuard`'s Drop spawns a detached
+    // task to flip Starting → Idle if any setup step below errors out.
+    // On success we install Running atomically at the end and disarm
+    // the revert guard.
+    let (mic_ownership_guard, mut starting_revert_guard, skip_preflight) = {
+        let mut guard = live_state.lock().await;
+        if !guard.slot(config.source_kind).is_idle() {
+            // Drop dictation_start_pos — no window was opened yet.
+            return Err(CommandError::InvalidInput {
+                message: format!(
+                    "live transcription ({}) is already running or finalizing",
+                    config.source_kind.as_str()
+                ),
+            });
+        }
+        if matches!(config.source_kind, LiveSourceKind::Session)
+            && guard.slot(LiveSourceKind::Dictation).is_idle()
+        {
+            // Defensive clear for the rare case where a prior dictation
+            // panic left state behind. Only safe when the dictation slot
+            // is Idle — otherwise we'd unwind a live dictation's open
+            // window and let the session ingest dictation audio.
+            dictation_owns_mic.clear_for_session();
+        }
+        let mic_guard: Option<MicOwnershipGuard> = if let Some(start) = dictation_start_pos {
+            dictation_owns_mic.open(start);
+            Some(MicOwnershipGuard {
+                state: dictation_owns_mic.inner().clone(),
+            })
+        } else {
+            None
+        };
+        // `skip_preflight` is captured here while we still have the
+        // live_state lock — preflight can replace the mic buffer
+        // (`RestartOutcome::BufferReplaced`), and only the session's
+        // in-loop restart handler resets `SourceVadState` cursors +
+        // session-WAV `flush_positions` on replacement. A preflight-
+        // driven replace from a parallel dictation start would leave
+        // an active session reading stale positions, so dictation
+        // defers to the session's stream-health watchdog when a
+        // session is live.
+        let skip_preflight = matches!(config.source_kind, LiveSourceKind::Dictation)
+            && !guard.slot(LiveSourceKind::Session).is_idle();
+        *guard.slot_mut(config.source_kind) = RuntimeSlot::Starting;
+        let revert_guard = StartingSlotRevertGuard {
+            state: live_state.inner().clone(),
+            kind: config.source_kind,
+            armed: true,
+        };
+        (mic_guard, revert_guard, skip_preflight)
+    };
+
     // Pre-flight: restart any silently-stalled capture streams before we
     // read backfill or spawn the loop. Without this, the first dictation
-    // after a long idle (device change, Bluetooth drop, OS sleep) transcribes
-    // whatever stale audio happens to be in the ring buffer.
-    //
-    // Skip for dictation-during-active-session: preflight can replace the
-    // mic buffer (`RestartOutcome::BufferReplaced`), and only the session
-    // loop's in-loop restart handler (line ~2540) knows how to reset
-    // `SourceVadState` cursors and the session-WAV `flush_positions` for
-    // the new buffer. A preflight-driven replace from a parallel dictation
-    // start would leave the session reading from stale raw-sample
-    // positions pointing into the dropped buffer. The session's own
-    // stream-health watchdog polls continuously and routes restarts
-    // through the in-loop path, so it's safe for dictation to defer here.
+    // after a long idle (device change, Bluetooth drop, OS sleep)
+    // transcribes whatever stale audio happens to be in the ring buffer.
     let preflight_source: CaptureSource = config.source.clone().into();
-    let skip_preflight = matches!(config.source_kind, LiveSourceKind::Dictation)
-        && !guard.slot(LiveSourceKind::Session).is_idle();
     if !skip_preflight {
         preflight_stream_health(audio_state.inner(), &preflight_source, &app_handle).await?;
     }
@@ -5196,21 +5274,31 @@ pub async fn start_live_transcription(
         }
     });
 
-    *guard.slot_mut(runtime_source_kind) = RuntimeSlot::Running(LiveTranscriptionRuntime {
-        controller: LiveTranscriptionController {
-            task_handle,
-            stop_tx: Some(stop_tx),
-            stop_requested,
-            session_id: controller_session_id,
-            effective_start_epoch_ms,
-            counters,
-            session_start_instant,
-            session_offset_base_seconds,
-        },
-        vocabulary_hints: vocab_hints,
-        source_kind: runtime_source_kind,
-        mic_ownership_guard,
-    });
+    // Re-acquire the live_state lock briefly to install Running. The
+    // task was spawned outside the lock; by the time we install Running
+    // the task may already be polling its first await, but it doesn't
+    // touch live_state until its finalizer runs, so there's no race
+    // observable from this side. The slot guard above guarantees no
+    // racing same-kind start can have written anything else here.
+    {
+        let mut guard = live_state.lock().await;
+        *guard.slot_mut(runtime_source_kind) = RuntimeSlot::Running(LiveTranscriptionRuntime {
+            controller: LiveTranscriptionController {
+                task_handle,
+                stop_tx: Some(stop_tx),
+                stop_requested,
+                session_id: controller_session_id,
+                effective_start_epoch_ms,
+                counters,
+                session_start_instant,
+                session_offset_base_seconds,
+            },
+            vocabulary_hints: vocab_hints,
+            source_kind: runtime_source_kind,
+            mic_ownership_guard,
+        });
+    }
+    starting_revert_guard.disarm();
 
     Ok(LiveTranscriptionStartResult {
         effective_start_epoch_ms,

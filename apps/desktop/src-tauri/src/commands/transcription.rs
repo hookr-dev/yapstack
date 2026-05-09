@@ -236,21 +236,31 @@ impl MicWindow {
     }
 }
 
-/// Internal mic-ownership state — open window plus a list of closed
+/// Internal mic-ownership state — open window plus a deque of closed
 /// windows that the session loop and WAV writer haven't fully consumed.
 /// Held under a single `Mutex` because reads happen at poll cadence
 /// (every ~30 ms) and writes happen only at dictation start / end /
-/// session start, all of which are rare and short.
+/// session start / per-tick prune, all of which are short.
+///
+/// `closed` is a `VecDeque` so the session loop can `prune_before` the
+/// minimum cursor position of all consumers (mic VAD + WAV writer) on
+/// each tick — popping front entries whose `end` is already behind the
+/// slowest consumer keeps the list bounded by the number of
+/// in-flight-or-recently-finished dictations regardless of session
+/// length. Without pruning, a long session with many dictations would
+/// grow a list that's cloned on every poll.
 #[derive(Default)]
 pub struct DictationMicState {
     /// Currently-open dictation window (start_pos). `Some` while a
     /// dictation runtime owns the mic. The end position is unknown
     /// until the dictation finalizer runs.
     pub open: Option<u64>,
-    /// Closed dictation windows since the last `clear_for_session`.
-    /// Bounded by the number of dictations per session (typically <10),
-    /// so cloning the small Vec on snapshot reads is cheap.
-    pub closed: Vec<MicWindow>,
+    /// Closed dictation windows still in scope for at least one
+    /// consumer (session mic loop / WAV writer). Pruned from the front
+    /// once both consumers have advanced past `window.end`. Always
+    /// ordered by `start` because dictations land in chronological
+    /// order on `close()`.
+    pub closed: std::collections::VecDeque<MicWindow>,
 }
 
 /// Mic-ownership coordination between the session and dictation live loops.
@@ -296,7 +306,7 @@ impl DictationOwnsMic {
         let mut s = self.state.lock().expect("dictation-owns-mic poisoned");
         if let Some(start) = s.open.take() {
             if end > start {
-                s.closed.push(MicWindow { start, end });
+                s.closed.push_back(MicWindow { start, end });
             }
         }
     }
@@ -324,6 +334,20 @@ impl DictationOwnsMic {
         s.open = None;
     }
 
+    /// Pop closed windows whose `end <= min_pos`. `min_pos` is the
+    /// minimum mic ring-buffer position across every consumer that
+    /// reads this state (session mic VAD cursor, session-WAV
+    /// `flush_positions.mic_pos`); a window whose `end` is already
+    /// behind every consumer can never affect any future decision and
+    /// is safe to drop. Called once per session tick to keep the list
+    /// bounded under sessions with many dictations.
+    pub fn prune_before(&self, min_pos: u64) {
+        let mut s = self.state.lock().expect("dictation-owns-mic poisoned");
+        while s.closed.front().is_some_and(|w| w.end <= min_pos) {
+            s.closed.pop_front();
+        }
+    }
+
     /// Cheap snapshot for a single decision: clones the closed windows
     /// (small Vec) and copies the open-window start. Use the snapshot's
     /// `windows()` to iterate all (open + closed) in one place.
@@ -347,7 +371,7 @@ impl Default for DictationOwnsMic {
 /// future sample is dictation-owned until the close lands.
 pub struct DictationMicSnapshot {
     pub open: Option<u64>,
-    pub closed: Vec<MicWindow>,
+    pub closed: std::collections::VecDeque<MicWindow>,
 }
 
 impl DictationMicSnapshot {
@@ -362,18 +386,19 @@ impl DictationMicSnapshot {
         self.closed.iter().any(|w| w.overlaps(start, end))
     }
 
-    /// All windows (closed + virtual open) for iteration, in start order.
-    /// Allocates a fresh Vec; cheap because both inputs are small.
-    pub fn all_windows(&self) -> Vec<MicWindow> {
-        let mut all: Vec<MicWindow> = self.closed.clone();
-        if let Some(open) = self.open {
-            all.push(MicWindow {
-                start: open,
+    /// Iterate all windows (closed in chronological order, then the
+    /// virtual open window). `closed` is already ordered by `start`
+    /// because dictations land sequentially via `close()`, so no sort
+    /// is needed; the open window's `start` is by construction past
+    /// every closed window's `end`.
+    pub fn iter_all(&self) -> impl Iterator<Item = MicWindow> + '_ {
+        self.closed
+            .iter()
+            .copied()
+            .chain(self.open.map(|start| MicWindow {
+                start,
                 end: u64::MAX,
-            });
-        }
-        all.sort_by_key(|w| w.start);
-        all
+            }))
     }
 }
 
@@ -816,17 +841,48 @@ pub async fn init_transcription_client(
     let scheduler = super::transcription_scheduler::TranscriptionScheduler::new(Arc::new(client));
     {
         let mut guard = scheduler_state.lock().await;
-        // Race-handling: if another init landed concurrently with the same
-        // config we'd reach here twice. The earlier guard read above is
-        // best-effort; tolerate a duplicate by replacing only if still None.
-        if guard.is_none() {
+        // Race-handling: two init calls can both pass the early `is_none`
+        // check at the top of this command, both build clients, and both
+        // reach here. The first one to take this lock wins. The runner-up
+        // must distinguish two cases:
+        //   - same config as the winner → idempotent OK (caller's intent
+        //     is satisfied; drop the orphan scheduler).
+        //   - different config → the caller asked for engine X but engine
+        //     Y is now live. Returning Ok would lie about the engine
+        //     state, so reject with the same "shut down first" error the
+        //     non-racing path returns. This keeps init's contract single-
+        //     valued: success means the engine running matches `requested`.
+        let runner_up = match guard.as_ref() {
+            None => false,
+            Some(existing) => {
+                if existing.config != requested {
+                    drop(guard);
+                    let timeout = std::time::Duration::from_secs(
+                        super::transcription_scheduler::DEFAULT_SHUTDOWN_TIMEOUT_SECS,
+                    );
+                    if let Err(e) = scheduler.shutdown_client(timeout).await {
+                        tracing::warn!("orphaned-scheduler shutdown error: {e}");
+                    }
+                    return Err(CommandError::InvalidInput {
+                        message: "engine already initialized with a different config; \
+                             call shutdown_transcription_client first"
+                            .into(),
+                    });
+                }
+                true
+            }
+        };
+        if !runner_up {
             *guard = Some(InitializedEngine {
                 config: requested,
                 scheduler,
             });
         } else {
-            // Drop the freshly-constructed scheduler; another init won.
-            // shutdown_client cleans up the orphaned client.
+            // Same-config runner-up: drop the freshly-constructed scheduler;
+            // the winner's scheduler is already serving the engine the
+            // caller asked for. shutdown_client cleans up the orphaned
+            // client.
+            drop(guard);
             let timeout = std::time::Duration::from_secs(
                 super::transcription_scheduler::DEFAULT_SHUTDOWN_TIMEOUT_SECS,
             );

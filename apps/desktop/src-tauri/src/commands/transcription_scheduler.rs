@@ -330,17 +330,26 @@ impl TranscriptionScheduler {
         &self,
         request: JobRequest,
     ) -> Result<oneshot::Receiver<JobOutcome>, SchedulerError> {
-        if SchedulerState::from_u8(self.inner.state.load(Ordering::Acquire))
-            != SchedulerState::Running
-        {
-            return Err(SchedulerError::Shutdown);
-        }
         let (tx, rx) = oneshot::channel();
         let env = JobEnvelope {
             request,
             respond: tx,
         };
+        // Re-check lifecycle state *while holding the queue lock* and only
+        // push if still Running. Without this, a thread could read
+        // `state == Running` outside the lock, get preempted while
+        // `shutdown_client` drains + cancels the queue and transitions
+        // Terminal, then resume and push into a dead worker's queue —
+        // the returned oneshot would never resolve. `shutdown_client`'s
+        // queue drain runs after the state transition, so checking under
+        // the queue lock pairs the two transitions atomically from the
+        // submitter's perspective.
         let mut queues = self.inner.queues.lock().expect("queue mutex poisoned");
+        if SchedulerState::from_u8(self.inner.state.load(Ordering::Acquire))
+            != SchedulerState::Running
+        {
+            return Err(SchedulerError::Shutdown);
+        }
         queues.push(env);
         drop(queues);
         self.inner.notify.notify_one();
