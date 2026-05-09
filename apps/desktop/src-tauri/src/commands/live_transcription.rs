@@ -1059,29 +1059,49 @@ fn poll_vad(state: &mut SourceVadState, probability: Option<f32>, tuning: &VadTu
 
 // --- Helpers ---
 
-#[allow(clippy::too_many_arguments)]
-fn emit_status(
-    app_handle: &AppHandle,
-    source_kind: LiveSourceKind,
-    phase: LiveTranscriptionPhase,
+/// Per-event progress snapshot bundled into `LiveTranscriptionStatus`.
+/// These five fields always travel together at every emit site; grouping
+/// them keeps `emit_status` to a manageable signature and lets the two
+/// "no data yet" sites use `StatusProgress::zero()` instead of repeating
+/// the literals.
+struct StatusProgress {
     chunks: u32,
     audio_secs: f32,
     lag_seconds: Option<f32>,
     live_drain_backlog_chunks: u32,
     live_drain_backlog_seconds: f32,
+}
+
+impl StatusProgress {
+    fn zero() -> Self {
+        Self {
+            chunks: 0,
+            audio_secs: 0.0,
+            lag_seconds: None,
+            live_drain_backlog_chunks: 0,
+            live_drain_backlog_seconds: 0.0,
+        }
+    }
+}
+
+fn emit_status(
+    app_handle: &AppHandle,
+    source_kind: LiveSourceKind,
+    phase: LiveTranscriptionPhase,
+    progress: StatusProgress,
 ) {
     let _ = app_handle.emit(
         "live-transcription-status",
         LiveTranscriptionStatus {
             phase,
-            chunks_processed: chunks,
-            total_audio_seconds: audio_secs,
+            chunks_processed: progress.chunks,
+            total_audio_seconds: progress.audio_secs,
             error_message: None,
             session_id: None,
             effective_start_epoch_ms: None,
-            lag_seconds,
-            live_drain_backlog_chunks,
-            live_drain_backlog_seconds,
+            lag_seconds: progress.lag_seconds,
+            live_drain_backlog_chunks: progress.live_drain_backlog_chunks,
+            live_drain_backlog_seconds: progress.live_drain_backlog_seconds,
             source_kind,
         },
     );
@@ -2517,11 +2537,7 @@ async fn live_transcription_loop(
         &ctx.app_handle,
         ctx.config.source_kind,
         LiveTranscriptionPhase::Running,
-        0,
-        0.0,
-        None,
-        0,
-        0.0,
+        StatusProgress::zero(),
     );
 
     let poll_interval = tuning.poll_interval;
@@ -2543,11 +2559,7 @@ async fn live_transcription_loop(
                 &ctx.app_handle,
                 ctx.config.source_kind,
                 LiveTranscriptionPhase::Error,
-                0,
-                0.0,
-                None,
-                0,
-                0.0,
+                StatusProgress::zero(),
             );
             return;
         }
@@ -3203,11 +3215,13 @@ async fn live_transcription_loop(
             &ctx.app_handle,
             ctx.config.source_kind,
             LiveTranscriptionPhase::Stopped,
-            final_chunks,
-            final_audio_seconds,
-            final_lag,
-            final_backlog_chunks,
-            final_backlog_seconds,
+            StatusProgress {
+                chunks: final_chunks,
+                audio_secs: final_audio_seconds,
+                lag_seconds: final_lag,
+                live_drain_backlog_chunks: final_backlog_chunks,
+                live_drain_backlog_seconds: final_backlog_seconds,
+            },
         );
     }
 
@@ -4370,11 +4384,13 @@ async fn transcribe_and_emit_chunk(
             &ctx.app_handle,
             ctx.config.source_kind,
             LiveTranscriptionPhase::Running,
-            total_chunks,
-            total_audio_seconds,
-            lag_seconds,
-            backlog_chunks,
-            backlog_seconds,
+            StatusProgress {
+                chunks: total_chunks,
+                audio_secs: total_audio_seconds,
+                lag_seconds,
+                live_drain_backlog_chunks: backlog_chunks,
+                live_drain_backlog_seconds: backlog_seconds,
+            },
         );
     }
 
