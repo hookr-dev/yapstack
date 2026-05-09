@@ -1085,26 +1085,52 @@ impl StatusProgress {
 }
 
 fn emit_status(
-    app_handle: &AppHandle,
-    source_kind: LiveSourceKind,
+    ctx: &TranscriptionContext,
     phase: LiveTranscriptionPhase,
     progress: StatusProgress,
 ) {
-    let _ = app_handle.emit(
+    let _ = ctx.app_handle.emit(
         "live-transcription-status",
         LiveTranscriptionStatus {
             phase,
             chunks_processed: progress.chunks,
             total_audio_seconds: progress.audio_secs,
             error_message: None,
-            session_id: None,
+            // Carrying session_id and source_kind on every status event is
+            // load-bearing for the frontend's two-prong filter: dictation
+            // listeners only resolve their stop-promise on a status whose
+            // session_id matches their synthetic dictation id, and the
+            // session UI only flips its phase machine on its own session's
+            // events. Without this, a dictation Stopped emit looked like a
+            // session Stopped emit (None == None, source_kind=session by
+            // default), so the dictation hook never observed completion
+            // and waited the full 5s timeout before AI / output / history.
+            session_id: ctx.config.session_id.clone(),
             effective_start_epoch_ms: None,
             lag_seconds: progress.lag_seconds,
             live_drain_backlog_chunks: progress.live_drain_backlog_chunks,
             live_drain_backlog_seconds: progress.live_drain_backlog_seconds,
-            source_kind,
+            source_kind: ctx.config.source_kind,
         },
     );
+}
+
+/// Mark this runtime as busy on the scheduler — used at the moment a stop
+/// is observed (before final-flush dispatch lands) and at any other site
+/// where we need to defensively block backfill from racing into the lane.
+/// Routes through `source_kind` so a dictation runtime only toggles the
+/// `Dictation` bit; a session toggles its `LiveMic + LiveSystem` bits.
+/// Without this, `stop_if_requested` and the inline stop branch in the
+/// live loop both called `set_live_busy(true)` unconditionally, leaving
+/// the LiveMic/LiveSystem bits set after a dictation finalize and
+/// blocking session backfill until a future session happened to clear them.
+fn mark_busy_for_stop(ctx: &TranscriptionContext) {
+    match ctx.config.source_kind {
+        LiveSourceKind::Session => ctx.scheduler.set_live_busy(true),
+        LiveSourceKind::Dictation => ctx
+            .scheduler
+            .set_busy(super::transcription_scheduler::BusyKind::Dictation, true),
+    }
 }
 
 fn update_scheduler_live_busy(
@@ -1170,7 +1196,7 @@ async fn stop_if_requested(
     if !stop_requested.load(Ordering::Acquire) {
         return None;
     }
-    ctx.scheduler.set_live_busy(true);
+    mark_busy_for_stop(ctx);
     Some(receive_stop_request_or_snapshot(stop_rx, audio_state).await)
 }
 
@@ -2534,8 +2560,7 @@ async fn live_transcription_loop(
     let mut prompt_seeded_from_backfill = false;
 
     emit_status(
-        &ctx.app_handle,
-        ctx.config.source_kind,
+        &ctx,
         LiveTranscriptionPhase::Running,
         StatusProgress::zero(),
     );
@@ -2555,12 +2580,7 @@ async fn live_transcription_loop(
                 "live transcription: failed to initialize Silero VAD — bailing out: {}",
                 e
             );
-            emit_status(
-                &ctx.app_handle,
-                ctx.config.source_kind,
-                LiveTranscriptionPhase::Error,
-                StatusProgress::zero(),
-            );
+            emit_status(&ctx, LiveTranscriptionPhase::Error, StatusProgress::zero());
             return;
         }
     };
@@ -2643,7 +2663,7 @@ async fn live_transcription_loop(
         };
 
         if let Some(req) = stop_signal {
-            ctx.scheduler.set_live_busy(true);
+            mark_busy_for_stop(&ctx);
             stop_request = Some(req);
             break;
         }
@@ -3212,8 +3232,7 @@ async fn live_transcription_loop(
     // Only emit Stopped if we didn't already emit Error (avoids duplicate finalization)
     if !exited_fatal {
         emit_status(
-            &ctx.app_handle,
-            ctx.config.source_kind,
+            &ctx,
             LiveTranscriptionPhase::Stopped,
             StatusProgress {
                 chunks: final_chunks,
@@ -4381,8 +4400,7 @@ async fn transcribe_and_emit_chunk(
             .app_handle
             .emit("live-transcription-segment", &result.event);
         emit_status(
-            &ctx.app_handle,
-            ctx.config.source_kind,
+            ctx,
             LiveTranscriptionPhase::Running,
             StatusProgress {
                 chunks: total_chunks,
@@ -4448,12 +4466,61 @@ pub async fn start_live_transcription(
             });
         }
     } else {
-        // Defensive clear on Session start — covers any stuck flag from a
-        // crashed prior dictation that somehow escaped Drop / finalizer.
+        // Defensive clear on Session start — but ONLY when the dictation
+        // slot is genuinely Idle. The flag is owned by an active dictation
+        // runtime when its slot is non-Idle; clearing it there would
+        // unwind the session-mic suspension while dictation is mid-
+        // utterance, letting the session ingest dictation audio. The
+        // defensive clear is only for the (rare) case where a prior
+        // dictation panic somehow escaped both the task finalizer and the
+        // RAII guard, leaving the flag stuck while the slot is Idle.
+        if guard.slot(LiveSourceKind::Dictation).is_idle() {
+            dictation_owns_mic
+                .flag
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    // Acquire mic ownership for dictation runtimes EARLY — immediately after
+    // the slot guard and source-kind validation pass, before any of the
+    // fallible setup work (preflight stream health, scheduler lookup,
+    // engine-info probe, audio file plumbing). If the flag flipped only at
+    // the spawn site, audio captured between the hotkey press and the
+    // spawn would still be ingested by an active session loop and never
+    // reach the dictation pipeline — the user's first syllable would land
+    // in the session transcript and be missing from the dictation output.
+    //
+    // The order of stores matters: snapshot `acquired_at` FIRST, then flip
+    // `flag`. Reversing it would briefly publish `flag=true` with a stale
+    // `acquired_at`, and the session's rising-edge handler could flush
+    // past the actual boundary.
+    //
+    // The RAII guard is owned by this stack frame from here through the
+    // runtime-placement at the bottom of the function. If any of the
+    // setup steps below returns Err, the guard drops on the way out and
+    // the flag is cleared — the session resumes mic ingest cleanly. On
+    // success the guard is moved into the LiveTranscriptionRuntime and
+    // its lifetime tracks the slot.
+    let mic_ownership_guard = if matches!(config.source_kind, LiveSourceKind::Dictation) {
+        let mic_pos: u64 = {
+            let manager = audio_state.lock().await;
+            manager
+                .mic_buffer_info()
+                .map(|i| i.samples_written as u64)
+                .unwrap_or(0)
+        };
+        dictation_owns_mic
+            .acquired_at
+            .store(mic_pos, std::sync::atomic::Ordering::SeqCst);
         dictation_owns_mic
             .flag
-            .store(false, std::sync::atomic::Ordering::SeqCst);
-    }
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        Some(MicOwnershipGuard {
+            state: dictation_owns_mic.inner().clone(),
+        })
+    } else {
+        None
+    };
 
     // Validate config values. Use `is_finite` alongside the sign checks
     // because NaN comparisons all return false — raw `<= 0.0` silently
@@ -4679,19 +4746,32 @@ pub async fn start_live_transcription(
     let (stop_tx, stop_rx) = oneshot::channel();
     let stop_requested = Arc::new(AtomicBool::new(false));
 
-    // Channel for RestartIntents from the device broker. The sender is
-    // installed in the managed inbox so the broker can find it; the
-    // receiver is consumed by the live loop. Replaces any prior sender
-    // (which would only exist if a previous session crashed without
-    // clearing the inbox in stop_live_transcription).
+    // Capture session_id before config is moved into TranscriptionContext
+    let controller_session_id = config.session_id.clone();
+    let runtime_source_kind = config.source_kind;
+
+    // Channel for RestartIntents from the device broker. The receiver is
+    // always consumed by the live loop's select! arm — every runtime needs
+    // one for the loop to compile. The *sender* is only published to the
+    // global inbox for Session runtimes: dictation is short-lived, mic-only,
+    // and never participates in the broker's restart-routing protocol.
+    // Without this gate, a dictation start during an active session would
+    // overwrite the session loop's installed sender, so subsequent device-
+    // change restarts would route to the dictation loop (or hit a closed
+    // channel after dictation exits) and the session would never see them.
     let (restart_intent_tx, restart_intent_rx) =
         tokio::sync::mpsc::unbounded_channel::<RestartIntent>();
-    {
+    if matches!(runtime_source_kind, LiveSourceKind::Session) {
         let mut inbox_guard = restart_intent_inbox
             .inner()
             .lock()
             .expect("restart-intent inbox poisoned");
         *inbox_guard = Some(restart_intent_tx);
+    } else {
+        // Drop the dictation-owned sender so the rx closes cleanly — no
+        // broker can post into it, and the loop's select! arm reads
+        // `None` instead of waiting forever on a leaked channel.
+        drop(restart_intent_tx);
     }
 
     let audio_state_clone = audio_state.inner().clone();
@@ -4699,10 +4779,6 @@ pub async fn start_live_transcription(
     // Align config backfill with the clamped value so WAV writer and transcript
     // cursor share the same time origin (prevents timestamp drift on playback).
     config.backfill_seconds = effective_backfill_seconds;
-
-    // Capture session_id before config is moved into TranscriptionContext
-    let controller_session_id = config.session_id.clone();
-    let runtime_source_kind = config.source_kind;
 
     // Clone the long-lived scheduler from app-level state. The scheduler
     // outlives the session — both the session live loop and the dictation
@@ -4790,35 +4866,6 @@ pub async fn start_live_transcription(
     }
     let live_session_present_for_task = if is_session {
         Some(Arc::clone(live_session_present.inner()))
-    } else {
-        None
-    };
-
-    // Acquire mic ownership for dictation runtimes. Synchronous — flip the
-    // flag here, before spawning the loop, so the session's mic-loop next
-    // tick observes `true` immediately. The order matters:
-    //   1. Snapshot the mic write position into `acquired_at` FIRST.
-    //   2. Then set `flag = true`.
-    // Reversing the order would briefly publish a `flag = true` with a
-    // stale `acquired_at`, and the session's rising-edge handler could
-    // flush past the actual boundary.
-    let mic_ownership_guard = if matches!(runtime_source_kind, LiveSourceKind::Dictation) {
-        let mic_pos: u64 = {
-            let manager = audio_state.lock().await;
-            manager
-                .mic_buffer_info()
-                .map(|i| i.samples_written as u64)
-                .unwrap_or(0)
-        };
-        dictation_owns_mic
-            .acquired_at
-            .store(mic_pos, std::sync::atomic::Ordering::SeqCst);
-        dictation_owns_mic
-            .flag
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-        Some(MicOwnershipGuard {
-            state: dictation_owns_mic.inner().clone(),
-        })
     } else {
         None
     };
