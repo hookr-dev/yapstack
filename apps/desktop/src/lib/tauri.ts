@@ -21,8 +21,17 @@ export type TranscriptSegmentDto = {
 };
 
 /** Origin class of a live segment event. Mirrors the scheduler's priority
- *  tier (FinalFlush > Live > Backfill). */
+ *  tier (FinalFlush > Dictation > Live > Backfill). Strictly distinct from
+ *  `source_kind` — `origin` is the priority class, `source_kind` is the
+ *  routing identity. Frontend code must route by `source_kind`, never by
+ *  `origin`. */
 export type SegmentOrigin = "live" | "backfill" | "final_flush";
+
+/** Routing identity of a live runtime — session vs dictation. The
+ *  frontend filters every live-transcription event on this so a
+ *  concurrently-running dictation never leaks segments / status into the
+ *  session UI and vice-versa. Mirrors the Rust `LiveSourceKind` enum. */
+export type LiveSourceKind = "session" | "dictation";
 
 export type LiveSegmentEvent = {
   chunk_index: number;
@@ -33,6 +42,8 @@ export type LiveSegmentEvent = {
   accumulated_text: string;
   /** Origin class set by the scheduler at emit time. */
   origin: SegmentOrigin;
+  /** Routing identity of the runtime that produced this segment. */
+  source_kind: LiveSourceKind;
   /** Session this chunk belongs to. Late-arriving segments still persist to
    * this session even after the frontend has cleared activeSessionId. */
   session_id: string | null;

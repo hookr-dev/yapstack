@@ -769,6 +769,13 @@ function createAppStore() {
               `origin=${event.origin}`,
           );
 
+          // Primary route: source_kind. Dictation segments are owned by
+          // useDictation.ts; they must never reach the session segments
+          // table. Belt-and-suspenders: the legacy synthetic-id match below
+          // catches any stale event lacking source_kind during a transitional
+          // build (default = "session" on the Rust side, but a failed
+          // binding regen would surface it here as undefined).
+          if (event.source_kind === "dictation") return;
           // Prefer the session_id carried on the event so late-arriving
           // segments (after `setLivePhase("Stopped")` has cleared
           // activeSessionId) still persist to the right session in the DB.
@@ -777,10 +784,6 @@ function createAppStore() {
           const { activeSessionId, dictationSessionId } = get();
           const targetSessionId = event.session_id ?? activeSessionId;
           if (!targetSessionId) return;
-          // Dictation runs live transcription against a synthetic session id
-          // that is never written to the `sessions` table; persisting here
-          // would fail the segments FK and fire a toast. Dictation consumes
-          // its own text via the raw live-segment listener in useDictation.
           if (targetSessionId === dictationSessionId) return;
 
           // Create one segment per Whisper/Parakeet segment to preserve timestamps
@@ -1091,6 +1094,7 @@ function createAppStore() {
           diarization:
             settings.selectedEngine === "Parakeet" && settings.diarizationEnabled,
           vocabulary_hints: vocabHints,
+          source_kind: "session",
         };
 
         // Pre-set `backfillActive` before the await so any `backfill-complete`
@@ -1221,6 +1225,7 @@ function createAppStore() {
             part_index: nextPartIndex,
             offset_base_seconds: offsetBaseSeconds,
           },
+          source_kind: "session",
         };
 
         const result = await commands.startLiveTranscription(config);
@@ -1266,7 +1271,7 @@ function createAppStore() {
         set({ sessionStopping: true });
 
         try {
-          await commands.stopLiveTranscription();
+          await commands.stopLiveTranscription("session");
         } catch (e) {
           console.error("Failed to stop session:", e);
           set({ sessionStopping: false });

@@ -6,6 +6,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+### Added
+- **Dictation works during an active session.** Hitting a dictation hotkey while a recording session is in progress now returns the dictated text (paste / clipboard / new-note, per slot config) without disturbing the session. Dictated content stays out of the session transcript: the session's own mic-side processing suspends for the duration of the dictation, with a rising-edge flush that preserves the partial word the user spoke just before triggering the hotkey, and a falling-edge reset that drops the dictation window's audio from session VAD state.
+- New `LiveSourceKind` (`session` | `dictation`) routing dimension carried end-to-end on every live-transcription event (segments, status, backfill-complete) and accepted on `start_live_transcription` / `stop_live_transcription` / `get_live_transcription_status`. Two-prong frontend filters (`source_kind` + `session_id`) keep dictation lifecycle from leaking into session UI state and vice-versa.
+- New scheduler `JobOrigin::Dictation` priority tier — order is `FinalFlush > Dictation > Live (mic/system round-robin) > Backfill`. Dictation chunks jump the queue past session live chunks. The scheduler is non-preemptive, so a dictation chunk still waits behind any sidecar job already in flight at trigger time.
+
+### Changed
+- The transcription scheduler is now a **long-lived app-level singleton**. It's constructed once at engine init and shared by every live runtime (one session + one dictation concurrently); previously each session built its own scheduler and round-tripped the `TranscriptionClient` back into shared state on stop. `init_transcription_client` is now idempotent on a matching engine/config and returns an explicit "shut down first" error on mismatch — engine swap is an explicit two-step operation. `submit()` returns `Result<Receiver, SchedulerError>` and rejects with `Shutdown` once the scheduler is terminal so racing `Arc<Scheduler>` clones can't enqueue into a dead worker. Backfill-gating is now a per-producer bitmask (`{LiveMic, LiveSystem, Dictation}`) so one runtime clearing its bit while another is mid-utterance can't unblock backfill prematurely.
+- `LiveTranscriptionState` is now a two-slot struct (`session`, `dictation`) with explicit `Idle | Starting | Running | Stopping` lifecycle states — same-kind double-start is rejected even during the finalization window, so a stop-then-fast-start can't race the prior task's tail emission.
+
 ## [1.0.0-alpha.10] - 2026-05-04
 
 ### Fixed
