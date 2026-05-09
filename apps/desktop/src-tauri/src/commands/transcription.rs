@@ -218,24 +218,120 @@ pub struct InitializedEngine {
 /// machine handles the in-between).
 pub type TranscriptionSchedulerState = Arc<Mutex<Option<InitializedEngine>>>;
 
-/// Shared mic-ownership coordination between the session and dictation live
-/// loops. While `flag` is true the session's mic-side processing is
-/// suspended; the dictation runtime owns the mic. `acquired_at` records the
-/// mic ring-buffer write position at the moment dictation acquired ownership
-/// — the session's mic loop uses this on the rising edge to flush any
-/// pending session speech up to that boundary before suspending, so the
-/// final word the user spoke before hitting the dictation hotkey is not
-/// lost.
+/// A range of mic ring-buffer write positions owned by a dictation runtime.
+/// Both endpoints are in raw-sample units (matches `mic_buffer_info().
+/// samples_written`). Samples in `[start, end)` were captured during
+/// dictation and must not appear in any session transcript or WAV export.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MicWindow {
+    pub start: u64,
+    pub end: u64,
+}
+
+impl MicWindow {
+    /// Treat the window as a half-open `[start, end)` interval and test
+    /// overlap against another `[other_start, other_end)`.
+    pub fn overlaps(&self, other_start: u64, other_end: u64) -> bool {
+        self.start < other_end && self.end > other_start
+    }
+}
+
+/// Internal mic-ownership state — open window plus a list of closed
+/// windows that the session loop and WAV writer haven't fully consumed.
+/// Held under a single `Mutex` because reads happen at poll cadence
+/// (every ~30 ms) and writes happen only at dictation start / end /
+/// session start, all of which are rare and short.
+#[derive(Default)]
+pub struct DictationMicState {
+    /// Currently-open dictation window (start_pos). `Some` while a
+    /// dictation runtime owns the mic. The end position is unknown
+    /// until the dictation finalizer runs.
+    pub open: Option<u64>,
+    /// Closed dictation windows since the last `clear_for_session`.
+    /// Bounded by the number of dictations per session (typically <10),
+    /// so cloning the small Vec on snapshot reads is cheap.
+    pub closed: Vec<MicWindow>,
+}
+
+/// Mic-ownership coordination between the session and dictation live loops.
+/// Replaces the prior boolean+atomic flag with explicit `[start, end)`
+/// windows that the session can reason about precisely:
+///
+/// - Catches dictations that open and close between two session polls
+///   (the boolean would have flickered without the session ever observing
+///   it; a closed window is durable).
+/// - Lets dictation initialize its own VAD/WAV cursors at `start` so audio
+///   captured between hotkey press and runtime spawn isn't dropped on
+///   the floor.
+/// - Lets WAV muting compute precise byte/sample ranges to zero, instead
+///   of zeroing whole batches and losing system audio in Mixed mode.
 pub struct DictationOwnsMic {
-    pub flag: std::sync::atomic::AtomicBool,
-    pub acquired_at: std::sync::atomic::AtomicU64,
+    state: std::sync::Mutex<DictationMicState>,
 }
 
 impl DictationOwnsMic {
     pub fn new() -> Self {
         Self {
-            flag: std::sync::atomic::AtomicBool::new(false),
-            acquired_at: std::sync::atomic::AtomicU64::new(0),
+            state: std::sync::Mutex::new(DictationMicState::default()),
+        }
+    }
+
+    /// Open a new dictation window. Called by `start_live_transcription`
+    /// for `Dictation` runtimes after the slot guard passes. Returns the
+    /// recorded `start` so the caller can pass it into the dictation
+    /// runtime's cursor init.
+    pub fn open(&self, start: u64) -> u64 {
+        let mut s = self.state.lock().expect("dictation-owns-mic poisoned");
+        s.open = Some(start);
+        start
+    }
+
+    /// Close the currently-open window with `end`. Called by the dictation
+    /// finalizer (and as a safety net by the runtime's RAII guard). If
+    /// no window is open, this is a no-op — happens when the runtime
+    /// errored out before opening or when the session already cleared
+    /// state via `clear_for_session`. Empty windows (`end <= start`) are
+    /// dropped rather than recorded.
+    pub fn close(&self, end: u64) {
+        let mut s = self.state.lock().expect("dictation-owns-mic poisoned");
+        if let Some(start) = s.open.take() {
+            if end > start {
+                s.closed.push(MicWindow { start, end });
+            }
+        }
+    }
+
+    /// Reset all state. Called at session start so a fresh session
+    /// observes only windows that occur during its lifetime, not stale
+    /// entries from a prior session that crashed without draining.
+    /// Called only when the dictation slot is genuinely Idle — otherwise
+    /// we'd unwind a live dictation's open window.
+    pub fn clear_for_session(&self) {
+        let mut s = self.state.lock().expect("dictation-owns-mic poisoned");
+        s.open = None;
+        s.closed.clear();
+    }
+
+    /// Clear the currently-open window without recording it as closed.
+    /// Used by the dictation runtime's RAII guard on Drop for early-
+    /// error paths that opened the window but never spawned the live
+    /// loop — no audio was actually transcribed, so there's nothing to
+    /// record. The normal close path on the spawned task's finalizer
+    /// is unaffected: by the time the guard drops in the slot's
+    /// transition to Idle, `open` is already None and this is a no-op.
+    pub fn clear_open(&self) {
+        let mut s = self.state.lock().expect("dictation-owns-mic poisoned");
+        s.open = None;
+    }
+
+    /// Cheap snapshot for a single decision: clones the closed windows
+    /// (small Vec) and copies the open-window start. Use the snapshot's
+    /// `windows()` to iterate all (open + closed) in one place.
+    pub fn snapshot(&self) -> DictationMicSnapshot {
+        let s = self.state.lock().expect("dictation-owns-mic poisoned");
+        DictationMicSnapshot {
+            open: s.open,
+            closed: s.closed.clone(),
         }
     }
 }
@@ -243,6 +339,41 @@ impl DictationOwnsMic {
 impl Default for DictationOwnsMic {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Snapshot of mic-ownership state for one decision. The open window
+/// (if any) is treated as `[start, u64::MAX)` for overlap math — every
+/// future sample is dictation-owned until the close lands.
+pub struct DictationMicSnapshot {
+    pub open: Option<u64>,
+    pub closed: Vec<MicWindow>,
+}
+
+impl DictationMicSnapshot {
+    /// Returns true if the buffer-position range `[start, end)` overlaps
+    /// any dictation window, open or closed.
+    pub fn overlaps(&self, start: u64, end: u64) -> bool {
+        if let Some(open) = self.open {
+            if open < end {
+                return true;
+            }
+        }
+        self.closed.iter().any(|w| w.overlaps(start, end))
+    }
+
+    /// All windows (closed + virtual open) for iteration, in start order.
+    /// Allocates a fresh Vec; cheap because both inputs are small.
+    pub fn all_windows(&self) -> Vec<MicWindow> {
+        let mut all: Vec<MicWindow> = self.closed.clone();
+        if let Some(open) = self.open {
+            all.push(MicWindow {
+                start: open,
+                end: u64::MAX,
+            });
+        }
+        all.sort_by_key(|w| w.start);
+        all
     }
 }
 

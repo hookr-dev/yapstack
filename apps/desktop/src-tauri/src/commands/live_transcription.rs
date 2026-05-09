@@ -416,8 +416,15 @@ struct TranscriptionContext {
     engine_profile: Arc<EngineProfile>,
     /// Mic-ownership coordination shared with any concurrent dictation
     /// runtime. Cloned-Arc so both runtimes' `TranscriptionContext` clones
-    /// observe the same flag.
+    /// observe the same window list.
     dictation_owns_mic: super::transcription::DictationOwnsMicState,
+    /// For dictation runtimes, the mic ring-buffer write position
+    /// captured at the moment the dictation runtime opened its window.
+    /// Used to initialize the dictation runtime's mic VAD cursors and
+    /// session-WAV flush position so audio captured between the hotkey
+    /// press and the live loop spawn is included in the dictation
+    /// transcript and WAV. `None` for session runtimes.
+    dictation_start_pos: Option<u64>,
 }
 
 /// Result of transcribing a single chunk.
@@ -571,22 +578,23 @@ impl LiveTranscriptionController {
     }
 }
 
-/// RAII guard that clears the `dictation_owns_mic` flag when dropped. Owned
-/// by the dictation runtime so the flag cleanup tracks the slot's lifetime.
-/// Idempotent with the task-finalizer-driven clear (clearing twice is
-/// harmless), but covers paths the finalizer doesn't reach — early errors
-/// after the guard is constructed but before the loop spawns, panics
-/// inside `start_live_transcription` after the guard is bound, or app exit
-/// dropping the slot.
+/// RAII safety net for the dictation runtime's open mic-ownership window.
+/// The dictation task's finalizer is the canonical close: it reads the
+/// final mic position and calls `close(end_pos)` to record an accurate
+/// `[start, end)` window the session can consume. This guard only fires
+/// for paths the finalizer doesn't reach — early errors after the window
+/// was opened but before the loop spawned, or app-exit dropping the slot
+/// without the spawned task completing. Both cases mean no audio was
+/// actually transcribed, so we use `clear_open()` to drop the open state
+/// without recording a window. Drop after a normal close is a no-op
+/// (state.open is already None).
 pub struct MicOwnershipGuard {
     state: super::transcription::DictationOwnsMicState,
 }
 
 impl Drop for MicOwnershipGuard {
     fn drop(&mut self) {
-        self.state
-            .flag
-            .store(false, std::sync::atomic::Ordering::SeqCst);
+        self.state.clear_open();
     }
 }
 
@@ -776,18 +784,23 @@ struct SourceVadState {
     /// True when a previous dispatch intentionally sent only the oldest
     /// max-sized slice and there is more already-captured audio to drain.
     force_drain: bool,
-    /// Edge-detect for `dictation_owns_mic` — true when the previous tick
-    /// observed dictation owning the mic. The session mic loop uses this to:
-    /// (a) on rising edge (false → true), flush any pending session speech
-    ///     up to the boundary `acquired_at` recorded at dictation start, so
-    ///     the user's last word before hitting the dictation hotkey isn't
-    ///     lost.
-    /// (b) on falling edge (true → false), fully reset VAD state so audio
-    ///     captured during the dictation window never becomes session
-    ///     transcript.
-    /// Always `false` for non-Mic sources and for non-Session runtimes —
-    /// system audio doesn't conflict with dictation.
-    dictation_was_active: bool,
+    /// Number of *closed* dictation windows this source has already
+    /// consumed (advanced its cursors past). Compared with
+    /// `dictation_owns_mic.snapshot().closed.len()` on each session
+    /// tick to detect any windows that opened-and-closed between two
+    /// session polls — those entries appear in `closed` even though the
+    /// session never observed an open window mid-flight, so a boolean-
+    /// flag race is impossible to miss with this counter. Always 0 for
+    /// non-Mic sources and for non-Session runtimes.
+    processed_closed_count: usize,
+    /// Start position of the *open* dictation window we've already pre-
+    /// flushed for. Set when a Mic-Session source observes
+    /// `snapshot.open == Some(start)` for the first time, so each open
+    /// window only triggers a single pre-window dispatch even if the
+    /// session ticks many times before the close lands. None when no
+    /// open window has been observed yet, or after the matching closed
+    /// window has been consumed.
+    flushed_open_at: Option<u64>,
 }
 
 impl SourceVadState {
@@ -818,7 +831,8 @@ impl SourceVadState {
             last_restart_at: None,
             silero: SileroSource::new(initial_pos),
             force_drain: false,
-            dictation_was_active: false,
+            processed_closed_count: 0,
+            flushed_open_at: None,
         }
     }
 
@@ -1115,31 +1129,40 @@ fn emit_status(
     );
 }
 
-/// Zero out mic-derived samples in a session-WAV extraction when the
-/// session's mic source observed dictation owning the mic during the
-/// extracted range. Without this, the recorded WAV file contains the
-/// dictated message even though the transcript correctly skipped it,
-/// creating a confusing playback / transcript mismatch.
+/// Zero out mono-frame samples in a session-WAV extraction that fall
+/// inside any dictation window — open or closed. Without this, the
+/// recorded WAV file contains the dictated message even though the
+/// transcript correctly skipped it, creating a confusing playback /
+/// transcript mismatch.
 ///
-/// Per-tick approximation: mute the entire batch when EITHER the live
-/// flag is currently set OR the mic source's `dictation_was_active` is
-/// set (covers the small window after dictation finalizer cleared the
-/// flag but before the session loop's falling-edge handler ran). For a
-/// poll interval ~30 ms this loses up to one tick of legitimate session
-/// audio at each edge — acceptable for an MVP that doesn't track
-/// dictation windows precisely.
+/// The extracted samples are mono (deinterleaved). One mono frame
+/// covers `mic_channels` raw mic-buffer positions, so a sample at
+/// mono index `i` corresponds to raw range
+/// `[old_pos + i*ch, old_pos + (i+1)*ch)`. We compute the mono index
+/// span for each overlapping window and zero only those samples.
 ///
 /// Source semantics:
-/// - `MicOnly`: extraction is mic samples; mute → silence during dictation.
-/// - `Mixed`: extraction is the (mic + system) mix; mute also loses system
-///   audio for the dictation window. Better than recording the dictation;
-///   a precise implementation would extract system-only during the window.
-/// - `SystemOnly`: never enters this helper — dictation can't affect the
-///   system buffer.
+/// - `MicOnly`: extraction is mic mono; precise zeroing → silence
+///   inside the dictation window, untouched session audio outside it.
+/// - `Mixed`: extraction is the (mic + system) mix at mic rate; we
+///   still compute the overlap against mic positions and zero those
+///   samples. The mute loses the system-audio portion during the
+///   dictation window; a fully precise implementation would extract
+///   system-only audio for that range and substitute it. Documented
+///   here as intentional MVP behavior — better than recording the
+///   dictation in the session WAV.
+/// - `SystemOnly`: never enters this helper — dictation can't affect
+///   the system buffer.
+///
+/// `old_pos` is the mic write position the extraction started from
+/// (i.e. the WAV writer's pre-extraction `flush_positions.mic_pos`).
+/// Without it we can't map mono indices back to ring-buffer positions
+/// for window-overlap math.
 fn mute_dictation_window_in_wav_extraction(
-    extraction: &mut (Vec<f32>, u32, BufferPositions),
+    samples: &mut [f32],
+    mic_channels: usize,
+    old_mic_pos: u64,
     ctx: &TranscriptionContext,
-    sources: &[SourceVadState],
     wav_source: CaptureSource,
 ) {
     if !matches!(ctx.config.source_kind, LiveSourceKind::Session) {
@@ -1148,16 +1171,32 @@ fn mute_dictation_window_in_wav_extraction(
     if !matches!(wav_source, CaptureSource::MicOnly | CaptureSource::Mixed) {
         return;
     }
-    let mic_was_active = sources
-        .iter()
-        .any(|s| matches!(s.label, AudioSourceLabel::Mic) && s.dictation_was_active);
-    let owns_now = ctx
-        .dictation_owns_mic
-        .flag
-        .load(std::sync::atomic::Ordering::SeqCst);
-    if owns_now || mic_was_active {
-        for s in extraction.0.iter_mut() {
-            *s = 0.0;
+    if mic_channels == 0 || samples.is_empty() {
+        return;
+    }
+    let snapshot = ctx.dictation_owns_mic.snapshot();
+    let frame_count = samples.len() as u64;
+    let extract_end_pos = old_mic_pos + frame_count * (mic_channels as u64);
+
+    // Build the list of windows (closed + virtual open extending to the
+    // extraction's end) and zero each overlap.
+    for window in snapshot.all_windows() {
+        if window.end <= old_mic_pos || window.start >= extract_end_pos {
+            continue;
+        }
+        let overlap_start = window.start.max(old_mic_pos);
+        let overlap_end = window.end.min(extract_end_pos);
+        // Convert raw positions to mono frame indices, rounding the
+        // start *down* and the end *up* so a partial frame at either
+        // boundary is fully muted (better to lose a frame of session
+        // audio than leak a frame of dictation).
+        let start_frame = ((overlap_start - old_mic_pos) / (mic_channels as u64)) as usize;
+        let end_frame = (overlap_end - old_mic_pos).div_ceil(mic_channels as u64) as usize;
+        let end_frame = end_frame.min(samples.len());
+        if start_frame < end_frame {
+            for s in &mut samples[start_frame..end_frame] {
+                *s = 0.0;
+            }
         }
     }
 }
@@ -1395,6 +1434,71 @@ async fn prepare_chunk_dispatch(
         None,
     )
     .await
+}
+
+/// Spawn a chunk task for the session mic source's pending speech bounded
+/// at `ceiling_pos` — used by the window pre-flush logic to flush the
+/// user's word-in-progress up to a dictation window's `start` before
+/// resetting state past `end`. Wraps the boilerplate that the inline
+/// rising-edge handler used to repeat: prepare the chunk, record drain
+/// backlog, spawn the task, push a panic-tolerant join handle into
+/// `chunk_tasks`. Caller has already verified `is_speaking == true`,
+/// `has_in_flight_task == false`, and `ceiling_pos > speech_start_pos`.
+///
+/// The argument list is long because every parameter is a distinct
+/// piece of live-loop state the helper needs &mut access to. Bundling
+/// into a struct adds construction boilerplate at the two call sites
+/// without simplifying anything; the lint is a smell-detector that
+/// doesn't apply to internal "pull this duplicated block into one
+/// place" helpers like this one.
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_pre_window_flush(
+    vad: &mut SourceVadState,
+    audio_state: &AudioManagerState,
+    ctx: &TranscriptionContext,
+    counters: &Arc<StdMutex<SessionCounters>>,
+    prompt: &Arc<StdMutex<PromptState>>,
+    chunk_tasks: &mut futures_util::stream::FuturesUnordered<ChunkTaskFuture>,
+    max_chunk_duration: Duration,
+    ceiling_pos: usize,
+) {
+    let prepared = prepare_chunk_dispatch_until(
+        vad,
+        audio_state,
+        true,
+        JobOrigin::Live,
+        ctx.session_offset_base_seconds,
+        max_chunk_duration,
+        ceiling_pos,
+    )
+    .await;
+    let Some(prepared) = prepared else { return };
+    record_live_drain_backlog(counters, prepared.origin, prepared.drain_backlog_seconds);
+    let task_ctx = ctx.clone();
+    let task_counters = counters.clone();
+    let task_prompt = prompt.clone();
+    let source_label = prepared.source_label;
+    let fallback_text = prepared.accumulated_text.clone();
+    let handle = tokio::spawn(async move {
+        run_chunk_task(prepared, task_ctx, task_counters, task_prompt).await
+    });
+    chunk_tasks.push(Box::pin(async move {
+        match handle.await {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                error!(
+                    "dictation pre-window flush task panicked or was cancelled: {} \
+                     — synthesizing outcome to free dispatch",
+                    e
+                );
+                ChunkTaskOutcome {
+                    source_label,
+                    accumulated_text: fallback_text,
+                    sidecar_dead: false,
+                }
+            }
+        }
+    }));
 }
 
 /// Variant that bounds the dispatch upper end at `ceiling_pos` instead of
@@ -2551,6 +2655,7 @@ async fn live_transcription_loop(
         check_mic,
         check_system,
         source,
+        ctx.dictation_start_pos,
     )
     .await;
 
@@ -2745,12 +2850,20 @@ async fn live_transcription_loop(
                 });
             }
             let flush = session_wav_state.as_ref().and_then(|ws| {
+                let old_mic_pos = ws.flush_positions.mic_pos as u64;
+                let mic_channels = manager.mic_buffer().map(|b| b.channels()).unwrap_or(1) as usize;
                 let mut extraction = manager.extract_since(
                     &ws.flush_positions,
                     ws.source,
                     ws.mix_config.as_ref(),
                 )?;
-                mute_dictation_window_in_wav_extraction(&mut extraction, &ctx, &sources, ws.source);
+                mute_dictation_window_in_wav_extraction(
+                    &mut extraction.0,
+                    mic_channels,
+                    old_mic_pos,
+                    &ctx,
+                    ws.source,
+                );
                 Some(extraction)
             });
             (inputs, flush)
@@ -2960,102 +3073,96 @@ async fn live_transcription_loop(
             })
             .collect();
 
-        // Mic-ownership: detect rising/falling edges of `dictation_owns_mic`
-        // and reconcile session mic state before the dispatch loop. Only
-        // affects the session's mic source — dictation runtimes own the mic
-        // themselves so the flag is irrelevant from their perspective, and
-        // system audio is never gated by this flag.
-        let owns_mic_now = ctx
-            .dictation_owns_mic
-            .flag
-            .load(std::sync::atomic::Ordering::SeqCst);
+        // Mic-ownership: drive session mic state from the explicit
+        // `[start, end)` windows in `dictation_owns_mic`. Two-step:
+        //   (a) Consume any *closed* windows that landed since the
+        //       previous tick. Each one: pre-flush the user's pending
+        //       session speech up to `window.start` (so the partial
+        //       word in-progress at hotkey press isn't lost), then
+        //       reset all VAD/cursor state to `window.end`. Closed
+        //       windows are durable — a fast dictation that opens
+        //       AND closes between two session polls still appears
+        //       in `closed` and is processed here, so the boolean-
+        //       flag race is impossible to miss.
+        //   (b) Pre-flush for the *open* window the first time we
+        //       observe its start (avoids re-flushing every tick
+        //       while the same window stays open).
+        // Mic dispatch for this tick is suspended whenever an open
+        // window exists OR we processed any closed windows (the
+        // pre-tick VAD-poll output reflects pre-window state and is
+        // stale after reset).
+        let mut suspend_mic_dispatch = false;
         if matches!(ctx.config.source_kind, LiveSourceKind::Session) {
-            // Snapshot to avoid borrowing &mut sources twice in the loop.
+            let snapshot = ctx.dictation_owns_mic.snapshot();
             let mic_idx = sources
                 .iter()
                 .position(|s| matches!(s.label, AudioSourceLabel::Mic));
             if let Some(i) = mic_idx {
-                let was_active = sources[i].dictation_was_active;
-                if owns_mic_now && !was_active {
-                    // Rising edge — dictation just acquired the mic.
-                    let acquired_at = ctx
-                        .dictation_owns_mic
-                        .acquired_at
-                        .load(std::sync::atomic::Ordering::SeqCst)
-                        as usize;
-                    // Flush any pending session speech up to acquired_at so
-                    // the user's word-in-progress at the moment they hit
-                    // the dictation hotkey isn't lost. Only meaningful when
-                    // the session's mic source has accumulated speech AND
-                    // there's no in-flight task already covering it.
+                // (a) Consume newly-closed windows in order.
+                while sources[i].processed_closed_count < snapshot.closed.len() {
+                    let window = snapshot.closed[sources[i].processed_closed_count];
+                    let window_start_us = window.start as usize;
+                    let window_end_us = window.end as usize;
                     if sources[i].is_speaking
                         && !sources[i].has_in_flight_task
-                        && acquired_at > sources[i].speech_start_pos
+                        && window_start_us > sources[i].speech_start_pos
                     {
-                        let prepared = prepare_chunk_dispatch_until(
+                        dispatch_pre_window_flush(
                             &mut sources[i],
                             &audio_state,
-                            true, // treat as force-chunk so duration mins are bypassed
-                            JobOrigin::Live,
-                            ctx.session_offset_base_seconds,
+                            &ctx,
+                            &counters,
+                            &prompt,
+                            &mut chunk_tasks,
                             tuning.max_chunk_duration,
-                            acquired_at,
+                            window_start_us,
                         )
                         .await;
-                        if let Some(prepared) = prepared {
-                            record_live_drain_backlog(
-                                &counters,
-                                prepared.origin,
-                                prepared.drain_backlog_seconds,
-                            );
-                            let task_ctx = ctx.clone();
-                            let task_counters = counters.clone();
-                            let task_prompt = prompt.clone();
-                            let source_label = prepared.source_label;
-                            let fallback_text = prepared.accumulated_text.clone();
-                            let handle = tokio::spawn(async move {
-                                run_chunk_task(prepared, task_ctx, task_counters, task_prompt).await
-                            });
-                            chunk_tasks.push(Box::pin(async move {
-                                match handle.await {
-                                    Ok(outcome) => outcome,
-                                    Err(e) => {
-                                        error!(
-                                            "rising-edge flush task panicked or was cancelled: {} \
-                                             — synthesizing outcome to free dispatch",
-                                            e
-                                        );
-                                        ChunkTaskOutcome {
-                                            source_label,
-                                            accumulated_text: fallback_text,
-                                            sidecar_dead: false,
-                                        }
-                                    }
-                                }
-                            }));
-                        }
                     }
-                    sources[i].dictation_was_active = true;
-                } else if !owns_mic_now && was_active {
-                    // Falling edge — dictation released the mic. Drop any
-                    // VAD/cursor state accumulated during the dictation
-                    // window. The samples in [acquired_at, current_write_pos]
-                    // are the user's dictation audio; they must never become
-                    // session transcript.
-                    let current_write_pos = {
-                        let manager = audio_state.lock().await;
-                        source_write_pos(&manager, &sources[i].label)
-                    };
-                    sources[i].cursor = current_write_pos;
-                    sources[i].speech_start_pos = current_write_pos;
-                    sources[i].earliest_next_chunk_pos = current_write_pos;
-                    sources[i].silero.read_pos = current_write_pos;
+                    // Reset state past `window.end` — any VAD progress
+                    // accumulated during the dictation window is dictation
+                    // audio and must not become session transcript.
+                    sources[i].cursor = window_end_us;
+                    sources[i].speech_start_pos = window_end_us;
+                    sources[i].earliest_next_chunk_pos = window_end_us;
+                    sources[i].silero.read_pos = window_end_us;
                     sources[i].silero.reset();
                     sources[i].is_speaking = false;
                     sources[i].speech_start_time = None;
                     sources[i].silence_since = None;
                     sources[i].force_drain = false;
-                    sources[i].dictation_was_active = false;
+                    sources[i].processed_closed_count += 1;
+                    // If the consumed window matches a previously pre-flushed
+                    // open window's start, drop that marker.
+                    if sources[i].flushed_open_at == Some(window.start) {
+                        sources[i].flushed_open_at = None;
+                    }
+                    suspend_mic_dispatch = true;
+                }
+
+                // (b) Pre-flush for the open window, once per window.
+                if let Some(open_start) = snapshot.open {
+                    if sources[i].flushed_open_at != Some(open_start) {
+                        let open_start_us = open_start as usize;
+                        if sources[i].is_speaking
+                            && !sources[i].has_in_flight_task
+                            && open_start_us > sources[i].speech_start_pos
+                        {
+                            dispatch_pre_window_flush(
+                                &mut sources[i],
+                                &audio_state,
+                                &ctx,
+                                &counters,
+                                &prompt,
+                                &mut chunk_tasks,
+                                tuning.max_chunk_duration,
+                                open_start_us,
+                            )
+                            .await;
+                        }
+                        sources[i].flushed_open_at = Some(open_start);
+                    }
+                    suspend_mic_dispatch = true;
                 }
             }
         }
@@ -3065,15 +3172,14 @@ async fn live_transcription_loop(
         // task submits to the scheduler and emits segments. The main loop
         // continues polling other sources next tick.
         for (i, (action, origin)) in actions.iter().enumerate() {
-            // Mic-ownership suspension: while dictation owns the mic, the
-            // session's mic-side dispatch is skipped. The session's audio
-            // ring buffer keeps filling; we just don't transcribe it.
-            // The falling-edge handler above resets cursor state so audio
-            // captured during the dictation window doesn't become a session
-            // segment when dictation ends.
+            // Mic-ownership suspension: skip session-mic dispatch when an
+            // open dictation window exists OR when this tick consumed any
+            // closed windows (in which case the pre-tick VAD output for
+            // mic source is stale relative to the post-reset state).
+            // System audio is never affected.
             if matches!(ctx.config.source_kind, LiveSourceKind::Session)
                 && matches!(sources[i].label, AudioSourceLabel::Mic)
-                && owns_mic_now
+                && suspend_mic_dispatch
             {
                 continue;
             }
@@ -3162,25 +3268,28 @@ async fn live_transcription_loop(
     }
 
     let final_pending_chunks = if let Some(req) = stop_request.as_ref() {
-        // Skip mic-side final flush when this is a Session whose mic is
-        // either currently suspended by dictation OR was suspended in the
-        // recent past and the falling-edge reset hasn't run yet. The flag
-        // alone isn't enough: dictation may clear the flag during the
-        // session's stop tail, before the session loop processes the
-        // falling edge — at that moment `flag == false` but the mic
-        // source's `speech_start_pos` and VAD state still point inside
-        // the dictation window. The per-source `dictation_was_active`
-        // flag is the session's view of "I observed dictation owning mic
-        // and haven't reset yet"; OR-ing it covers both states cleanly.
-        let mic_was_active_in_session = sources
-            .iter()
-            .any(|s| matches!(s.label, AudioSourceLabel::Mic) && s.dictation_was_active);
-        let skip_mic = matches!(ctx.config.source_kind, LiveSourceKind::Session)
-            && (ctx
-                .dictation_owns_mic
-                .flag
-                .load(std::sync::atomic::Ordering::SeqCst)
-                || mic_was_active_in_session);
+        // Skip mic-side final flush when this is a Session whose pending
+        // mic range overlaps any dictation window — open or closed. The
+        // mic source's `speech_start_pos..req.positions.mic_pos` range
+        // is what the final flush would copy; if any dictation window
+        // overlaps that range, those samples are dictation audio and
+        // must not become session segments. Driven entirely off the
+        // snapshot, so a fast dictation that opened-and-closed during
+        // the stop tail still appears as a closed window and is
+        // detected here even if the live loop never observed the open
+        // state mid-flight.
+        let skip_mic = matches!(ctx.config.source_kind, LiveSourceKind::Session) && {
+            let snapshot = ctx.dictation_owns_mic.snapshot();
+            let mic_source = sources
+                .iter()
+                .find(|s| matches!(s.label, AudioSourceLabel::Mic));
+            match mic_source {
+                Some(s) => {
+                    snapshot.overlaps(s.speech_start_pos as u64, req.positions.mic_pos as u64)
+                }
+                None => false,
+            }
+        };
         copy_final_pending_chunks_until(
             &sources,
             &audio_state,
@@ -3195,7 +3304,7 @@ async fn live_transcription_loop(
     };
 
     if let (Some(ref mut ws), Some(req)) = (session_wav_state.as_mut(), stop_request.as_ref()) {
-        flush_session_wav_to_limit(ws, &audio_state, Some(&req.positions), &ctx, &sources).await;
+        flush_session_wav_to_limit(ws, &audio_state, Some(&req.positions), &ctx).await;
     }
 
     drain_in_flight_chunks(&mut chunk_tasks, &mut sources).await;
@@ -3214,7 +3323,7 @@ async fn live_transcription_loop(
         )
         .await;
         if let Some(ref mut ws) = session_wav_state {
-            flush_session_wav_to_limit(ws, &audio_state, None, &ctx, &sources).await;
+            flush_session_wav_to_limit(ws, &audio_state, None, &ctx).await;
         }
     }
 
@@ -3343,6 +3452,7 @@ async fn build_initial_sources_and_backfill(
     check_mic: bool,
     check_system: bool,
     source: CaptureSource,
+    dictation_start_pos: Option<u64>,
 ) -> (Vec<SourceVadState>, Vec<(Vec<f32>, u32, AudioSourceLabel)>) {
     let manager = audio_state.lock().await;
     let positions = manager.buffer_positions();
@@ -3355,7 +3465,19 @@ async fn build_initial_sources_and_backfill(
         let (initial_pos, session_start, sr, ch) = if let Some(buf) = manager.mic_buffer() {
             let sr = buf.sample_rate();
             let ch = buf.channels();
-            if has_backfill {
+            // Dictation runtimes initialize at their `dictation_start_pos`
+            // (captured when the runtime opened its mic-ownership window)
+            // rather than the current write position. Without this, the
+            // audio captured between hotkey press and live-loop spawn is
+            // dropped on the floor: the session correctly skips it (it's
+            // inside an open dictation window) but dictation never reads
+            // from before the spawn, so neither pipeline ever sees it.
+            // For sessions, fall through to the normal backfill / current-
+            // pos selection — the dictation_start_pos arg is None.
+            if let Some(start) = dictation_start_pos {
+                let clamped = (start as usize).min(positions.mic_pos);
+                (clamped, clamped, sr, ch)
+            } else if has_backfill {
                 let raw = (config.backfill_seconds * sr as f32 * ch as f32) as usize;
                 // Round down to frame boundary for correct deinterleaving.
                 let rewind = raw - (raw % ch as usize);
@@ -3692,19 +3814,26 @@ async fn dispatch_final_pending_chunks(
     prompt: &Arc<StdMutex<PromptState>>,
     max_chunk_duration: Duration,
 ) {
-    // Same two-prong guard as the stop-positions final-flush path: skip mic
-    // when EITHER dictation currently owns it OR the mic source observed
-    // dictation and hasn't yet processed the falling edge. See the call
-    // site in `live_transcription_loop` for the full rationale.
-    let mic_was_active_in_session = sources
-        .iter()
-        .any(|s| matches!(s.label, AudioSourceLabel::Mic) && s.dictation_was_active);
-    let skip_mic = matches!(ctx.config.source_kind, LiveSourceKind::Session)
-        && (ctx
-            .dictation_owns_mic
-            .flag
-            .load(std::sync::atomic::Ordering::SeqCst)
-            || mic_was_active_in_session);
+    // Same overlap-based guard as the stop-positions final-flush path:
+    // skip mic when the pending mic range overlaps any dictation window.
+    // `dispatch_final_pending_chunks` runs without an explicit stop limit,
+    // so we use the current write position as the upper bound.
+    let skip_mic = matches!(ctx.config.source_kind, LiveSourceKind::Session) && {
+        let snapshot = ctx.dictation_owns_mic.snapshot();
+        let mic_source = sources
+            .iter()
+            .find(|s| matches!(s.label, AudioSourceLabel::Mic));
+        match mic_source {
+            Some(s) => {
+                let write_pos = {
+                    let manager = audio_state.lock().await;
+                    source_write_pos(&manager, &s.label)
+                };
+                snapshot.overlaps(s.speech_start_pos as u64, write_pos as u64)
+            }
+            None => false,
+        }
+    };
     for source in sources.iter_mut() {
         if skip_mic && matches!(source.label, AudioSourceLabel::Mic) {
             // Same final-flush mic guard as the stop-positions path —
@@ -3944,11 +4073,12 @@ async fn flush_session_wav_to_limit(
     audio_state: &AudioManagerState,
     limit: Option<&BufferPositions>,
     ctx: &TranscriptionContext,
-    sources: &[SourceVadState],
 ) {
-    let final_flush = {
+    let (final_flush, mic_channels, old_mic_pos) = {
         let manager = audio_state.lock().await;
-        match limit {
+        let old_mic_pos = ws.flush_positions.mic_pos as u64;
+        let mic_channels = manager.mic_buffer().map(|b| b.channels()).unwrap_or(1) as usize;
+        let extraction = match limit {
             Some(limit) => manager.extract_since_until(
                 &ws.flush_positions,
                 limit,
@@ -3965,19 +4095,20 @@ async fn flush_session_wav_to_limit(
                         overrun: false,
                     },
                 ),
-        }
+        };
+        (extraction, mic_channels, old_mic_pos)
     };
     if let Some(mut flush) = final_flush {
-        // Mute mic-derived samples if dictation owns / recently owned the mic.
-        // Reuse the same helper the per-tick flush uses so the boundary
-        // semantics stay consistent.
-        let mut tuple_view = (
-            std::mem::take(&mut flush.samples),
-            flush.sample_rate,
-            flush.new_positions,
+        // Mute samples in any dictation-window overlap. Same helper the
+        // per-tick flush uses, so the precise window-overlap math stays
+        // consistent across both flush paths.
+        mute_dictation_window_in_wav_extraction(
+            &mut flush.samples,
+            mic_channels,
+            old_mic_pos,
+            ctx,
+            ws.source,
         );
-        mute_dictation_window_in_wav_extraction(&mut tuple_view, ctx, sources, ws.source);
-        flush.samples = tuple_view.0;
         if flush.overrun {
             warn!(
                 marker = "session_wav_stop_overrun",
@@ -4554,54 +4685,54 @@ pub async fn start_live_transcription(
         }
     } else {
         // Defensive clear on Session start — but ONLY when the dictation
-        // slot is genuinely Idle. The flag is owned by an active dictation
-        // runtime when its slot is non-Idle; clearing it there would
-        // unwind the session-mic suspension while dictation is mid-
-        // utterance, letting the session ingest dictation audio. The
-        // defensive clear is only for the (rare) case where a prior
-        // dictation panic somehow escaped both the task finalizer and the
-        // RAII guard, leaving the flag stuck while the slot is Idle.
+        // slot is genuinely Idle. If a dictation runtime is active, its
+        // open window in `dictation_owns_mic` is load-bearing for the
+        // session-mic suspension; clearing it would unwind the suspension
+        // and let the session ingest dictation audio. The clear here is
+        // only for the (rare) case where a prior dictation panic somehow
+        // escaped both the task finalizer and the RAII guard, leaving
+        // stale state behind.
         if guard.slot(LiveSourceKind::Dictation).is_idle() {
-            dictation_owns_mic
-                .flag
-                .store(false, std::sync::atomic::Ordering::SeqCst);
+            dictation_owns_mic.clear_for_session();
         }
     }
 
-    // Acquire mic ownership for dictation runtimes EARLY — immediately after
+    // Open the dictation mic-ownership window EARLY — immediately after
     // the slot guard and source-kind validation pass, before any of the
     // fallible setup work (preflight stream health, scheduler lookup,
-    // engine-info probe, audio file plumbing). If the flag flipped only at
-    // the spawn site, audio captured between the hotkey press and the
-    // spawn would still be ingested by an active session loop and never
-    // reach the dictation pipeline — the user's first syllable would land
-    // in the session transcript and be missing from the dictation output.
+    // engine-info probe, audio file plumbing). If we waited until the
+    // spawn site, audio captured between the hotkey press and the spawn
+    // would either be ingested by an active session loop (the session
+    // wouldn't yet see an open window) OR dropped on the floor (the
+    // dictation runtime's own cursor would initialize at a later position
+    // and never read backward to the hotkey moment).
     //
-    // The order of stores matters: snapshot `acquired_at` FIRST, then flip
-    // `flag`. Reversing it would briefly publish `flag=true` with a stale
-    // `acquired_at`, and the session's rising-edge handler could flush
-    // past the actual boundary.
+    // The captured `dictation_start_pos` is also threaded into the
+    // dictation runtime's `TranscriptionContext` below so its mic VAD
+    // cursors and session-WAV flush position both initialize at the
+    // window start, capturing every sample from the hotkey forward.
     //
-    // The RAII guard is owned by this stack frame from here through the
-    // runtime-placement at the bottom of the function. If any of the
-    // setup steps below returns Err, the guard drops on the way out and
-    // the flag is cleared — the session resumes mic ingest cleanly. On
-    // success the guard is moved into the LiveTranscriptionRuntime and
-    // its lifetime tracks the slot.
-    let mic_ownership_guard = if matches!(config.source_kind, LiveSourceKind::Dictation) {
-        let mic_pos: u64 = {
-            let manager = audio_state.lock().await;
-            manager
-                .mic_buffer_info()
-                .map(|i| i.samples_written as u64)
-                .unwrap_or(0)
+    // The RAII guard owns the open window for this stack frame's lifetime.
+    // If any setup step returns Err, the guard drops and `clear_open()`
+    // discards the window without recording it (no audio was actually
+    // transcribed). On success the guard moves into the
+    // LiveTranscriptionRuntime; the dictation task's finalizer closes
+    // the window with the real `end_pos` before the slot transitions to
+    // Idle, so the post-finalize Drop sees `open == None` and is a no-op.
+    let dictation_start_pos: Option<u64> =
+        if matches!(config.source_kind, LiveSourceKind::Dictation) {
+            let mic_pos: u64 = {
+                let manager = audio_state.lock().await;
+                manager
+                    .mic_buffer_info()
+                    .map(|i| i.samples_written as u64)
+                    .unwrap_or(0)
+            };
+            Some(dictation_owns_mic.open(mic_pos))
+        } else {
+            None
         };
-        dictation_owns_mic
-            .acquired_at
-            .store(mic_pos, std::sync::atomic::Ordering::SeqCst);
-        dictation_owns_mic
-            .flag
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+    let mic_ownership_guard: Option<MicOwnershipGuard> = if dictation_start_pos.is_some() {
         Some(MicOwnershipGuard {
             state: dictation_owns_mic.inner().clone(),
         })
@@ -4926,6 +5057,7 @@ pub async fn start_live_transcription(
         session_start_instant,
         engine_profile,
         dictation_owns_mic: dictation_owns_mic.inner().clone(),
+        dictation_start_pos,
     };
 
     let counters = Arc::new(StdMutex::new(SessionCounters {
@@ -4960,8 +5092,14 @@ pub async fn start_live_transcription(
     // Clone state handles for the spawned task's finalizer — slot
     // transition Stopping → Idle MUST happen on every exit path including
     // panic, otherwise a same-kind start is permanently rejected.
+    // `audio_state_for_finalizer` is a separate Arc clone because
+    // `audio_state_clone` is moved into `live_transcription_loop` and
+    // is no longer accessible after the loop returns; the finalizer
+    // needs its own handle to read the final mic position when closing
+    // the dictation window.
     let live_state_for_finalizer = live_state.inner().clone();
     let dictation_owns_mic_for_finalizer = dictation_owns_mic.inner().clone();
+    let audio_state_for_finalizer = audio_state.inner().clone();
 
     let task_handle = tokio::spawn({
         let ctx_guard = ctx.clone();
@@ -5007,16 +5145,23 @@ pub async fn start_live_transcription(
                 );
             }
 
-            // Primary clear of `dictation_owns_mic.flag`: the dictation
-            // task's finalizer is the canonical "dictation is done" signal.
-            // Idempotent with the runtime's RAII guard. Cleared *before*
-            // we drop the runtime out of the slot so the session loop's
-            // next tick already sees the falling edge by the time the
-            // slot is Idle.
+            // Close the dictation mic-ownership window with the actual
+            // end position read from the audio manager. The closed window
+            // is then visible to the session loop on its next tick (or
+            // any future tick — closed windows are durable, so a fast
+            // dictation that opens-and-closes between two session polls
+            // can't be missed). Done BEFORE the slot transitions to Idle
+            // so the session sees the closed window before any racing
+            // same-kind dictation start could re-open one.
             if matches!(runtime_source_kind, LiveSourceKind::Dictation) {
-                dictation_owns_mic_for_finalizer
-                    .flag
-                    .store(false, std::sync::atomic::Ordering::SeqCst);
+                let end_pos: u64 = {
+                    let manager = audio_state_for_finalizer.lock().await;
+                    manager
+                        .mic_buffer_info()
+                        .map(|i| i.samples_written as u64)
+                        .unwrap_or(0)
+                };
+                dictation_owns_mic_for_finalizer.close(end_pos);
             }
 
             // Slot transition: Running/Stopping → Idle. Idempotent — if
