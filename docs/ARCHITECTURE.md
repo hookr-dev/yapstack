@@ -279,12 +279,12 @@ Frontend: start_live_transcription(config)  // config.source_kind selects slot
            submitting the next, so this is a wait for actual transcription,
            not for an enqueue loop. Chunks not yet submitted at submitter
            abort time are not on any durable queue and are lost.
-        8. scheduler.shutdown_and_return(timeout) — finishes whichever single
-           chunk is in-flight at the scheduler when the submitter exits and
-           returns the client to TranscriptionClientState (even after panic
-           via AssertUnwindSafe). On worker timeout the client is dropped
-           rather than returned, since an aborted worker may still hold an
-           in-flight Arc clone — the next session re-initializes the engine.
+        8. Slot transitions to Idle. The scheduler is long-lived and
+           keeps running across sessions / dictations; engine-level
+           shutdown is the explicit `shutdown_transcription_client`
+           command (gated on every runtime slot being Idle), which
+           calls `scheduler.shutdown_client()` to drain the worker and
+           tear down the inner TranscriptionClient.
     → Per-source VAD: SourceVadState tracks mic/system independently
     → Prompt context: per-source accumulated_text (up to 1000 chars) truncated to prompt_context_chars (default 350) for Whisper initial_prompt
     → Prompt decay: clears both shared_prompt and per-source accumulated_text after prompt_decay_silence_seconds (default 5s) of
@@ -334,13 +334,37 @@ the next, so this wait is a wait for actual transcription to finish, not for
 an enqueue loop to drain. Anything still in the submitter's `Vec<f32>` chunk
 list at the join timeout is lost — there is no durable scheduler queue that
 holds chunks the submitter never submitted. After the submitter exits,
-`shutdown_and_return` finishes whatever single chunk is in-flight at the
-scheduler and hands the client back to `TranscriptionClientState`; on a
-worker-timeout abort it drops the client instead of returning it, since the
-aborted worker may still hold an in-flight Arc clone. Backfill audio captured
-into the submitter's `Vec<f32>` is durable against ring-buffer churn for as
-long as the submitter is alive; ring-buffer audio written after the bounded
+the scheduler keeps running — it's now a long-lived app-level singleton
+that outlives every session, so there's no client round-trip at session
+end. The session simply finalizes its WAV, releases its busy bits via
+the per-producer bitmask, and the slot transitions to `Idle`. Engine
+shutdown happens via the explicit `shutdown_transcription_client`
+command, which calls `scheduler.shutdown_client()` to drain the worker
+and tear down the inner `TranscriptionClient`; that command is gated on
+both runtime slots being `Idle`. Backfill audio captured into the
+submitter's `Vec<f32>` is durable against ring-buffer churn for as long
+as the submitter is alive; ring-buffer audio written after the bounded
 stop tail is ignored for the stopped session.
+
+**Concurrent dictation.** Hitting a dictation hotkey while a session is
+recording opens a *mic-ownership window* in `DictationOwnsMic`: the
+runtime captures the current mic ring-buffer write position as
+`start_pos`, threads it into the dictation runtime's
+`TranscriptionContext::dictation_start_pos`, and the dictation runtime
+initializes its mic VAD cursor + WAV flush position there so audio
+captured between hotkey press and live-loop spawn is included. The
+dictation task's finalizer reads the final mic write position, calls
+`close(end_pos)` to record a closed `[start, end)` window, and the slot
+transitions to `Idle`. The session loop drives off the window list (not
+edge-detection on a boolean), so a fast dictation that opens-and-closes
+between two session polls still appears as a closed window and is
+consumed by the next tick's window-handling block. The session's mic
+dispatch is suspended while an open window exists; the WAV writer mutes
+samples whose ring-buffer positions overlap any window. `MicOnly` mutes
+to silence; `Mixed` zeros the overlap (loses system audio for the
+dictation duration, documented as MVP behavior); `SystemOnly` is never
+affected. The `JobOrigin::Dictation` priority tier puts dictation chunks
+ahead of session live chunks in the scheduler queue.
 
 **Job submission API.** `scheduler.submit(JobRequest { origin, source,
 wav_path, language, initial_prompt, diarization })` returns a
@@ -385,11 +409,12 @@ Two coordinated paths recover from a Stream that's gone bad: a *symptom-based* i
 ## State Management
 
 ### Backend (Rust)
-Four `Arc<Mutex<T>>` states managed by Tauri:
+Five `Arc<Mutex<T>>` (or `Arc<T>`) states managed by Tauri:
 - `AudioManagerState` — audio capture lifecycle, ring buffers, sessions
 - `ModelManagerState` — model download/delete/list (Whisper + Parakeet + Sortformer)
-- `TranscriptionClientState` — `Arc<Mutex<Option<Arc<TranscriptionClient>>>>`, sidecar process lifecycle. Whichever engine is selected, the value here is the engine-agnostic `TranscriptionClient`. During an active live transcription session the client is held by the `TranscriptionScheduler` (sole `transcribe_with` caller); the scheduler returns it on `shutdown_and_return`.
-- `LiveTranscriptionState` — `Option<LiveTranscriptionController>`, live transcription task + stop signal
+- `TranscriptionSchedulerState` — `Arc<Mutex<Option<InitializedEngine>>>`, the single source of truth for engine initialization. The scheduler owns the `Arc<TranscriptionClient>` for its full lifetime as the sole `transcribe_with` caller; both the session and dictation runtimes clone `Arc<TranscriptionScheduler>` from here. `init_transcription_client` is idempotent on a matching engine config; engine swap is an explicit two-step (`shutdown_transcription_client` first, then re-init).
+- `LiveTranscriptionState` — `Arc<Mutex<LiveTranscriptionSlots>>` with `session` and `dictation` slots, each carrying explicit `Idle | Starting | Running | Stopping` lifecycle. Same-kind double-start is rejected even during finalization.
+- `DictationOwnsMicState` — `Arc<DictationOwnsMic>` (mutex-protected window list). Records the open dictation window's start position and a list of closed `[start, end)` windows. Drives session mic suspension, WAV muting, and dictation-runtime cursor initialization.
 
 Startup also runs `db::ensure_runtime_schema()` *before* tauri-plugin-sql wires up — it opens the SQLite DB directly via `rusqlite`, sweeps stale `recording`-status sessions left by a prior crash, and creates the `audio_save_locations` table used by reconciliation on next startup. The Parakeet+Sortformer `segments.speaker_id INTEGER` column is added separately by the frontend's `getDb()` after migrations run, sidestepping a "ghost" v11 entry that some local dev DBs picked up from another branch.
 

@@ -4785,8 +4785,22 @@ pub async fn start_live_transcription(
     // read backfill or spawn the loop. Without this, the first dictation
     // after a long idle (device change, Bluetooth drop, OS sleep) transcribes
     // whatever stale audio happens to be in the ring buffer.
+    //
+    // Skip for dictation-during-active-session: preflight can replace the
+    // mic buffer (`RestartOutcome::BufferReplaced`), and only the session
+    // loop's in-loop restart handler (line ~2540) knows how to reset
+    // `SourceVadState` cursors and the session-WAV `flush_positions` for
+    // the new buffer. A preflight-driven replace from a parallel dictation
+    // start would leave the session reading from stale raw-sample
+    // positions pointing into the dropped buffer. The session's own
+    // stream-health watchdog polls continuously and routes restarts
+    // through the in-loop path, so it's safe for dictation to defer here.
     let preflight_source: CaptureSource = config.source.clone().into();
-    preflight_stream_health(audio_state.inner(), &preflight_source, &app_handle).await?;
+    let skip_preflight = matches!(config.source_kind, LiveSourceKind::Dictation)
+        && !guard.slot(LiveSourceKind::Session).is_idle();
+    if !skip_preflight {
+        preflight_stream_health(audio_state.inner(), &preflight_source, &app_handle).await?;
+    }
 
     // Resuming forces backfill to 0 — new audio is captured fresh, not
     // dredged from the ring buffer.
