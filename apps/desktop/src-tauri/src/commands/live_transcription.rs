@@ -1115,6 +1115,53 @@ fn emit_status(
     );
 }
 
+/// Zero out mic-derived samples in a session-WAV extraction when the
+/// session's mic source observed dictation owning the mic during the
+/// extracted range. Without this, the recorded WAV file contains the
+/// dictated message even though the transcript correctly skipped it,
+/// creating a confusing playback / transcript mismatch.
+///
+/// Per-tick approximation: mute the entire batch when EITHER the live
+/// flag is currently set OR the mic source's `dictation_was_active` is
+/// set (covers the small window after dictation finalizer cleared the
+/// flag but before the session loop's falling-edge handler ran). For a
+/// poll interval ~30 ms this loses up to one tick of legitimate session
+/// audio at each edge — acceptable for an MVP that doesn't track
+/// dictation windows precisely.
+///
+/// Source semantics:
+/// - `MicOnly`: extraction is mic samples; mute → silence during dictation.
+/// - `Mixed`: extraction is the (mic + system) mix; mute also loses system
+///   audio for the dictation window. Better than recording the dictation;
+///   a precise implementation would extract system-only during the window.
+/// - `SystemOnly`: never enters this helper — dictation can't affect the
+///   system buffer.
+fn mute_dictation_window_in_wav_extraction(
+    extraction: &mut (Vec<f32>, u32, BufferPositions),
+    ctx: &TranscriptionContext,
+    sources: &[SourceVadState],
+    wav_source: CaptureSource,
+) {
+    if !matches!(ctx.config.source_kind, LiveSourceKind::Session) {
+        return;
+    }
+    if !matches!(wav_source, CaptureSource::MicOnly | CaptureSource::Mixed) {
+        return;
+    }
+    let mic_was_active = sources
+        .iter()
+        .any(|s| matches!(s.label, AudioSourceLabel::Mic) && s.dictation_was_active);
+    let owns_now = ctx
+        .dictation_owns_mic
+        .flag
+        .load(std::sync::atomic::Ordering::SeqCst);
+    if owns_now || mic_was_active {
+        for s in extraction.0.iter_mut() {
+            *s = 0.0;
+        }
+    }
+}
+
 /// Mark this runtime as busy on the scheduler — used at the moment a stop
 /// is observed (before final-flush dispatch lands) and at any other site
 /// where we need to defensively block backfill from racing into the lane.
@@ -2698,7 +2745,13 @@ async fn live_transcription_loop(
                 });
             }
             let flush = session_wav_state.as_ref().and_then(|ws| {
-                manager.extract_since(&ws.flush_positions, ws.source, ws.mix_config.as_ref())
+                let mut extraction = manager.extract_since(
+                    &ws.flush_positions,
+                    ws.source,
+                    ws.mix_config.as_ref(),
+                )?;
+                mute_dictation_window_in_wav_extraction(&mut extraction, &ctx, &sources, ws.source);
+                Some(extraction)
             });
             (inputs, flush)
         };
@@ -3109,16 +3162,25 @@ async fn live_transcription_loop(
     }
 
     let final_pending_chunks = if let Some(req) = stop_request.as_ref() {
-        // Skip mic-side final flush when this is a Session whose mic was
-        // suspended by an active dictation. Dictation may have already
-        // cleared the flag in its finalizer, but if either the flag is
-        // still true OR the mic source is in the just-reset state from a
-        // recent falling edge, there's no pending mic content.
+        // Skip mic-side final flush when this is a Session whose mic is
+        // either currently suspended by dictation OR was suspended in the
+        // recent past and the falling-edge reset hasn't run yet. The flag
+        // alone isn't enough: dictation may clear the flag during the
+        // session's stop tail, before the session loop processes the
+        // falling edge — at that moment `flag == false` but the mic
+        // source's `speech_start_pos` and VAD state still point inside
+        // the dictation window. The per-source `dictation_was_active`
+        // flag is the session's view of "I observed dictation owning mic
+        // and haven't reset yet"; OR-ing it covers both states cleanly.
+        let mic_was_active_in_session = sources
+            .iter()
+            .any(|s| matches!(s.label, AudioSourceLabel::Mic) && s.dictation_was_active);
         let skip_mic = matches!(ctx.config.source_kind, LiveSourceKind::Session)
-            && ctx
+            && (ctx
                 .dictation_owns_mic
                 .flag
-                .load(std::sync::atomic::Ordering::SeqCst);
+                .load(std::sync::atomic::Ordering::SeqCst)
+                || mic_was_active_in_session);
         copy_final_pending_chunks_until(
             &sources,
             &audio_state,
@@ -3133,7 +3195,7 @@ async fn live_transcription_loop(
     };
 
     if let (Some(ref mut ws), Some(req)) = (session_wav_state.as_mut(), stop_request.as_ref()) {
-        flush_session_wav_to_limit(ws, &audio_state, Some(&req.positions)).await;
+        flush_session_wav_to_limit(ws, &audio_state, Some(&req.positions), &ctx, &sources).await;
     }
 
     drain_in_flight_chunks(&mut chunk_tasks, &mut sources).await;
@@ -3152,7 +3214,7 @@ async fn live_transcription_loop(
         )
         .await;
         if let Some(ref mut ws) = session_wav_state {
-            flush_session_wav_to_limit(ws, &audio_state, None).await;
+            flush_session_wav_to_limit(ws, &audio_state, None, &ctx, &sources).await;
         }
     }
 
@@ -3630,11 +3692,19 @@ async fn dispatch_final_pending_chunks(
     prompt: &Arc<StdMutex<PromptState>>,
     max_chunk_duration: Duration,
 ) {
+    // Same two-prong guard as the stop-positions final-flush path: skip mic
+    // when EITHER dictation currently owns it OR the mic source observed
+    // dictation and hasn't yet processed the falling edge. See the call
+    // site in `live_transcription_loop` for the full rationale.
+    let mic_was_active_in_session = sources
+        .iter()
+        .any(|s| matches!(s.label, AudioSourceLabel::Mic) && s.dictation_was_active);
     let skip_mic = matches!(ctx.config.source_kind, LiveSourceKind::Session)
-        && ctx
+        && (ctx
             .dictation_owns_mic
             .flag
-            .load(std::sync::atomic::Ordering::SeqCst);
+            .load(std::sync::atomic::Ordering::SeqCst)
+            || mic_was_active_in_session);
     for source in sources.iter_mut() {
         if skip_mic && matches!(source.label, AudioSourceLabel::Mic) {
             // Same final-flush mic guard as the stop-positions path —
@@ -3864,10 +3934,17 @@ async fn seed_prompt_from_backfill(
 
 /// Flush any remaining session audio. When `limit` is present, reads are
 /// bounded to the stop snapshot so post-stop samples cannot enter the part.
+/// Mutes mic samples in the extracted batch when the session's mic source
+/// observed dictation owning the mic — same per-tick approximation
+/// `mute_dictation_window_in_wav_extraction` uses, propagated to the
+/// stop-time flush so an in-flight dictation can't leak audio into the
+/// session WAV during the final drain.
 async fn flush_session_wav_to_limit(
     ws: &mut SessionWavState,
     audio_state: &AudioManagerState,
     limit: Option<&BufferPositions>,
+    ctx: &TranscriptionContext,
+    sources: &[SourceVadState],
 ) {
     let final_flush = {
         let manager = audio_state.lock().await;
@@ -3890,7 +3967,17 @@ async fn flush_session_wav_to_limit(
                 ),
         }
     };
-    if let Some(flush) = final_flush {
+    if let Some(mut flush) = final_flush {
+        // Mute mic-derived samples if dictation owns / recently owned the mic.
+        // Reuse the same helper the per-tick flush uses so the boundary
+        // semantics stay consistent.
+        let mut tuple_view = (
+            std::mem::take(&mut flush.samples),
+            flush.sample_rate,
+            flush.new_positions,
+        );
+        mute_dictation_window_in_wav_extraction(&mut tuple_view, ctx, sources, ws.source);
+        flush.samples = tuple_view.0;
         if flush.overrun {
             warn!(
                 marker = "session_wav_stop_overrun",

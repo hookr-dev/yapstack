@@ -312,15 +312,42 @@ pub fn run() {
         ]);
 
     #[cfg(debug_assertions)]
-    specta_builder
-        .export(
-            specta_typescript::Typescript::default()
-                .header("// @ts-nocheck")
-                .bigint(specta_typescript::BigIntExportBehavior::Number)
-                .formatter(specta_typescript::formatter::prettier),
-            "../src/lib/types.ts",
-        )
-        .expect("failed to export specta types");
+    {
+        let types_path = "../src/lib/types.ts";
+        specta_builder
+            .export(
+                specta_typescript::Typescript::default()
+                    .header("// @ts-nocheck")
+                    .bigint(specta_typescript::BigIntExportBehavior::Number)
+                    .formatter(specta_typescript::formatter::prettier),
+                types_path,
+            )
+            .expect("failed to export specta types");
+        // Specta + the prettier formatter leaves trailing whitespace on
+        // JSDoc comment continuation lines (e.g. ` * ` produced from a Rust
+        // doc-comment with a blank intermediate line). Prettier doesn't
+        // normalize them and `git diff --check` flags them as "trailing
+        // whitespace". Strip per-line as a post-export pass so the
+        // generated file is clean every time and future regenerations
+        // can't reintroduce the diff noise.
+        if let Ok(contents) = std::fs::read_to_string(types_path) {
+            let trimmed: String = contents
+                .lines()
+                .map(str::trim_end)
+                .collect::<Vec<_>>()
+                .join("\n");
+            // Preserve a final newline if the original had one.
+            let needs_trailing_newline = contents.ends_with('\n');
+            let out = if needs_trailing_newline {
+                format!("{trimmed}\n")
+            } else {
+                trimmed
+            };
+            if out != contents {
+                let _ = std::fs::write(types_path, out);
+            }
+        }
+    }
 
     let mut builder = tauri::Builder::default();
     #[cfg(target_os = "macos")]
