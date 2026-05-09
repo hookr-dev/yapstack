@@ -222,10 +222,10 @@ export function useDictation() {
       // a prior cycle can't land on the backend after our snapshot is taken
       // and clear it mid-recording.
       if (s.settings.dictationDuckEnabled) {
-        const target = s.settings.dictationDuckTarget;
+        const amount = s.settings.dictationDuckAmount;
         const prerequisite = pendingRestoreRef.current ?? Promise.resolve();
         const duckPromise = prerequisite
-          .then(() => commands.applyVolumeDuck(target))
+          .then(() => commands.applyVolumeDuck(amount))
           .catch((err) => {
             console.debug("volume duck failed:", err);
           });

@@ -1,13 +1,16 @@
 //! System output volume control for the dictation duck feature.
 //!
 //! While the user is actively recording a dictation, we lower the system
-//! output volume to a configured target so they can hear themselves and
-//! anyone trying to talk over them. The prior level is snapshotted at duck
+//! output volume by a configured fraction (the "duck amount") so they can
+//! hear themselves and anyone trying to talk over them. The duck is
+//! relative to the current system volume at the time of duck — `amount`
+//! is the fraction we *reduce by*, so `current * (1 - amount)` is what
+//! we land on. Setting amount=0.8 on a system at 50% lands on 10%; on a
+//! system at 30% it lands on 6%. The prior level is snapshotted at duck
 //! time and restored when recording ends (or on app exit as a safety net).
 //!
-//! Only ever lowers — never raises. If the current volume is already at or
-//! below the target, `apply_duck` is a no-op and no snapshot is captured,
-//! so a subsequent `restore` won't accidentally raise the user's volume.
+//! Reduce-by semantics mean we never raise: with amount in [0, 1] the
+//! computed absolute is always ≤ current.
 //!
 //! The snapshot tracks the **device id** alongside the level. If the user
 //! switches default output mid-dictation (AirPods connect, USB DAC unplug),
@@ -53,19 +56,19 @@ pub trait SystemOutputVolume: Send + Sync {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum DuckOutcome {
-    /// Volume on `device` was lowered from `from` to `to`, and `(device, from)`
-    /// is now snapshotted.
+    /// Volume on `device` was set from `from` to `to` (= `from * (1 - amount)`),
+    /// and `(device, from)` is now snapshotted. With `amount = 0` this still
+    /// fires — `to` equals `from` and the snapshot lets `restore` no-op safely.
     Applied {
         device: DeviceId,
         from: f32,
         to: f32,
     },
-    /// Current volume was already at or below the target — no change made,
-    /// no snapshot captured.
-    Skipped { current: f32, target: f32 },
     /// A snapshot was already held from a prior `apply_duck`; we re-applied
-    /// the target without overwriting the original snapshot.
-    AlreadyDucked { target: f32 },
+    /// the same reduce-by `amount` against the snapshotted *original* level
+    /// (not the currently-ducked level — that would compound) without
+    /// overwriting the original snapshot.
+    AlreadyDucked { amount: f32 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -87,45 +90,46 @@ fn controller() -> Box<dyn SystemOutputVolume> {
     }
 }
 
-/// Duck the system volume to `target` (in 0.0..=1.0) if and only if the
-/// current volume on the default output device is above `target`. Snapshots
-/// the prior `(device, level)` pair so `restore` puts that exact device back,
-/// even if the user changes default output during the duck.
-pub fn apply_duck(target: f32) -> Result<DuckOutcome, VolumeError> {
-    apply_duck_inner(&SNAPSHOT, controller().as_ref(), target)
+/// Duck the system volume by a fraction `amount` (in 0.0..=1.0) of the
+/// current level on the default output device. The new level is
+/// `current * (1 - amount)`: `amount = 0.0` is a no-op write at the
+/// current level, `amount = 1.0` mutes. Snapshots the prior `(device, level)`
+/// pair so `restore` puts that exact device back, even if the user changes
+/// default output during the duck.
+pub fn apply_duck(amount: f32) -> Result<DuckOutcome, VolumeError> {
+    apply_duck_inner(&SNAPSHOT, controller().as_ref(), amount)
 }
 
 fn apply_duck_inner(
     snap_cell: &Mutex<Option<Snapshot>>,
     ctrl: &dyn SystemOutputVolume,
-    target: f32,
+    amount: f32,
 ) -> Result<DuckOutcome, VolumeError> {
-    let target = target.clamp(0.0, 1.0);
+    let amount = amount.clamp(0.0, 1.0);
     let device = ctrl.default_device()?;
     let current = ctrl.get(device)?;
 
     // Hold the snapshot mutex across BOTH the snapshot write AND the volume
     // set. Without this, a concurrent `restore_inner` call landing between
     // "publish snapshot" and "lower volume" could clear the snapshot and
-    // restore the original level, after which our `set(target)` would land
+    // restore the original level, after which our `set` would land
     // with no snapshot left to recover from — leaving the user ducked with
     // no way to undo it. Trade: `ctrl.set` runs under the mutex (one
     // CoreAudio call, typically sub-millisecond on macOS), in exchange for
     // strict apply/restore atomicity.
     let mut snap = snap_cell.lock().expect("system_volume snapshot poisoned");
     if let Some(snapped) = *snap {
-        // Already ducked — re-apply target on the *originally* ducked
-        // device (held in the snapshot), but don't clobber the snapshot.
+        // Already ducked — re-apply against the snapshotted *original*
+        // level (not the currently-ducked level, which would compound).
         // Only set if we'd actually be lowering; never raise.
-        if ctrl.get(snapped.device)? > target {
-            ctrl.set(snapped.device, target)?;
+        let absolute = (snapped.level * (1.0 - amount)).clamp(0.0, 1.0);
+        if ctrl.get(snapped.device)? > absolute {
+            ctrl.set(snapped.device, absolute)?;
         }
-        return Ok(DuckOutcome::AlreadyDucked { target });
+        return Ok(DuckOutcome::AlreadyDucked { amount });
     }
 
-    if current <= target {
-        return Ok(DuckOutcome::Skipped { current, target });
-    }
+    let absolute = (current * (1.0 - amount)).clamp(0.0, 1.0);
 
     // Write snapshot first, then apply. If the set call fails, the snapshot
     // is rolled back so a later restore can't try to "recover" to a level
@@ -134,14 +138,14 @@ fn apply_duck_inner(
         device,
         level: current,
     });
-    if let Err(e) = ctrl.set(device, target) {
+    if let Err(e) = ctrl.set(device, absolute) {
         *snap = None;
         return Err(e);
     }
     Ok(DuckOutcome::Applied {
         device,
         from: current,
-        to: target,
+        to: absolute,
     })
 }
 
@@ -370,35 +374,82 @@ mod tests {
         Mutex::new(None)
     }
 
-    #[test]
-    fn skipped_when_current_at_or_below_target() {
-        let snap = fresh_snap();
-        let ctrl = MockController::with_devices(&[(1, 0.15)], 1);
-
-        let outcome = apply_duck_inner(&snap, &ctrl, 0.20).expect("apply_duck");
-        assert!(matches!(outcome, DuckOutcome::Skipped { .. }));
-        assert!(snap.lock().unwrap().is_none(), "no snapshot when skipped");
-        assert_eq!(ctrl.snapshot_of(1), 0.15, "volume unchanged");
+    /// Helper: assert two f32s are within a small epsilon. Floating-point
+    /// chains like `0.4 * 0.7` don't land on the literal 0.28; we want
+    /// `(0.27999... - 0.28).abs() < 1e-6` to pass.
+    fn close(a: f32, b: f32) {
+        assert!((a - b).abs() < 1e-6, "expected ~{b}, got {a}");
     }
 
     #[test]
     fn applied_lowers_and_snapshots() {
+        // current=0.80, amount=0.80 → absolute = 0.80 * 0.20 = 0.16.
         let snap = fresh_snap();
         let ctrl = MockController::with_devices(&[(1, 0.80)], 1);
 
-        let outcome = apply_duck_inner(&snap, &ctrl, 0.20).expect("apply_duck");
+        let outcome = apply_duck_inner(&snap, &ctrl, 0.80).expect("apply_duck");
         match outcome {
             DuckOutcome::Applied { device, from, to } => {
                 assert_eq!(device, 1);
-                assert!((from - 0.80).abs() < 1e-6);
-                assert!((to - 0.20).abs() < 1e-6);
+                close(from, 0.80);
+                close(to, 0.16);
             }
             other => panic!("expected Applied, got {other:?}"),
         }
-        assert_eq!(ctrl.snapshot_of(1), 0.20, "device 1 ducked to target");
+        close(ctrl.snapshot_of(1), 0.16);
         let s = snap.lock().unwrap().expect("snapshot present");
         assert_eq!(s.device, 1);
-        assert!((s.level - 0.80).abs() < 1e-6);
+        close(s.level, 0.80);
+    }
+
+    #[test]
+    fn applied_uses_reduction_of_current() {
+        // Lock in the reduce-BY math across a few representative inputs.
+        for &(current, amount, expected) in &[
+            (0.50_f32, 0.90_f32, 0.05_f32),
+            (1.00, 0.80, 0.20),
+            (0.30, 0.50, 0.15),
+            (0.40, 0.70, 0.12),
+        ] {
+            let snap = fresh_snap();
+            let ctrl = MockController::with_devices(&[(1, current)], 1);
+            apply_duck_inner(&snap, &ctrl, amount).expect("apply");
+            close(ctrl.snapshot_of(1), expected);
+        }
+    }
+
+    #[test]
+    fn amount_zero_is_effective_noop_and_still_snapshots() {
+        // amount=0 means "reduce by 0%" — write current back to itself,
+        // but still capture a snapshot so restore is well-defined.
+        let snap = fresh_snap();
+        let ctrl = MockController::with_devices(&[(1, 0.50)], 1);
+
+        let outcome = apply_duck_inner(&snap, &ctrl, 0.0).expect("apply_duck");
+        match outcome {
+            DuckOutcome::Applied { from, to, .. } => {
+                close(from, 0.50);
+                close(to, 0.50);
+            }
+            other => panic!("expected Applied, got {other:?}"),
+        }
+        close(ctrl.snapshot_of(1), 0.50);
+        assert!(snap.lock().unwrap().is_some(), "snapshot captured");
+
+        restore_inner(&snap, &ctrl).expect("restore");
+        close(ctrl.snapshot_of(1), 0.50);
+    }
+
+    #[test]
+    fn amount_one_mutes() {
+        let snap = fresh_snap();
+        let ctrl = MockController::with_devices(&[(1, 0.50)], 1);
+
+        apply_duck_inner(&snap, &ctrl, 1.0).expect("apply");
+        close(ctrl.snapshot_of(1), 0.0);
+
+        restore_inner(&snap, &ctrl).expect("restore");
+        close(ctrl.snapshot_of(1), 0.50);
     }
 
     #[test]
@@ -406,10 +457,10 @@ mod tests {
         let snap = fresh_snap();
         let ctrl = MockController::with_devices(&[(1, 0.80)], 1);
 
-        apply_duck_inner(&snap, &ctrl, 0.20).expect("apply");
+        apply_duck_inner(&snap, &ctrl, 0.80).expect("apply");
         restore_inner(&snap, &ctrl).expect("restore");
 
-        assert_eq!(ctrl.snapshot_of(1), 0.80, "restored to original level");
+        close(ctrl.snapshot_of(1), 0.80);
         assert!(snap.lock().unwrap().is_none(), "snapshot cleared");
     }
 
@@ -420,25 +471,17 @@ mod tests {
         let snap = fresh_snap();
         let ctrl = MockController::with_devices(&[(1, 0.80), (2, 0.50)], 1);
 
-        apply_duck_inner(&snap, &ctrl, 0.20).expect("apply on device 1");
-        assert_eq!(ctrl.snapshot_of(1), 0.20);
-        assert_eq!(ctrl.snapshot_of(2), 0.50);
+        apply_duck_inner(&snap, &ctrl, 0.80).expect("apply on device 1");
+        close(ctrl.snapshot_of(1), 0.16);
+        close(ctrl.snapshot_of(2), 0.50);
 
         // User connects AirPods mid-dictation → default switches.
         ctrl.set_default(2);
 
         restore_inner(&snap, &ctrl).expect("restore");
 
-        assert_eq!(
-            ctrl.snapshot_of(1),
-            0.80,
-            "original device restored to its prior level"
-        );
-        assert_eq!(
-            ctrl.snapshot_of(2),
-            0.50,
-            "the new default's volume is untouched by restore"
-        );
+        close(ctrl.snapshot_of(1), 0.80);
+        close(ctrl.snapshot_of(2), 0.50);
     }
 
     #[test]
@@ -447,7 +490,7 @@ mod tests {
         let ctrl = MockController::with_devices(&[(1, 0.50)], 1);
 
         restore_inner(&snap, &ctrl).expect("restore should noop");
-        assert_eq!(ctrl.snapshot_of(1), 0.50);
+        close(ctrl.snapshot_of(1), 0.50);
     }
 
     #[test]
@@ -455,30 +498,35 @@ mod tests {
         let snap = fresh_snap();
         let ctrl = MockController::with_devices(&[(1, 0.80)], 1);
 
-        apply_duck_inner(&snap, &ctrl, 0.20).expect("first apply");
+        apply_duck_inner(&snap, &ctrl, 0.80).expect("first apply");
         // A re-entrant duck call (e.g. retry) must not capture the now-ducked
-        // 0.20 as a new snapshot, or restore would leave the user at 0.20.
-        let outcome = apply_duck_inner(&snap, &ctrl, 0.20).expect("second apply");
+        // 0.16 as a new snapshot, or restore would leave the user at 0.16.
+        let outcome = apply_duck_inner(&snap, &ctrl, 0.80).expect("second apply");
         assert!(matches!(outcome, DuckOutcome::AlreadyDucked { .. }));
 
         restore_inner(&snap, &ctrl).expect("restore");
-        assert_eq!(
-            ctrl.snapshot_of(1),
-            0.80,
-            "restore returns to the *original* prior level"
-        );
+        close(ctrl.snapshot_of(1), 0.80);
     }
 
     #[test]
-    fn duck_skipped_leaves_no_snapshot_to_restore() {
-        // Regression guard: a Skipped duck must never plant a snapshot that
-        // would cause restore to set anything.
+    fn re_entry_uses_snapshotted_level_not_current() {
+        // Regression: re-applying with the same amount must be idempotent
+        // against the original level. Computing from the *currently-ducked*
+        // level would compound (e.g., 0.80 → 0.40 → 0.20 → 0.10 …).
         let snap = fresh_snap();
-        let ctrl = MockController::with_devices(&[(1, 0.10)], 1);
+        let ctrl = MockController::with_devices(&[(1, 0.80)], 1);
 
-        apply_duck_inner(&snap, &ctrl, 0.20).expect("apply");
+        apply_duck_inner(&snap, &ctrl, 0.50).expect("first apply");
+        close(ctrl.snapshot_of(1), 0.40);
+
+        apply_duck_inner(&snap, &ctrl, 0.50).expect("second apply");
+        close(ctrl.snapshot_of(1), 0.40);
+
+        apply_duck_inner(&snap, &ctrl, 0.50).expect("third apply");
+        close(ctrl.snapshot_of(1), 0.40);
+
         restore_inner(&snap, &ctrl).expect("restore");
-        assert_eq!(ctrl.snapshot_of(1), 0.10);
+        close(ctrl.snapshot_of(1), 0.80);
     }
 
     #[test]
@@ -507,8 +555,9 @@ mod tests {
 
         let snap_a = Arc::clone(&snap);
         let ctrl_a = Arc::clone(&ctrl);
+        // amount=0.80 on current=0.80 → ducked level = 0.16.
         let apply_handle =
-            thread::spawn(move || apply_duck_inner(snap_a.as_ref(), ctrl_a.as_ref(), 0.20));
+            thread::spawn(move || apply_duck_inner(snap_a.as_ref(), ctrl_a.as_ref(), 0.80));
 
         // Give thread A enough lead time to acquire the snapshot mutex
         // before the restore call below races to grab it.
@@ -525,7 +574,7 @@ mod tests {
 
         // Consistent post-states only — no broken interleave.
         let consistent = match snap_final.is_some() {
-            true => (vol - 0.20).abs() < 1e-3,  // apply won outright
+            true => (vol - 0.16).abs() < 1e-3,  // apply won outright
             false => (vol - 0.80).abs() < 1e-3, // apply→restore both ran in order
         };
         assert!(
@@ -567,12 +616,14 @@ mod tests {
         ctrl.set(device, start).expect("set start");
         let observed_start = ctrl.get(device).expect("get observed start");
 
-        let target = 0.2_f32;
-        apply_duck_inner(&snap, ctrl.as_ref(), target).expect("apply_duck");
+        let amount = 0.8_f32;
+        let expected = observed_start * (1.0 - amount);
+        apply_duck_inner(&snap, ctrl.as_ref(), amount).expect("apply_duck");
         let after_duck = ctrl.get(device).expect("get after duck");
         assert!(
-            after_duck <= target + 0.05,
-            "expected duck near {target}, got {after_duck}"
+            (after_duck - expected).abs() < 0.05,
+            "expected duck near {expected} (= {observed_start} * {}), got {after_duck}",
+            1.0 - amount
         );
 
         restore_inner(&snap, ctrl.as_ref()).expect("restore");

@@ -256,7 +256,7 @@ export function DictationTab() {
   const dictation = useAppStore((s) => s.settings.dictation);
   const shortcutBindings = useAppStore((s) => s.settings.shortcutBindings);
   const dictationDuckEnabled = useAppStore((s) => s.settings.dictationDuckEnabled);
-  const dictationDuckTarget = useAppStore((s) => s.settings.dictationDuckTarget);
+  const dictationDuckAmount = useAppStore((s) => s.settings.dictationDuckAmount);
   const updateSettings = useAppStore((s) => s.updateSettings);
 
   const handleToggleEnabled = (checked: boolean) => {
@@ -415,9 +415,9 @@ export function DictationTab() {
           <div className="space-y-3">
             <div className="flex items-center justify-between">
               <div>
-                <Label className="text-xs">Lower volume while recording</Label>
+                <Label className="text-xs">Lower Volume</Label>
                 <p className="text-[11px] text-muted-foreground mt-0.5">
-                  Quiets system audio so you can hear yourself.
+                  Quiets system audio by a set percentage.
                 </p>
               </div>
               <Switch
@@ -429,20 +429,20 @@ export function DictationTab() {
             </div>
             <div className="space-y-1.5">
               <div className="flex items-center justify-between">
-                <Label className="text-[11px] text-muted-foreground">Duck to</Label>
+                <Label className="text-[11px] text-muted-foreground">Reduce volume by</Label>
                 <span className="text-[11px] text-muted-foreground tabular-nums">
-                  {Math.round(dictationDuckTarget * 100)}%
+                  {Math.round(dictationDuckAmount * 100)}%
                 </span>
               </div>
               <Slider
                 min={0}
                 max={100}
                 step={5}
-                value={[Math.round(dictationDuckTarget * 100)]}
+                value={[Math.round(dictationDuckAmount * 100)]}
                 disabled={!dictationDuckEnabled}
                 onValueChange={(values) => {
-                  const pct = values[0] ?? 20;
-                  updateSettings({ dictationDuckTarget: pct / 100 });
+                  const pct = values[0] ?? 80;
+                  updateSettings({ dictationDuckAmount: pct / 100 });
                 }}
               />
             </div>
