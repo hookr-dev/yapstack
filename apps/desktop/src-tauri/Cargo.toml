@@ -50,6 +50,16 @@ tauri-plugin-http = "2.5.9"
 # both engines. Speech-trained; robust to background noise, music, and
 # quiet speech that RMS would either miss or false-trigger on.
 silero = "0.2"
+# Process-memory sampling for the periodic heap log. We only read RSS
+# (`physical_mem`) — virtual size on macOS 14+ reports hundreds of GB
+# from `mach_task_basic_info.virtual_size` due to kernel-reserved
+# address ranges (shared cache, guard regions), which is true of every
+# crate that reads that syscall, this one included. RSS is the signal
+# that actually correlates with growth; we leave VSZ unread.
+# Picked over `sysinfo` because we only need self-process RSS:
+# `memory-stats` is single-purpose with near-zero deps, while `sysinfo`
+# pulls in CPU, disk, and OS-wide process enumeration we don't use.
+memory-stats = "1"
 
 [dev-dependencies]
 tempfile = { workspace = true }

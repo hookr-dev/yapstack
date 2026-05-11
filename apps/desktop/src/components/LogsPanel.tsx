@@ -1,5 +1,5 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
-import { Copy, FolderOpen, Trash2 } from "lucide-react";
+import { Camera, Copy, FolderOpen, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
@@ -11,6 +11,8 @@ import {
   subscribeLogs,
   type LogEntry,
 } from "@/lib/logs";
+import { captureDiagnostics } from "@/lib/logger";
+import { useAppStore } from "@/stores/appStore";
 
 // Cap for the tailed live stream (the initial snapshot is already
 // bounded by the backend ring buffer, but incoming `log://entry`
@@ -173,6 +175,20 @@ export function LogsPanel() {
     }
   };
 
+  const onSnapshot = () => {
+    // Use store.getState() (not hooks) so the snapshot reflects the values
+    // at the moment the user clicked, even if a render is pending.
+    const state = useAppStore.getState();
+    captureDiagnostics({
+      activeSession: state.activeSessionId ?? "none",
+      activeSegments: state.activeSessionSegments.length,
+      livePhase: state.livePhase ?? "Idle",
+      backfillActive: state.backfillActive ? 1 : 0,
+      sessions: state.sessions.length,
+    });
+    toast.success("Diagnostic snapshot logged");
+  };
+
   const onClear = async () => {
     try {
       await clearLogs();
@@ -212,6 +228,16 @@ export function LogsPanel() {
           >
             <Copy className="h-3 w-3" />
             Copy
+          </Button>
+          <Button
+            size="sm"
+            variant="ghost"
+            className="h-7 gap-1.5 px-2 text-[11px]"
+            onClick={onSnapshot}
+            title="Log a heap + session-state snapshot to the rolling log"
+          >
+            <Camera className="h-3 w-3" />
+            Snapshot
           </Button>
           <Button
             size="sm"
