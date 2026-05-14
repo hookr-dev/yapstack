@@ -11,6 +11,15 @@ import { BulkActionsBar } from "@/components/transcript/BulkActionsBar";
 import { useAppStore } from "@/stores/appStore";
 import type { DbSegment } from "@/lib/db";
 
+// Click-vs-drag threshold for marquee promotion. Matches the macOS Finder
+// convention and gives trackpad jitter room before a tap turns into a
+// drag.
+const DRAG_THRESHOLD_PX = 6;
+// Edge auto-scroll: linear velocity ramp from 0 at SCROLL_HOT_ZONE px
+// from the viewport edge to SCROLL_MAX_VELOCITY px/frame at the edge.
+const SCROLL_HOT_ZONE = 30;
+const SCROLL_MAX_VELOCITY = 12;
+
 export function ChatView({
   sessionId,
   segments,
@@ -146,7 +155,6 @@ export function ChatView({
   const lastPointerRef = useRef<{ x: number; y: number } | null>(null);
   const scrollRafRef = useRef<number | null>(null);
   const containerRef = useRef<HTMLElement | null>(null);
-  const DRAG_THRESHOLD_PX = 6;
 
   // Stick-to-bottom: follow new segments unless the user has scrolled away.
   useEffect(() => {
@@ -244,9 +252,6 @@ export function ChatView({
     [onTimestampClick]
   );
 
-  const SCROLL_HOT_ZONE = 30; // px from viewport edge that triggers scroll
-  const SCROLL_MAX_VELOCITY = 12; // px / frame at the very edge
-
   // Compute auto-scroll velocity from a pointer's clientY relative to
   // the viewport. Linear ramp inside the hot zones, zero otherwise.
   // Positive = scroll down, negative = scroll up.
@@ -288,6 +293,20 @@ export function ChatView({
     const next = { left, top, width, height };
     marqueeRectRef.current = next;
     marqueeOverlayRef.current?.setRect(next);
+  };
+
+  // Wipe all drag-tracking refs and hide the overlay. Shared by the
+  // pointerup commit path and the pointercancel path. Does NOT touch
+  // suppressNextClickRef — its disarm policy differs by branch (deferred
+  // on commit, immediate on cancel).
+  const resetMarqueeState = () => {
+    marqueeStartRef.current = null;
+    pendingDownRef.current = null;
+    lastPointerRef.current = null;
+    viewportRef.current = null;
+    containerRef.current = null;
+    marqueeRectRef.current = null;
+    marqueeOverlayRef.current?.hide();
   };
 
   const stopAutoScroll = () => {
@@ -407,14 +426,8 @@ export function ChatView({
     if (e.currentTarget.hasPointerCapture(e.pointerId)) {
       e.currentTarget.releasePointerCapture(e.pointerId);
     }
-    marqueeStartRef.current = null;
-    lastPointerRef.current = null;
-    viewportRef.current = null;
-    containerRef.current = null;
-    pendingDownRef.current = null;
     const rect = marqueeRectRef.current;
-    marqueeRectRef.current = null;
-    marqueeOverlayRef.current?.hide();
+    resetMarqueeState();
     if (!rect) {
       // Threshold was crossed (start ref was set) but the marquee never
       // rendered (movement stayed under the per-axis render threshold).
@@ -469,16 +482,10 @@ export function ChatView({
     if (e.currentTarget.hasPointerCapture(e.pointerId)) {
       e.currentTarget.releasePointerCapture(e.pointerId);
     }
-    marqueeStartRef.current = null;
-    lastPointerRef.current = null;
-    viewportRef.current = null;
-    containerRef.current = null;
-    pendingDownRef.current = null;
     // A canceled drag never produces a click, so disarm immediately so
     // a later normal click on a bubble is not swallowed.
     suppressNextClickRef.current = false;
-    marqueeRectRef.current = null;
-    marqueeOverlayRef.current?.hide();
+    resetMarqueeState();
   };
 
   // Find the active segment based on playback time. Null when not
