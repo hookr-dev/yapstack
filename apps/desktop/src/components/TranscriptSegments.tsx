@@ -1,4 +1,4 @@
-import { Fragment, useMemo, useState, type RefObject } from "react";
+import { Fragment, memo, useMemo, useState, type RefObject } from "react";
 import { EditableSegment } from "@/components/EditableSegment";
 import { useAppStore } from "@/stores/appStore";
 import type { DbSegment } from "@/lib/db";
@@ -94,7 +94,7 @@ type Group = {
   items: DbSegment[];
 };
 
-export function TranscriptSegments({
+function TranscriptSegmentsInner({
   sessionId,
   segments,
   isEditable,
@@ -195,3 +195,9 @@ export function TranscriptSegments({
     </>
   );
 }
+
+// Memoized so a parent re-render (e.g. ChatView updating marquee-related
+// state during a drag) doesn't walk the segment list when our props are
+// unchanged. All props are primitives, stable refs, or memoized arrays —
+// shallow comparison suffices.
+export const TranscriptSegments = memo(TranscriptSegmentsInner);

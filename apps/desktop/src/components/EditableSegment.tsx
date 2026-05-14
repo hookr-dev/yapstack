@@ -192,7 +192,7 @@ export const EditableSegment = memo(forwardRef<
                   ? "ring-primary/60 ring-offset-2 ring-offset-background"
                   : "ring-primary/60"),
                 isEditing
-                  ? "outline-none ring-2 ring-ring cursor-text"
+                  ? "outline-none ring-2 ring-ring cursor-text select-text"
                   : readOnly
                     ? "cursor-default"
                     : "cursor-pointer",
