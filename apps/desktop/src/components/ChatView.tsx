@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ArrowDown, ArrowUp } from "lucide-react";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { TranscriptSegments } from "@/components/TranscriptSegments";
+import { MarqueeOverlay } from "@/components/MarqueeOverlay";
 import { BulkActionsBar } from "@/components/transcript/BulkActionsBar";
 import { useAppStore } from "@/stores/appStore";
 import type { DbSegment } from "@/lib/db";
@@ -542,17 +543,7 @@ export function ChatView({
               onTimestampClick={handleTimestampClick}
             />
           )}
-          {marquee && (
-            <div
-              className="pointer-events-none absolute rounded border border-primary/50 bg-primary/10"
-              style={{
-                left: marquee.left,
-                top: marquee.top,
-                width: marquee.width,
-                height: marquee.height,
-              }}
-            />
-          )}
+          <MarqueeOverlay marquee={marquee} />
           <div ref={bottomRef} />
         </div>
       </ScrollArea>
