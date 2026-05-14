@@ -108,12 +108,24 @@ export function ChatView({
     };
   }, [segments, backfillActive, backfillBoundarySeconds]);
 
-  // Marquee selection state — drag-select on whitespace within the
-  // transcript. Bubbles own their own click handling (incl. ContextMenu
-  // right-click, shift-click range, cmd-click toggle), so the marquee
-  // never starts on a bubble. This keeps the system simple: there's no
-  // click-vs-drag disambiguation for bubbles to fight with.
+  // Marquee selection state — drag-select across the transcript. Any
+  // pointerdown in the container records a pending start; we commit to
+  // marquee mode once the pointer moves past DRAG_THRESHOLD_PX. Below
+  // threshold the pointerup falls through to the bubble's onClick
+  // (toggle / shift-range / cmd-toggle / enter-edit). Active editing
+  // controls (contenteditable, input, textarea) are exempt from the
+  // pending-pointer path so in-edit text selection still works.
   const marqueeStartRef = useRef<{ x: number; y: number } | null>(null);
+  const pendingDownRef = useRef<{
+    clientX: number;
+    clientY: number;
+    onBubble: boolean;
+  } | null>(null);
+  // Set when marquee promotion commits; the synthetic click that would
+  // otherwise fire on the originating bubble is intercepted in an
+  // onClickCapture handler and discarded. More deterministic than
+  // leaning on setPointerCapture to suppress the click.
+  const suppressNextClickRef = useRef(false);
   const [marquee, setMarquee] = useState<{
     left: number;
     top: number;
@@ -128,6 +140,7 @@ export function ChatView({
   const lastPointerRef = useRef<{ x: number; y: number } | null>(null);
   const scrollRafRef = useRef<number | null>(null);
   const containerRef = useRef<HTMLElement | null>(null);
+  const DRAG_THRESHOLD_PX = 6;
 
   // Stick-to-bottom: follow new segments unless the user has scrolled away.
   useEffect(() => {
@@ -265,7 +278,7 @@ export function ChatView({
     const top = Math.min(start.y, y);
     const width = Math.abs(x - start.x);
     const height = Math.abs(y - start.y);
-    if (width < 4 && height < 4) return;
+    if (width < DRAG_THRESHOLD_PX && height < DRAG_THRESHOLD_PX) return;
     setMarquee({ left, top, width, height });
   };
 
@@ -311,40 +324,56 @@ export function ChatView({
     // React routes synthetic events through the component tree, so a click
     // on a Radix portal child (e.g. an open ContextMenu item) bubbles here
     // even though its DOM lives in document.body. Without this bail we'd
-    // preventDefault that pointerdown and swallow the menu item's click.
+    // record a pendingDownRef for an event that isn't ours.
     if (!e.currentTarget.contains(e.target as Node)) return;
     const target = e.target as HTMLElement;
-    // Bubbles handle their own clicks (incl. shift/cmd modifiers) and
-    // right-click ContextMenu; the marquee only starts on whitespace.
-    // Drag-select bubbles via shift-click instead.
-    if (target.closest("[data-segment-id]")) return;
-    // preventDefault below blocks the focus shift the click would
-    // otherwise cause; explicitly blur so an editing bubble's onBlur
-    // still fires and saves.
-    const active = document.activeElement as HTMLElement | null;
-    if (active && active !== document.body) active.blur();
-    // Pointer capture so pointermove fires past the viewport edge —
-    // required for edge auto-scroll.
-    e.currentTarget.setPointerCapture(e.pointerId);
-    e.preventDefault();
-    const container = e.currentTarget as HTMLElement;
-    containerRef.current = container;
-    // Cache the Radix ScrollArea viewport — that's the actual scrolling
-    // node, not our marquee container.
-    viewportRef.current =
-      scrollAreaRef.current?.querySelector<HTMLElement>(
-        '[data-slot="scroll-area-viewport"]',
-      ) ?? null;
-    const rect = container.getBoundingClientRect();
-    marqueeStartRef.current = {
-      x: e.clientX - rect.left + container.scrollLeft,
-      y: e.clientY - rect.top + container.scrollTop,
+    // Active editing controls own their own pointer behavior. Skipping
+    // pendingDownRef here keeps drag-to-select-text inside an editing
+    // bubble (or future <input>/<textarea>) from being clobbered by the
+    // marquee promotion path.
+    if (target.closest('[contenteditable="true"], input, textarea')) return;
+    pendingDownRef.current = {
+      clientX: e.clientX,
+      clientY: e.clientY,
+      onBubble: !!target.closest("[data-segment-id]"),
     };
-    lastPointerRef.current = { x: e.clientX, y: e.clientY };
   };
 
   const handleContainerPointerMove = (e: React.PointerEvent) => {
-    if (!marqueeStartRef.current) return;
+    if (!marqueeStartRef.current) {
+      const pending = pendingDownRef.current;
+      if (!pending) return;
+      const dx = Math.abs(e.clientX - pending.clientX);
+      const dy = Math.abs(e.clientY - pending.clientY);
+      if (Math.max(dx, dy) < DRAG_THRESHOLD_PX) return;
+      // Promote to marquee mode. Pointer capture so pointermove keeps
+      // firing past the viewport edge for auto-scroll.
+      e.currentTarget.setPointerCapture(e.pointerId);
+      e.preventDefault();
+      // Arm the one-shot click interceptor so the bubble's onClick
+      // (toggle / enter-edit) cannot fire after the drag releases.
+      suppressNextClickRef.current = true;
+      // Blur any editing bubble so its onBlur (save) fires before the
+      // selection changes underneath it.
+      const active = document.activeElement as HTMLElement | null;
+      if (active && active !== document.body) active.blur();
+      const container = e.currentTarget as HTMLElement;
+      containerRef.current = container;
+      viewportRef.current =
+        scrollAreaRef.current?.querySelector<HTMLElement>(
+          '[data-slot="scroll-area-viewport"]',
+        ) ?? null;
+      const rect = container.getBoundingClientRect();
+      // Anchor the marquee at the *pending* start, not the current
+      // pointer — otherwise the first 6 px of movement wouldn't be
+      // covered by the rect.
+      marqueeStartRef.current = {
+        x: pending.clientX - rect.left + container.scrollLeft,
+        y: pending.clientY - rect.top + container.scrollTop,
+      };
+      pendingDownRef.current = null;
+      window.getSelection()?.removeAllRanges();
+    }
     window.getSelection()?.removeAllRanges();
     lastPointerRef.current = { x: e.clientX, y: e.clientY };
     updateMarqueeFromPointer();
@@ -352,21 +381,35 @@ export function ChatView({
   };
 
   const handleContainerPointerUp = (e: React.PointerEvent) => {
+    // Pre-threshold: pointerdown was tracked but no marquee committed.
+    // Hand off to the bubble's click (or clear selection on whitespace).
+    if (!marqueeStartRef.current) {
+      const pending = pendingDownRef.current;
+      pendingDownRef.current = null;
+      if (!pending) return;
+      if (!pending.onBubble) {
+        // Bare whitespace click — preserve the existing
+        // "click-empty-space clears multi-selection" behavior.
+        clearSegmentSelection();
+      }
+      return;
+    }
     stopAutoScroll();
     if (e.currentTarget.hasPointerCapture(e.pointerId)) {
       e.currentTarget.releasePointerCapture(e.pointerId);
     }
-    const start = marqueeStartRef.current;
     marqueeStartRef.current = null;
     lastPointerRef.current = null;
     viewportRef.current = null;
     containerRef.current = null;
-    if (!start || !marquee) {
+    pendingDownRef.current = null;
+    if (!marquee) {
       setMarquee(null);
-      // Bare click on whitespace (no drag) clears the multi-selection.
-      // Pointerdown only fires on whitespace (we bail on bubbles), so
-      // every no-drag pointerup here was a whitespace click.
-      if (start) clearSegmentSelection();
+      // Threshold was crossed (start ref was set) but the marquee never
+      // rendered (movement stayed under the per-axis render threshold).
+      // Treat as a whitespace clear if we started on whitespace.
+      // The originating bubble (if any) will not receive a click because
+      // suppressNextClickRef was armed at promotion time.
       return;
     }
     const container = e.currentTarget as HTMLElement;
@@ -402,6 +445,29 @@ export function ChatView({
       setSegmentSelection(picked);
     }
     setMarquee(null);
+    // Belt-and-suspenders: if Chromium suppressed the synthetic click
+    // after the drag, the onClickCapture interceptor won't fire and the
+    // ref would leak, swallowing an unrelated future click. Disarm on
+    // the next tick — any synthesized click will already have fired.
+    window.setTimeout(() => {
+      suppressNextClickRef.current = false;
+    }, 0);
+  };
+
+  const handleContainerPointerCancel = (e: React.PointerEvent) => {
+    stopAutoScroll();
+    if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+      e.currentTarget.releasePointerCapture(e.pointerId);
+    }
+    marqueeStartRef.current = null;
+    lastPointerRef.current = null;
+    viewportRef.current = null;
+    containerRef.current = null;
+    pendingDownRef.current = null;
+    // A canceled drag never produces a click, so disarm immediately so
+    // a later normal click on a bubble is not swallowed.
+    suppressNextClickRef.current = false;
+    setMarquee(null);
   };
 
   // Find the active segment based on playback time. Null when not
@@ -430,15 +496,18 @@ export function ChatView({
     <div className="relative min-h-0 flex-1 select-text">
       <ScrollArea ref={scrollAreaRef} className="h-full">
         <div
-          className={
-            marquee
-              ? "relative min-h-full space-y-2 px-3 py-2 select-none"
-              : "relative min-h-full space-y-2 px-3 py-2"
-          }
+          className="relative min-h-full space-y-2 px-3 py-2 select-none"
           onPointerDown={handleContainerPointerDown}
           onPointerMove={handleContainerPointerMove}
           onPointerUp={handleContainerPointerUp}
-          onPointerCancel={handleContainerPointerUp}
+          onPointerCancel={handleContainerPointerCancel}
+          onClickCapture={(e) => {
+            if (suppressNextClickRef.current) {
+              suppressNextClickRef.current = false;
+              e.preventDefault();
+              e.stopPropagation();
+            }
+          }}
         >
           <TranscriptSegments
             sessionId={sessionId ?? ""}
