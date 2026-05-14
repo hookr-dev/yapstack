@@ -2,7 +2,11 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ArrowDown, ArrowUp } from "lucide-react";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { TranscriptSegments } from "@/components/TranscriptSegments";
-import { MarqueeOverlay } from "@/components/MarqueeOverlay";
+import {
+  MarqueeOverlay,
+  type MarqueeOverlayHandle,
+  type MarqueeRect,
+} from "@/components/MarqueeOverlay";
 import { BulkActionsBar } from "@/components/transcript/BulkActionsBar";
 import { useAppStore } from "@/stores/appStore";
 import type { DbSegment } from "@/lib/db";
@@ -127,12 +131,13 @@ export function ChatView({
   // onClickCapture handler and discarded. More deterministic than
   // leaning on setPointerCapture to suppress the click.
   const suppressNextClickRef = useRef(false);
-  const [marquee, setMarquee] = useState<{
-    left: number;
-    top: number;
-    width: number;
-    height: number;
-  } | null>(null);
+  // The marquee rect is intentionally NOT React state: at ~120 Hz a
+  // setState per pointermove forces ChatView and its subtree to reconcile
+  // and the drag visibly stutters. Instead we keep the rect in a ref and
+  // mutate the overlay div's style imperatively via marqueeOverlayRef.
+  // The ref is read on pointerup to compute the intersection.
+  const marqueeRectRef = useRef<MarqueeRect | null>(null);
+  const marqueeOverlayRef = useRef<MarqueeOverlayHandle | null>(null);
   // Edge auto-scroll: 30 px hot zones at top + bottom, linear velocity
   // ramp capped at 12 px/frame, RAF loop that recomputes the marquee
   // end-point from the cached pointer each tick so the rect grows as
@@ -280,7 +285,9 @@ export function ChatView({
     const width = Math.abs(x - start.x);
     const height = Math.abs(y - start.y);
     if (width < DRAG_THRESHOLD_PX && height < DRAG_THRESHOLD_PX) return;
-    setMarquee({ left, top, width, height });
+    const next = { left, top, width, height };
+    marqueeRectRef.current = next;
+    marqueeOverlayRef.current?.setRect(next);
   };
 
   const stopAutoScroll = () => {
@@ -404,8 +411,10 @@ export function ChatView({
     viewportRef.current = null;
     containerRef.current = null;
     pendingDownRef.current = null;
-    if (!marquee) {
-      setMarquee(null);
+    const rect = marqueeRectRef.current;
+    marqueeRectRef.current = null;
+    marqueeOverlayRef.current?.hide();
+    if (!rect) {
       // Threshold was crossed (start ref was set) but the marquee never
       // rendered (movement stayed under the per-axis render threshold).
       // Treat as a whitespace clear if we started on whitespace.
@@ -416,12 +425,12 @@ export function ChatView({
     const container = e.currentTarget as HTMLElement;
     const containerRect = container.getBoundingClientRect();
     const marqueeRect = {
-      left: marquee.left - container.scrollLeft + containerRect.left,
-      top: marquee.top - container.scrollTop + containerRect.top,
+      left: rect.left - container.scrollLeft + containerRect.left,
+      top: rect.top - container.scrollTop + containerRect.top,
       right:
-        marquee.left + marquee.width - container.scrollLeft + containerRect.left,
+        rect.left + rect.width - container.scrollLeft + containerRect.left,
       bottom:
-        marquee.top + marquee.height - container.scrollTop + containerRect.top,
+        rect.top + rect.height - container.scrollTop + containerRect.top,
     };
     const nodes = container.querySelectorAll<HTMLElement>("[data-segment-id]");
     const picked = new Set<string>();
@@ -445,7 +454,6 @@ export function ChatView({
     } else {
       setSegmentSelection(picked);
     }
-    setMarquee(null);
     // Belt-and-suspenders: if Chromium suppressed the synthetic click
     // after the drag, the onClickCapture interceptor won't fire and the
     // ref would leak, swallowing an unrelated future click. Disarm on
@@ -468,7 +476,8 @@ export function ChatView({
     // A canceled drag never produces a click, so disarm immediately so
     // a later normal click on a bubble is not swallowed.
     suppressNextClickRef.current = false;
-    setMarquee(null);
+    marqueeRectRef.current = null;
+    marqueeOverlayRef.current?.hide();
   };
 
   // Find the active segment based on playback time. Null when not
@@ -543,7 +552,7 @@ export function ChatView({
               onTimestampClick={handleTimestampClick}
             />
           )}
-          <MarqueeOverlay marquee={marquee} />
+          <MarqueeOverlay ref={marqueeOverlayRef} />
           <div ref={bottomRef} />
         </div>
       </ScrollArea>
