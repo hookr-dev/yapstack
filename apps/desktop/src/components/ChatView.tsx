@@ -380,8 +380,9 @@ export function ChatView({
         y: pending.clientY - rect.top + container.scrollTop,
       };
       pendingDownRef.current = null;
-      window.getSelection()?.removeAllRanges();
     }
+    // Clear any selection the browser may have started before we
+    // promoted (or any caret left by a click that re-promoted later).
     window.getSelection()?.removeAllRanges();
     lastPointerRef.current = { x: e.clientX, y: e.clientY };
     updateMarqueeFromPointer();
