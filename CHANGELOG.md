@@ -15,6 +15,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 - The transcription scheduler is now a **long-lived app-level singleton**. It's constructed once at engine init and shared by every live runtime (one session + one dictation concurrently); previously each session built its own scheduler and round-tripped the `TranscriptionClient` back into shared state on stop. `init_transcription_client` is now idempotent on a matching engine/config and returns an explicit "shut down first" error on mismatch — engine swap is an explicit two-step operation. `submit()` returns `Result<Receiver, SchedulerError>` and rejects with `Shutdown` once the scheduler is terminal so racing `Arc<Scheduler>` clones can't enqueue into a dead worker. Backfill-gating is now a per-producer bitmask (`{LiveMic, LiveSystem, Dictation}`) so one runtime clearing its bit while another is mid-utterance can't unblock backfill prematurely.
 - `LiveTranscriptionState` is now a two-slot struct (`session`, `dictation`) with explicit `Idle | Starting | Running | Stopping` lifecycle states — same-kind double-start is rejected even during the finalization window, so a stop-then-fast-start can't race the prior task's tail emission.
 
+### Fixed
+- **Double-clicking a chat action (Summarize, Key Points, etc.) no longer fires the action twice.** The `isStreaming` React state guard didn't apply the disabled attribute until the next render, so a fast second click on the same `CommandItem` slipped through and triggered duplicate LLM requests (and could trip OpenAI rate limits when chained). `useChatMessages.handleSend` now bails synchronously via a `useRef` reentrancy guard.
+
 ## [1.0.0-alpha.10] - 2026-05-04
 
 ### Fixed

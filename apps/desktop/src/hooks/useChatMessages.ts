@@ -164,6 +164,11 @@ export function useChatMessages(
   messagesRef.current = messages;
   const inputRef = useRef(input);
   inputRef.current = input;
+  // Synchronous reentrancy guard. `isStreaming` (React state) doesn't flip in
+  // the DOM until the next commit, so a double-click on Summarize or any
+  // other action item fires `handleSend` twice before the disabled attribute
+  // applies. The ref blocks the second call in the same tick.
+  const sendingRef = useRef(false);
 
   const aiSettings = useAppStore((s) => s.settings.ai) ?? DEFAULT_AI_SETTINGS;
   const activeConfig = getActiveConfig(aiSettings);
@@ -274,6 +279,8 @@ export function useChatMessages(
       const actionId = actionDef?.id ?? "general";
 
       if (!actionDef && !userText) return;
+      if (sendingRef.current) return;
+      sendingRef.current = true;
 
       // For action invocations with no typed text, send the action's
       // verbose userPrompt as the model-visible content (falls back to
@@ -796,6 +803,7 @@ export function useChatMessages(
         if (flushTimer) clearInterval(flushTimer);
         setIsStreaming(false);
         abortRef.current = null;
+        sendingRef.current = false;
       }
     },
     [
