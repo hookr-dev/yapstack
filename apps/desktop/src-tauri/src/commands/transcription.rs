@@ -358,6 +358,73 @@ impl DictationOwnsMic {
             closed: s.closed.clone(),
         }
     }
+
+    /// Atomically rebind mic-ownership state across a mic ring-buffer
+    /// replacement. All positions stored here live in the mic ring's
+    /// coordinate space; once that ring is swapped out (device-format
+    /// change), every previously-recorded `start`/`end` value is a
+    /// reference into a buffer the session can no longer read.
+    ///
+    /// Semantics:
+    /// - **All closed windows are drained** and returned to the caller.
+    ///   They cannot be consumed against the new buffer (their `end`
+    ///   could be well past the new buffer's `write_pos`), so leaving
+    ///   them in place would corrupt the next session tick's overlap
+    ///   math. The caller uses the returned windows to decide whether
+    ///   pre-swap rescue ranges need to be truncated (a dictated range
+    ///   inside the rescue range must not leak into session content).
+    /// - **The open window's `start` is rebased** to `new_open_start`
+    ///   (typically the new buffer's `write_pos` at the swap instant).
+    ///   The dictation runtime experiences the same swap on its own
+    ///   `SourceVadState` and will record the eventual `close(end)` in
+    ///   new-buffer coordinates; rebasing the start keeps both sides
+    ///   of the window in the same coordinate system. If no window was
+    ///   open, this is a no-op.
+    /// - Returns the prior open start (if any) so the caller can
+    ///   truncate any rescue range that overlaps the original open
+    ///   start in old coordinates.
+    ///
+    /// Unlike `clear_for_session`, this is safe to call while a
+    /// dictation is actively owning the mic — the runtime's
+    /// in-progress transcription continues uninterrupted, just in
+    /// the new buffer's coordinate space.
+    pub fn rebase_for_mic_buffer_replacement(
+        &self,
+        new_open_start: u64,
+    ) -> DictationRebaseResult {
+        let mut s = self.state.lock().expect("dictation-owns-mic poisoned");
+        let dropped_closed: std::collections::VecDeque<MicWindow> = std::mem::take(&mut s.closed);
+        let prior_open = s.open;
+        if prior_open.is_some() {
+            s.open = Some(new_open_start);
+        }
+        DictationRebaseResult {
+            dropped_closed,
+            prior_open,
+            new_open: s.open,
+        }
+    }
+}
+
+/// Result of `DictationOwnsMic::rebase_for_mic_buffer_replacement`. The
+/// caller uses `dropped_closed` + `prior_open` to decide whether a
+/// pre-swap rescue range overlaps any dictation window — if so, the
+/// rescue must be truncated at the earliest dictation boundary to keep
+/// dictated audio out of the session transcript / WAV.
+#[derive(Debug)]
+pub struct DictationRebaseResult {
+    /// Closed windows that were dropped from the queue. Their
+    /// `start`/`end` are in the OLD mic ring's coordinate space; only
+    /// useful for boundary computations against pre-swap rescue ranges
+    /// (also in OLD coordinates).
+    pub dropped_closed: std::collections::VecDeque<MicWindow>,
+    /// The open window's start in OLD coordinates, before the rebase.
+    /// `None` if no window was open at the moment of swap.
+    pub prior_open: Option<u64>,
+    /// The open window's start in NEW coordinates, after the rebase.
+    /// `Some(new_open_start)` if a window was open; `None` otherwise.
+    /// Mirrors what subsequent `snapshot()` calls will return.
+    pub new_open: Option<u64>,
 }
 
 impl Default for DictationOwnsMic {

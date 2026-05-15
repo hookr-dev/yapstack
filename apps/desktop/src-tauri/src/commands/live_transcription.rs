@@ -814,6 +814,19 @@ struct SourceVadState {
     accumulated_text: String,
     /// Buffer position corresponding to T=0 on the session timeline (rewound backfill position).
     session_start_pos: usize,
+    /// Session-time (in seconds) corresponding to this source's current
+    /// `session_start_pos`. At source construction this equals
+    /// `ctx.session_offset_base_seconds`; on `reset_for_buffer_replacement`
+    /// it advances by the wall-clock time elapsed since the last reset/resume
+    /// so that the chunk-offset formula
+    /// `audio_offset = anchor + (start_pos - session_start_pos)/sr`
+    /// stays continuous across ring-buffer swaps. Read at the chunk-emit
+    /// site in `prepare_chunk_dispatch_inner` and in the stop-time
+    /// `copy_final_pending_chunks_until` helper. Never used in lag
+    /// calculations — those keep using `ctx.session_offset_base_seconds`
+    /// (session-wide, immutable) plus `session_start_instant.elapsed()`
+    /// (wall-clock).
+    audio_offset_anchor_seconds: f32,
     /// Sample rate of this source's ring buffer.
     source_sample_rate: u32,
     /// Channel count of this source's ring buffer (interleaved).
@@ -871,6 +884,7 @@ impl SourceVadState {
         session_start_pos: usize,
         sample_rate: u32,
         channels: u16,
+        audio_offset_anchor_seconds: f32,
     ) -> Self {
         Self {
             has_in_flight_task: false,
@@ -884,6 +898,7 @@ impl SourceVadState {
             chunk_index: 0,
             accumulated_text: String::new(),
             session_start_pos,
+            audio_offset_anchor_seconds,
             source_sample_rate: sample_rate,
             source_channels: channels,
             last_seen_write_pos: initial_pos,
@@ -921,14 +936,36 @@ impl SourceVadState {
     /// change during restart). Positions from the old buffer are not
     /// meaningful against the new one, and the sample rate / channel count
     /// must track the new device's format so extraction and WAV writes stay
-    /// correct. Preserves cross-buffer state: chunk_index, accumulated_text.
-    fn reset_for_buffer_replacement(&mut self, new_pos: usize, sample_rate: u32, channels: u16) {
+    /// correct.
+    ///
+    /// Also re-anchors `audio_offset_anchor_seconds` to `new_anchor` so the
+    /// chunk-offset formula stays continuous with wall-clock session time —
+    /// without this, the post-swap `session_start_pos` would map to the
+    /// old anchor (typically `ctx.session_offset_base_seconds`), silently
+    /// rewinding every subsequent chunk's offset by however many seconds
+    /// of wall clock have elapsed inside the current loop. Callers compute
+    /// `new_anchor` as `ctx.session_offset_base_seconds + ctx.session_start_instant.elapsed()`.
+    ///
+    /// Preserves cross-buffer state: `chunk_index`, `accumulated_text`.
+    /// `dictation_consumed_through` and `flushed_open_at` are caller-managed
+    /// (reset in `handle_buffer_replacement` for mic sources) — they are
+    /// ring-buffer positions and would also be invalid against the new
+    /// buffer, but only the live loop knows whether this source is the
+    /// mic in a Session runtime, so the policy lives there.
+    fn reset_for_buffer_replacement(
+        &mut self,
+        new_pos: usize,
+        sample_rate: u32,
+        channels: u16,
+        new_anchor: f32,
+    ) {
         self.is_speaking = false;
         self.speech_start_pos = new_pos;
         self.cursor = new_pos;
         self.speech_start_time = None;
         self.silence_since = None;
         self.session_start_pos = new_pos;
+        self.audio_offset_anchor_seconds = new_anchor;
         self.source_sample_rate = sample_rate;
         self.source_channels = channels;
         self.last_seen_write_pos = new_pos;
@@ -1479,7 +1516,6 @@ async fn prepare_chunk_dispatch(
     audio_state: &AudioManagerState,
     is_force_chunk: bool,
     origin: JobOrigin,
-    session_offset_base_seconds: f32,
     max_chunk_duration: Duration,
 ) -> Option<PreparedChunk> {
     prepare_chunk_dispatch_inner(
@@ -1487,7 +1523,6 @@ async fn prepare_chunk_dispatch(
         audio_state,
         is_force_chunk,
         origin,
-        session_offset_base_seconds,
         max_chunk_duration,
         None,
     )
@@ -1525,7 +1560,6 @@ async fn dispatch_pre_window_flush(
         audio_state,
         true,
         JobOrigin::Live,
-        ctx.session_offset_base_seconds,
         max_chunk_duration,
         ceiling_pos,
     )
@@ -1570,7 +1604,6 @@ async fn prepare_chunk_dispatch_until(
     audio_state: &AudioManagerState,
     is_force_chunk: bool,
     origin: JobOrigin,
-    session_offset_base_seconds: f32,
     max_chunk_duration: Duration,
     ceiling_pos: usize,
 ) -> Option<PreparedChunk> {
@@ -1579,7 +1612,6 @@ async fn prepare_chunk_dispatch_until(
         audio_state,
         is_force_chunk,
         origin,
-        session_offset_base_seconds,
         max_chunk_duration,
         Some(ceiling_pos),
     )
@@ -1591,7 +1623,6 @@ async fn prepare_chunk_dispatch_inner(
     audio_state: &AudioManagerState,
     is_force_chunk: bool,
     origin: JobOrigin,
-    session_offset_base_seconds: f32,
     max_chunk_duration: Duration,
     ceiling_pos: Option<usize>,
 ) -> Option<PreparedChunk> {
@@ -1645,11 +1676,15 @@ async fn prepare_chunk_dispatch_inner(
     let drain_backlog_seconds = current_pos.saturating_sub(extraction.end_pos) as f32
         / (vad.source_sample_rate as f32 * vad.source_channels as f32);
 
-    // Deterministic offset from buffer position delta. On a resumed Session,
-    // `session_offset_base_seconds` shifts every live offset past the prior
-    // parts' cumulative duration so persisted Segments stay continuous.
+    // Deterministic offset from buffer position delta. The anchor encodes
+    // "session-time at which this source's `session_start_pos` was set" —
+    // at loop entry it equals `ctx.session_offset_base_seconds` (so persisted
+    // Segments stay continuous past prior session parts on resume), and on
+    // every `BufferReplaced` it advances by the wall-clock time elapsed
+    // inside the current loop, keeping post-swap chunks aligned with real
+    // session-time instead of silently rewinding by minutes.
     let samples_since_start = extraction.start_pos.saturating_sub(vad.session_start_pos);
-    let audio_offset = session_offset_base_seconds
+    let audio_offset = vad.audio_offset_anchor_seconds
         + samples_since_start as f32 / (vad.source_sample_rate as f32 * vad.source_channels as f32);
 
     debug!(
@@ -2436,10 +2471,15 @@ fn source_display_name(label: &AudioSourceLabel) -> &'static str {
 /// buffer-replacing restart can reset the WAV writer's flush position;
 /// otherwise the old position against the fresh buffer stalls writes until
 /// the new counter climbs past it.
+#[allow(clippy::too_many_arguments)]
 async fn check_stream_health(
     sources: &mut [SourceVadState],
     audio_state: &AudioManagerState,
-    app_handle: &AppHandle,
+    ctx: &TranscriptionContext,
+    counters: &Arc<StdMutex<SessionCounters>>,
+    prompt: &Arc<StdMutex<PromptState>>,
+    chunk_tasks: &mut futures_util::stream::FuturesUnordered<ChunkTaskFuture>,
+    pending_outcomes: &mut Vec<ChunkTaskOutcome>,
     mut session_wav_state: Option<&mut SessionWavState>,
     is_mixed: bool,
 ) -> bool {
@@ -2468,15 +2508,36 @@ async fn check_stream_health(
         let ws_borrow = session_wav_state.as_deref_mut();
         // Watchdog-driven restart: cpal error or write-pos stall. The
         // bound device is presumed still correct; just the stream died.
-        attempt_source_restart(
+        let report = attempt_source_restart(
             source,
             audio_state,
-            app_handle,
-            ws_borrow,
+            ctx,
             &reason,
             yapstack_audio::manager::RestartTarget::PreserveBinding,
         )
         .await;
+        if let Some(mut report) = report {
+            if report.outcome == yapstack_audio::manager::RestartOutcome::BufferReplaced {
+                // `.take()` moves the Arc out of the report; the manager's
+                // own handle has already been dropped, so this is the only
+                // remaining reference to the old buffer (callers own the
+                // unique handle once they observe `BufferReplaced`).
+                let previous_buffer = report.previous_buffer.take();
+                handle_buffer_replacement(
+                    source,
+                    audio_state,
+                    ctx,
+                    counters,
+                    prompt,
+                    chunk_tasks,
+                    pending_outcomes,
+                    previous_buffer,
+                    ws_borrow,
+                    source_display_name(&source.label),
+                )
+                .await;
+            }
+        }
     }
 
     // Mixed mid-capture fail-fast. The user's intent with Mixed is
@@ -2534,14 +2595,28 @@ async fn evaluate_speculative_signals(
 /// retry counter and clears the cooldown so the next tick can try again
 /// immediately instead of waiting 5 s. Emits a `stream-health` event in
 /// every outcome.
+/// Run a single stream-restart attempt and update `source.restart_attempts`
+/// / `last_restart_at` bookkeeping. **Does not** handle buffer replacement —
+/// the caller inspects the returned `RestartReport` and, if
+/// `outcome == BufferReplaced`, calls `handle_buffer_replacement` with the
+/// full set of live-loop state it needs (`chunk_tasks`, `pending_outcomes`,
+/// `session_wav_state`). Splitting these responsibilities lets the rescue
+/// path coordinate with the in-flight task drain without re-plumbing those
+/// fields through the stream-error code path.
+///
+/// Returns `Some(report)` on success and `None` on error (where
+/// `restart_attempts` was already incremented and a `stream-health` event
+/// emitted). Same-device rebinds still return `Some` because they're a
+/// successful manager call — the caller's `BufferReplaced` check will be
+/// false so no rescue runs, but the stream-health event is emitted.
 async fn attempt_source_restart(
     source: &mut SourceVadState,
     audio_state: &AudioManagerState,
-    app_handle: &AppHandle,
-    mut session_wav_state: Option<&mut SessionWavState>,
+    ctx: &TranscriptionContext,
     reason: &str,
     target: yapstack_audio::manager::RestartTarget,
-) {
+) -> Option<yapstack_audio::manager::RestartReport> {
+    let app_handle = &ctx.app_handle;
     let source_name = source_display_name(&source.label);
     warn!(
         "stream health: {} needs restart ({}, target={:?}), attempt {}/{}",
@@ -2595,12 +2670,6 @@ async fn attempt_source_restart(
                 source.last_write_pos_advance = Instant::now();
             }
 
-            if report.outcome == yapstack_audio::manager::RestartOutcome::BufferReplaced {
-                #[allow(clippy::needless_option_as_deref)]
-                let ws_borrow = session_wav_state.as_deref_mut();
-                handle_buffer_replacement(source, audio_state, ws_borrow, source_name).await;
-            }
-
             let _ = app_handle.emit(
                 "stream-health",
                 StreamHealthEvent {
@@ -2610,6 +2679,7 @@ async fn attempt_source_restart(
                     bound_device_name: report.bound_device_name.clone(),
                 },
             );
+            Some(report)
         }
         Err(e) => {
             source.restart_attempts += 1;
@@ -2634,23 +2704,85 @@ async fn attempt_source_restart(
                     bound_device_name: None,
                 },
             );
+            None
         }
     }
 }
 
-/// Buffer-replaced restart bookkeeping. Reads the fresh buffer's metadata
-/// (sample rate, channels, write_pos) and resets every cursor on the source
-/// to point into the new buffer. Also resets just this source's
-/// `flush_positions` on the WAV writer — leaving the old position would stall
-/// WAV writes until the new buffer's counter climbs past it. Sample-rate
-/// mismatch is logged; the per-tick write path resamples on the fly.
+/// Buffer-replaced bookkeeping. Coordinates the full set of state that gets
+/// invalidated when a ring buffer is swapped out from under us, in an order
+/// that preserves audio continuity *and* the per-source one-in-flight-task
+/// invariant.
+///
+/// Steps (in order):
+///
+/// 1. **Snapshot the swap instant** — read the new buffer's `write_pos` and
+///    sample `session_start_instant.elapsed()` together, before any other
+///    await. The new buffer received its first samples at the manager's
+///    `restart_*` return; reading `write_pos` *now* picks up whatever cpal
+///    has written since, and pairing it with `elapsed()` locks the session-
+///    time → buffer-position bijection at the swap moment. Doing this
+///    *before* the in-flight drain and the pre-swap rescue prevents the
+///    seconds of slow await work from shifting the new anchor forward and
+///    silently discarding audio captured during the rescue window.
+///
+/// 2. **Drain the source's in-flight chunk task**, if any, so the rescue
+///    dispatch below sees the latest `accumulated_text` and doesn't race
+///    a still-running task's outcome. Other sources' outcomes that arrive
+///    in the meantime are pushed onto `pending_outcomes` so the next normal
+///    loop tick applies them — preserves the global drain contract.
+///
+/// 3. **Rescue pre-swap audio** by spawning a `FinalFlush` chunk into
+///    `chunk_tasks` with the *old* anchor and old source format. The chunk
+///    starts at `speech_start_pos` (not `cursor`) so a pending utterance
+///    that hasn't been dispatched yet — typically due to pre-roll
+///    extending the start before the latest extraction, or a previous
+///    too-short extraction — isn't truncated at the front. This goes
+///    through the same chunk_tasks pipeline as a normal dispatch
+///    (`mem::take(accumulated_text)`, `has_in_flight_task = true`,
+///    `chunk_index` increment), so the global text-restoration contract
+///    holds.
+///
+/// 4. **Rescue session-WAV audio** by reading `[ws.flush_positions.*pos,
+///    prev_buf.write_pos)` from `previous_buffer` and appending it to the
+///    WAV with resampling. Scope: `MicOnly` and `SystemOnly` capture
+///    sources; `Mixed` logs a warning and skips (rescuing the mix would
+///    require both sources' old buffers at the same instant and is out of
+///    scope for V1).
+///
+/// 5. **Reset position state and re-anchor** using the values snapshotted
+///    in step 1. After this, the source's `session_start_pos = new_pos@swap`
+///    and `audio_offset_anchor_seconds = new_anchor@swap`. Any audio
+///    captured between the swap instant and now is past `session_start_pos`
+///    and will be picked up by the next chunk extraction.
+///
+/// 6. **Purge `dictation_owns_mic` on Mic-Session.** Closed and open
+///    windows store positions in the old mic ring's coordinate space; the
+///    next session tick would consume them against the new buffer and call
+///    `reset_vad_past(old_end)` which is past the new buffer's `write_pos`.
+///    `clear_for_session` drops both. Any dictation in flight at the moment
+///    of swap loses its session-side bookkeeping — the dictation runtime
+///    handles its own `BufferReplaced` event independently. Also clears
+///    this source's `dictation_consumed_through` / `flushed_open_at` for
+///    the same reason.
+///
+/// 7. **Update WAV flush_positions** to `new_pos@swap`. Done last so the
+///    step-4 rescue isn't re-extracted on the next tick.
+#[allow(clippy::too_many_arguments)]
 async fn handle_buffer_replacement(
     source: &mut SourceVadState,
     audio_state: &AudioManagerState,
-    session_wav_state: Option<&mut SessionWavState>,
+    ctx: &TranscriptionContext,
+    counters: &Arc<StdMutex<SessionCounters>>,
+    prompt: &Arc<StdMutex<PromptState>>,
+    chunk_tasks: &mut futures_util::stream::FuturesUnordered<ChunkTaskFuture>,
+    pending_outcomes: &mut Vec<ChunkTaskOutcome>,
+    previous_buffer: Option<yapstack_audio::SharedAudioRingBuffer>,
+    mut session_wav_state: Option<&mut SessionWavState>,
     source_name: &str,
 ) {
-    let (new_pos, sr, ch) = {
+    // (1) Snapshot the swap instant.
+    let (new_pos_at_swap, new_sr, new_ch) = {
         let manager = audio_state.lock().await;
         let info = match source.label {
             AudioSourceLabel::Mic => manager.mic_buffer_info(),
@@ -2663,24 +2795,448 @@ async fn handle_buffer_replacement(
             source.source_channels,
         ))
     };
-    source.reset_for_buffer_replacement(new_pos, sr, ch);
+    let elapsed_secs = ctx.session_start_instant.elapsed().as_secs_f32();
+    let new_anchor = ctx.session_offset_base_seconds + elapsed_secs;
+
+    // Snapshot every pre-swap value used below before mutating `source`.
+    let old_anchor = source.audio_offset_anchor_seconds;
+    let old_session_start_pos = source.session_start_pos;
+    // Pre-swap rescue extracts from `speech_start_pos`, not `cursor`: a
+    // pending utterance can have `speech_start_pos < cursor` after a
+    // pre-roll rewind or a too-short extraction (see prepare_chunk_dispatch_inner).
+    let old_speech_start_pos = source.speech_start_pos;
+    let old_sr = source.source_sample_rate;
+    let old_ch = source.source_channels;
+    let source_label = source.label;
+
+    // (1a) Mic-Session: rebase dictation_owns_mic *before* the rescues.
+    // Capture the dropped closed windows and the prior open start in OLD
+    // coordinates so the rescue helpers can truncate their extraction
+    // range at the earliest dictation boundary inside it (dictated audio
+    // must never leak into session content). Rebasing the open window's
+    // start to `new_pos_at_swap` keeps the in-flight dictation safe — the
+    // dictation runtime experiences its own buffer-replacement event on
+    // its own SourceVadState and will record the eventual `close(end)` in
+    // new-buffer coordinates, matching the rebased start. This replaces
+    // the previous `clear_for_session()` call which was unsafe while a
+    // dictation was actively owning the mic (it would unwind the open
+    // window and let dictated audio leak into subsequent session segments).
+    let dictation_rebase = if matches!(source.label, AudioSourceLabel::Mic)
+        && matches!(ctx.config.source_kind, LiveSourceKind::Session)
+    {
+        Some(
+            ctx.dictation_owns_mic
+                .rebase_for_mic_buffer_replacement(new_pos_at_swap as u64),
+        )
+    } else {
+        None
+    };
+    // Earliest dictation boundary inside [old_speech_start_pos, old_write_pos).
+    // Used to truncate both the transcript rescue and the WAV rescue so
+    // dictated audio captured before the swap doesn't end up in the
+    // session's transcript or recording. None means the rescue can run
+    // to the full extent of the old buffer.
+    let dictation_truncate_at = dictation_rebase.as_ref().and_then(|r| {
+        let range_end_hint = previous_buffer
+            .as_ref()
+            .map(|b| b.samples_written())
+            .unwrap_or(old_speech_start_pos);
+        earliest_dictation_start_in_range(old_speech_start_pos, range_end_hint, r)
+    });
+
+    // (2) Drain in-flight task for this source so the rescue's
+    // `mem::take(accumulated_text)` and `has_in_flight_task` writes don't
+    // race a still-running task's outcome.
+    if source.has_in_flight_task {
+        drain_in_flight_for_source(source, chunk_tasks, pending_outcomes).await;
+    }
+
+    // (3) Spawn the pre-swap transcription rescue.
+    let rescue_audio = previous_buffer.as_ref().and_then(|prev| {
+        spawn_pre_swap_rescue_chunk(
+            source,
+            prev,
+            old_anchor,
+            old_session_start_pos,
+            old_speech_start_pos,
+            old_sr,
+            old_ch,
+            dictation_truncate_at,
+            ctx,
+            counters,
+            prompt,
+            chunk_tasks,
+        )
+    });
+
+    // (4) Rescue session-WAV audio from the old buffer (MicOnly / SystemOnly).
+    let wav_rescue = if let (Some(prev), Some(ws)) =
+        (previous_buffer.as_ref(), session_wav_state.as_deref_mut())
+    {
+        rescue_pre_swap_wav_audio(ws, prev, source.label, dictation_truncate_at, source_name)
+    } else {
+        None
+    };
+
+    // (5) Reset position state and re-anchor.
+    source.reset_for_buffer_replacement(new_pos_at_swap, new_sr, new_ch, new_anchor);
+
+    // (6) Mic-Session: clear the source's local mic-ownership cursors.
+    // dictation_owns_mic itself was already rebased in step (1a) — the
+    // open window (if any) now points into the new buffer's coordinate
+    // space, the dropped closed windows are consumed by the rescue
+    // truncation, and no `clear_for_session` is needed.
+    if matches!(source.label, AudioSourceLabel::Mic)
+        && matches!(ctx.config.source_kind, LiveSourceKind::Session)
+    {
+        source.dictation_consumed_through = 0;
+        source.flushed_open_at = None;
+    }
+
+    // (7) Update WAV flush positions and log.
+    let (rescue_samples, rescue_duration_secs) = rescue_audio.unwrap_or((0, 0.0));
+    let (wav_rescue_samples, wav_rescue_duration_secs) = wav_rescue.unwrap_or((0, 0.0));
+    let dictation_rebase_info = dictation_rebase.as_ref();
+    info!(
+        marker = "buffer_replaced_rebase",
+        source = ?source_label,
+        old_anchor_secs = old_anchor,
+        new_anchor_secs = new_anchor,
+        anchor_delta_secs = new_anchor - old_anchor,
+        elapsed_in_loop_secs = elapsed_secs,
+        rescue_chunk_samples = rescue_samples,
+        rescue_chunk_duration_secs = rescue_duration_secs,
+        wav_rescue_samples,
+        wav_rescue_duration_secs,
+        new_write_pos = new_pos_at_swap,
+        new_sample_rate = new_sr,
+        new_channels = new_ch,
+        dictation_dropped_closed = dictation_rebase_info.map(|r| r.dropped_closed.len()).unwrap_or(0),
+        dictation_prior_open = ?dictation_rebase_info.and_then(|r| r.prior_open),
+        dictation_new_open = ?dictation_rebase_info.and_then(|r| r.new_open),
+        dictation_truncate_at = ?dictation_truncate_at,
+        "rebased source on buffer replacement"
+    );
     warn!(
         "{} buffer replaced on restart ({}Hz/{}ch) — source state reset",
-        source_name, sr, ch
+        source_name, new_sr, new_ch
     );
 
     if let Some(ws) = session_wav_state {
         match source.label {
-            AudioSourceLabel::Mic => ws.flush_positions.mic_pos = new_pos,
-            AudioSourceLabel::System => ws.flush_positions.system_pos = new_pos,
+            AudioSourceLabel::Mic => ws.flush_positions.mic_pos = new_pos_at_swap,
+            AudioSourceLabel::System => ws.flush_positions.system_pos = new_pos_at_swap,
         }
-        if sr != ws.wav_sample_rate {
+        if new_sr != ws.wav_sample_rate {
             info!(
                 "WAV sample-rate mismatch on {} rebind: writer={}Hz, new buffer={}Hz — extracted samples will be resampled on write",
-                source_name, ws.wav_sample_rate, sr
+                source_name, ws.wav_sample_rate, new_sr
             );
         }
     }
+}
+
+/// Earliest mic-buffer position inside `[range_start, range_end)` at which a
+/// dictation window begins. Used to truncate a pre-swap rescue range so
+/// dictated audio doesn't leak into session content.
+///
+/// Walks both the closed windows just drained by
+/// `DictationOwnsMic::rebase_for_mic_buffer_replacement` and the prior open
+/// start. All positions are in OLD mic-ring coordinates, same as the
+/// rescue range.
+fn earliest_dictation_start_in_range(
+    range_start: usize,
+    range_end: usize,
+    rebase: &super::transcription::DictationRebaseResult,
+) -> Option<usize> {
+    if range_start >= range_end {
+        return None;
+    }
+    let mut earliest: Option<u64> = None;
+    let consider = |earliest: &mut Option<u64>, pos: u64| {
+        if (pos as usize) >= range_start && (pos as usize) < range_end {
+            *earliest = Some(earliest.map_or(pos, |e: u64| e.min(pos)));
+        }
+    };
+    for w in &rebase.dropped_closed {
+        consider(&mut earliest, w.start);
+    }
+    if let Some(open_start) = rebase.prior_open {
+        consider(&mut earliest, open_start);
+    }
+    earliest.map(|e| e as usize)
+}
+
+/// Drain `chunk_tasks` until the in-flight task for `source.label` lands.
+/// Other sources' outcomes are queued onto `pending_outcomes` so the next
+/// normal loop tick applies them; we can't drop them or apply them inline
+/// because each source's outcome must be matched against its own
+/// `SourceVadState`. Returns early if `chunk_tasks` is unexpectedly empty —
+/// the `has_in_flight_task` flag is set in lockstep with the push, so this
+/// only happens on programmer error and is treated as a soft failure
+/// (clear the flag and continue).
+async fn drain_in_flight_for_source(
+    source: &mut SourceVadState,
+    chunk_tasks: &mut futures_util::stream::FuturesUnordered<ChunkTaskFuture>,
+    pending_outcomes: &mut Vec<ChunkTaskOutcome>,
+) {
+    use futures_util::stream::StreamExt;
+    while source.has_in_flight_task {
+        let Some(outcome) = chunk_tasks.next().await else {
+            warn!(
+                marker = "buffer_replaced_drain_empty",
+                source = ?source.label,
+                "expected in-flight chunk task on source, but chunk_tasks is empty; \
+                 clearing has_in_flight_task to unblock"
+            );
+            source.has_in_flight_task = false;
+            return;
+        };
+        if outcome.source_label == source.label {
+            source.accumulated_text = outcome.accumulated_text;
+            source.has_in_flight_task = false;
+            if outcome.sidecar_dead {
+                // Queue so the main loop's `fatal` check sees it. Use
+                // pending_outcomes (same as the normal drain path).
+                pending_outcomes.push(ChunkTaskOutcome {
+                    source_label: outcome.source_label,
+                    accumulated_text: source.accumulated_text.clone(),
+                    sidecar_dead: true,
+                });
+            }
+        } else {
+            pending_outcomes.push(outcome);
+        }
+    }
+}
+
+/// Extract `[old_speech_start_pos, old_write_pos)` from the just-swapped-out
+/// ring, deinterleave to mono, and **spawn** a `FinalFlush` chunk into
+/// `chunk_tasks`. Uses the *old* anchor / sample rate / channel count so the
+/// resulting segment's `audio_offset_seconds` reflects pre-swap session-time
+/// even though the transcribe happens after the swap. Mutates source state
+/// exactly the way a normal `prepare_chunk_dispatch` call does (taking
+/// `accumulated_text`, bumping `chunk_index`, setting `has_in_flight_task =
+/// true`) — the global text-restoration contract relies on this so a later
+/// outcome can apply cleanly.
+///
+/// Returns `Some((sample_count, duration_secs))` when a chunk was queued,
+/// `None` for empty / sub-threshold extractions. Caller must have already
+/// drained any prior in-flight task on this source (see
+/// `drain_in_flight_for_source`) — this helper assumes
+/// `source.has_in_flight_task == false`.
+#[allow(clippy::too_many_arguments)]
+fn spawn_pre_swap_rescue_chunk(
+    source: &mut SourceVadState,
+    previous_buffer: &yapstack_audio::SharedAudioRingBuffer,
+    old_anchor: f32,
+    old_session_start_pos: usize,
+    old_speech_start_pos: usize,
+    old_sr: u32,
+    old_ch: u16,
+    // Earliest mic-buffer position inside the rescue range where a
+    // dictation window begins. The rescue is clamped to end here so
+    // dictated audio doesn't leak into the session transcript. `None`
+    // means no dictation overlap — extract through to the old write
+    // position. Always `None` for non-mic sources (System audio is
+    // never dictated).
+    dictation_truncate_at: Option<usize>,
+    ctx: &TranscriptionContext,
+    counters: &Arc<StdMutex<SessionCounters>>,
+    prompt: &Arc<StdMutex<PromptState>>,
+    chunk_tasks: &mut futures_util::stream::FuturesUnordered<ChunkTaskFuture>,
+) -> Option<(usize, f32)> {
+    let old_write_pos = previous_buffer.samples_written();
+    let effective_end = dictation_truncate_at
+        .map(|d| d.min(old_write_pos))
+        .unwrap_or(old_write_pos);
+    if effective_end <= old_speech_start_pos {
+        return None;
+    }
+    let snapshot = previous_buffer.snapshot_range(old_speech_start_pos, effective_end);
+    if snapshot.samples.is_empty() {
+        return None;
+    }
+    if snapshot.overrun {
+        warn!(
+            marker = "buffer_replaced_overrun",
+            source = ?source.label,
+            requested_start = old_speech_start_pos,
+            actual_start = snapshot.start_pos,
+            end = snapshot.end_pos,
+            "previous buffer overran before pre-swap rescue could read it; \
+             oldest unconsumed samples were lost"
+        );
+    }
+    let mono = yapstack_common::audio::deinterleave_to_mono(&snapshot.samples, old_ch).into_owned();
+    if mono.is_empty() {
+        return None;
+    }
+    let duration = mono.len() as f32 / old_sr as f32;
+    if duration < MIN_CHUNK_DURATION_SECS {
+        return None;
+    }
+
+    let samples_since_start = snapshot.start_pos.saturating_sub(old_session_start_pos);
+    let audio_offset_seconds =
+        old_anchor + samples_since_start as f32 / (old_sr as f32 * old_ch as f32);
+
+    let chunk_index = source.chunk_index;
+    source.chunk_index = source.chunk_index.wrapping_add(1);
+    let accumulated_text = std::mem::take(&mut source.accumulated_text);
+
+    let sample_count = mono.len();
+    let source_label = source.label;
+    let prepared = PreparedChunk {
+        samples: mono,
+        sample_rate: old_sr,
+        audio_offset_seconds,
+        source_label,
+        chunk_index,
+        accumulated_text: accumulated_text.clone(),
+        origin: JobOrigin::FinalFlush,
+        drain_backlog_seconds: 0.0,
+    };
+
+    // Mark the source as in-flight via this rescue task. The normal
+    // dispatch path's pending_outcomes drain will restore
+    // `accumulated_text` from the rescue's outcome — same lifecycle as a
+    // regular chunk.
+    source.has_in_flight_task = true;
+    source.force_drain = false;
+
+    let task_ctx = ctx.clone();
+    let task_counters = counters.clone();
+    let task_prompt = prompt.clone();
+    let handle = tokio::spawn(async move {
+        run_chunk_task(prepared, task_ctx, task_counters, task_prompt).await
+    });
+    chunk_tasks.push(Box::pin(async move {
+        match handle.await {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                error!(
+                    "pre-swap rescue task panicked or was cancelled for source {:?}: {} \
+                     — synthesizing outcome to free dispatch",
+                    source_label, e
+                );
+                ChunkTaskOutcome {
+                    source_label,
+                    accumulated_text,
+                    sidecar_dead: false,
+                }
+            }
+        }
+    }));
+    Some((sample_count, duration))
+}
+
+/// Read `[ws.flush_positions.<source>_pos, prev_buf.write_pos)` from the old
+/// ring and append it to the session WAV with resampling. Bridges the gap
+/// that would otherwise appear in the persisted audio file when a buffer is
+/// replaced between WAV flushes.
+///
+/// Scope: `MicOnly` and `SystemOnly` only. `Mixed` requires both sources'
+/// old buffers at the swap instant for a faithful re-mix; only one source's
+/// `previous_buffer` is available here, and falling back to "mix old-mic
+/// with new-system" (or vice versa) would splice across the device boundary.
+/// We log a warning and skip — the gap is bounded by the WAV-flush interval
+/// (~100ms typical) and the WAV continues correctly from `new_pos_at_swap`.
+///
+/// Returns `Some((sample_count, duration_secs))` when audio was rescued,
+/// `None` for empty extractions or unsupported capture modes.
+fn rescue_pre_swap_wav_audio(
+    ws: &mut SessionWavState,
+    previous_buffer: &yapstack_audio::SharedAudioRingBuffer,
+    source_label: AudioSourceLabel,
+    // Earliest mic-buffer position inside the WAV rescue range where a
+    // dictation window begins. The rescue is clamped to end here so
+    // dictated audio doesn't appear in the persisted recording. `None`
+    // means no dictation overlap or non-mic source. Always `None` for
+    // System audio.
+    dictation_truncate_at: Option<usize>,
+    source_name: &str,
+) -> Option<(usize, f32)> {
+    let old_flush_pos = match source_label {
+        AudioSourceLabel::Mic => ws.flush_positions.mic_pos,
+        AudioSourceLabel::System => ws.flush_positions.system_pos,
+    };
+    match ws.source {
+        CaptureSource::MicOnly if !matches!(source_label, AudioSourceLabel::Mic) => return None,
+        CaptureSource::SystemOnly if !matches!(source_label, AudioSourceLabel::System) => {
+            return None
+        }
+        CaptureSource::Mixed => {
+            warn!(
+                marker = "buffer_replaced_wav_gap_mixed",
+                source = ?source_label,
+                "Mixed-mode session WAV rescue is out of scope; pre-swap audio \
+                 between last flush and swap is lost from the recorded file. \
+                 The transcript rescue covers the same range so transcription \
+                 continuity is preserved."
+            );
+            return None;
+        }
+        _ => {}
+    }
+
+    let old_write_pos = previous_buffer.samples_written();
+    let effective_end = dictation_truncate_at
+        .map(|d| d.min(old_write_pos))
+        .unwrap_or(old_write_pos);
+    if effective_end <= old_flush_pos {
+        return None;
+    }
+    let snapshot = previous_buffer.snapshot_range(old_flush_pos, effective_end);
+    if snapshot.samples.is_empty() {
+        return None;
+    }
+    if snapshot.overrun {
+        warn!(
+            marker = "buffer_replaced_wav_overrun",
+            source = ?source_label,
+            requested_start = old_flush_pos,
+            actual_start = snapshot.start_pos,
+            "previous buffer overran before WAV rescue could read it; \
+             oldest pre-swap WAV samples were lost"
+        );
+    }
+    let mono = yapstack_common::audio::deinterleave_to_mono(
+        &snapshot.samples,
+        previous_buffer.channels(),
+    )
+    .into_owned();
+    if mono.is_empty() {
+        return None;
+    }
+    let prev_sr = previous_buffer.sample_rate();
+    let to_write: std::borrow::Cow<[f32]> = if prev_sr == ws.wav_sample_rate {
+        std::borrow::Cow::Borrowed(&mono)
+    } else {
+        match yapstack_common::audio::resample(&mono, prev_sr, ws.wav_sample_rate) {
+            Ok(cow) => std::borrow::Cow::Owned(cow.into_owned()),
+            Err(e) => {
+                error!(
+                    "WAV pre-swap rescue resample {}Hz → {}Hz failed, dropping {} samples: {}",
+                    prev_sr,
+                    ws.wav_sample_rate,
+                    mono.len(),
+                    e
+                );
+                return None;
+            }
+        }
+    };
+    let written = to_write.len();
+    if let Err(e) = ws.writer.write_samples(&to_write) {
+        error!(
+            "session WAV pre-swap rescue write error ({} samples may be lost) on {}: {}",
+            written, source_name, e
+        );
+        return None;
+    }
+    let duration = mono.len() as f32 / prev_sr as f32;
+    Some((written, duration))
 }
 
 async fn live_transcription_loop(
@@ -2714,6 +3270,7 @@ async fn live_transcription_loop(
         check_system,
         source,
         ctx.dictation_start_pos,
+        ctx.session_offset_base_seconds,
     )
     .await;
 
@@ -2857,15 +3414,34 @@ async fn live_transcription_loop(
                     // not the previously-bound one — probe the new
                     // default first and let `restart_mic` fall through
                     // to stored id/name only if the OS hasn't settled.
-                    attempt_source_restart(
+                    let report = attempt_source_restart(
                         source,
                         &audio_state,
-                        &ctx.app_handle,
-                        ws_borrow,
+                        &ctx,
                         "device-change",
                         yapstack_audio::manager::RestartTarget::FollowDefault,
                     )
                     .await;
+                    if let Some(mut report) = report {
+                        if report.outcome
+                            == yapstack_audio::manager::RestartOutcome::BufferReplaced
+                        {
+                            let previous_buffer = report.previous_buffer.take();
+                            handle_buffer_replacement(
+                                source,
+                                &audio_state,
+                                &ctx,
+                                &counters,
+                                &prompt,
+                                &mut chunk_tasks,
+                                &mut pending_outcomes,
+                                previous_buffer,
+                                ws_borrow,
+                                source_display_name(&source.label),
+                            )
+                            .await;
+                        }
+                    }
                 }
                 None
             }
@@ -3006,7 +3582,11 @@ async fn live_transcription_loop(
         let mixed_fail_fast = check_stream_health(
             &mut sources,
             &audio_state,
-            &ctx.app_handle,
+            &ctx,
+            &counters,
+            &prompt,
+            &mut chunk_tasks,
+            &mut pending_outcomes,
             session_wav_state.as_mut(),
             matches!(source, CaptureSource::Mixed),
         )
@@ -3264,7 +3844,6 @@ async fn live_transcription_loop(
                         &audio_state,
                         is_force,
                         *origin,
-                        ctx.session_offset_base_seconds,
                         tuning.max_chunk_duration,
                     )
                     .await;
@@ -3382,7 +3961,6 @@ async fn live_transcription_loop(
         copy_final_pending_chunks_until(
             &sources,
             &audio_state,
-            &ctx,
             tuning.max_chunk_duration,
             &req.positions,
             skip_mic,
@@ -3536,6 +4114,11 @@ async fn build_initial_sources_and_backfill(
     check_system: bool,
     source: CaptureSource,
     dictation_start_pos: Option<u64>,
+    // Initial anchor for every source's `audio_offset_anchor_seconds`. Equal
+    // to `ctx.session_offset_base_seconds` at loop entry (the "prior parts
+    // duration" baked into the resume contract). Sources mutate their own
+    // anchor on `BufferReplaced`; this argument only seeds the value.
+    session_offset_base_seconds: f32,
 ) -> (Vec<SourceVadState>, Vec<(Vec<f32>, u32, AudioSourceLabel)>) {
     let manager = audio_state.lock().await;
     let positions = manager.buffer_positions();
@@ -3578,6 +4161,7 @@ async fn build_initial_sources_and_backfill(
             session_start,
             sr,
             ch,
+            session_offset_base_seconds,
         ));
     }
     if check_system {
@@ -3598,6 +4182,7 @@ async fn build_initial_sources_and_backfill(
                 session_start,
                 sr,
                 ch,
+                session_offset_base_seconds,
             ));
         } else if matches!(source, CaptureSource::Mixed) {
             warn!("mixed mode: system buffer unavailable, running mic-only");
@@ -3779,7 +4364,6 @@ struct FinalPendingChunk {
 async fn copy_final_pending_chunks_until(
     sources: &[SourceVadState],
     audio_state: &AudioManagerState,
-    ctx: &TranscriptionContext,
     max_chunk_duration: Duration,
     stop_positions: &BufferPositions,
     skip_mic: bool,
@@ -3830,7 +4414,14 @@ async fn copy_final_pending_chunks_until(
                 let samples_since_start = extraction
                     .start_pos
                     .saturating_sub(source.session_start_pos);
-                let audio_offset_seconds = ctx.session_offset_base_seconds
+                // Per-source anchor (not the session-wide offset_base) — see
+                // the rationale at the main offset-formula site in
+                // `prepare_chunk_dispatch_inner`. Without this, the final
+                // pre-stop flush on a session that has experienced any
+                // buffer replacement would stamp this chunk with a
+                // pre-replacement offset, conflicting with everything
+                // dispatched since the swap.
+                let audio_offset_seconds = source.audio_offset_anchor_seconds
                     + samples_since_start as f32
                         / (source.source_sample_rate as f32 * source.source_channels as f32);
                 pending.push(FinalPendingChunk {
@@ -3946,7 +4537,6 @@ async fn dispatch_final_pending_chunks(
                 audio_state,
                 true,
                 JobOrigin::FinalFlush,
-                ctx.session_offset_base_seconds,
                 max_chunk_duration,
             )
             .await;
@@ -5495,7 +6085,7 @@ mod tests {
 
     #[test]
     fn test_poll_vad_silence_returns_none() {
-        let mut state = SourceVadState::new(AudioSourceLabel::Mic, 0, 0, 48000, 1);
+        let mut state = SourceVadState::new(AudioSourceLabel::Mic, 0, 0, 48000, 1, 0.0);
         // Below threshold while not speaking → None, stays not-speaking
         let action = poll(&mut state, Some(0.10));
         assert!(matches!(action, VadAction::None));
@@ -5504,7 +6094,7 @@ mod tests {
 
     #[test]
     fn test_poll_vad_speech_onset() {
-        let mut state = SourceVadState::new(AudioSourceLabel::Mic, 0, 0, 48000, 1);
+        let mut state = SourceVadState::new(AudioSourceLabel::Mic, 0, 0, 48000, 1, 0.0);
         // Above threshold while not speaking → transitions to speaking
         let action = poll(&mut state, Some(0.90));
         assert!(matches!(action, VadAction::None));
@@ -5514,7 +6104,7 @@ mod tests {
 
     #[test]
     fn test_poll_vad_loud_clears_silence_timer() {
-        let mut state = SourceVadState::new(AudioSourceLabel::Mic, 0, 0, 48000, 1);
+        let mut state = SourceVadState::new(AudioSourceLabel::Mic, 0, 0, 48000, 1, 0.0);
         state.is_speaking = true;
         state.speech_start_time = Some(Instant::now());
         state.silence_since = Some(Instant::now()); // had some silence accumulating
@@ -5526,7 +6116,7 @@ mod tests {
 
     #[test]
     fn test_poll_vad_energy_at_exact_threshold() {
-        let mut state = SourceVadState::new(AudioSourceLabel::Mic, 0, 0, 48000, 1);
+        let mut state = SourceVadState::new(AudioSourceLabel::Mic, 0, 0, 48000, 1, 0.0);
         // Exactly at threshold (0.50) while not speaking — uses >=, so SHOULD trigger onset
         let action = poll(&mut state, Some(0.50));
         assert!(matches!(action, VadAction::None));
@@ -5536,7 +6126,7 @@ mod tests {
 
     #[test]
     fn test_poll_vad_silence_begins() {
-        let mut state = SourceVadState::new(AudioSourceLabel::Mic, 0, 0, 48000, 1);
+        let mut state = SourceVadState::new(AudioSourceLabel::Mic, 0, 0, 48000, 1, 0.0);
         state.is_speaking = true;
         state.speech_start_time = Some(Instant::now());
         // Below threshold while speaking → sets silence_since but not long enough yet
@@ -5547,7 +6137,7 @@ mod tests {
 
     #[test]
     fn test_poll_vad_silence_triggers_chunk() {
-        let mut state = SourceVadState::new(AudioSourceLabel::Mic, 0, 0, 48000, 1);
+        let mut state = SourceVadState::new(AudioSourceLabel::Mic, 0, 0, 48000, 1, 0.0);
         state.is_speaking = true;
         state.speech_start_time = Some(Instant::now());
         // Silence started longer ago than the threshold
@@ -5558,7 +6148,7 @@ mod tests {
 
     #[test]
     fn test_poll_vad_force_chunk_max_duration() {
-        let mut state = SourceVadState::new(AudioSourceLabel::Mic, 0, 0, 48000, 1);
+        let mut state = SourceVadState::new(AudioSourceLabel::Mic, 0, 0, 48000, 1, 0.0);
         state.is_speaking = true;
         state.speech_start_time = Some(Instant::now() - Duration::from_secs(31));
         // Above threshold while speaking past max_chunk_duration → ForceChunk
@@ -5569,7 +6159,7 @@ mod tests {
     #[test]
     fn test_poll_vad_none_energy() {
         // energy = None → always None regardless of state
-        let mut state = SourceVadState::new(AudioSourceLabel::Mic, 0, 0, 48000, 1);
+        let mut state = SourceVadState::new(AudioSourceLabel::Mic, 0, 0, 48000, 1, 0.0);
         let action = poll(&mut state, None);
         assert!(matches!(action, VadAction::None));
 
@@ -5584,7 +6174,7 @@ mod tests {
 
     #[test]
     fn test_prompt_decay_clears_after_timeout() {
-        let mut sources = vec![SourceVadState::new(AudioSourceLabel::Mic, 0, 0, 48000, 1)];
+        let mut sources = vec![SourceVadState::new(AudioSourceLabel::Mic, 0, 0, 48000, 1, 0.0)];
         let mut prompt = "some prior transcript context".to_string();
         let last_transcription_at = Some(Instant::now() - Duration::from_secs(6));
         let cleared = check_prompt_decay(&mut sources, &mut prompt, 5.0, last_transcription_at);
@@ -5594,7 +6184,7 @@ mod tests {
 
     #[test]
     fn test_prompt_decay_no_clear_with_recent_transcription() {
-        let mut sources = vec![SourceVadState::new(AudioSourceLabel::Mic, 0, 0, 48000, 1)];
+        let mut sources = vec![SourceVadState::new(AudioSourceLabel::Mic, 0, 0, 48000, 1, 0.0)];
         let mut prompt = "some context".to_string();
         // Transcription just happened — should not decay
         let last_transcription_at = Some(Instant::now());
@@ -5605,7 +6195,7 @@ mod tests {
 
     #[test]
     fn test_prompt_decay_no_clear_before_timeout() {
-        let mut sources = vec![SourceVadState::new(AudioSourceLabel::Mic, 0, 0, 48000, 1)];
+        let mut sources = vec![SourceVadState::new(AudioSourceLabel::Mic, 0, 0, 48000, 1, 0.0)];
         let mut prompt = "some context".to_string();
         let last_transcription_at = Some(Instant::now() - Duration::from_secs(2));
         let cleared = check_prompt_decay(&mut sources, &mut prompt, 5.0, last_transcription_at);
@@ -5615,7 +6205,7 @@ mod tests {
 
     #[test]
     fn test_prompt_decay_disabled_when_zero() {
-        let mut sources = vec![SourceVadState::new(AudioSourceLabel::Mic, 0, 0, 48000, 1)];
+        let mut sources = vec![SourceVadState::new(AudioSourceLabel::Mic, 0, 0, 48000, 1, 0.0)];
         let mut prompt = "some context".to_string();
         let last_transcription_at = Some(Instant::now() - Duration::from_secs(60));
         let cleared = check_prompt_decay(&mut sources, &mut prompt, 0.0, last_transcription_at);
@@ -5625,7 +6215,7 @@ mod tests {
 
     #[test]
     fn test_prompt_decay_already_empty() {
-        let mut sources = vec![SourceVadState::new(AudioSourceLabel::Mic, 0, 0, 48000, 1)];
+        let mut sources = vec![SourceVadState::new(AudioSourceLabel::Mic, 0, 0, 48000, 1, 0.0)];
         let mut prompt = String::new();
         let last_transcription_at = Some(Instant::now() - Duration::from_secs(10));
         let cleared = check_prompt_decay(&mut sources, &mut prompt, 5.0, last_transcription_at);
@@ -5635,8 +6225,8 @@ mod tests {
     #[test]
     fn test_prompt_decay_clears_accumulated_text() {
         let mut sources = vec![
-            SourceVadState::new(AudioSourceLabel::Mic, 0, 0, 48000, 1),
-            SourceVadState::new(AudioSourceLabel::System, 0, 0, 48000, 2),
+            SourceVadState::new(AudioSourceLabel::Mic, 0, 0, 48000, 1, 0.0),
+            SourceVadState::new(AudioSourceLabel::System, 0, 0, 48000, 2, 0.0),
         ];
         sources[0].accumulated_text = "mic transcript context".to_string();
         sources[1].accumulated_text = "system transcript context".to_string();
@@ -5652,7 +6242,7 @@ mod tests {
     #[test]
     fn test_prompt_decay_triggers_on_accumulated_text_only() {
         // shared_prompt is empty but accumulated_text is not — should still trigger
-        let mut sources = vec![SourceVadState::new(AudioSourceLabel::Mic, 0, 0, 48000, 1)];
+        let mut sources = vec![SourceVadState::new(AudioSourceLabel::Mic, 0, 0, 48000, 1, 0.0)];
         sources[0].accumulated_text = "stale context from before silence".to_string();
         let mut prompt = String::new();
         let last_transcription_at = Some(Instant::now() - Duration::from_secs(6));
@@ -5665,7 +6255,7 @@ mod tests {
     fn test_prompt_decay_no_clear_when_never_transcribed() {
         // No transcription has ever occurred — prompt may have been seeded
         // but last_transcription_at is None → no decay
-        let mut sources = vec![SourceVadState::new(AudioSourceLabel::Mic, 0, 0, 48000, 1)];
+        let mut sources = vec![SourceVadState::new(AudioSourceLabel::Mic, 0, 0, 48000, 1, 0.0)];
         sources[0].accumulated_text = "seeded context".to_string();
         let mut prompt = "shared prompt".to_string();
         let cleared = check_prompt_decay(&mut sources, &mut prompt, 5.0, None);
@@ -5825,7 +6415,7 @@ mod tests {
         use yapstack_common::types::EngineKind;
         let cfg = dummy_config();
         let tuning = profile_for(EngineKind::Parakeet, &cfg).vad_tuning;
-        let mut state = SourceVadState::new(AudioSourceLabel::Mic, 0, 0, 48000, 1);
+        let mut state = SourceVadState::new(AudioSourceLabel::Mic, 0, 0, 48000, 1, 0.0);
 
         // Simulate one 100 ms Parakeet poll containing: silence → loud →
         // silence. Previously (score_stream returning only the last prob),
@@ -5986,6 +6576,7 @@ mod tests {
             session_start,
             48000,
             1,
+            0.0,
         );
         // Pre-reset invariants: everything points at the rewound position.
         assert_eq!(s.silero.read_pos, session_start);
@@ -6007,5 +6598,272 @@ mod tests {
         assert_eq!(s.speech_start_pos, current);
         assert_eq!(s.earliest_next_chunk_pos, current);
         assert!(s.silero.last_probability.is_none());
+    }
+
+    // --- Audio offset anchor (buffer-replacement bookkeeping) ---
+    //
+    // These tests pin down the invariants the production bug violated.
+    // Before the fix, every device-change buffer swap silently rewound
+    // chunk offsets by the wall-clock time elapsed since the last reset.
+    // See `handle_buffer_replacement` and the field doc on
+    // `SourceVadState.audio_offset_anchor_seconds`.
+
+    #[test]
+    fn anchor_initializes_from_constructor_arg() {
+        // Loop entry / resume sets the anchor to
+        // `ctx.session_offset_base_seconds`. Subsequent chunks compute
+        // `audio_offset = anchor + samples_since_session_start/sr`, so the
+        // first segment after a resume is stamped at `offset_base` (not 0).
+        let s = SourceVadState::new(AudioSourceLabel::Mic, 0, 0, 48000, 1, 1720.5);
+        assert_eq!(s.audio_offset_anchor_seconds, 1720.5);
+    }
+
+    #[test]
+    fn reset_for_buffer_replacement_advances_anchor_and_positions() {
+        // The reset must move `audio_offset_anchor_seconds` to the caller-
+        // computed `new_anchor` *and* point every position cursor at the
+        // fresh buffer's `write_pos`. Without the anchor advance, the bug
+        // returns: post-swap chunks would carry pre-swap offsets.
+        let mut s = SourceVadState::new(AudioSourceLabel::Mic, 0, 0, 24000, 1, 0.0);
+        s.dictation_consumed_through = 42; // unrelated, must NOT be touched here
+        s.reset_for_buffer_replacement(500, 48000, 2, 367.5);
+        assert_eq!(s.audio_offset_anchor_seconds, 367.5);
+        assert_eq!(s.session_start_pos, 500);
+        assert_eq!(s.cursor, 500);
+        assert_eq!(s.speech_start_pos, 500);
+        assert_eq!(s.earliest_next_chunk_pos, 500);
+        assert_eq!(s.source_sample_rate, 48000);
+        assert_eq!(s.source_channels, 2);
+        // Mic-ownership cursor reset is the caller's responsibility
+        // (handle_buffer_replacement gates it on Session-Mic) so this
+        // pure reset must NOT clobber it.
+        assert_eq!(s.dictation_consumed_through, 42);
+    }
+
+    #[test]
+    fn reset_vad_past_preserves_anchor() {
+        // Closing a dictation mic-ownership window calls `reset_vad_past`
+        // to skip past the window's audio. That's a position rewind only —
+        // the buffer-to-session-time mapping is unchanged, so the anchor
+        // MUST NOT move. If it did, the bug would re-appear on every
+        // dictation hotkey release in a Session run.
+        let mut s = SourceVadState::new(AudioSourceLabel::Mic, 0, 0, 48000, 1, 42.5);
+        s.is_speaking = true;
+        s.reset_vad_past(1000);
+        assert_eq!(s.audio_offset_anchor_seconds, 42.5);
+        assert_eq!(s.session_start_pos, 0, "reset_vad_past must not touch session_start_pos");
+        assert_eq!(s.cursor, 1000);
+        assert!(!s.is_speaking);
+    }
+
+    #[test]
+    fn chunk_offset_formula_uses_anchor_not_zero() {
+        // Pure-formula regression test. The post-fix formula reads the
+        // anchor; the pre-fix formula read `session_offset_base_seconds`.
+        // With the anchor advanced 367s into a fresh buffer, a chunk
+        // extracted at sample_index=48000 (1s into the new buffer at 48 kHz
+        // mono) must stamp at 368.0s — not at 1.0s as the bug did.
+        let sample_rate: u32 = 48000;
+        let channels: u16 = 1;
+        let session_start_pos: usize = 0; // fresh buffer post-reset
+        let anchor_seconds: f32 = 367.0;
+        let extraction_start_pos: usize = 48000; // exactly 1 s of audio after reset
+        let samples_since_start = extraction_start_pos.saturating_sub(session_start_pos);
+        let audio_offset = anchor_seconds
+            + samples_since_start as f32 / (sample_rate as f32 * channels as f32);
+        assert!(
+            (audio_offset - 368.0).abs() < 1e-3,
+            "expected ~368.0s, got {audio_offset}"
+        );
+    }
+
+    #[test]
+    fn two_consecutive_buffer_replacements_anchors_monotonic() {
+        // The cascade we saw in production (AirPods connect → settle → format
+        // flip) triggers two BufferReplaced events seconds apart. Each must
+        // advance the anchor monotonically; the second swap must not lose
+        // the wall-clock time accumulated since the first.
+        let mut s = SourceVadState::new(AudioSourceLabel::Mic, 0, 0, 48000, 1, 0.0);
+        s.reset_for_buffer_replacement(0, 48000, 1, 10.0);
+        assert_eq!(s.audio_offset_anchor_seconds, 10.0);
+        s.reset_for_buffer_replacement(0, 24000, 1, 15.5);
+        assert_eq!(s.audio_offset_anchor_seconds, 15.5);
+        assert_eq!(s.source_sample_rate, 24000);
+    }
+
+    #[test]
+    fn anchor_is_per_source_not_global() {
+        // Mic and System ring buffers can be replaced at different
+        // instants (the 19:38 cascade replaced System a second before
+        // Mic). Anchors live on `SourceVadState`, not on
+        // `TranscriptionContext`, so each source's offsets track its
+        // own zero-point independently.
+        let mut mic = SourceVadState::new(AudioSourceLabel::Mic, 0, 0, 48000, 1, 100.0);
+        let mut sys = SourceVadState::new(AudioSourceLabel::System, 0, 0, 48000, 2, 100.0);
+        mic.reset_for_buffer_replacement(0, 48000, 1, 110.0);
+        sys.reset_for_buffer_replacement(0, 48000, 2, 115.0);
+        assert_eq!(mic.audio_offset_anchor_seconds, 110.0);
+        assert_eq!(sys.audio_offset_anchor_seconds, 115.0);
+    }
+
+    // --- drain_in_flight_for_source ---
+    //
+    // Buffer replacement must drain only the in-flight task whose source
+    // is being reset. Other sources' outcomes that land in the same
+    // drain window must be queued for the main loop, not dropped, and not
+    // applied to the wrong source. Tests the contract end-to-end against
+    // a `FuturesUnordered<ChunkTaskFuture>` with synthetic outcomes.
+
+    fn dummy_outcome(label: AudioSourceLabel, text: &str) -> ChunkTaskOutcome {
+        ChunkTaskOutcome {
+            source_label: label,
+            accumulated_text: text.to_string(),
+            sidecar_dead: false,
+        }
+    }
+
+    fn push_dummy_outcome(
+        chunk_tasks: &mut futures_util::stream::FuturesUnordered<ChunkTaskFuture>,
+        outcome: ChunkTaskOutcome,
+    ) {
+        chunk_tasks.push(Box::pin(async move { outcome }));
+    }
+
+    #[tokio::test]
+    async fn drain_in_flight_applies_only_matching_source() {
+        // Source under replacement is Mic; an earlier System chunk
+        // happens to land in the same drain window. We must apply only
+        // the Mic outcome to the Mic source and queue the System outcome
+        // for the main loop.
+        let mut mic = SourceVadState::new(AudioSourceLabel::Mic, 0, 0, 48000, 1, 0.0);
+        mic.has_in_flight_task = true;
+        mic.accumulated_text = String::from("stale");
+
+        let mut chunk_tasks: futures_util::stream::FuturesUnordered<ChunkTaskFuture> =
+            futures_util::stream::FuturesUnordered::new();
+        // Push System first so its outcome arrives before the Mic one
+        // does — FuturesUnordered isn't strictly FIFO, but with already-
+        // resolved futures it picks them up in push order. The drain
+        // helper must tolerate either order.
+        push_dummy_outcome(
+            &mut chunk_tasks,
+            dummy_outcome(AudioSourceLabel::System, "system fresh"),
+        );
+        push_dummy_outcome(
+            &mut chunk_tasks,
+            dummy_outcome(AudioSourceLabel::Mic, "mic fresh"),
+        );
+        let mut pending_outcomes: Vec<ChunkTaskOutcome> = Vec::new();
+
+        drain_in_flight_for_source(&mut mic, &mut chunk_tasks, &mut pending_outcomes).await;
+
+        assert!(!mic.has_in_flight_task, "drain must clear the in-flight flag");
+        assert_eq!(mic.accumulated_text, "mic fresh");
+        assert_eq!(pending_outcomes.len(), 1);
+        assert_eq!(pending_outcomes[0].source_label, AudioSourceLabel::System);
+        assert_eq!(pending_outcomes[0].accumulated_text, "system fresh");
+    }
+
+    // --- Dictation rebase on mic buffer replacement ---
+    //
+    // These tests pin down P1 behavior: a mic buffer replacement during
+    // an active dictation must preserve mic-ownership state (in the new
+    // buffer's coordinate space) instead of unwinding the open window.
+
+    #[test]
+    fn rebase_drops_closed_and_rebinds_open() {
+        // Active dictation + a prior closed dictation in the queue. The
+        // rebase drops the closed window (its positions are in the old
+        // buffer's coordinate space and can't survive the swap) and
+        // rebases the open window's start to the new buffer's write_pos.
+        let state = super::super::transcription::DictationOwnsMic::new();
+        // Push a prior closed window into the queue.
+        state.open(1_000_000);
+        state.close(2_000_000);
+        // Now open a new dictation, simulating "active mid-swap".
+        state.open(3_000_000);
+        let result = state.rebase_for_mic_buffer_replacement(42);
+        assert_eq!(result.prior_open, Some(3_000_000));
+        assert_eq!(result.new_open, Some(42));
+        // The previously-closed window {1_000_000, 2_000_000} was
+        // drained on rebase.
+        assert_eq!(result.dropped_closed.len(), 1);
+        assert_eq!(result.dropped_closed[0].start, 1_000_000);
+        assert_eq!(result.dropped_closed[0].end, 2_000_000);
+        // Snapshot now reflects the rebased open and empty closed list.
+        let snap = state.snapshot();
+        assert_eq!(snap.open, Some(42));
+        assert!(snap.closed.is_empty());
+    }
+
+    #[test]
+    fn rebase_with_no_open_is_safe() {
+        // Mic swap with no dictation in flight: rebase still drops any
+        // stale closed windows but doesn't fabricate an open one.
+        let state = super::super::transcription::DictationOwnsMic::new();
+        state.open(100);
+        state.close(200);
+        let result = state.rebase_for_mic_buffer_replacement(999);
+        assert_eq!(result.prior_open, None);
+        assert_eq!(result.new_open, None);
+        assert_eq!(result.dropped_closed.len(), 1);
+        assert!(state.snapshot().open.is_none());
+        assert!(state.snapshot().closed.is_empty());
+    }
+
+    #[test]
+    fn truncate_at_earliest_dictation_in_range() {
+        // The rescue range [100, 1000) contains a closed window starting
+        // at 400 and an open window starting at 700. The truncate point
+        // must be the earlier of the two (400) so the rescue stops
+        // before any dictated content.
+        let state = super::super::transcription::DictationOwnsMic::new();
+        state.open(400);
+        state.close(500);
+        state.open(700);
+        let rebase = state.rebase_for_mic_buffer_replacement(0);
+        let truncate = earliest_dictation_start_in_range(100, 1000, &rebase);
+        assert_eq!(truncate, Some(400));
+    }
+
+    #[test]
+    fn truncate_returns_none_when_no_overlap() {
+        // Closed window {2000, 3000} lives past the rescue range
+        // [100, 1000); no truncation needed.
+        let state = super::super::transcription::DictationOwnsMic::new();
+        state.open(2000);
+        state.close(3000);
+        let rebase = state.rebase_for_mic_buffer_replacement(0);
+        let truncate = earliest_dictation_start_in_range(100, 1000, &rebase);
+        assert_eq!(truncate, None);
+    }
+
+    #[test]
+    fn truncate_returns_none_for_empty_range() {
+        // Defensive: empty or inverted ranges return None regardless of
+        // dictation state.
+        let state = super::super::transcription::DictationOwnsMic::new();
+        state.open(500);
+        let rebase = state.rebase_for_mic_buffer_replacement(0);
+        assert_eq!(earliest_dictation_start_in_range(100, 100, &rebase), None);
+        assert_eq!(earliest_dictation_start_in_range(500, 100, &rebase), None);
+    }
+
+    #[tokio::test]
+    async fn drain_in_flight_handles_empty_tasks_gracefully() {
+        // Defensive: if `has_in_flight_task` is true but chunk_tasks is
+        // somehow empty (programmer error elsewhere), the drain must
+        // clear the flag and warn rather than block forever.
+        let mut mic = SourceVadState::new(AudioSourceLabel::Mic, 0, 0, 48000, 1, 0.0);
+        mic.has_in_flight_task = true;
+
+        let mut chunk_tasks: futures_util::stream::FuturesUnordered<ChunkTaskFuture> =
+            futures_util::stream::FuturesUnordered::new();
+        let mut pending_outcomes: Vec<ChunkTaskOutcome> = Vec::new();
+
+        drain_in_flight_for_source(&mut mic, &mut chunk_tasks, &mut pending_outcomes).await;
+
+        assert!(!mic.has_in_flight_task);
+        assert!(pending_outcomes.is_empty());
     }
 }
