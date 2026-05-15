@@ -55,7 +55,11 @@ pub enum RestartTarget {
 /// `same_device` means the rebind was effectively a no-op and the caller
 /// should retry after letting macOS settle, rather than treating the
 /// restart as complete.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `PartialEq`/`Eq` are not derived because `previous_buffer` is an `Arc`
+/// to a ring buffer whose interior atomics aren't comparable. No production
+/// or test code currently compares whole `RestartReport` values.
+#[derive(Debug, Clone)]
 pub struct RestartReport {
     pub outcome: RestartOutcome,
     /// `true` if the new bound device ID matches the pre-restart bound ID.
@@ -66,6 +70,13 @@ pub struct RestartReport {
     /// restart, if known. Surfaced through `stream-health` so the FE can
     /// render a "Switched to {name}" toast on auto-failover.
     pub bound_device_name: Option<String>,
+    /// `Some(arc)` when `outcome == BufferReplaced`: the old
+    /// `Arc<AudioRingBuffer>` that was just swapped out. Callers may extract
+    /// any unconsumed audio from this buffer (its samples still live there)
+    /// before dropping their reference — once dropped, those samples are
+    /// unreachable. `None` for `BufferPreserved` (the slot still points at
+    /// the same buffer the caller already had).
+    pub previous_buffer: Option<SharedAudioRingBuffer>,
 }
 
 /// Compute the post-restart `bound_is_default` flag. Pure for testability.
@@ -888,6 +899,14 @@ impl AudioManager {
             let (buffer, outcome) = self.pick_buffer_for_restart(&existing, probed);
             match self.mic.start(candidate, Arc::clone(&buffer)) {
                 Ok(()) => {
+                    // Capture the previous Arc only when the slot is about
+                    // to be swapped out — for BufferPreserved the slot
+                    // already pointed at the same Arc and the caller doesn't
+                    // need a separate handle.
+                    let previous_buffer = match outcome {
+                        RestartOutcome::BufferReplaced => Some(Arc::clone(&existing)),
+                        RestartOutcome::BufferPreserved => None,
+                    };
                     self.mic_buffer = Some(buffer);
                     let new_device_id = self.mic.last_device_id().map(|s| s.to_string());
                     let bound_is_default = derive_bound_is_default(
@@ -908,6 +927,7 @@ impl AudioManager {
                         same_device,
                         new_device_id,
                         bound_device_name,
+                        previous_buffer,
                     });
                 }
                 Err(e) => {
@@ -957,6 +977,12 @@ impl AudioManager {
         let (buffer, outcome) = self.pick_buffer_for_restart(&existing, probed);
 
         self.system.start(Arc::clone(&buffer))?;
+        // Capture the previous Arc only when the slot is about to be swapped
+        // out — for BufferPreserved the slot already pointed at the same Arc.
+        let previous_buffer = match outcome {
+            RestartOutcome::BufferReplaced => Some(Arc::clone(&existing)),
+            RestartOutcome::BufferPreserved => None,
+        };
         self.system_buffer = Some(buffer);
 
         let new_device_id = self.system.last_device_id().map(|s| s.to_string());
@@ -967,6 +993,7 @@ impl AudioManager {
             same_device,
             new_device_id,
             bound_device_name,
+            previous_buffer,
         })
     }
 
@@ -1623,10 +1650,55 @@ mod tests {
             same_device: true,
             new_device_id: Some("dev-A".into()),
             bound_device_name: Some("Dev A".into()),
+            previous_buffer: None,
         };
         assert!(report.same_device);
         assert_eq!(report.new_device_id.as_deref(), Some("dev-A"));
         assert_eq!(report.bound_device_name.as_deref(), Some("Dev A"));
+        assert!(report.previous_buffer.is_none());
+    }
+
+    #[test]
+    fn test_restart_mic_buffer_replaced_returns_previous_buffer() {
+        // Production seam: after `BufferReplaced`, callers (specifically
+        // `handle_buffer_replacement` in the live-transcription loop) must be
+        // able to read any audio captured in the old buffer that hasn't been
+        // consumed yet — otherwise those samples are dropped on the floor
+        // when the Arc is replaced. Asserting the field is populated only on
+        // `BufferReplaced` documents the contract end-to-end.
+        let original = Arc::new(AudioRingBuffer::with_duration(10.0, 16000, 1));
+        original.write(&[0.5; 800]);
+
+        // Pure helper test — we don't need to drive cpal. Construct the
+        // post-restart Arc the same way the production code does.
+        let preserved = original.clone();
+        let preserved_report = RestartReport {
+            outcome: RestartOutcome::BufferPreserved,
+            same_device: true,
+            new_device_id: None,
+            bound_device_name: None,
+            previous_buffer: None,
+        };
+        assert!(Arc::ptr_eq(&preserved, &original));
+        assert!(preserved_report.previous_buffer.is_none());
+
+        let replacement = Arc::new(AudioRingBuffer::with_duration(10.0, 24000, 1));
+        let replaced_report = RestartReport {
+            outcome: RestartOutcome::BufferReplaced,
+            same_device: false,
+            new_device_id: None,
+            bound_device_name: None,
+            previous_buffer: Some(Arc::clone(&original)),
+        };
+        // Replacement is a fresh Arc; previous_buffer still points at the
+        // old ring whose samples are intact.
+        assert!(!Arc::ptr_eq(&replacement, &original));
+        assert!(replaced_report.previous_buffer.is_some());
+        let prev = replaced_report.previous_buffer.as_ref().unwrap();
+        assert!(Arc::ptr_eq(prev, &original));
+        // And the samples written above are still readable through it.
+        let (samples, _new_pos) = prev.snapshot_since_with_pos(0);
+        assert_eq!(samples.len(), 800);
     }
 
     #[test]

@@ -585,12 +585,14 @@ pub enum CommandError {
 ```
 
 ### Managed State
-```rust
-AudioManagerState        = Arc<Mutex<AudioManager>>
-ModelManagerState        = Arc<Mutex<ModelManager>>
-TranscriptionClientState = Arc<Mutex<Option<Arc<TranscriptionClient>>>>
-LiveTranscriptionState   = Arc<Mutex<Option<LiveTranscriptionController>>>
-```
+
+Five managed states. The Tauri-facing names (rather than full type definitions) appear here; field shapes live with the Rust types and rotate freely without a doc change.
+
+- `AudioManagerState` — audio capture lifecycle, ring buffers, capture-source tracking.
+- `ModelManagerState` — Whisper / Parakeet / Sortformer model download + path resolution.
+- `TranscriptionSchedulerState` — single source of truth for engine initialization. Wraps an `Option<InitializedEngine>` carrying the active `EngineConfig` and the long-lived `Arc<TranscriptionScheduler>`. The scheduler owns the sole `Arc<TranscriptionClient>` for the engine's lifetime; both runtimes clone it from here.
+- `LiveTranscriptionState` — two named slots (`session`, `dictation`), each carrying explicit `Idle | Starting | Running | Stopping` lifecycle. See ARCHITECTURE.md § "Live Transcription" and the rustdoc on `RuntimeSlot` / `LiveTranscriptionSlots`.
+- `DictationOwnsMicState` — mic-ownership window list (open + closed `[start, end)` intervals). See GLOSSARY.md "Mic-ownership window" and the rustdoc on `DictationOwnsMic` for the contract.
 
 ### Audio Commands (`commands/audio.rs`)
 | Command | Args | Returns |
@@ -633,7 +635,14 @@ The session lifecycle (start, finalize, export) is owned by `start_live_transcri
 | `download_sortformer_model` | `variant: SortformerVariantDto` | `String` (path) |
 | `delete_sortformer_model` | `variant: SortformerVariantDto` | `()` |
 
-`init_transcription_client` validates that the requested engine's model is on disk (returns `NotFound` otherwise — frontend should call the appropriate `download_*` first), resolves the CoreML cache dir under `$APP_DATA_DIR/cache/coreml/`, optionally calls `ensure_sortformer` when `enable_diarization=true`, then spawns the sidecar with the engine + paths. Idempotent: returns `Ok(())` immediately if a client is already live.
+`init_transcription_client` validates that the requested engine's model is on disk (returns `NotFound` otherwise — frontend should call the appropriate `download_*` first), resolves the CoreML cache dir under `$APP_DATA_DIR/cache/coreml/`, optionally calls `ensure_sortformer` when `enable_diarization=true`, then spawns the sidecar with the engine + paths and constructs the long-lived `TranscriptionScheduler`.
+
+Re-init semantics are precise:
+- If the engine is uninitialized: build client + scheduler, OK.
+- If already initialized with a *matching* `EngineConfig` (engine kind + Whisper model + Parakeet variant + diarization): return OK (idempotent — covers HMR remounts).
+- If already initialized with a *different* config: return `InvalidInput` with "engine already initialized; call shutdown_transcription_client first". Engine swap is an explicit two-step operation; there is no implicit drain.
+
+`shutdown_transcription_client` refuses with `InvalidInput` if any runtime slot is non-`Idle`; otherwise calls `scheduler.shutdown_client()` to drain the worker, take the client, and call `client.shutdown().await`.
 
 All `download_*` commands emit `"model-download-progress"` events to the window with `{ percent: f32, ... }` (additional fields for Parakeet/Sortformer: `kind: "parakeet" | "sortformer"`, `variant`).
 
@@ -641,16 +650,24 @@ All `download_*` commands emit `"model-download-progress"` events to the window 
 | Command | Args | Returns |
 |---------|------|---------|
 | `start_live_transcription` | `config: LiveTranscriptionConfig` | `LiveTranscriptionStartResult` |
-| `stop_live_transcription` | — | `()` |
-| `get_live_transcription_status` | — | `LiveTranscriptionStatus` |
+| `stop_live_transcription` | `kind?: LiveSourceKind` | `()` |
+| `get_live_transcription_status` | `kind?: LiveSourceKind` | `LiveTranscriptionStatus` |
 
-Emits `"live-transcription-segment"` events with `LiveSegmentEvent` (full shape: see `commands/live_transcription.rs`). Notable contract points: `session_id` mirrors `LiveTranscriptionConfig.session_id` so multi-session listeners (dictation hook + main view) can route events without stale-state guards; `origin: "live" | "backfill" | "final_flush"` is set by the scheduler at emit time and tells the frontend which priority tier produced the chunk. `LiveTranscriptionConfig.diarization` (optional, default false) is honored only when the active engine is Parakeet *and* the sidecar was spawned with a Sortformer model. Each `TranscriptSegmentDto` in `segments` carries `speaker_id: number | null`.
+`start_live_transcription` accepts a `source_kind: LiveSourceKind` field on `LiveTranscriptionConfig` (defaults to `Session` for legacy callers; the dictation hook passes `Dictation` explicitly). The command rejects if the target slot is non-`Idle` — both "already running" and "previous run still finalizing" cases. For `Dictation` runtimes it additionally enforces the boundary invariants `source == MicOnly`, `backfill_seconds == 0`, `persist_audio_part == false`; any deviation is an `InvalidInput`.
 
-`stop_live_transcription` remains a no-argument frontend command, but internally snapshots `AudioManager::buffer_positions()` plus a short tail grace into a `StopRequest`. After that point, the live loop skips normal VAD polling, idle cursor advancement, stream-health restarts, and unbounded WAV flushing. Final live chunks and the session WAV tail are read only up to that bounded stop position; later samples are ignored for the stopped session.
+`stop_live_transcription` and `get_live_transcription_status` take an `Option<LiveSourceKind>`; `None` defaults to `Session`. Tauri/Specta cannot fill a missing invoke arg from a Rust default, so the parameter is required to be `Option<>` rather than defaulted at the type level — TS callers must pass `"session"` or `"dictation"` literally.
 
-`LiveTranscriptionStatus` includes `lag_seconds`, `live_drain_backlog_chunks`, and `live_drain_backlog_seconds`. The backlog fields replace the old head-drop cap counter: non-zero values mean live audio is being preserved and drained because inference fell behind real time. `LiveTranscriptionPressureEvent` also carries `drain_backlog_seconds` per chunk.
+Emits `"live-transcription-segment"` events with `LiveSegmentEvent` (full shape: see `commands/live_transcription.rs`). Two routing fields, with strictly distinct meanings:
+- `source_kind: "session" | "dictation"` — *routing identity*. Frontend listeners filter on this to decide which UI surface owns the event. The session segment store skips `dictation` events; the dictation hook accepts only `dictation` events with a matching synthetic `session_id`.
+- `origin: "live" | "backfill" | "final_flush"` — *priority class* set by the scheduler at emit time. Tells the frontend which queue lane the chunk came from. **Never route on `origin`**: a dictation runtime's stop-time chunks are legitimately `final_flush`. See PRINCIPLES.md § "Routing identity is not priority class".
 
-Emits `"backfill-complete"` event (empty payload) when backfill processing finishes.
+Other contract points on `LiveSegmentEvent`: `session_id` mirrors `LiveTranscriptionConfig.session_id` so multi-session listeners can route without stale-state guards. `LiveTranscriptionConfig.diarization` (optional, default false) is honored only when the active engine is Parakeet *and* the sidecar was spawned with a Sortformer model. Each `TranscriptSegmentDto` in `segments` carries `speaker_id: number | null`.
+
+`stop_live_transcription` snapshots `AudioManager::buffer_positions()` plus a short tail grace into a `StopRequest` for the targeted slot. After that point, the targeted live loop skips normal VAD polling, idle cursor advancement, stream-health restarts, and unbounded WAV flushing. Final live chunks and the session WAV tail are read only up to that bounded stop position; later samples are ignored for the stopped runtime. The other slot's runtime (e.g. a session running while a dictation stops) is unaffected.
+
+`LiveTranscriptionStatus` includes `lag_seconds`, `live_drain_backlog_chunks`, `live_drain_backlog_seconds`, and `source_kind`. The `source_kind` is load-bearing for the frontend's two-prong filter: status events without it would let a dictation `Stopped` flip the session UI's phase machine. The backlog fields signal that live audio is being preserved and drained because inference fell behind real time. `LiveTranscriptionPressureEvent` also carries `drain_backlog_seconds` per chunk.
+
+Emits `"backfill-complete"` event (empty payload) when backfill processing finishes for a `Session` runtime. Suppressed for `Dictation` runtimes — dictation has `backfill_seconds == 0` so the event is meaningless, and emitting would clobber session backfill UI state when both runtimes are concurrent.
 
 Emits `"session-part-ready"` event with `SessionPartReadyEvent { session_id, part_index, file_path, format: AudioExportFormatDto ("wav" \| "mp3"), duration_seconds, sample_rate }` when the streaming part is finalized after the loop exits. When `LiveTranscriptionConfig.persist_audio_part` is true (the default — actual sessions), a `session_audio_parts` row is inserted from Rust *before* this event fires, so the DB stays the durable source of truth even if the listener is gone. When the flag is false (dictation), the row insert is skipped — dictation owns its audio path on `dictation_history` instead, and the synthetic `session_id` has no `sessions.id` to FK against.
 
@@ -660,22 +677,33 @@ Emits `"stream-health"` events with `StreamHealthEvent { source: AudioSourceLabe
 
 Emits `"live-transcription-warning"` event with `{ message }` when the sidecar is auto-restarted mid-session after a transcription failure (transient); the loop continues.
 
-Emits `"transcription-engine-dropped"` event (empty payload) from the cleanup path when the scheduler hit its shutdown timeout and had to drop the transcription client instead of returning it to shared state. Listeners should treat the engine as un-initialized — `enginePhase` should reset to `idle` and re-init should run before the next session start. Without this signal, a wedged-sidecar shutdown would leave the FE thinking the engine is ready while shared state is empty, and the next session would fail with `NotInitialized`.
+**`LiveTranscriptionConfig`** field-level shape is the source-of-truth on the Rust struct. Notable fields the frontend touches:
+- `source_kind: LiveSourceKind` (default `Session`) — routing identity; the dictation hook passes `Dictation` explicitly. Drives every downstream filter.
+- `silence_duration_ms` (default 800; Whisper-only — Parakeet uses a fixed 200 ms), `max_chunk_seconds` (default 30), `backfill_seconds` (default 0), `source`, `mix_config?`, `language?`, `prompt_context_chars?` (default 350), `prompt_decay_silence_seconds?` (default 5.0, set to 0 to disable).
+- `session_id?` enables streaming session audio recording into a new part.
+- `persist_audio_part?: bool` (default `true`; `false` for dictation so finalize skips the `session_audio_parts` insert that would FK-orphan against the synthetic id).
+- `audio_save_location?`, `audio_export_format?: "wav" | "mp3"` (default `"mp3"`), `mp3_bitrate?` (kbps, validated against the LAME-supported set; default 64).
+- `diarization?`, `vocabulary_hints?` (Whisper-only).
+- `resume?: ResumeConfig` (prior cumulative duration → `session_offset_base_seconds`, next `part_index`).
 
-**`LiveTranscriptionConfig`**: `silence_duration_ms` (default 800; Whisper-only — Parakeet uses a fixed 200 ms), `max_chunk_seconds` (default 30), `backfill_seconds` (default 0), `source`, `mix_config?`, `language?`, `prompt_context_chars?` (default 350), `prompt_decay_silence_seconds?` (default 5.0, set to 0 to disable — seconds of all-source silence before clearing prompt context to prevent hallucination from stale context), `session_id?` (enables streaming session audio recording into a new part), `persist_audio_part?: bool` (default `true`; set to `false` for dictation so finalize skips the `session_audio_parts` insert that would FK-orphan against the synthetic id), `audio_save_location?` (override the default `$APP_DATA_DIR/audio/` dir), `audio_export_format?: AudioExportFormatDto` (`"wav"` or `"mp3"`, default `"mp3"`; typed end-to-end so unknown values are rejected at deserialization), `mp3_bitrate?` (kbps, validated against the LAME-supported set; default 64), `diarization?`, `vocabulary_hints?` (folder/tag names ≥4 chars, comma-separated, ~80 char budget — Whisper-only), `resume?: ResumeConfig` (carries the prior cumulative duration that becomes `session_offset_base_seconds`, plus the next `part_index` so segments and audio parts continue numbering from where the prior run left off).
+For `source_kind: Dictation`, the boundary validator additionally requires `source == MicOnly`, `backfill_seconds == 0`, `persist_audio_part == false` (rejected with `InvalidInput` otherwise — failing fast beats letting an inconsistent dictation runtime emit segments into session storage paths).
 
 **`LiveTranscriptionPhase`**: `Running`, `Stopped`, `Error`.
 
-**Internal types** (not exported via Tauri): `TranscriptionContext`, `SessionWavState`, `SourceVadState`, `VadAction`, `ChunkResult`, `SegmentOrigin`. Field-level shape lives with the Rust definitions in `commands/live_transcription.rs` — see those rustdoc comments for the source of truth. `TranscriptionContext` now holds `Arc<TranscriptionScheduler>` for the duration of a session (replacing the prior `transcription_client + shared_transcription_state` pair). `SegmentOrigin` is the IPC mirror of the scheduler's `JobOrigin`.
+**Internal types** (not exported via Tauri): `TranscriptionContext`, `SessionWavState`, `SourceVadState`, `VadAction`, `ChunkResult`, `SegmentOrigin`, `RuntimeSlot`, `LiveTranscriptionSlots`, `MicOwnershipGuard`. Field-level shape lives with the rustdoc on each definition — see `commands/live_transcription.rs` for the source of truth. Two notes:
+- `TranscriptionContext` holds `Arc<TranscriptionScheduler>` cloned from `TranscriptionSchedulerState` (replacing the prior per-session client + round-trip to `TranscriptionClientState`). Multiple runtimes hold cloned contexts that share the same scheduler.
+- `SegmentOrigin` is the IPC mirror of `JobOrigin`. Maps `JobOrigin::Dictation → SegmentOrigin::Live` deliberately: a dictation runtime's mic chunks are tagged `JobOrigin::Dictation` for *queue priority*, but `origin` is the segment's priority class — frontends route by `source_kind`, never by `origin`. There is no `SegmentOrigin::Dictation` for that exact reason.
 
 ### Transcription Scheduler (`commands/transcription_scheduler.rs`)
 
-Internal module — not exported via Tauri. See ARCHITECTURE.md § "Transcription Scheduler" for the design rationale, and the rustdoc on `TranscriptionScheduler` / `JobRequest` / `JobOutcome` / `SchedulerError` for current type shapes. The behavioural contract is small and worth stating once here:
+Internal module — not exported via Tauri. See ARCHITECTURE.md § "Transcription Scheduler" for the design rationale, and the rustdoc on `TranscriptionScheduler` / `JobRequest` / `JobOutcome` / `SchedulerError` / `BusyKind` for current type shapes. The behavioural contract:
 
-- One worker, three priority tiers (`FinalFlush > Live > Backfill`), mic/system round-robin at the Live tier.
-- `Backfill` jobs are admitted only when no `FinalFlush`/`Live` job is queued and the live loop's busy gate is clear.
-- Sole caller of `TranscriptionClient::transcribe_with` during a session, which makes sidecar respawn race-free.
-- `shutdown_and_return(timeout) -> bool` finishes whichever single chunk is in-flight at the scheduler when called and *attempts* to return the client to `TranscriptionClientState`. Returns `true` only when the client was actually placed back into shared state; returns `false` for any non-clean path — worker timeout (aborted; an in-flight clone may still be live), worker panic (e.g. the `Arc::try_unwrap` invariant panic inside `respawn_client`, which takes the client *before* panicking and leaves shared state empty), or any other non-clean exit. The cleanup path in `commands/live_transcription.rs` emits `transcription-engine-dropped` on `false` so the frontend can re-init. The timeout caps a wedged-sidecar worst case; default is 5 minutes, generous enough for a typical 5-minute backfill window to finish on a slow sidecar.
+- **Long-lived singleton.** Constructed once at engine init by `init_transcription_client`, stored in `TranscriptionSchedulerState`, owns the sole `Arc<TranscriptionClient>` for the engine's full lifetime. Multiple runtimes (one session + one dictation) clone `Arc<Scheduler>` and submit into the same single worker.
+- **Four priority tiers**: `FinalFlush > Dictation > Live (mic/system round-robin) > Backfill`. Dictation chunks jump the queue past session live chunks but cannot preempt an in-flight sidecar job — once a job has crossed into the sidecar, `Dictation` waits for it to finish.
+- **Per-producer busy bitmask** `{LiveMic, LiveSystem, Dictation}` gates `Backfill`. Admitted only when every bit is clear; one runtime clearing its bit while another is still busy can't unblock backfill.
+- **Sole caller of `TranscriptionClient::transcribe_with`**, which keeps sidecar respawn race-free (the worker is the only long-lived `Arc<TranscriptionClient>` holder, so `Arc::try_unwrap` succeeds at respawn time).
+- **`submit()` rejects after shutdown.** Returns `Result<oneshot::Receiver<JobOutcome>, SchedulerError>` and rejects with `Shutdown` once the scheduler is non-`Running`. Protects `Arc<Scheduler>` clones held by racing callers (e.g. a session-stop racing engine shutdown) from enqueueing into a dead worker. Taking the scheduler out of app-state alone is insufficient — `Arc` clones outlive the slot.
+- **Lifecycle states** `Running | ShuttingDown | Terminal`. `shutdown_client(timeout)` transitions through ShuttingDown to Terminal: drains the worker, takes the inner client, calls `client.shutdown().await`. Idempotent; safe to call multiple times. The 5-minute default timeout caps a wedged-sidecar worst case.
 
 ### Dictation Commands (`commands/dictation.rs`)
 | Command | Args | Returns |

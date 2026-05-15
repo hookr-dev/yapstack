@@ -30,7 +30,7 @@ use yapstack_transcription::ModelManager;
 
 // Lock ordering (acquire in this order to prevent deadlocks):
 //   1. AudioManagerState
-//   2. TranscriptionClientState
+//   2. TranscriptionSchedulerState
 //   3. LiveTranscriptionState
 //   4. ModelManagerState
 //   5. TrayState
@@ -309,18 +309,46 @@ pub fn run() {
             commands::logs::clear_logs,
             commands::logs::get_log_dir,
             commands::logs::reveal_log_dir,
+            commands::logs::log_frontend,
         ]);
 
     #[cfg(debug_assertions)]
-    specta_builder
-        .export(
-            specta_typescript::Typescript::default()
-                .header("// @ts-nocheck")
-                .bigint(specta_typescript::BigIntExportBehavior::Number)
-                .formatter(specta_typescript::formatter::prettier),
-            "../src/lib/types.ts",
-        )
-        .expect("failed to export specta types");
+    {
+        let types_path = "../src/lib/types.ts";
+        specta_builder
+            .export(
+                specta_typescript::Typescript::default()
+                    .header("// @ts-nocheck")
+                    .bigint(specta_typescript::BigIntExportBehavior::Number)
+                    .formatter(specta_typescript::formatter::prettier),
+                types_path,
+            )
+            .expect("failed to export specta types");
+        // Specta + the prettier formatter leaves trailing whitespace on
+        // JSDoc comment continuation lines (e.g. ` * ` produced from a Rust
+        // doc-comment with a blank intermediate line). Prettier doesn't
+        // normalize them and `git diff --check` flags them as "trailing
+        // whitespace". Strip per-line as a post-export pass so the
+        // generated file is clean every time and future regenerations
+        // can't reintroduce the diff noise.
+        if let Ok(contents) = std::fs::read_to_string(types_path) {
+            let trimmed: String = contents
+                .lines()
+                .map(str::trim_end)
+                .collect::<Vec<_>>()
+                .join("\n");
+            // Preserve a final newline if the original had one.
+            let needs_trailing_newline = contents.ends_with('\n');
+            let out = if needs_trailing_newline {
+                format!("{trimmed}\n")
+            } else {
+                trimmed
+            };
+            if out != contents {
+                let _ = std::fs::write(types_path, out);
+            }
+        }
+    }
 
     let mut builder = tauri::Builder::default();
     #[cfg(target_os = "macos")]
@@ -486,7 +514,10 @@ pub fn run() {
         })
         .manage(Arc::new(Mutex::new(AudioManager::new())) as commands::audio::AudioManagerState)
         .manage(Arc::new(Mutex::new(None::<TrayIcon>)) as TrayState)
-        .manage(Arc::new(Mutex::new(None)) as commands::live_transcription::LiveTranscriptionState)
+        .manage(
+            Arc::new(Mutex::new(commands::live_transcription::LiveTranscriptionSlots::new()))
+                as commands::live_transcription::LiveTranscriptionState,
+        )
         .manage(Arc::new(StdMutex::new(None)) as commands::live_transcription::RestartIntentInbox)
         .manage(Arc::new(AtomicBool::new(false)) as commands::live_transcription::LiveSessionPresent)
         .manage(Arc::new(StdMutex::new(HashSet::<PathBuf>::new())) as TrustedAudioDirs)
@@ -510,6 +541,13 @@ pub fn run() {
             let (log_buffer, log_guard) = logging::init(&log_dir, app.handle().clone());
             app.manage(log_buffer);
             app.manage(log_guard);
+
+            // Periodic process-memory sampling. Runs forever in a daemon
+            // thread; gives us a historical RSS/VSZ trace in the rolling
+            // log so we can correlate growth with crashes / lockups. The
+            // FE-side `performance.memory` sampler is complementary —
+            // captures JS-heap on Chromium webviews, no-ops on WKWebView.
+            let _ = logging::spawn_memory_sampler();
 
             // Initialize model manager with app data directory
             let app_data_dir = app
@@ -546,10 +584,18 @@ pub fn run() {
                 Arc::new(Mutex::new(model_manager)) as commands::transcription::ModelManagerState
             );
 
-            // Initialize transcription client state (starts as None)
+            // Initialize transcription scheduler state (starts as None — the
+            // long-lived scheduler is constructed on first
+            // `init_transcription_client` and lives until shutdown).
             app.manage(
-                Arc::new(Mutex::new(None)) as commands::transcription::TranscriptionClientState
+                Arc::new(Mutex::new(None))
+                    as commands::transcription::TranscriptionSchedulerState,
             );
+
+            // Mic-ownership coordination shared between the session and
+            // dictation live loops. Always present; the flag flips at runtime.
+            app.manage(Arc::new(commands::transcription::DictationOwnsMic::new())
+                as commands::transcription::DictationOwnsMicState);
 
             let menu = build_tray_menu(app.handle(), false, false)?;
 
@@ -685,7 +731,13 @@ pub fn run() {
                         matches!(status.state, commands::audio::CaptureStateDto::Capturing);
                     let is_recording = {
                         let guard = live_state.lock().await;
-                        guard.as_ref().is_some_and(|r| r.controller.is_running())
+                        // Tray "recording" indicator reflects the session
+                        // slot only — dictation is short-lived and shouldn't
+                        // flip the menu state.
+                        guard
+                            .session
+                            .runtime()
+                            .is_some_and(|r| r.controller.is_running())
                     };
 
                     if prev_status.as_ref() != Some(&status) {

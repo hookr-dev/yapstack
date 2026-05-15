@@ -214,7 +214,7 @@ export function StatusPopover() {
     }, 100);
     const statusTimer = window.setInterval(async () => {
       try {
-        const r = await commands.getLiveTranscriptionStatus();
+        const r = await commands.getLiveTranscriptionStatus("session");
         if (!cancelled && r.status === "ok") setLiveStatus(r.data);
       } catch {
         /* ignore */

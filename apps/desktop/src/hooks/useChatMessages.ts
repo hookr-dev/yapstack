@@ -164,6 +164,11 @@ export function useChatMessages(
   messagesRef.current = messages;
   const inputRef = useRef(input);
   inputRef.current = input;
+  // Synchronous reentrancy guard. `isStreaming` (React state) doesn't flip in
+  // the DOM until the next commit, so a double-click on Summarize or any
+  // other action item fires `handleSend` twice before the disabled attribute
+  // applies. The ref blocks the second call in the same tick.
+  const sendingRef = useRef(false);
 
   const aiSettings = useAppStore((s) => s.settings.ai) ?? DEFAULT_AI_SETTINGS;
   const activeConfig = getActiveConfig(aiSettings);
@@ -274,6 +279,8 @@ export function useChatMessages(
       const actionId = actionDef?.id ?? "general";
 
       if (!actionDef && !userText) return;
+      if (sendingRef.current) return;
+      sendingRef.current = true;
 
       // For action invocations with no typed text, send the action's
       // verbose userPrompt as the model-visible content (falls back to
@@ -474,6 +481,13 @@ export function useChatMessages(
           }));
           allToolExecs.push(...pendingExecs);
           allCallIds.push(...turnToolCalls.map((c) => c.id));
+          // Slice point so we can fire `onToolsExecuted` for the tools that
+          // ran *this round* once the inner loop finishes — the model's next
+          // round sees a fresh world via `getToolContext()` (line below) and
+          // the UI sees it via the per-round refresh after the loop. Avoids
+          // a "batched at end" model where errors mid-conversation leave
+          // committed DB writes invisible to the store.
+          const roundStart = executedTools.length;
 
           setMessages((prev) =>
             prev.map((m) =>
@@ -659,6 +673,13 @@ export function useChatMessages(
           }
 
           turnMessages = [...turnMessages, ...toolResultMessages];
+
+          const roundExecuted = executedTools.slice(roundStart);
+          if (roundExecuted.length > 0 && onToolsExecuted) {
+            onToolsExecuted(roundExecuted.map((t) => t.name)).catch((err) => {
+              console.error(`[chat] tool refresh failed: ${err}`);
+            });
+          }
         }
 
         clearInterval(flushTimer);
@@ -738,10 +759,6 @@ export function useChatMessages(
         if (executedTools.length > 0) {
           const toolNames = executedTools.map((t) => t.label).join(", ");
 
-          if (onToolsExecuted) {
-            await onToolsExecuted(executedTools.map((t) => t.name));
-          }
-
           const timer = setTimeout(() => {
             setUndoState(null);
           }, UNDO_TIMEOUT_MS);
@@ -796,6 +813,7 @@ export function useChatMessages(
         if (flushTimer) clearInterval(flushTimer);
         setIsStreaming(false);
         abortRef.current = null;
+        sendingRef.current = false;
       }
     },
     [

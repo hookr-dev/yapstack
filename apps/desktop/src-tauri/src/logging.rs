@@ -14,6 +14,8 @@ use std::collections::VecDeque;
 use std::fmt::Write as _;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use specta::Type;
@@ -199,6 +201,8 @@ const DEFAULT_FILTER: &str = "info,\
     yapstack_audio=info,\
     yapstack_transcription=debug,\
     yapstack_transcription_sidecar=debug,\
+    frontend=debug,\
+    heap=info,\
     tao=warn,\
     wry=warn,\
     hyper=warn,\
@@ -237,4 +241,61 @@ pub fn init(log_dir: &Path, app: AppHandle) -> (Arc<LogBuffer>, WorkerGuard) {
 
     tracing::info!(log_dir = ?log_dir, "logging initialised");
     (buffer, guard)
+}
+
+/// How often the background sampler logs process memory. 60s strikes a
+/// balance between "useful for spotting growth over a multi-hour session"
+/// and "not noisy in the rolling log file."
+pub const MEMORY_SAMPLE_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Spawn a daemon thread that emits a `tracing` event with the current
+/// process-level memory footprint every [`MEMORY_SAMPLE_INTERVAL`]. The
+/// returned `JoinHandle` is detached by the caller; the thread runs for
+/// the life of the process. Exits silently on platforms where
+/// `memory_stats` returns `None`.
+///
+/// Sampling Rust-side measures the whole process — Rust heap, audio
+/// buffers, model weights, AND the WebView — which is the right
+/// granularity for "is the app leaking?" triage and is the only path
+/// that works on WKWebView (macOS), where `performance.memory` is
+/// unavailable. The frontend bridge handles on-demand JS-heap snapshots
+/// via `captureDiagnostics`; we don't run a parallel periodic timer
+/// there, since process RSS captures the same growth signal.
+pub fn spawn_memory_sampler() -> thread::JoinHandle<()> {
+    thread::Builder::new()
+        .name("yapstack-memory-sampler".into())
+        .spawn(|| {
+            // memory_stats availability is deterministic per-platform, so
+            // probe once. If unavailable, log a single warn and exit
+            // rather than spinning a thread that no-ops every minute.
+            if memory_stats::memory_stats().is_none() {
+                tracing::warn!(
+                    target: "heap",
+                    "process memory_stats unavailable on this platform; periodic sampling disabled"
+                );
+                return;
+            }
+            // Emit a baseline immediately so the first session-relative
+            // delta is visible without waiting a full interval.
+            log_memory_sample("baseline");
+            loop {
+                thread::sleep(MEMORY_SAMPLE_INTERVAL);
+                log_memory_sample("interval");
+            }
+        })
+        .expect("failed to spawn memory sampler thread")
+}
+
+fn log_memory_sample(reason: &'static str) {
+    if let Some(stats) = memory_stats::memory_stats() {
+        // RSS only. `stats.virtual_mem` reports hundreds of GB on macOS
+        // 14+ due to kernel-reserved address ranges, which would crowd
+        // the log with a meaningless 6-digit number on our primary
+        // platform. RSS is the signal we actually care about.
+        let phys_mb = stats.physical_mem as f64 / (1024.0 * 1024.0);
+        tracing::info!(
+            target: "heap",
+            "process physMB={phys_mb:.1} reason={reason}"
+        );
+    }
 }

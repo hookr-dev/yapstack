@@ -1471,6 +1471,91 @@ Two small landings folded into the alpha.10 cycle.
 - **React's portal events route through the component tree, not the DOM tree.** Any pointer/mouse handler attached as a React prop on a container that *transitively* owns a `<ContextMenu>` / `<DropdownMenu>` / `<Tooltip>` will receive synthetic events from those portals' children. If the handler's contract is "this gesture started inside my DOM subtree" — as drag-select handlers usually are — it needs an explicit `currentTarget.contains(target)` check, or it needs to be wired via native `addEventListener` instead. The latter is the pattern the rest of this codebase already uses (`useClickOutside`, the Settings/Onboarding mousedown listeners) and is the longer-term correct shape for ChatView's marquee logic.
 - **`preventDefault` on a `pointerdown` for a mouse pointer suppresses the corresponding mousedown / mouseup / click events.** This is per W3C spec and is exactly why the menu items lost their click delivery: once the marquee handler called `preventDefault`, the click event Radix's MenuItem composes its `onSelect` onto never fired. Easy to forget when reading just the marquee code in isolation.
 
+## Phase 37 — Active-Session Dictation (Concurrent Runtimes + Mic-Ownership Windows)
+
+### What was built
+
+A user can now hit a dictation hotkey while a recording session is in progress and get the dictated text back through the normal paste/clipboard/new-note path, without leaking the dictated audio into the session transcript or session WAV. The session keeps recording across the dictation; the user's word-in-progress at the moment they hit the hotkey is preserved.
+
+The change is mostly an architectural refactor: the `TranscriptionScheduler` becomes a long-lived app-level singleton, the `LiveTranscriptionState` becomes two named slots with explicit lifecycle states, and a new "mic-ownership window" model coordinates which runtime owns mic samples during which intervals.
+
+### The bugs / gap being addressed
+
+Before this phase, hitting a dictation hotkey during a recording session failed with "transcription client not initialized" — `start_live_transcription` rejected a second call because `LiveTranscriptionState` was a single `Option<Runtime>` and the `TranscriptionClient` was extracted exclusively into the per-session scheduler at session start. This was the long-flagged "Dictation during active recording" item under "What's Not Yet Built."
+
+Several bugs surfaced during review and were fixed in the same PR:
+
+- Status events emitted by `emit_status` always set `session_id: None`, so the dictation hook's two-prong `source_kind + session_id` filter never matched the dictation Stopped event and every dictation waited the full 5 s grace timeout before AI/output/history.
+- `start_live_transcription` unconditionally installed the device-broker `RestartIntent` sender into the global inbox, so a dictation start during a session replaced the session loop's sender — subsequent device-change restarts routed to the dictation loop and the session never received its restarts.
+- Stop-time `set_live_busy(true)` always toggled the session bits regardless of source kind. A dictation finalize then cleared only its `Dictation` bit, leaving session bits stuck and blocking backfill until a future session happened to clear them.
+- The defensive `dictation_owns_mic.flag` clear on session start fired unconditionally, including while a dictation runtime was mid-utterance — which unwound the session-mic suspension and let the session ingest dictation audio.
+- Dictation acquired its mic ownership flag only at the spawn site, after preflight + scheduler lookup + engine-info probe + audio file plumbing. Audio captured between hotkey press and that point was still ingested by the session loop.
+- A race-prone earlier design: a boolean `dictation_owns_mic` flag with edge detection on `dictation_was_active` could miss a dictation that opened-and-closed between two session polls. The closed window left dictation audio in the session transcript and WAV.
+- Stop-time final flush could still transcribe dictation audio into the session if dictation cleared the flag during the session's stop tail before the session loop processed the falling edge.
+- Session WAV captured dictation audio (transcript skipped it but the recorded file still played back the dictation, creating a confusing playback / transcript mismatch).
+- `preflight_stream_health` could replace the mic buffer (`RestartOutcome::BufferReplaced`) during a dictation start, leaving the session loop with stale buffer positions — only the session's in-loop restart handler knows how to reset cursors + WAV `flush_positions` on buffer replacement.
+
+### Key decisions
+
+- **Long-lived scheduler.** `TranscriptionScheduler` is constructed once at engine init in `init_transcription_client` and stored in a new `TranscriptionSchedulerState`. Both runtimes clone `Arc<Scheduler>` from there. The scheduler owns the sole `Arc<TranscriptionClient>` for its full lifetime; engine teardown is the explicit `shutdown_transcription_client` command, which calls `scheduler.shutdown_client()` and is gated on every runtime slot being `Idle`. Replaces the per-session `shutdown_and_return` round-trip back to `TranscriptionClientState`. The legacy state is removed.
+
+- **Routing identity is separate from priority class.** Two new dimensions, deliberately orthogonal:
+  - `JobOrigin` (extended with a `Dictation` variant) is the scheduler's *priority class* — which lane a job occupies. Order is `FinalFlush > Dictation > Live (mic/system round-robin) > Backfill`.
+  - `LiveSourceKind` (`Session | Dictation`) is the *routing identity* of the runtime that produced an event — what UI surface the event belongs to, what storage path it writes to.
+
+  A dictation runtime's stop-time chunks are still legitimately `JobOrigin::FinalFlush` (priority); their `source_kind` is `Dictation` (routing). Conflating them invites real bugs — e.g. `SegmentOrigin::Dictation` was deliberately *not* added because that would invite frontend code to route on `origin`, which is wrong. Frontend filters everywhere on `source_kind`, never on `origin`. This split is now codified in PRINCIPLES.md.
+
+- **Two-slot runtime state with explicit lifecycle.** `LiveTranscriptionState` becomes `LiveTranscriptionSlots { session, dictation }`, each `RuntimeSlot { Idle | Starting | Running | Stopping }`. The slot stays non-`Idle` for the full lifetime including finalization — the spawned task's finalizer transitions the slot back to `Idle` after the loop's tail emission completes. Same-kind double-start is rejected even during finalization, so a stop-then-fast-start can't race the prior task's tail.
+
+- **Per-producer busy bitmask.** The scheduler's single `live_busy` boolean became insufficient with two producers. Replaced with a per-kind bitmask `{LiveMic, LiveSystem, Dictation}`. Backfill is gated unless every bit is clear; one runtime clearing its bit while another is still busy can't unblock backfill prematurely.
+
+- **`submit()` rejects after shutdown.** `submit()` returns `Result<Receiver, SchedulerError>` and rejects with `Shutdown` once the scheduler is non-`Running`. Without this, racing `Arc<Scheduler>` clones (e.g. a session-stop path racing engine shutdown) could enqueue work into a dead worker. Taking the scheduler out of app-state alone is insufficient because Arc clones outlive the slot.
+
+- **Mic-ownership window model — `[start, end)` intervals, not a boolean.** An earlier draft used `(flag: AtomicBool, acquired_at: AtomicU64)` with edge detection on a `dictation_was_active` per-source flag. That had a fundamental race: a dictation that opened and closed between two session polls never flipped the flag. Replaced with `DictationOwnsMic` holding an `open: Option<u64>` window and a `closed: Vec<MicWindow>` list of completed `[start, end)` intervals. Closed windows are durable — even a dictation that didn't survive a single session tick still appears as a closed window and is consumed by the next tick.
+
+- **Dictation initializes its cursors at the window start.** A captured `dictation_start_pos` is threaded through `TranscriptionContext` into `build_initial_sources_and_backfill`. The dictation runtime's mic VAD cursor + WAV flush position both initialize at the window start instead of `current_write_pos`. Without this, audio captured between hotkey press and live-loop spawn was dropped on the floor — the session correctly skipped it (inside the open window) but dictation never read backward to the hotkey moment, so neither pipeline saw it.
+
+- **Session loop drives off the window list, not edge detection.** Each session tick: consume any closed windows that landed since the previous tick (pre-flush pending session speech up to `window.start`, reset VAD past `window.end`); fire a one-time pre-flush for the open window if applicable; suspend mic dispatch while an open window exists OR closed windows were processed this tick (post-tick VAD output is stale relative to the post-reset state). The pre-flush preserves the user's word-in-progress at the hotkey moment; the post-window reset drops any VAD progress accumulated on dictation audio.
+
+- **WAV muting computes precise mono-frame ranges.** `mute_dictation_window_in_wav_extraction` zeros only the samples whose mic ring-buffer positions fall inside any window — it doesn't mute whole batches. For `MicOnly` this means silence inside windows, untouched session audio outside. For `Mixed` the zeroing also wipes system audio in the overlap (loses the system audio for the dictation window — known MVP tradeoff over a more complex extract-system-only-during-window path).
+
+- **Dictation defers to the session's in-loop watchdog for stream health.** Preflight is skipped for a dictation start during an active session; the session's watchdog already polls and routes restarts through the in-loop path that knows how to reset `SourceVadState` cursors and the session-WAV `flush_positions` on `BufferReplaced`. Without this, a preflight-driven mic-buffer replace from dictation startup would leave the session reading from stale raw-sample positions pointing into the dropped buffer.
+
+- **Layered cleanup for the dictation flag.** Three paths cooperate so the flag is always reset:
+  1. Dictation task finalizer is the canonical close: reads the final mic position, calls `dictation_owns_mic.close(end_pos)` to record an accurate `[start, end)` window, runs *before* the slot transitions to `Idle` so the session sees the closed window before any racing same-kind start could re-open one.
+  2. `MicOwnershipGuard::Drop` on the runtime is the safety net for paths the finalizer doesn't reach (early errors after the window opened but before the task spawned). Calls `clear_open()` to discard the open state without recording a window — no audio was actually transcribed.
+  3. Defensive `clear_for_session()` on session start, gated on the dictation slot being `Idle`. Covers the rare case where a prior dictation panic somehow escaped both the finalizer and the RAII guard.
+
+- **Backend boundary validation.** `source_kind == Dictation` requires `MicOnly + backfill_seconds=0 + persist_audio_part=false`. Failing fast at the boundary beats letting an inconsistent dictation runtime emit segments into session storage paths.
+
+- **Specta post-export trim.** Pre-existing trailing whitespace on JSDoc continuation lines (` * `) in `apps/desktop/src/lib/types.ts` triggered `git diff --check` after every regen. The Specta + prettier formatter combination doesn't normalize these. Added a small post-export pass in `lib.rs` that trims per line so future regens stay clean — matched to the same place the export call lives, not in a separate build step.
+
+### What was learned
+
+- **A boolean is the wrong model for "is this thing currently happening?" when the consumer polls at finite cadence.** The session loop polls every ~30 ms; a dictation that opens AND closes between two ticks never flips a boolean the loop observes. Closed `[start, end)` intervals are durable — the loop catches up on its next tick regardless of how fast the open phase was. The same lesson applies to any "track an event that happens between polls" problem: a list of completed events beats a flag the consumer races to read.
+
+- **"Routing identity vs priority class" deserves to be its own concept.** When the original design wanted to add `SegmentOrigin::Dictation`, that felt natural for symmetry — but it would have invited frontend code to filter on `origin`, which is the *wrong* dimension. Origin is the scheduler's priority lane (a dictation's stop-time final flush is legitimately `FinalFlush`); routing is "what UI surface and storage path does this event belong to" (`source_kind`). Codified in PRINCIPLES.md so the next person designing a parallel pipeline doesn't conflate them.
+
+- **A long-lived scheduler is structurally simpler than a per-session scheduler that round-trips a client through shared state.** The per-session design existed because there was only one caller of `transcribe_with` at a time. As soon as a second caller (dictation) needed to coexist, the round-trip became actively harmful — the next session's caller had to wait for the current session's `shutdown_and_return` to land back in shared state, which is unbounded under a wedged sidecar. Hoisting the scheduler removed that coupling entirely; the cleanup of `transcription-engine-dropped` and the worker-timeout-drops-client branches fell out for free.
+
+- **`#[allow(clippy::too_many_arguments)]` is correct on framework-mandated signatures, lazy on extracted helpers.** Tauri commands need every state injection as a top-level argument because the framework wires them from the signature at registration time. There the allow is the only option. For an internal helper extracted to factor out duplication between two call sites, the right move is bundling the related arguments into a struct (`StatusProgress`) — only fall back to `#[allow]` when the args are genuinely independent borrows the helper needs `&mut` access to.
+
+### Files Changed
+
+| File | Change |
+|------|--------|
+| `apps/desktop/src-tauri/src/commands/transcription.rs` | New `TranscriptionSchedulerState` (sole engine-init source of truth), `EngineConfig` for re-init matching, `MicWindow` + `DictationOwnsMic` (open + closed window list with `open()` / `close()` / `clear_open()` / `clear_for_session()` / `snapshot()`), `init_transcription_client` rewrite (idempotent on matching engine config, explicit error on mismatch), `shutdown_transcription_client` rewrite (refuses while any runtime active, calls `scheduler.shutdown_client()`). `TranscriptionClientState` deleted. |
+| `apps/desktop/src-tauri/src/commands/transcription_scheduler.rs` | `JobOrigin::Dictation` priority tier, `BusyKind` per-producer bitmask, explicit `Running \| ShuttingDown \| Terminal` lifecycle, `submit()` returns `Result` + rejects when non-`Running`, new `shutdown_client` method, cached engine accessors. `shutdown_and_return` deleted. |
+| `apps/desktop/src-tauri/src/commands/live_transcription.rs` | Two-slot `LiveTranscriptionState`, `LiveSourceKind` threaded through `LiveTranscriptionConfig` / `LiveSegmentEvent` / `LiveTranscriptionStatus` / `start` / `stop` / `get_status`, dictation invariant validation at the boundary, mic-ownership acquisition early in `start_live_transcription`, dictation cursor init at `dictation_start_pos`, window-driven session loop (consume closed windows + pre-flush + post-window reset), precise per-window WAV muting (`MicOnly` silence, `Mixed` overlap-zero), `dispatch_pre_window_flush` helper, final-flush mic guards via `snapshot.overlaps()`, preflight skipped for dictation-during-session, `LiveSourceKind::set_scheduler_busy` for source-kind-aware busy-bit toggling, status event source_kind filtering, `backfill-complete` suppression for dictation runtimes. The earlier `dictation_was_active: bool` per-source flag and rising/falling-edge handler are removed. |
+| `apps/desktop/src-tauri/src/lib.rs` | State registrations swapped to `TranscriptionSchedulerState` + `DictationOwnsMicState`, slot-aware tray-recording check, post-Specta-export trim pass that strips trailing whitespace from `types.ts`. |
+| `apps/desktop/src/hooks/useDictation.ts` | `source_kind: "dictation"` on start; segment + status listeners filter on `source_kind === "dictation"` AND matching dictation `session_id`; `stop_live_transcription("dictation")` everywhere. |
+| `apps/desktop/src/hooks/useLiveTranscriptionEvents.ts` | Two-prong filter on every listener: `source_kind === "session"` AND `session_id === activeSessionId`. |
+| `apps/desktop/src/stores/appStore.ts` | `source_kind: "session"` at session-start config, segment listener filters on `source_kind === "dictation"` first (with the legacy synthetic-id match kept as belt-and-suspenders), `stopLiveTranscription("session")`. |
+| `apps/desktop/src/components/StatusPopover.tsx`, `apps/desktop/src/lib/tauri.ts` | `LiveSourceKind` type, status polling explicit on `"session"`. |
+| `docs/ARCHITECTURE.md`, `docs/plans/shared-scheduler-dictation.md`, `CHANGELOG.md` | Long-lived scheduler + window model documented; old plan marked superseded. |
+
+---
+
 ## What's Not Yet Built
 
 - **End-to-end integration tests** — capture audio, transcribe, verify text (unit + component tests now exist; integration tests still needed)
@@ -1482,6 +1567,6 @@ Two small landings folded into the alpha.10 cycle.
 - **Memory UI & vault sync** — Memory browser, backlinks panel, action item tracker, optional markdown vault sync for Obsidian interop.
 - **Tag management UI** — Tag CRUD, tag picker, tag filtering in sidebar, tags in search results. Tags infrastructure exists but no dedicated management UI yet.
 - **Sharing** — `shares` table exists but no sharing UI or backend logic
-- **Dictation during active recording** — `TranscriptionClient` is exclusively held by live transcription; dictation is unavailable while recording. Requires a second client instance or queuing mechanism.
 - **Multi-platform dictation testing** — Auto-paste (`osascript`) is macOS-only. Windows implementation needs testing. Linux not yet supported.
+- **Mixed-source WAV preserves system audio during dictation** — Phase 37's WAV muting zeros the (mic+system) mix sample for the dictation window, which loses the system audio for that interval. Precise impl would extract system-only audio for the overlap and substitute it. Tracked as MVP behavior in the helper rustdoc.
 - **Session-stable speaker IDs** — Sortformer's chunk-local speaker IDs cause the same person to flip across speaker numbers across chunk boundaries. Diarization is force-disabled on upgrade (settings v22→23) until session-stable IDs land. The IPC + DB + sidecar plumbing is intact, so re-enabling is a one-line change once stability is solved.

@@ -268,8 +268,10 @@ export interface Settings {
   /// Restored as soon as recording ends. Only ever lowers — never raises.
   /// macOS only (no-op on other platforms).
   dictationDuckEnabled: boolean;
-  /// Target volume to duck to, in [0, 1]. Default 0.2.
-  dictationDuckTarget: number;
+  /// Fraction by which to reduce the current system volume while ducking,
+  /// in [0, 1]. The ducked level is `current * (1 - dictationDuckAmount)`.
+  /// 0 = no reduction, 1 = mute. Default 0.8.
+  dictationDuckAmount: number;
   onboarding: OnboardingState;
 }
 
@@ -593,7 +595,7 @@ const defaultSettings: Settings = {
   dictation: DEFAULT_DICTATION_SETTINGS,
   showRecordingIndicator: true,
   dictationDuckEnabled: false,
-  dictationDuckTarget: 0.2,
+  dictationDuckAmount: 0.8,
   onboarding: { completedFlows: {} },
 };
 
@@ -773,6 +775,13 @@ function createAppStore() {
               `origin=${event.origin}`,
           );
 
+          // Primary route: source_kind. Dictation segments are owned by
+          // useDictation.ts; they must never reach the session segments
+          // table. Belt-and-suspenders: the legacy synthetic-id match below
+          // catches any stale event lacking source_kind during a transitional
+          // build (default = "session" on the Rust side, but a failed
+          // binding regen would surface it here as undefined).
+          if (event.source_kind === "dictation") return;
           // Prefer the session_id carried on the event so late-arriving
           // segments (after `setLivePhase("Stopped")` has cleared
           // activeSessionId) still persist to the right session in the DB.
@@ -781,10 +790,6 @@ function createAppStore() {
           const { activeSessionId, dictationSessionId } = get();
           const targetSessionId = event.session_id ?? activeSessionId;
           if (!targetSessionId) return;
-          // Dictation runs live transcription against a synthetic session id
-          // that is never written to the `sessions` table; persisting here
-          // would fail the segments FK and fire a toast. Dictation consumes
-          // its own text via the raw live-segment listener in useDictation.
           if (targetSessionId === dictationSessionId) return;
 
           // Create one segment per Whisper/Parakeet segment to preserve timestamps
@@ -1094,6 +1099,7 @@ function createAppStore() {
           mp3_bitrate: settings.audioExportFormat === "mp3" ? settings.mp3Bitrate : null,
           diarization: settings.diarizationEnabled,
           vocabulary_hints: vocabHints,
+          source_kind: "session",
         };
 
         // Pre-set `backfillActive` before the await so any `backfill-complete`
@@ -1223,6 +1229,7 @@ function createAppStore() {
             part_index: nextPartIndex,
             offset_base_seconds: offsetBaseSeconds,
           },
+          source_kind: "session",
         };
 
         const result = await commands.startLiveTranscription(config);
@@ -1268,7 +1275,7 @@ function createAppStore() {
         set({ sessionStopping: true });
 
         try {
-          await commands.stopLiveTranscription();
+          await commands.stopLiveTranscription("session");
         } catch (e) {
           console.error("Failed to stop session:", e);
           set({ sessionStopping: false });
@@ -2433,6 +2440,36 @@ function createAppStore() {
       partialize: (state) => ({
         settings: state.settings,
       }),
+      // Custom merge does two non-obvious things:
+      // 1. Deep-merges `settings` so new fields in DEFAULT_SETTINGS backfill
+      //    for users whose persisted state predates them — Zustand's default
+      //    shallow merge would replace `settings` wholesale.
+      // 2. Hosts legacy field renames so they run unconditionally on every
+      //    rehydrate, robust to any prior persist-version arithmetic skew.
+      merge: (persisted, current) => {
+        const p = (persisted as { settings?: Record<string, unknown> }) ?? {};
+        const persistedSettings = { ...(p.settings ?? {}) };
+
+        // dictationDuckTarget (reduce-TO) → dictationDuckAmount (reduce-BY).
+        // `new = 1 - old` preserves effective duck strength. Guard prevents
+        // clobbering a value the user already edited under the new key.
+        if (
+          typeof persistedSettings.dictationDuckTarget === "number" &&
+          persistedSettings.dictationDuckAmount === undefined
+        ) {
+          persistedSettings.dictationDuckAmount =
+            1 - persistedSettings.dictationDuckTarget;
+        }
+        delete persistedSettings.dictationDuckTarget;
+
+        return {
+          ...current,
+          settings: {
+            ...current.settings,
+            ...(persistedSettings as Partial<Settings>),
+          },
+        };
+      },
       migrate: (persisted: unknown, version: number) => {
         const state = persisted as { settings?: Record<string, unknown> };
         if (version < 1 && state.settings) {

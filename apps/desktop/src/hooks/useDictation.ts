@@ -222,10 +222,10 @@ export function useDictation() {
       // a prior cycle can't land on the backend after our snapshot is taken
       // and clear it mid-recording.
       if (s.settings.dictationDuckEnabled) {
-        const target = s.settings.dictationDuckTarget;
+        const amount = s.settings.dictationDuckAmount;
         const prerequisite = pendingRestoreRef.current ?? Promise.resolve();
         const duckPromise = prerequisite
-          .then(() => commands.applyVolumeDuck(target))
+          .then(() => commands.applyVolumeDuck(amount))
           .catch((err) => {
             console.debug("volume duck failed:", err);
           });
@@ -253,10 +253,17 @@ export function useDictation() {
         output_action: slot.outputAction ?? "paste",
       });
 
-      // Set up event listeners before starting live transcription
+      // Set up event listeners before starting live transcription. The
+      // backend emits segment + status events with `source_kind`; we filter
+      // by both `source_kind === "dictation"` AND matching dictation
+      // session_id so a concurrent session's events never leak into this
+      // dictation's accumulator.
+      const currentDictId = dictationIdRef.current;
       const segmentUnlisten = await listenEvent(
         EVENTS.LIVE_TRANSCRIPTION_SEGMENT,
         (payload) => {
+          if (payload.source_kind !== "dictation") return;
+          if (payload.session_id !== currentDictId) return;
           for (const seg of payload.segments) {
             const text = seg.text.trim();
             if (text) {
@@ -276,7 +283,6 @@ export function useDictation() {
       // Listen for the part-ready event for this dictation. Dictation always
       // produces a single part per recording, so we just stash the file
       // path/duration for the dictation_history insert below.
-      const currentDictId = dictationIdRef.current;
       const wavUnlisten = await listenEvent(
         EVENTS.SESSION_PART_READY,
         (payload) => {
@@ -297,6 +303,11 @@ export function useDictation() {
       const statusUnlisten = await listenEvent(
         EVENTS.LIVE_TRANSCRIPTION_STATUS,
         (payload) => {
+          // Filter: only resolve `stopped` when the *dictation* status flips
+          // — without this, a concurrent session's `Stopped`/`Error` could
+          // resolve our wait early. Two-prong: kind + matching session_id.
+          if (payload.source_kind !== "dictation") return;
+          if (payload.session_id !== currentDictId) return;
           if (payload.phase === "Stopped" || payload.phase === "Error") {
             stoppedDeferredRef.current?.resolve();
           }
@@ -327,6 +338,7 @@ export function useDictation() {
         diarization:
           s.settings.selectedEngine === "Parakeet" && s.settings.diarizationEnabled,
         vocabulary_hints: buildVocabularyHints(await listFolders(), await listTags()),
+        source_kind: "dictation",
       });
 
       if (result.status === "error") {
@@ -348,7 +360,7 @@ export function useDictation() {
       // transcription. Cancel owns its own cleanup; only run cleanup here when
       // we're in the handleStop ghost case.
       if (stateRef.current !== "recording") {
-        await commands.stopLiveTranscription().catch(() => {});
+        await commands.stopLiveTranscription("dictation").catch(() => {});
         if (stateRef.current !== "cancelling") cleanupListeners();
         return;
       }
@@ -421,7 +433,7 @@ export function useDictation() {
         // it ample time to land before setIdle.
         safeRestoreVolume();
 
-        await commands.stopLiveTranscription();
+        await commands.stopLiveTranscription("dictation");
         if (phase() === "cancelling") return;
 
         // Wait for "Stopped" event (final chunks will have been emitted)
@@ -638,7 +650,7 @@ export function useDictation() {
       // Stop live transcription — finalizes the session part (WAV or MP3 per
       // audioExportFormat) and emits "Stopped". Capture itself is app-wide
       // and stays running.
-      await commands.stopLiveTranscription().catch(() => {});
+      await commands.stopLiveTranscription("dictation").catch(() => {});
 
       // Wait briefly for the part to finalize so we can delete it.
       // wavInfoRef populates from the session-part-ready listener, which is
@@ -680,7 +692,7 @@ export function useDictation() {
       window.removeEventListener("yapstack:dictation-cancel", handleCancel);
       abortRef.current?.abort();
       if (stateRef.current !== "idle" && stateRef.current !== "done") {
-        commands.stopLiveTranscription().catch(() => {});
+        commands.stopLiveTranscription("dictation").catch(() => {});
         safeRestoreVolume();
         unregisterCancelHotkey();
       }

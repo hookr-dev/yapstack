@@ -22,6 +22,21 @@ pub struct AudioRingBuffer {
     channels: u16,
 }
 
+/// Manual `Debug` impl that prints buffer metadata only — never the sample
+/// contents. A derived impl would walk the `Box<[AtomicU32]>` and dump up to
+/// `capture_history_seconds * sample_rate * channels` atomic values (millions),
+/// which would dominate any log line `RestartReport` lands in.
+impl std::fmt::Debug for AudioRingBuffer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AudioRingBuffer")
+            .field("capacity", &self.capacity)
+            .field("sample_rate", &self.sample_rate)
+            .field("channels", &self.channels)
+            .field("write_pos", &self.write_pos.load(Ordering::Relaxed))
+            .finish()
+    }
+}
+
 pub type SharedAudioRingBuffer = Arc<AudioRingBuffer>;
 
 /// Result of reading a bounded cursor range from the ring buffer.

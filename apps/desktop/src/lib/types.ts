@@ -77,7 +77,7 @@ async peekCaptureEnergy(windowSecs: number) : Promise<Result<CaptureEnergyDto, C
  * for sessions that pre-date the v15 `session_audio_parts` migration (where
  * the FE has no per-part path to delete) and as the fallback path inside
  * `appStore.deleteSessionAudio` when the parts list is empty.
- * 
+ *
  * Authorization: the resolved `audio_dir` must already be in
  * `TrustedAudioDirs` — otherwise the command returns `InvalidInput` and
  * nothing is touched. This stops a malicious caller from passing an
@@ -100,7 +100,7 @@ async deleteSessionWav(sessionId: string, audioSaveLocation: string | null) : Pr
  * in directories across the session's lifetime if the user changed
  * `audioSaveLocation` between recording runs, and every directory we've
  * ever written a part to is in the set.
- * 
+ *
  * Returns `Err(CommandError)` if any path could not be deleted, listing
  * every failed path so the caller can log/toast a useful diagnostic.
  */
@@ -140,6 +140,15 @@ async deleteModel(size: ModelSizeDto) : Promise<Result<null, CommandError>> {
  * Spawn the sidecar with the requested engine. Whisper requires
  * `whisper_model`; Parakeet requires `parakeet_variant` and may optionally
  * enable Sortformer diarization.
+ *
+ * Re-init semantics:
+ * - If the engine is uninitialized, build the client + scheduler.
+ * - If the engine is already initialized with a *matching* config (same
+ * kind + variant + diarization), return OK (idempotent — covers HMR
+ * remounts that re-call init).
+ * - If the engine is already initialized with a *different* config, return
+ * an explicit error directing the caller to `shutdown_transcription_client`
+ * first. Engine swap is an explicit two-step operation; no implicit drain.
  */
 async initTranscriptionClient(engine: EngineKindDto, whisperModel: ModelSizeDto | null, parakeetVariant: ParakeetVariantDto | null, enableDiarization: boolean) : Promise<Result<null, CommandError>> {
     try {
@@ -159,7 +168,7 @@ async shutdownTranscriptionClient() : Promise<Result<null, CommandError>> {
 },
 /**
  * Reports whether the transcription sidecar has been initialized.
- * 
+ *
  * The frontend uses this on mount to decide whether to call
  * `init_transcription_client` again. Without it, a Vite HMR remount re-runs
  * autoSetup and respawns the sidecar even when the backend is already warm,
@@ -198,7 +207,7 @@ async getParakeetModels() : Promise<Result<ParakeetModelInfoDto[], CommandError>
  * Returns the Parakeet variant the current host should run. Apple Silicon
  * gets the int8 bundle (smaller, no external `.onnx.data`, accelerator-
  * compatible); other targets keep the fp32 bundle.
- * 
+ *
  * The frontend uses this in two places:
  * 1. As the source of truth for the v24 store migration that coerces
  * pre-existing `selectedParakeetVariant` values.
@@ -261,17 +270,17 @@ async startLiveTranscription(config: LiveTranscriptionConfig) : Promise<Result<L
     else return { status: "error", error: e  as any };
 }
 },
-async stopLiveTranscription() : Promise<Result<null, CommandError>> {
+async stopLiveTranscription(kind: LiveSourceKind | null) : Promise<Result<null, CommandError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("stop_live_transcription") };
+    return { status: "ok", data: await TAURI_INVOKE("stop_live_transcription", { kind }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
-async getLiveTranscriptionStatus() : Promise<Result<LiveTranscriptionStatus, CommandError>> {
+async getLiveTranscriptionStatus(kind: LiveSourceKind | null) : Promise<Result<LiveTranscriptionStatus, CommandError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("get_live_transcription_status") };
+    return { status: "ok", data: await TAURI_INVOKE("get_live_transcription_status", { kind }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -294,15 +303,15 @@ async clipboardPaste(text: string, autoPaste: boolean) : Promise<Result<null, Co
 }
 },
 /**
- * Lower the system output volume to `target` (0.0..=1.0). No-op if the
- * current volume is already at or below `target`. Snapshots the prior
+ * Reduce the system output volume by `amount` (0.0..=1.0) of its current
+ * level — i.e. land on `current * (1 - amount)`. Snapshots the prior
  * value so `restore_volume` can put it back. Always succeeds from the
  * frontend's perspective: any platform-level error is logged and
  * swallowed because volume control is a UX nicety, not load-bearing for
  * the caller.
  */
-async applyVolumeDuck(target: number) : Promise<void> {
-    await TAURI_INVOKE("apply_volume_duck", { target });
+async applyVolumeDuck(amount: number) : Promise<void> {
+    await TAURI_INVOKE("apply_volume_duck", { amount });
 },
 /**
  * Restore the volume snapshotted at the most recent `apply_volume_duck`
@@ -409,6 +418,29 @@ async revealLogDir() : Promise<Result<null, CommandError>> {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
+},
+/**
+ * Forward a frontend log event into the unified `tracing` subscriber so it
+ * lands on stderr, the rolling daily log file, AND the in-memory ring
+ * buffer (and therefore the LogsPanel + any saved-machine-log archive).
+ * 
+ * `module` is an optional sub-target (e.g. "console", "window.error",
+ * "heap"); it is rendered as a bracketed prefix on the message. We keep
+ * `target` fixed at `frontend` so the subscriber filter (`frontend=debug`)
+ * is a single knob.
+ * 
+ * Best-effort by contract — the JS caller fires-and-forgets and we never
+ * surface a failure that would itself produce an error during error
+ * reporting. Capping the message length prevents a runaway stack trace
+ * from blowing past the ring buffer's per-entry budget.
+ */
+async logFrontend(level: FrontendLogLevel, module: string | null, message: string) : Promise<Result<null, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("log_frontend", { level, module, message }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
 }
 }
 
@@ -438,7 +470,7 @@ export type CaptureStateDto = "Idle" | "Capturing" | "Error"
 export type CaptureStatusDto = { state: CaptureStateDto; mic_active: boolean; system_audio_active: boolean; error_message: string | null }
 /**
  * Unified error type for all Tauri commands.
- * 
+ *
  * Serializes to `{ "kind": "...", "message": "..." }` via `#[serde(tag = "kind")]`.
  * Auto-generated TypeScript types via specta.
  */
@@ -452,42 +484,63 @@ export type EngineDescriptorDto = { kind: EngineKindDto; display_name: string; l
  * Which transcription engine the frontend has selected.
  */
 export type EngineKindDto = "Whisper" | "Parakeet"
+/**
+ * Level passed by the frontend logger. Mirrors `tracing::Level` so the
+ * in-process subscriber can route the event identically to a native call.
+ * Lowercase serde matches the JS-side string literals.
+ */
+export type FrontendLogLevel = "error" | "warn" | "info" | "debug" | "trace"
 export type HealthStatus = { status: string; version: string }
-export type LiveTranscriptionConfig = { 
+/**
+ * Routing identity of a live-transcription runtime. `Session` is the
+ * long-running recording flow that writes session audio parts; `Dictation`
+ * is the user-triggered, mic-only utterance flow whose segments must not
+ * land in any session transcript. The frontend filters all live-
+ * transcription events (segments, status, backfill-complete, etc.) on this
+ * field rather than string-matching session ids.
+ *
+ * This is *routing identity*, separate from `JobOrigin` which is the
+ * scheduler's *priority class* (a dictation runtime can still emit
+ * `FinalFlush`-class jobs at stop time). Frontend code that needs to know
+ * "is this segment for the session transcript or the dictation history"
+ * must read `source_kind`, never `origin`.
+ */
+export type LiveSourceKind = "session" | "dictation"
+export type LiveTranscriptionConfig = {
 /**
  * Milliseconds of continuous silence before triggering a chunk. Default: 800.
  */
-silence_duration_ms: number; 
+silence_duration_ms: number;
 /**
  * Force a chunk after this many seconds of continuous speech. Default: 30.
  */
-max_chunk_seconds: number; 
+max_chunk_seconds: number;
 /**
  * Seconds of buffer lookback at session start (backfill). Default: 0.
  */
-backfill_seconds: number; 
+backfill_seconds: number;
 /**
  * Audio source.
  */
-source: CaptureSourceDto; 
+source: CaptureSourceDto;
 /**
  * Mix config for `Mixed` source. `None` for `MicOnly` / `SystemOnly`,
  * where mixing is undefined.
  */
-mix_config: MixConfigDto | null; 
+mix_config: MixConfigDto | null;
 /**
  * Whisper language.
  */
-language: string | null; 
+language: string | null;
 /**
  * Max characters of prior transcript to feed as Whisper prompt context. Default: 350.
  */
-prompt_context_chars: number | null; 
+prompt_context_chars: number | null;
 /**
  * Seconds of all-source silence before clearing prompt context to prevent
  * hallucination from stale context. Default: 5.0. Set to 0 to disable.
  */
-prompt_decay_silence_seconds: number | null; 
+prompt_decay_silence_seconds: number | null;
 /**
  * Session ID for streaming session-audio recording. If set, the loop
  * streams a new audio part to disk during the session and emits
@@ -496,7 +549,7 @@ prompt_decay_silence_seconds: number | null;
  * where `part_index` is 0 for a fresh session and `N` when resuming a
  * session that already has parts.
  */
-session_id: string | null; 
+session_id: string | null;
 /**
  * When `true`, the finalize path inserts a `session_audio_parts` row
  * keyed by `session_id` so the DB stays the durable source of truth even
@@ -506,14 +559,14 @@ session_id: string | null;
  * `dictation_history` instead. Defaults to `true` to preserve historical
  * behavior for actual sessions; the dictation hook flips it off.
  */
-persist_audio_part?: boolean; 
+persist_audio_part?: boolean;
 /**
  * Custom directory for saving session audio parts. If None, uses
  * `$APP_DATA_DIR/audio/`. The directory is registered with
  * `audio_save_locations` at recording start so reconciliation can
  * recover orphan parts on the next startup.
  */
-audio_save_location: string | null; 
+audio_save_location: string | null;
 /**
  * Audio export format applied at part finalization. Default: `Mp3`
  * (matches the legacy "no value provided" behaviour). Choosing `Mp3`
@@ -522,50 +575,62 @@ audio_save_location: string | null;
  * or typo'd caller fails at deserialization rather than silently
  * rerouting through the MP3 branch.
  */
-audio_export_format: AudioExportFormatDto | null; 
+audio_export_format: AudioExportFormatDto | null;
 /**
  * MP3 bitrate in kbps (e.g. 64, 128, 192). Only used when format is "mp3".
  */
-mp3_bitrate: number | null; 
+mp3_bitrate: number | null;
 /**
  * Request speaker diarization on every transcribed chunk. Honored only
  * when the active engine is Parakeet *and* the sidecar was spawned with
  * a Sortformer model path. Whisper sessions ignore this flag.
  */
-diarization?: boolean; 
+diarization?: boolean;
 /**
  * Comma-separated vocabulary hints (folder/tag names) prepended to the
  * Whisper initial_prompt to improve recognition of proper nouns. Ignored
  * for Parakeet sessions (the TDT decoder has no text-prompt input).
  */
-vocabulary_hints: string | null; 
+vocabulary_hints: string | null;
 /**
  * When set, this run is a resume of an existing Session. The new
  * recording becomes a fresh audio part appended after the existing parts;
  * no prior file is read or modified. Backfill is forced to 0.
  */
-resume?: ResumeConfig | null }
+resume?: ResumeConfig | null;
+/**
+ * Routing identity of this runtime. Defaults to `Session` so existing
+ * callers keep working without TS-side changes during a transitional
+ * build; the dictation hook must pass `Dictation` explicitly.
+ */
+source_kind?: LiveSourceKind }
 export type LiveTranscriptionPhase = "Running" | "Stopped" | "Error"
 export type LiveTranscriptionStartResult = { effective_start_epoch_ms: number }
-export type LiveTranscriptionStatus = { phase: LiveTranscriptionPhase; chunks_processed: number; total_audio_seconds: number; error_message: string | null; session_id: string | null; effective_start_epoch_ms: number | null; 
+export type LiveTranscriptionStatus = { phase: LiveTranscriptionPhase; chunks_processed: number; total_audio_seconds: number; error_message: string | null; session_id: string | null; effective_start_epoch_ms: number | null;
 /**
  * Session-time elapsed since session start minus the latest completed
  * chunk's end offset. Rising values mean transcription is falling behind
  * real time; falling values mean the consumer is catching up. None until
  * the first successful chunk lands.
  */
-lag_seconds: number | null; 
+lag_seconds: number | null;
 /**
  * Count of live chunks that left already-captured audio to drain after
  * dispatching one max-duration slice. Non-zero means the sidecar fell
  * behind real time, but audio is being preserved rather than dropped.
  */
-live_drain_backlog_chunks: number; 
+live_drain_backlog_chunks: number;
 /**
  * Latest backlog depth after a live max-duration slice was dispatched.
  * Returns to 0.0 once the live force-drain path catches up.
  */
-live_drain_backlog_seconds: number }
+live_drain_backlog_seconds: number;
+/**
+ * Routing identity of the runtime that emitted this status. Listeners
+ * in the frontend filter by this so a dictation runtime's `Stopped`
+ * or `Error` does not flow into the session UI's phase machine.
+ */
+source_kind: LiveSourceKind }
 /**
  * One log line visible to the frontend. `ts_ms` is unix-epoch milliseconds.
  */
@@ -579,7 +644,7 @@ export type MixConfigDto = { mic_gain: number; system_gain: number; normalize: b
 export type ModelInfoDto = { size: ModelSizeDto; downloaded: boolean; path: string | null; display_name: string; approximate_size_bytes: number }
 export type ModelSizeDto = "Tiny" | "Base" | "Small" | "Medium"
 export type ParakeetModelInfoDto = { variant: ParakeetVariantDto; downloaded: boolean; display_name: string; approximate_size_bytes: number }
-export type ParakeetVariantDto = "TdtV3" | 
+export type ParakeetVariantDto = "TdtV3" |
 /**
  * int8-quantized variant — same model, smaller footprint, no
  * external `.onnx.data` so accelerators can load it. Used on
@@ -588,13 +653,13 @@ export type ParakeetVariantDto = "TdtV3" |
  */
 "TdtV3Int8"
 export type PermissionStatusDto = "Granted" | "Denied" | "NotDetermined" | "Unavailable"
-export type ResumeConfig = { 
+export type ResumeConfig = {
 /**
  * The index of the new part being recorded — equals the count of
  * existing parts in the session. The output WAV/MP3 is named
  * `{session_id}.{part_index}.{ext}`.
  */
-part_index: number; 
+part_index: number;
 /**
  * Cumulative duration of the existing parts. Added to every Segment's
  * `audio_offset_seconds` so persisted Segments stay continuous.
