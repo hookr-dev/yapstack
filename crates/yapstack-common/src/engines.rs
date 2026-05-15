@@ -22,8 +22,12 @@ pub struct EngineDescriptor {
     /// BCP-47 / ISO-639-1 codes the engine can transcribe. The first entry
     /// is the engine's primary language.
     pub languages: &'static [&'static str],
-    /// True when the engine supports an optional speaker-diarization pass
-    /// (today: Parakeet via Sortformer).
+    /// True when the engine can be paired with the Sortformer speaker
+    /// diarization post-pass. Sortformer runs as a shared step at the
+    /// dispatcher level after either backend transcribes, so this is now
+    /// `true` for every engine — kept as a per-engine flag because we may
+    /// add cloud or low-resource engines in the future where running
+    /// Sortformer alongside isn't viable.
     pub supports_diarization: bool,
     /// True when the engine accepts an `initial_prompt` for cross-chunk
     /// continuity (today: Whisper only).
@@ -53,7 +57,7 @@ static CATALOGUE: [EngineDescriptor; 2] = [
         kind: EngineKind::Whisper,
         display_name: "Whisper",
         languages: WHISPER_LANGUAGES,
-        supports_diarization: false,
+        supports_diarization: true,
         supports_initial_prompt: true,
     },
     EngineDescriptor {
@@ -106,7 +110,8 @@ mod tests {
         let d = descriptor(EngineKind::Whisper);
         assert_eq!(d.languages.len(), 99, "Whisper publishes 99 languages");
         assert!(d.supports_initial_prompt);
-        assert!(!d.supports_diarization);
+        // Sortformer post-pass runs after Whisper too — both engines now diarize.
+        assert!(d.supports_diarization);
         assert!(d.supports_language("en"));
         assert!(d.supports_language("ja"));
     }

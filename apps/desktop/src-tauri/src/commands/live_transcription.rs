@@ -5307,6 +5307,20 @@ async fn transcribe_and_emit_chunk(
     outcome
 }
 
+/// Force `diarization = false` when this config marks a dictation session.
+/// Dictation is single-speaker by definition (the user dictating into the
+/// active app), so running Sortformer on it loads the model and burns
+/// compute for nothing. The `persist_audio_part = false` flag is the
+/// dictation marker — real sessions always set it true. This is defense
+/// in depth: the frontend already passes `diarization: false` for
+/// dictation, but we enforce it here so a stale FE state can't leak.
+fn suppress_dictation_diarization(config: &mut LiveTranscriptionConfig) {
+    if !config.persist_audio_part && config.diarization {
+        info!("dictation detected; forcing diarization=false");
+        config.diarization = false;
+    }
+}
+
 // --- Tauri commands ---
 
 #[tauri::command]
@@ -5476,6 +5490,8 @@ pub async fn start_live_transcription(
     if config.resume.is_some() {
         config.backfill_seconds = 0.0;
     }
+
+    suppress_dictation_diarization(&mut config);
     let session_offset_base_seconds = config
         .resume
         .as_ref()
@@ -6355,6 +6371,38 @@ mod tests {
             resume: None,
             source_kind: LiveSourceKind::Session,
         }
+    }
+
+    #[test]
+    fn dictation_suppresses_diarization_even_when_caller_sets_true() {
+        // FE shouldn't set this combination, but if it does the Tauri
+        // boundary must zero the flag — sidecar should never spin up
+        // Sortformer for a single-speaker dictation stream.
+        let mut cfg = dummy_config();
+        cfg.persist_audio_part = false;
+        cfg.diarization = true;
+        suppress_dictation_diarization(&mut cfg);
+        assert!(!cfg.diarization, "dictation must force diarization=false");
+    }
+
+    #[test]
+    fn session_keeps_diarization_when_caller_sets_true() {
+        // Sessions (persist_audio_part=true) carry diarization through
+        // unchanged so Sortformer runs as normal.
+        let mut cfg = dummy_config();
+        cfg.persist_audio_part = true;
+        cfg.diarization = true;
+        suppress_dictation_diarization(&mut cfg);
+        assert!(cfg.diarization, "session config must preserve diarization");
+    }
+
+    #[test]
+    fn dictation_with_diarization_false_is_unchanged() {
+        let mut cfg = dummy_config();
+        cfg.persist_audio_part = false;
+        cfg.diarization = false;
+        suppress_dictation_diarization(&mut cfg);
+        assert!(!cfg.diarization);
     }
 
     #[test]

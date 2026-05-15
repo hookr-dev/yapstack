@@ -1,18 +1,20 @@
 //! Parakeet TDT-v3 backend (parakeet-rs 0.3 + ONNX Runtime via `ort`).
+//!
+//! Sortformer-based speaker diarization no longer lives here — it runs as
+//! a shared post-pass at the dispatcher level (see `crate::diarization`)
+//! so Whisper sessions get the same treatment.
 
 use std::path::{Path, PathBuf};
 
-use parakeet_rs::sortformer::{Sortformer, SpeakerSegment};
 use parakeet_rs::{ParakeetTDT, TimedToken, TimestampMode, Transcriber};
 use tracing::{debug, info, warn};
 use yapstack_common::types::TranscriptSegment;
 
 use crate::engines::{
-    normalize_spacing, read_wav_as_mono_16k, sanitize_text, should_include_segment, EngineInfo,
-    TranscribeOpts, TranscriptionBackend, TranscriptionOutput,
+    normalize_spacing, sanitize_text, should_include_segment, EngineInfo, TranscribeOpts,
+    TranscriptionBackend, TranscriptionOutput,
 };
 
-const SORTFORMER_SAMPLE_RATE: u32 = 16000;
 /// parakeet-rs's `transcribe_samples` rejects anything other than 16 kHz mono
 /// despite docs claiming auto-resampling (verified against parakeet-rs 0.3.5).
 const PARAKEET_SAMPLE_RATE: u32 = 16000;
@@ -22,8 +24,6 @@ const MAX_SEGMENT_SECS: f32 = 12.0;
 
 pub struct ParakeetBackend {
     model: Option<ParakeetTDT>,
-    sortformer_model_path: Option<PathBuf>,
-    sortformer: Option<Sortformer>,
     coreml_cache_dir: Option<PathBuf>,
     /// Set after each successful `load_model` so `engine_info()` can
     /// report what's actually running. Cleared if reload fails.
@@ -31,31 +31,12 @@ pub struct ParakeetBackend {
 }
 
 impl ParakeetBackend {
-    pub fn new(sortformer_model_path: Option<PathBuf>, coreml_cache_dir: Option<PathBuf>) -> Self {
+    pub fn new(coreml_cache_dir: Option<PathBuf>) -> Self {
         Self {
             model: None,
-            sortformer_model_path,
-            sortformer: None,
             coreml_cache_dir,
             last_engine_info: None,
         }
-    }
-
-    fn ensure_sortformer(&mut self) -> Result<&mut Sortformer, String> {
-        if self.sortformer.is_none() {
-            let path = self
-                .sortformer_model_path
-                .as_ref()
-                .ok_or("sortformer model not provided to sidecar")?;
-            info!(
-                "loading sortformer diarization model from {}",
-                path.display()
-            );
-            let s = Sortformer::new(path)
-                .map_err(|e| format!("failed to load sortformer model: {e}"))?;
-            self.sortformer = Some(s);
-        }
-        Ok(self.sortformer.as_mut().unwrap())
     }
 }
 
@@ -140,33 +121,30 @@ impl TranscriptionBackend for ParakeetBackend {
 
     fn transcribe(
         &mut self,
-        audio_path: &Path,
+        samples: &[f32],
         opts: TranscribeOpts<'_>,
     ) -> Result<TranscriptionOutput, String> {
         let model = self.model.as_mut().ok_or("no model loaded")?;
 
-        let mono_16k = read_wav_as_mono_16k(audio_path)?;
-        let audio_seconds = mono_16k.len() as f32 / PARAKEET_SAMPLE_RATE as f32;
+        let audio_seconds = samples.len() as f32 / PARAKEET_SAMPLE_RATE as f32;
         debug!(
-            "parakeet transcribe: {} samples ({:.2}s) at 16kHz mono (diarization={})",
-            mono_16k.len(),
-            audio_seconds,
-            opts.diarization
+            "parakeet transcribe: {} samples ({:.2}s) at 16kHz mono",
+            samples.len(),
+            audio_seconds
         );
 
         _ = opts.language;
         _ = opts.initial_prompt;
         _ = opts.single_segment;
+        _ = opts.diarization;
 
         let start = std::time::Instant::now();
-        let (transcribe_input, diarize_input) = if opts.diarization {
-            (mono_16k.clone(), Some(mono_16k))
-        } else {
-            (mono_16k, None)
-        };
+        // parakeet-rs takes ownership of the sample buffer; clone the
+        // dispatcher-owned slice so the same buffer can be reused for the
+        // diarization post-pass.
         let result = model
             .transcribe_samples(
-                transcribe_input,
+                samples.to_vec(),
                 PARAKEET_SAMPLE_RATE,
                 1,
                 Some(TimestampMode::Words),
@@ -223,52 +201,12 @@ impl TranscriptionBackend for ParakeetBackend {
             });
         }
 
-        if let Some(diarize_audio) = diarize_input {
-            match self.run_diarization(diarize_audio) {
-                Ok(speaker_segs) => {
-                    debug!(
-                        "sortformer produced {} speaker segments",
-                        speaker_segs.len()
-                    );
-                    assign_speakers(&mut filtered, &speaker_segs);
-                }
-                Err(e) => {
-                    warn!("diarization failed; returning transcript without speaker IDs: {e}");
-                }
-            }
-        }
-
         let duration_ms = start.elapsed().as_millis() as u64;
         Ok(TranscriptionOutput {
             text,
             segments: filtered,
             duration_ms,
         })
-    }
-}
-
-impl ParakeetBackend {
-    /// Run Sortformer diarization on a single chunk's audio.
-    ///
-    /// **Known limitation — chunk-local speaker IDs.** Sortformer::diarize()
-    /// resets internal state per call, so the `speaker_id` values returned
-    /// here are only consistent *within this chunk*. The frontend treats
-    /// speaker_id as a session-stable identity (groups + renames by id), so
-    /// the same person can end up labeled Speaker 0 in one chunk and
-    /// Speaker 1 in the next. This is why diarization is currently off by
-    /// default in Settings and the UI falls back to source-based labels.
-    ///
-    /// Before re-enabling diarization for users, we need one of:
-    ///   - Streaming Sortformer state across calls (parakeet-rs feature),
-    ///   - A post-session pass that runs Sortformer once on the full WAV
-    ///     and retro-annotates segments, or
-    ///   - An embedding-based speaker registry that maps chunk-local IDs to
-    ///     session-stable IDs via similarity matching.
-    fn run_diarization(&mut self, mono_16k: Vec<f32>) -> Result<Vec<SpeakerSegment>, String> {
-        let sortformer = self.ensure_sortformer()?;
-        sortformer
-            .diarize(mono_16k, SORTFORMER_SAMPLE_RATE, 1)
-            .map_err(|e| format!("sortformer diarize failed: {e}"))
     }
 }
 
@@ -453,27 +391,6 @@ fn build_webgpu_config() -> Option<parakeet_rs::ExecutionConfig> {
     Some(ExecutionConfig::default().with_execution_provider(ExecutionProvider::WebGPU))
 }
 
-fn assign_speakers(segments: &mut [TranscriptSegment], speakers: &[SpeakerSegment]) {
-    for seg in segments {
-        let mut best: Option<(u64, u8)> = None;
-        for sp in speakers {
-            let sp_start_ms = sp.start * 1000 / SORTFORMER_SAMPLE_RATE as u64;
-            let sp_end_ms = sp.end * 1000 / SORTFORMER_SAMPLE_RATE as u64;
-            let overlap_start = seg.start_ms.max(sp_start_ms);
-            let overlap_end = seg.end_ms.min(sp_end_ms);
-            if overlap_end > overlap_start {
-                let overlap = overlap_end - overlap_start;
-                if best.is_none_or(|(b, _)| overlap > b) {
-                    best = Some((overlap, sp.speaker_id as u8));
-                }
-            }
-        }
-        if let Some((_, id)) = best {
-            seg.speaker_id = Some(id);
-        }
-    }
-}
-
 struct GroupedSegment {
     text: String,
     start_secs: f32,
@@ -590,56 +507,5 @@ mod tests {
     fn empty_token_input_yields_no_segments() {
         let segs = group_tokens_into_segments(&[]);
         assert!(segs.is_empty());
-    }
-
-    fn ts(start_ms: u64, end_ms: u64) -> TranscriptSegment {
-        TranscriptSegment {
-            start_ms,
-            end_ms,
-            text: "x".to_string(),
-            confidence: 1.0,
-            speaker_id: None,
-        }
-    }
-
-    fn sp(start_secs: f32, end_secs: f32, id: usize) -> SpeakerSegment {
-        SpeakerSegment {
-            start: (start_secs * SORTFORMER_SAMPLE_RATE as f32) as u64,
-            end: (end_secs * SORTFORMER_SAMPLE_RATE as f32) as u64,
-            speaker_id: id,
-        }
-    }
-
-    #[test]
-    fn assigns_speaker_with_full_overlap() {
-        let mut segs = vec![ts(0, 1000), ts(2000, 3000)];
-        let speakers = vec![sp(0.0, 1.5, 0), sp(1.6, 3.2, 1)];
-        assign_speakers(&mut segs, &speakers);
-        assert_eq!(segs[0].speaker_id, Some(0));
-        assert_eq!(segs[1].speaker_id, Some(1));
-    }
-
-    #[test]
-    fn assigns_speaker_with_max_overlap_when_segments_straddle() {
-        // Transcript segment 0..2000ms straddles two speakers; speaker 1 owns more of it.
-        let mut segs = vec![ts(0, 2000)];
-        let speakers = vec![sp(0.0, 0.5, 0), sp(0.5, 2.0, 1)];
-        assign_speakers(&mut segs, &speakers);
-        assert_eq!(segs[0].speaker_id, Some(1));
-    }
-
-    #[test]
-    fn leaves_speaker_none_when_no_overlap() {
-        let mut segs = vec![ts(5000, 6000)];
-        let speakers = vec![sp(0.0, 1.0, 0)];
-        assign_speakers(&mut segs, &speakers);
-        assert_eq!(segs[0].speaker_id, None);
-    }
-
-    #[test]
-    fn assign_speakers_with_empty_diarization_is_noop() {
-        let mut segs = vec![ts(0, 1000), ts(1000, 2000)];
-        assign_speakers(&mut segs, &[]);
-        assert!(segs.iter().all(|s| s.speaker_id.is_none()));
     }
 }

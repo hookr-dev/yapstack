@@ -829,7 +829,26 @@ pub async fn init_transcription_client(
     };
     let sidecar_path = find_sidecar_path()?;
 
-    let (model_path, vad_model_path, sortformer_model_path, coreml_cache_dir) = match engine {
+    // Sortformer runs as a shared post-pass after either engine, so the
+    // resolution is engine-agnostic. Failures fall back to None — the
+    // sidecar then runs without diarization rather than blocking the
+    // session start.
+    let sortformer_model_path = if enable_diarization {
+        match manager.ensure_sortformer(SortformerVariant::V2_1).await {
+            Ok(p) => Some(p),
+            Err(e) => {
+                error!(
+                    "ensure_sortformer failed: {}; proceeding without diarization",
+                    e
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let (model_path, vad_model_path, coreml_cache_dir) = match engine {
         EngineKindDto::Whisper => {
             let size: ModelSize = whisper_model
                 .ok_or(CommandError::NotFound {
@@ -846,7 +865,7 @@ pub async fn init_transcription_client(
                     None
                 }
             };
-            (mp, vad, None, None)
+            (mp, vad, None)
         }
         EngineKindDto::Parakeet => {
             let variant: ParakeetVariant = parakeet_variant
@@ -860,17 +879,12 @@ pub async fn init_transcription_client(
                 });
             }
             let mp = manager.parakeet_model_dir(variant);
-            let sortformer = if enable_diarization {
-                Some(manager.ensure_sortformer(SortformerVariant::V2_1).await?)
-            } else {
-                None
-            };
             let cache_dir = app_handle
                 .path()
                 .app_data_dir()
                 .ok()
                 .map(|d| d.join("cache").join("coreml"));
-            (mp, None, sortformer, cache_dir)
+            (mp, None, cache_dir)
         }
     };
 
