@@ -481,6 +481,13 @@ export function useChatMessages(
           }));
           allToolExecs.push(...pendingExecs);
           allCallIds.push(...turnToolCalls.map((c) => c.id));
+          // Slice point so we can fire `onToolsExecuted` for the tools that
+          // ran *this round* once the inner loop finishes — the model's next
+          // round sees a fresh world via `getToolContext()` (line below) and
+          // the UI sees it via the per-round refresh after the loop. Avoids
+          // a "batched at end" model where errors mid-conversation leave
+          // committed DB writes invisible to the store.
+          const roundStart = executedTools.length;
 
           setMessages((prev) =>
             prev.map((m) =>
@@ -666,6 +673,13 @@ export function useChatMessages(
           }
 
           turnMessages = [...turnMessages, ...toolResultMessages];
+
+          const roundExecuted = executedTools.slice(roundStart);
+          if (roundExecuted.length > 0 && onToolsExecuted) {
+            onToolsExecuted(roundExecuted.map((t) => t.name)).catch((err) => {
+              console.error(`[chat] tool refresh failed: ${err}`);
+            });
+          }
         }
 
         clearInterval(flushTimer);
@@ -744,10 +758,6 @@ export function useChatMessages(
 
         if (executedTools.length > 0) {
           const toolNames = executedTools.map((t) => t.label).join(", ");
-
-          if (onToolsExecuted) {
-            await onToolsExecuted(executedTools.map((t) => t.name));
-          }
 
           const timer = setTimeout(() => {
             setUndoState(null);
