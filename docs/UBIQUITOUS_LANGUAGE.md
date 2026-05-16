@@ -105,19 +105,32 @@ The shared vocabulary for YapStack. Use these terms verbatim in code, docs, PRDs
 | **Share**        | A folder-scoped sharing record (table exists from migration v6, currently unused by the app).                                 | Export, public link            |
 | **List filter**  | The sidebar's view scope: `all`, `pinned`, `folder`, or `dictation`.                                                          | View, tab                      |
 
+## AI providers, connections, and profiles
+
+| Term                  | Definition                                                                                                                                                                                                                                                  | Aliases to avoid                                                            |
+| --------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------- |
+| **AI provider**       | The *kind* of external LLM backend a **Connection** talks to: `openai`, `openrouter`, or `custom` (any OpenAI-compatible endpoint). A category, not an instance.                                                                                            | LLM provider, vendor, backend type                                          |
+| **Connection**        | A configured, named instance of an **AI provider**: id, display name, kind, baseUrl, **Available models**, and an **API key** stored in app settings (OS keychain migration tracked as a follow-on PR). Users may have multiple connections of the same kind (e.g. "Work OpenAI" + "Personal OpenAI"). | Provider config, provider configuration, endpoint, account, provider slot   |
+| **Profile**           | A user-named, thin selection of `(Connection, Model)` that features bind to via an **Assignment**. Carries no system prompt or sampling params — those stay on the consuming feature (e.g. `DictationSlot.prompt`).                                          | Preset, model profile, connection profile                                   |
+| **Assignment**        | The binding between a **Feature consumer** and a **Profile** (or `null`, meaning "no AI for this feature"). Editable inline at each feature and summarised in the Profiles tab.                                                                              | Feature binding, target, route                                              |
+| **Feature consumer**  | An in-app feature that needs a **Profile** to invoke an LLM: **Chat**, **Dictation slot** cleanup, notes generation, session summarization. Each feature consumer has one **Assignment**.                                                                    | Consumer, AI consumer                                                       |
+| **Available models**  | The cached, filtered list of chat-capable models a **Connection** exposes via `/v1/models`. Populated at Connection save, refreshable manually, free-text override allowed in the **Profile** model picker.                                                  | Model catalog (legacy), model list, fetched models                          |
+| **Model filter**      | The kind-aware predicate that drops non-chat models (embeddings, TTS, audio, moderation) from a Connection's raw `/v1/models` response. Applied for known kinds (`openai`, `openrouter`); `custom` Connections are unfiltered.                                | —                                                                           |
+| **Quick start preset** | A pre-filled baseUrl template offered when creating a `custom` Connection (Ollama, LM Studio, llama.cpp, vLLM). Convenience only — no dedicated SDK or **AI provider** kind.                                                                              | Quickstart, URL template                                                    |
+| **Slow hint**         | A cosmetic tag shown next to known reasoning-family models (`o1-*`, `o3-*`, `chatgpt-*`) in the **Profile** model picker. Purely informational — does not filter, does not affect routing.                                                                   | Slow tag, perf badge                                                        |
+| **API key**           | A user-supplied secret authenticating one **Connection**. Stored on the Connection in app settings. Migrating to the OS keychain is a tracked follow-on PR; until then keys persist in plaintext alongside the rest of `AIConfig`. BYO-key per Connection. | Token, credential                                                           |
+| **Chat profile picker** | The composer-header dropdown in **Chat** that overrides the assigned **Profile** for the current chat session only. The override is persisted on the chat session, so reopening that conversation resumes with its last-chosen Profile.                  | Model switcher, profile selector                                            |
+
 ## AI chat
 
 | Term              | Definition                                                                                                                          | Aliases to avoid       |
 | ----------------- | ----------------------------------------------------------------------------------------------------------------------------------- | ---------------------- |
-| **Chat**          | A conversation with an LLM scoped to a context (a session, a folder, the pinned set, dictation history, or global), exposed via the floating chat bar. | Assistant, copilot     |
+| **Chat**          | A conversation with an LLM scoped to a context (a session, a folder, the pinned set, dictation history, or global), exposed via the floating chat bar. Uses the Chat **Assignment** as the default **Profile** for new chats; per-chat overrides are set via the **Chat profile picker** and persisted on the chat session. | Assistant, copilot     |
 | **Context key**   | The string that scopes a chat: `global`, `pinned`, `dictation`, `folder:{id}`, or a session id. Determines what content the LLM sees and where messages are filed. | Scope, channel         |
 | **Chat message**  | One turn (user or assistant) in a chat, persisted in SQLite with its context key.                                                   | Reply, exchange        |
 | **Tool**          | A typed function the LLM can invoke via OpenAI tool calling. Each tool declares a `kind` (`"read"` or `"mutate"`) and an optional `affects` effect set; only `mutate` tools enter the Undo window. The current registry has ten: `update_title`, `save_to_notes`, `pin_session`, `tag_session`, `add_session_to_folder`, `replace_in_transcript` (mutating); `search_folders`, `search_sessions`, `search_dictations`, `get_session_context` (retrieval). | Action, function call  |
 | **Citation**      | An inline `[[seg:ID]]` reference in chat output that resolves to a clickable timestamp chip on a segment.                           | Reference, link        |
 | **Undo window**   | The 10-second period after a tool mutation during which the user can revert it.                                                     | Grace period, rollback |
-| **AI provider**   | An external LLM backend the chat can target: `openai`, `openrouter`, or `custom` (any OpenAI-compatible endpoint).                  | LLM provider, vendor   |
-| **API key**       | A user-supplied secret authenticating chat requests to a provider. Stored locally; BYO-key.                                         | Token, credential      |
-| **Model catalog** | The per-provider list of selectable chat models — built-in for known providers, fetched at runtime for custom.                      | Model list             |
 
 ## Lifecycle and states
 
@@ -146,9 +159,12 @@ The shared vocabulary for YapStack. Use these terms verbatim in code, docs, PRDs
 - A **Capture** writes into one **Ring buffer** per **Source**; **Live transcription** reads from those buffers.
 - An **Engine** runs inside the **Sidecar**; the **Transcription client** is its in-process handle. The engine's readiness is tracked as the **Engine phase**.
 - **Diarization** assigns a **Speaker ID** to a **Segment**; the user maps it to a **Speaker label** per-session (Zustand-persisted, not in SQL).
-- A **Chat** is scoped by a **Context key** (a session id, a folder id, `pinned`, `dictation`, or `global`) and uses one **AI provider** + **API key** + selected model from the **Model catalog**. Session-scoped chats may emit **Citations** that resolve to that session's **Segments**.
+- A **Chat** is scoped by a **Context key** (a session id, a folder id, `pinned`, `dictation`, or `global`) and resolves a **Profile** via the Chat **Assignment** by default; a per-chat-session override set through the **Chat profile picker** is persisted on the chat session and wins for that conversation. Session-scoped chats may emit **Citations** that resolve to that session's **Segments**.
+- A **Profile** points to exactly one **Connection** and one **Model**. A **Connection** can be referenced by zero or many Profiles. A **Connection** belongs to exactly one **AI provider** kind, but a single AI provider can back many Connections.
+- Deleting a **Connection** cascades to its **Profiles**, and onward to any **Assignments** pointing at those Profiles (which become `null`). Deleting a **Profile** cascades to its Assignments the same way. Both deletions are confirmation-gated and enumerate dependents; no orphan references are left behind.
+- A **Connection** holds the **API key** (in app settings; OS keychain migration is a tracked follow-on) and **Available models**; the **Profile** picks one model from that list. Failures (auth, network, server down) surface as feature-level errors — no fallback chain is attempted.
 - **Dictation** produces transcribed text without creating a **Session** unless the active **Dictation slot**'s **Output action** is `new-note`. Either way it is logged in **Dictation history** (with the finalized **Session audio part**'s path on `wav_file_path`; the `session_id` FK is set only on `new-note`).
-- A **Dictation slot** owns one **Binding** (a **Global hotkey**) and one **Dictation activation mode**.
+- A **Dictation slot** owns one **Binding** (a **Global hotkey**), one **Dictation activation mode**, and a nullable **Profile** **Assignment** that controls AI cleanup (`null` = raw transcription with no AI pass; non-null = run cleanup through that Profile using the slot's **prompt**).
 - **Capture source** = `Mixed` is the only mode that consults **Mix config** (mic gain, system gain, normalize).
 
 ## Example dialogue
@@ -185,6 +201,18 @@ The shared vocabulary for YapStack. Use these terms verbatim in code, docs, PRDs
 
 > **Domain expert:** "A **Note** has no folder of its own. It's pinned 1:1 to a single **Session** by `notes.session_id`, and you reach it through the session. Folders contain sessions; notes ride along."
 
+> **Dev:** "If a user wants their local llama.cpp for dictation cleanup but OpenAI for chat, do they create two **AI providers**?"
+
+> **Domain expert:** "Two **Connections**, not two providers. The **AI provider** is just the kind — `custom` for the llama.cpp box, `openai` for the cloud one. They'd create one Connection of kind `custom` (Quick start preset pre-fills the llama.cpp URL) and one Connection of kind `openai`. Then they create two **Profiles** — one per Connection + chosen Model — and set the Dictation slot's **Assignment** to the local Profile and the Chat **Assignment** to the OpenAI Profile."
+
+> **Dev:** "What if mid-chat they want to try the local Profile instead?"
+
+> **Domain expert:** "Use the **Chat profile picker** in the composer. That overrides the Chat **Assignment** for that chat session only — it's persisted on the chat record, so reopening the conversation later resumes on the local Profile. New chats still start on whatever the Chat Assignment points to."
+
+> **Dev:** "And if they delete the local Connection?"
+
+> **Domain expert:** "Confirmation dialog enumerates the cascade: the Connection, every Profile that referenced it, and every Assignment that pointed at those Profiles. On confirm, all three layers are removed atomically. Any feature whose Assignment became `null` will show the inline 'no profile' empty state next time it's invoked. No silent breakage, no orphans."
+
 ## Flagged ambiguities
 
 - **"Whisper client"** (legacy, no longer in code) vs **Transcription client** (current). The engine-agnostic Rust type is `TranscriptionClient` and the Tauri managed-state alias is `TranscriptionClientState`. The legacy `WhisperClient` / `WhisperClientState` aliases have been removed; "Whisper client" is dead terminology — always say **Transcription client**.
@@ -198,6 +226,14 @@ The shared vocabulary for YapStack. Use these terms verbatim in code, docs, PRDs
 - **"Hotkey"** vs **Shortcut** vs **Global hotkey** vs **Binding**: a **Shortcut** is a named in-app action; a **Binding** is the key combination assigned to it; a **Global hotkey** is a binding registered with the OS so it fires while YapStack is unfocused (used for **Dictation slots**). Don't use "hotkey" alone — qualify it.
 - **"Output"** in dictation context means **Output action** (`paste`/`clipboard`/`new-note`), not the audio output device. Audio output as a *capture target* is **System audio**.
 - **"Provider"** has two senses we keep distinct: the **AI provider** (OpenAI/OpenRouter/custom) for chat, and the ORT **Execution provider** (cpu/coreml/webgpu) for the Parakeet engine. Always qualify which one you mean.
+- **"Provider"** vs **Connection**: an **AI provider** is a *kind* (OpenAI, OpenRouter, custom); a **Connection** is a *configured instance* of that kind. A user can have two **Connections** of the same AI provider (e.g. "Work OpenAI" and "Personal OpenAI"). Don't say "add a new provider" when the user is adding a **Connection** — the providers are a fixed enum and don't grow at runtime.
+- **"Profile"** vs **Dictation slot**: both are user-named entities but they live in different layers. A **Profile** is an AI-routing object — `(Connection, Model)` — that **Feature consumers** bind to. A **Dictation slot** is a hotkey-bound capture preset that *consumes* a Profile (its cleanup Assignment). A slot is not a profile; a profile is not a slot.
+- **"Slot"** is reserved for **Dictation slot**. The early design framing "provider slot" was rejected for exactly this collision; the canonical term for a configured provider instance is **Connection**.
+- **"Provider configuration"**, **"endpoint"**, **"account"** are all rejected synonyms for **Connection**. Use **Connection** in all UI copy, code identifiers, docs, and PRDs.
+- **"Model catalog"** is legacy terminology. There is no static catalog; a Connection's selectable models are its **Available models**, sourced from `/v1/models` at runtime and run through the **Model filter** for known kinds.
+- **"aiEnabled"** is dead. Dictation slots historically carried a separate boolean for whether AI cleanup ran; that's now collapsed into the slot's **Profile Assignment** (`null` = AI off, non-null = AI on with that Profile).
+- **"Active provider"** is legacy. The pre-refactor `AISettings.activeProvider` flag is gone; per-feature **Assignment** replaces it. There is no global "current provider" state anymore.
+- **"Fallback"** is not a YapStack concept for AI routing. If a Connection fails, the error surfaces and the user fixes it — there is no automatic retry against a backup Profile or Connection. Don't propose fallback behavior in plans or PRDs.
 - **"Engine phase"** vs **"Live phase"**: the **Engine phase** describes whether the *engine's model* is loaded and ready (idle → downloading → initializing → ready); the **Live phase** describes whether a *live transcription stream* is currently running. They're independent — the engine can be `ready` with no live stream active.
 - **"Folder contains notes"** — false. **Folders** contain **Sessions** (many-to-many via `session_folders`); a session has at most one **Note**, and that note is reachable only through its session. There is no `note_folders` table.
 - **"Chat is per-session"** — incomplete. A **Chat** is scoped by a **Context key** that can be a session id but can also be `global`, `pinned`, `dictation`, or `folder:{id}`. Don't say "the session's chat" if you actually mean any chat keyed off something other than a session.

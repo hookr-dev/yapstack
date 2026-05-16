@@ -54,6 +54,45 @@ export interface AISettings {
   providers: Record<AIProvider, AIProviderConfig>;
 }
 
+// ----- Connection / Profile (added; not yet consumed) -----
+//
+// New domain shape that replaces the single-active-provider model with
+// multiple named Connections + Profiles. Migration lands in a later
+// commit; these types exist now so downstream commits can compile.
+
+export type AIProviderKind = "openai" | "openrouter" | "custom";
+
+export interface Connection {
+  id: string;
+  name: string;
+  kind: AIProviderKind;
+  baseUrl: string;
+  apiKey: string;
+  availableModels?: string[];
+  fetchedAt?: string;
+  fetchError?: string;
+}
+
+export interface Profile {
+  id: string;
+  name: string;
+  connectionId: string;
+  model: string;
+}
+
+export interface AIAssignments {
+  chatProfileId: string | null;
+  aiActionsProfileId: string | null;
+}
+
+export interface AIConfig {
+  connections: Connection[];
+  profiles: Profile[];
+  assignments: AIAssignments;
+}
+
+export type LegacyAISettings = AISettings;
+
 export type ToolExecutionStatus = "running" | "done" | "error";
 
 export interface ToolExecution {
