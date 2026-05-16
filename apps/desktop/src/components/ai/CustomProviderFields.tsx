@@ -18,6 +18,7 @@ const CUSTOM_URL_PRESETS: { label: string; url: string }[] = [
   { label: "llama.cpp", url: "http://127.0.0.1:8080/v1" },
   { label: "LM Studio", url: "http://127.0.0.1:1234/v1" },
   { label: "Ollama", url: "http://127.0.0.1:11434/v1" },
+  { label: "vLLM", url: "http://127.0.0.1:8000/v1" },
 ];
 
 export function CustomBaseUrlField({

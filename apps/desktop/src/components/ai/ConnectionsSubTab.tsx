@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useAppStore } from "@/stores/appStore";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -52,7 +52,13 @@ interface DeleteState {
   affectedSlotNames: string[];
 }
 
-export function ConnectionsSubTab() {
+export function ConnectionsSubTab({
+  autoOpenEditor = false,
+  onAutoOpenConsumed,
+}: {
+  autoOpenEditor?: boolean;
+  onAutoOpenConsumed?: () => void;
+} = {}) {
   const aiConfig = useAppStore((s) => s.settings.aiConfig);
   const dictation = useAppStore((s) => s.settings.dictation);
   const updateSettings = useAppStore((s) => s.updateSettings);
@@ -62,6 +68,16 @@ export function ConnectionsSubTab() {
     mode: "create",
   });
   const [deleteState, setDeleteState] = useState<DeleteState | null>(null);
+
+  // Honor the one-shot autoOpenEditor signal exactly once on mount.
+  useEffect(() => {
+    if (autoOpenEditor) {
+      setEditState({ open: true, mode: "create" });
+      onAutoOpenConsumed?.();
+    }
+    // Intentional: only fire on mount.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const connections = aiConfig.connections;
 

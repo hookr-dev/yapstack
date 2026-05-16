@@ -445,6 +445,14 @@ interface AppState {
     view: "note-list" | "note-detail" | "settings",
     sessionId?: string,
   ) => void;
+  /**
+   * One-shot signal from anywhere in the app to land the user on a specific
+   * Settings location. Consumed by SettingsPanel + AITab + ConnectionsSubTab
+   * on mount, then cleared. Single-value rather than a queue — only the most
+   * recent intent matters. Cleared after consumption.
+   */
+  settingsRequest: "ai-add-connection" | null;
+  setSettingsRequest: (request: "ai-add-connection" | null) => void;
   setListFilter: (filter: ListFilter) => void;
   refreshDevices: () => Promise<void>;
   /**
@@ -1394,6 +1402,11 @@ function createAppStore() {
           currentView: view,
           selectedSessionId: sessionId ?? null,
         });
+      },
+
+      settingsRequest: null,
+      setSettingsRequest: (request) => {
+        set({ settingsRequest: request });
       },
 
       setListFilter: (filter) => {

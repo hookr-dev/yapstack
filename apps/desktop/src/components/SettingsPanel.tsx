@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { useAppStore } from "@/stores/appStore";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
@@ -11,6 +12,13 @@ import { DictationTab } from "@/components/settings/DictationTab";
 
 export function SettingsPanel() {
   const navigateTo = useAppStore((s) => s.navigateTo);
+  // Seed the initial tab from a one-shot settingsRequest. AITab is responsible
+  // for clearing the request once it's consumed (so the request doesn't fire
+  // again on the next mount).
+  const initialTab = useAppStore.getState().settingsRequest === "ai-add-connection"
+    ? "ai"
+    : "general";
+  const [tab, setTab] = useState(initialTab);
 
   return (
     <div className="flex flex-1 flex-col min-h-0">
@@ -27,7 +35,11 @@ export function SettingsPanel() {
       </div>
 
       {/* Tabs */}
-      <Tabs defaultValue="general" className="flex flex-1 flex-col min-h-0">
+      <Tabs
+        value={tab}
+        onValueChange={setTab}
+        className="flex flex-1 flex-col min-h-0"
+      >
         <TabsList variant="line" className="px-4 pt-1 w-full">
           <TabsTrigger value="general">General</TabsTrigger>
           <TabsTrigger value="audio">Audio</TabsTrigger>
