@@ -383,6 +383,19 @@ async function ensureRuntimeSchema(db: Database): Promise<void> {
        WHERE wav_file_path IS NOT NULL`,
     )
     .catch(() => {});
+
+  // chat_context_settings — per-chat-context Profile override for the
+  // AI Connection/Profile refactor. profile_id NULL means "use the live
+  // default Chat Assignment"; non-null persists an explicit override.
+  await db
+    .execute(
+      `CREATE TABLE IF NOT EXISTS chat_context_settings (
+         context_key TEXT PRIMARY KEY,
+         profile_id  TEXT NULL,
+         updated_at  TEXT NOT NULL
+       )`,
+    )
+    .catch(() => {});
 }
 
 // --- Session CRUD ---
@@ -1293,6 +1306,55 @@ export async function markToolCallsAsUndone(
       [JSON.stringify(next), row.id],
     );
   }
+}
+
+// --- Chat context settings (per-chat Profile override) ---
+
+/**
+ * Returns the explicit Profile override for a chat context, or null if the
+ * context has no row (in which case callers should fall back to the live
+ * Chat assignment from AIConfig).
+ */
+export async function getChatContextProfileId(
+  contextKey: string,
+): Promise<string | null> {
+  const db = await getDb();
+  const rows = await db.select<{ profile_id: string | null }[]>(
+    "SELECT profile_id FROM chat_context_settings WHERE context_key = $1 LIMIT 1",
+    [contextKey],
+  );
+  return rows[0]?.profile_id ?? null;
+}
+
+/**
+ * Persist a per-chat Profile override. Passing `null` writes a NULL row
+ * (treated as "use default" on read). Use `clearChatContextProfile` to
+ * remove the row entirely.
+ */
+export async function setChatContextProfileId(
+  contextKey: string,
+  profileId: string | null,
+): Promise<void> {
+  const db = await getDb();
+  await db.execute(
+    `INSERT INTO chat_context_settings (context_key, profile_id, updated_at)
+     VALUES ($1, $2, $3)
+     ON CONFLICT(context_key) DO UPDATE SET
+       profile_id = excluded.profile_id,
+       updated_at = excluded.updated_at`,
+    [contextKey, profileId, new Date().toISOString()],
+  );
+}
+
+/** Remove a chat's profile override entirely (reverts to the live default). */
+export async function clearChatContextProfile(
+  contextKey: string,
+): Promise<void> {
+  const db = await getDb();
+  await db.execute(
+    "DELETE FROM chat_context_settings WHERE context_key = $1",
+    [contextKey],
+  );
 }
 
 // --- Dictation history ---
