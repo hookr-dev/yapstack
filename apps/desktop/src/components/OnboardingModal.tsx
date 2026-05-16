@@ -484,12 +484,22 @@ function AIStep({
     <div className="flex flex-col">
       <div className="flex items-center gap-2 mb-0.5">
         <Sparkles className="h-5 w-5 text-primary" />
-        <h2 className="text-lg font-semibold">AI Assistant</h2>
+        <h2 className="text-lg font-semibold">Connect an AI provider</h2>
       </div>
-      <p className="text-sm text-muted-foreground mb-6">
-        Connect an AI provider for smart features like summarization,
-        dictation cleanup, and chat. You can add more in Settings later.
+      <p className="text-sm text-muted-foreground mb-4">
+        YapStack lets you wire up multiple AI connections — a cloud account
+        for fast chat, a local server for private notes, or both at once.
+        Different features can use different providers.
       </p>
+
+      <div className="mb-5 rounded-md border border-border bg-muted/40 px-3 py-2.5">
+        <p className="text-[11px] leading-relaxed text-muted-foreground">
+          <span className="font-medium text-foreground">Your first Connection</span>
+          {" "}will be assigned to Chat and AI actions by default. Add more
+          Connections and Profiles anytime in{" "}
+          <span className="font-medium text-foreground">Settings → AI</span>.
+        </p>
+      </div>
 
       <div className="space-y-3 mb-4">
         {/* Provider */}
@@ -631,8 +641,8 @@ function AIStep({
           <ChevronLeft className="mr-1.5 h-4 w-4" />
           Back
         </Button>
-        <Button className="flex-1" onClick={handleNext}>
-          Next
+        <Button className="flex-1" onClick={handleNext} disabled={!canTest}>
+          Add Connection
           <ChevronRight className="ml-1.5 h-4 w-4" />
         </Button>
       </div>
@@ -641,7 +651,7 @@ function AIStep({
         className="text-xs text-muted-foreground hover:text-foreground mt-3 mx-auto transition-colors"
         onClick={onNext}
       >
-        Skip for now
+        Skip — set up AI later
       </button>
     </div>
   );
