@@ -28,7 +28,7 @@ import type { FileAttachment } from "@/lib/ai";
 import type { ActionDefinition } from "@/lib/ai-actions";
 import type { ContextSource } from "@/lib/ai-context";
 import { ContextPill } from "./ContextPill";
-import { ModelPickerPill } from "./ModelPickerPill";
+import { ChatProfilePickerPill } from "./ChatProfilePickerPill";
 import { useAppStore } from "@/stores/appStore";
 import { toast } from "sonner";
 
@@ -50,6 +50,8 @@ interface ChatInputBarProps {
   messagesExist: boolean;
   isExpanded: boolean;
   setIsExpanded: (value: boolean) => void;
+  /** Chat context key (used by the per-conversation Profile picker). */
+  contextKey: string;
 }
 
 export function ChatInputBar({
@@ -68,6 +70,7 @@ export function ChatInputBar({
   messagesExist,
   isExpanded,
   setIsExpanded,
+  contextKey,
 }: ChatInputBarProps) {
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const selectedSegmentCount = useAppStore(
@@ -224,7 +227,7 @@ export function ChatInputBar({
 
       {/* Context pills */}
       <div className="flex items-center gap-1.5 px-2 pb-2.5">
-        <ModelPickerPill />
+        <ChatProfilePickerPill contextKey={contextKey} />
         <span className="text-muted-foreground/30 text-[9px] select-none">|</span>
         {sources.map((source) => (
           <ContextPill

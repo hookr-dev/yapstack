@@ -219,6 +219,7 @@ export function FloatingChatBar() {
           messagesExist={messages.length > 0}
           isExpanded={isExpanded}
           setIsExpanded={setIsExpanded}
+          contextKey={ctx.contextKey}
         />
       </Collapsible>
     </div>
