@@ -1556,6 +1556,60 @@ Several bugs surfaced during review and were fixed in the same PR:
 
 ---
 
+## Phase 38 — Frontend log bridge, buffer-replaced offset rebase, transcript hit-zone fix
+
+### What was built
+
+A handful of independent items that landed between Phase 37 and the `1.0.0-alpha.11` cut:
+
+- **Unified frontend log bridge.** A new Tauri command `log_frontend(level, module, message)` routes JS log events through the existing `tracing` subscriber so they land on stderr, the rolling daily log file under `app_log_dir()`, and the in-memory ring buffer tailed by LogsPanel — alongside every native log source. The frontend bridge installs once in `main.tsx` before React mounts and captures: explicit `log.error/warn/info/debug` calls, every `console.error` / `console.warn` (forwarded; original devtools output preserved), uncaught errors via `window.onerror`, and unhandled promise rejections. Adds a "Snapshot" button in LogsPanel that captures a JS-heap snapshot on demand, plus a daemon thread on the Rust side sampling process RSS every 60 s via `memory-stats` so heap-growth analysis works on macOS where WKWebView doesn't expose `performance.memory`.
+- **Buffer-replaced audio-offset rebase.** A per-source `audio_offset_anchor_seconds` on `SourceVadState` that advances on every `BufferReplaced` to `ctx.session_offset_base_seconds + session_start_instant.elapsed()`. Fixes a production bug where device-change-driven ring-buffer swaps were rewinding every post-swap chunk's `audio_offset_seconds` by however many seconds had elapsed inside the loop. The session-wide `session_offset_base_seconds` stays immutable (it represents prior-parts duration from resume) and continues to drive lag.
+- **Transcript marquee hit-zone + drag perf.** Drag-select on the transcript previously bailed the moment the pointer landed on any segment bubble, so a drag starting on a bubble's top/bottom edge fell through to native text selection. The marquee now starts on any pointerdown in the container and promotes after a 6 px movement threshold; the marquee rect moved off React state and onto an imperative ref so a drag performs zero React work per pointermove.
+- **Mid-session segment-action refresh.** `refreshViewSessionSegments` previously early-returned for the live session, so right-click context-menu actions wrote to the DB but didn't update `activeSessionSegments` until stop. Now refreshes both the view-session and active-session arrays when the selected session is the active one.
+- **Reduce-by ducking semantics.** The dictation duck setting now lowers the *current* system volume by the slider fraction (Discord/Windows model) instead of snapping to an absolute level. Existing settings convert in the persist merge (`new = 1 − old`) to preserve effective duck strength.
+- **Hour-bucket timestamps.** `formatTime` and `formatElapsed` gained an hours bucket; a third copy of the same buggy formatter inside `AIChatMessage` is removed in favor of the shared one.
+- **Resize handle focus outline removed.**
+
+### Bugs / gaps being addressed
+
+- **Witnessed in production:** a session ran 60 min wall / 58 min audio with `final_lag_secs = 388.88 s` after two AirPods reconnect cascades; all post-swap segments were stamped ~6 min behind real session-time. Root cause: `session_start_pos` was reset to the fresh buffer's `write_pos` on `BufferReplaced` without any compensating offset bookkeeping, so the offset formula treated post-swap audio as if it had started at session-time `now − elapsed`.
+- The frontend logger had three independent console paths (devtools, in-memory diagnostics, occasional `eprintln` from Rust), so a heap-growth investigation against a user's installed build had no way to read JS-side state. WKWebView's lack of `performance.memory` made a JS-only heap sampler insufficient even when the user could grant access.
+- Drag-select was visibly broken in a way the transcript's owners shipped and lived with — the regression surface was specifically the bubble's top/bottom edges, which are easy to miss in casual testing.
+- Mid-session segment edits/deletes/hides looked like silent no-ops because the bubble persisted on screen until `loadSessions/recovery` re-read the DB at session stop.
+- Ducking-as-absolute over-quieted at low ambient volumes (50% → 20% is barely audible) and under-quieted at high ones, which read as inconsistent across users with different baseline output levels.
+
+### Key decisions
+
+- **Per-source anchor, immutable session base.** The session-wide offset base couldn't be mutated on `BufferReplaced` because lag is computed against it and resume relies on it staying at "prior parts duration." A per-source anchor keeps offsets correct without disturbing those invariants — the chunk offset formula now consults the anchor instead of computing from session start.
+- **Surface the swapped-out buffer through `RestartReport.previous_buffer`.** The live loop atomically snapshots `new_pos_at_swap` + `new_anchor` before any await so audio captured during rescue work isn't dropped, drains only the matching source's in-flight chunk task before touching `accumulated_text`, spawns a `FinalFlush` rescue chunk from `speech_start_pos` through the normal `chunk_tasks` pipeline, appends pre-swap unflushed audio to the session WAV with resampling (MicOnly / SystemOnly; Mixed logs `buffer_replaced_wav_gap_mixed`), rebases `dictation_owns_mic` instead of clearing it, and truncates both rescues at the earliest dictation boundary so dictated audio doesn't leak into session content.
+- **Frontend log bridge as a Tauri command, not a sidecar channel.** The bridge is fire-and-forget by contract — the JS caller never surfaces a failure that would itself produce an error during error reporting. Message length is capped to prevent a runaway stack trace from flooding the ring buffer. `target` is fixed at `frontend` so the subscriber filter (`frontend=debug`) is a single knob.
+- **Marquee start-anywhere with movement-threshold promotion.** A pending start records on every pointerdown in the container; the marquee promotes once movement crosses the 6 px threshold. Below threshold the bubble's `onClick` runs untouched; above threshold an `onClickCapture` interceptor + one-shot `suppressNextClickRef` deterministically blocks the synthesized click. Active editing controls (contenteditable/input/textarea) are exempt from the pending path so in-edit text selection is never clobbered by marquee promotion.
+- **Imperative marquee overlay, ref-driven.** ChatView keeps the rect in a ref and calls `setRect`/`hide` on the `MarqueeOverlay` via `useImperativeHandle`. The overlay div is mounted once and its style is mutated directly on each pointermove — combined with a `React.memo` on `TranscriptSegments`, a drag in the middle of the transcript performs zero React work per pointermove.
+- **Reduce-by persist migration, not a settings version bump.** The duck-amount field is converted in place in the persist-merge (`new = 1 − old`) instead of bumping the settings schema version. The conversion is loss-preserving (effective duck strength is identical for the same starting volume) and avoids a migration-on-upgrade for a single-field change.
+
+### What was learned
+
+- **A buffer-swap is an offset-coordinate-system change.** The system has two independent ways to express "where in time is this audio": ring-buffer `write_pos` (mutates on swap) and `audio_offset_seconds` (must stay monotonic against session-time). The pre-fix code only had bookkeeping for the first, and treated the offset as a derived property of the first — which works exactly as long as the buffer never replaces underneath you. Once swap is real, the offset needs its own anchor that doesn't reset.
+- **WKWebView lacks `performance.memory`.** The JS-side heap-sampling story for production diagnostics is "it works on Chromium devtools-as-debugger and nowhere else," so any heap-growth investigation against a shipped macOS build needs a Rust-side process-RSS sampler as the floor. `memory-stats` gives cross-platform RSS via `process_memory_info()` without an OS-specific dance.
+- **A "click vs drag" disambiguation needs a movement threshold AND a deterministic synthesized-click suppressor.** Relying on the spec's `setPointerCapture` / pointer-event ordering is fragile under React re-renders; a one-shot ref + onClickCapture is the explicit version. Worth codifying as a pattern for any future hit-zone work in the editor.
+
+### Files Changed
+
+| File | Change |
+|------|--------|
+| `apps/desktop/src-tauri/src/commands/log_frontend.rs` (new) | Tauri command that emits a `tracing::event!` at the requested level, with `target = "frontend"` and the `module` rendered as a bracketed prefix. Caps message length. |
+| `apps/desktop/src-tauri/src/lib.rs` | Registers `log_frontend` + `capture_diagnostics`; spawns the 60 s `memory-stats` RSS sampler thread on startup. |
+| `apps/desktop/src/lib/logger.ts` (new), `apps/desktop/src/main.tsx` | `installFrontendLogBridge()` runs before React mounts. Hooks `console.error` / `console.warn` / `window.onerror` / `unhandledrejection`. |
+| `apps/desktop/src/components/LogsPanel.tsx` | "Snapshot" button calls `captureDiagnostics`. |
+| `apps/desktop/src-tauri/src/commands/live_transcription.rs` | Per-source `audio_offset_anchor_seconds`; chunk offset formula consults the anchor; on-`BufferReplaced` snapshot + drain + rescue chunk + WAV append + dictation rebase + truncation; new `marker = "buffer_replaced_rebase"` info log + `buffer_replaced_overrun` / `buffer_replaced_wav_overrun` / `buffer_replaced_wav_gap_mixed` / `buffer_replaced_drain_empty` / `buffer_replaced_sidecar_dead` warn markers. New unit tests for anchor init/reset/per-source independence/consecutive rebases/formula regression, drain-in-flight ordering, and dictation rebase + truncation invariants. |
+| `apps/desktop/src/components/ChatView.tsx`, `apps/desktop/src/components/transcript/MarqueeOverlay.tsx` (new), `apps/desktop/src/components/transcript/TranscriptSegments.tsx` | Movement-threshold marquee promotion, onClickCapture + one-shot suppression, imperative overlay ref, `React.memo` on `TranscriptSegments`, hoisted constants + extracted `resetMarqueeState` helper, dedicated `pointercancel` handler. |
+| `apps/desktop/src/stores/appStore.ts` | `refreshViewSessionSegments` now also refreshes `activeSessionSegments` when the selected session is the active session. |
+| `apps/desktop/src/stores/appStore.ts` (duck merge), `apps/desktop/src/components/settings/DictationTab.tsx` | Reduce-by duck math + persist merge `new = 1 − old`; setting label updated to "while dictating" with a one-line subtext. |
+| `apps/desktop/src/lib/format.ts`, `apps/desktop/src/components/AIChatMessage.tsx` | `formatTime`/`formatElapsed` gain an hours bucket; AIChatMessage drops its inline copy for the shared one. |
+| `CHANGELOG.md`, `apps/desktop/src-tauri/Cargo.toml`, `apps/desktop/src-tauri/tauri.conf.json`, `Cargo.lock` | Version bump to `1.0.0-alpha.11`; CHANGELOG section dated and PR-cross-referenced. |
+
+---
+
 ## What's Not Yet Built
 
 - **End-to-end integration tests** — capture audio, transcribe, verify text (unit + component tests now exist; integration tests still needed)

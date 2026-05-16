@@ -3201,11 +3201,9 @@ fn rescue_pre_swap_wav_audio(
              oldest pre-swap WAV samples were lost"
         );
     }
-    let mono = yapstack_common::audio::deinterleave_to_mono(
-        &snapshot.samples,
-        previous_buffer.channels(),
-    )
-    .into_owned();
+    let mono =
+        yapstack_common::audio::deinterleave_to_mono(&snapshot.samples, previous_buffer.channels())
+            .into_owned();
     if mono.is_empty() {
         return None;
     }
@@ -6174,7 +6172,14 @@ mod tests {
 
     #[test]
     fn test_prompt_decay_clears_after_timeout() {
-        let mut sources = vec![SourceVadState::new(AudioSourceLabel::Mic, 0, 0, 48000, 1, 0.0)];
+        let mut sources = vec![SourceVadState::new(
+            AudioSourceLabel::Mic,
+            0,
+            0,
+            48000,
+            1,
+            0.0,
+        )];
         let mut prompt = "some prior transcript context".to_string();
         let last_transcription_at = Some(Instant::now() - Duration::from_secs(6));
         let cleared = check_prompt_decay(&mut sources, &mut prompt, 5.0, last_transcription_at);
@@ -6184,7 +6189,14 @@ mod tests {
 
     #[test]
     fn test_prompt_decay_no_clear_with_recent_transcription() {
-        let mut sources = vec![SourceVadState::new(AudioSourceLabel::Mic, 0, 0, 48000, 1, 0.0)];
+        let mut sources = vec![SourceVadState::new(
+            AudioSourceLabel::Mic,
+            0,
+            0,
+            48000,
+            1,
+            0.0,
+        )];
         let mut prompt = "some context".to_string();
         // Transcription just happened — should not decay
         let last_transcription_at = Some(Instant::now());
@@ -6195,7 +6207,14 @@ mod tests {
 
     #[test]
     fn test_prompt_decay_no_clear_before_timeout() {
-        let mut sources = vec![SourceVadState::new(AudioSourceLabel::Mic, 0, 0, 48000, 1, 0.0)];
+        let mut sources = vec![SourceVadState::new(
+            AudioSourceLabel::Mic,
+            0,
+            0,
+            48000,
+            1,
+            0.0,
+        )];
         let mut prompt = "some context".to_string();
         let last_transcription_at = Some(Instant::now() - Duration::from_secs(2));
         let cleared = check_prompt_decay(&mut sources, &mut prompt, 5.0, last_transcription_at);
@@ -6205,7 +6224,14 @@ mod tests {
 
     #[test]
     fn test_prompt_decay_disabled_when_zero() {
-        let mut sources = vec![SourceVadState::new(AudioSourceLabel::Mic, 0, 0, 48000, 1, 0.0)];
+        let mut sources = vec![SourceVadState::new(
+            AudioSourceLabel::Mic,
+            0,
+            0,
+            48000,
+            1,
+            0.0,
+        )];
         let mut prompt = "some context".to_string();
         let last_transcription_at = Some(Instant::now() - Duration::from_secs(60));
         let cleared = check_prompt_decay(&mut sources, &mut prompt, 0.0, last_transcription_at);
@@ -6215,7 +6241,14 @@ mod tests {
 
     #[test]
     fn test_prompt_decay_already_empty() {
-        let mut sources = vec![SourceVadState::new(AudioSourceLabel::Mic, 0, 0, 48000, 1, 0.0)];
+        let mut sources = vec![SourceVadState::new(
+            AudioSourceLabel::Mic,
+            0,
+            0,
+            48000,
+            1,
+            0.0,
+        )];
         let mut prompt = String::new();
         let last_transcription_at = Some(Instant::now() - Duration::from_secs(10));
         let cleared = check_prompt_decay(&mut sources, &mut prompt, 5.0, last_transcription_at);
@@ -6242,7 +6275,14 @@ mod tests {
     #[test]
     fn test_prompt_decay_triggers_on_accumulated_text_only() {
         // shared_prompt is empty but accumulated_text is not — should still trigger
-        let mut sources = vec![SourceVadState::new(AudioSourceLabel::Mic, 0, 0, 48000, 1, 0.0)];
+        let mut sources = vec![SourceVadState::new(
+            AudioSourceLabel::Mic,
+            0,
+            0,
+            48000,
+            1,
+            0.0,
+        )];
         sources[0].accumulated_text = "stale context from before silence".to_string();
         let mut prompt = String::new();
         let last_transcription_at = Some(Instant::now() - Duration::from_secs(6));
@@ -6255,7 +6295,14 @@ mod tests {
     fn test_prompt_decay_no_clear_when_never_transcribed() {
         // No transcription has ever occurred — prompt may have been seeded
         // but last_transcription_at is None → no decay
-        let mut sources = vec![SourceVadState::new(AudioSourceLabel::Mic, 0, 0, 48000, 1, 0.0)];
+        let mut sources = vec![SourceVadState::new(
+            AudioSourceLabel::Mic,
+            0,
+            0,
+            48000,
+            1,
+            0.0,
+        )];
         sources[0].accumulated_text = "seeded context".to_string();
         let mut prompt = "shared prompt".to_string();
         let cleared = check_prompt_decay(&mut sources, &mut prompt, 5.0, None);
@@ -6651,7 +6698,10 @@ mod tests {
         s.is_speaking = true;
         s.reset_vad_past(1000);
         assert_eq!(s.audio_offset_anchor_seconds, 42.5);
-        assert_eq!(s.session_start_pos, 0, "reset_vad_past must not touch session_start_pos");
+        assert_eq!(
+            s.session_start_pos, 0,
+            "reset_vad_past must not touch session_start_pos"
+        );
         assert_eq!(s.cursor, 1000);
         assert!(!s.is_speaking);
     }
@@ -6669,8 +6719,8 @@ mod tests {
         let anchor_seconds: f32 = 367.0;
         let extraction_start_pos: usize = 48000; // exactly 1 s of audio after reset
         let samples_since_start = extraction_start_pos.saturating_sub(session_start_pos);
-        let audio_offset = anchor_seconds
-            + samples_since_start as f32 / (sample_rate as f32 * channels as f32);
+        let audio_offset =
+            anchor_seconds + samples_since_start as f32 / (sample_rate as f32 * channels as f32);
         assert!(
             (audio_offset - 368.0).abs() < 1e-3,
             "expected ~368.0s, got {audio_offset}"
@@ -6757,7 +6807,10 @@ mod tests {
 
         drain_in_flight_for_source(&mut mic, &mut chunk_tasks, &mut pending_outcomes).await;
 
-        assert!(!mic.has_in_flight_task, "drain must clear the in-flight flag");
+        assert!(
+            !mic.has_in_flight_task,
+            "drain must clear the in-flight flag"
+        );
         assert_eq!(mic.accumulated_text, "mic fresh");
         assert_eq!(pending_outcomes.len(), 1);
         assert_eq!(pending_outcomes[0].source_label, AudioSourceLabel::System);
