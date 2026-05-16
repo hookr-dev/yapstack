@@ -2,10 +2,14 @@ import { describe, it, expect } from "vitest";
 import {
   migrateLegacyAISettings,
   resolveProfile,
+  type LegacyAISettings,
   type LegacyDictationSlot,
 } from "./ai-config";
-import { DEFAULT_AI_SETTINGS } from "./ai";
-import type { AIConfig, LegacyAISettings } from "./ai";
+import type { AIConfig } from "./ai";
+
+// Mirrors the pre-refactor default for the `custom` provider so the test
+// fixture matches what the migration's isProviderConfigured() check expects.
+const LEGACY_CUSTOM_DEFAULT_BASE_URL = "http://127.0.0.1:8080/v1";
 
 function legacy(overrides: Partial<LegacyAISettings> = {}): LegacyAISettings {
   return {
@@ -20,7 +24,7 @@ function legacy(overrides: Partial<LegacyAISettings> = {}): LegacyAISettings {
       custom: {
         apiKey: "",
         model: "",
-        baseUrl: DEFAULT_AI_SETTINGS.providers.custom.baseUrl,
+        baseUrl: LEGACY_CUSTOM_DEFAULT_BASE_URL,
       },
     },
     ...overrides,
@@ -91,7 +95,7 @@ describe("migrateLegacyAISettings", () => {
             custom: {
               apiKey: "",
               model: "",
-              baseUrl: DEFAULT_AI_SETTINGS.providers.custom.baseUrl,
+              baseUrl: LEGACY_CUSTOM_DEFAULT_BASE_URL,
             },
           },
         }),

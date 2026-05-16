@@ -25,6 +25,7 @@ import {
   type AIProviderKind,
   type Connection,
 } from "@/lib/ai";
+import { CustomBaseUrlField } from "./CustomProviderFields";
 
 const KIND_LABELS: Record<AIProviderKind, string> = {
   openai: "OpenAI",
@@ -225,20 +226,18 @@ export function ConnectionEditorDialog({
             </div>
           </div>
 
-          <div className="space-y-2">
-            <Label className="text-xs text-muted-foreground">Base URL</Label>
-            <Input
-              value={baseUrl}
-              onChange={(e) => setBaseUrl(e.target.value)}
-              readOnly={kind !== "custom"}
-              className="h-8 text-xs"
-            />
-            {kind === "custom" && (
-              <p className="text-[10px] text-muted-foreground leading-relaxed">
-                Any OpenAI-compatible server (llama.cpp, LM Studio, Ollama, vLLM).
-              </p>
-            )}
-          </div>
+          {kind === "custom" ? (
+            <CustomBaseUrlField baseUrl={baseUrl} onChange={setBaseUrl} />
+          ) : (
+            <div className="space-y-2">
+              <Label className="text-xs text-muted-foreground">Base URL</Label>
+              <Input
+                value={baseUrl}
+                readOnly
+                className="h-8 text-xs"
+              />
+            </div>
+          )}
 
           {initial?.availableModels !== undefined && (
             <Badge variant="secondary" className="text-[10px]">

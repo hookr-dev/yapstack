@@ -16,16 +16,12 @@ import { fetch as tauriFetch } from "@tauri-apps/plugin-http";
 
 import {
   chatContextKey,
-  getModelsForProvider,
   assembleTranscriptContext,
   assembleNoteContext,
   formatSegmentSpeaker,
   markdownToBasicHtml,
   fetchCustomModels,
-  isAIConfigured,
-  DEFAULT_AI_SETTINGS,
   type ChatContext,
-  type AISettings,
 } from "./ai";
 import type { DbSegment } from "./db";
 
@@ -48,25 +44,6 @@ describe("chatContextKey", () => {
   it('returns "pinned" for pinned context', () => {
     const ctx: ChatContext = { type: "pinned" };
     expect(chatContextKey(ctx)).toBe("pinned");
-  });
-});
-
-describe("getModelsForProvider", () => {
-  it("returns models for openai", () => {
-    const models = getModelsForProvider("openai");
-    expect(models).not.toBeNull();
-    expect(models!.length).toBeGreaterThan(0);
-    expect(models!.some((m) => m.id === "gpt-4o")).toBe(true);
-  });
-
-  it("returns models for openrouter", () => {
-    const models = getModelsForProvider("openrouter");
-    expect(models).not.toBeNull();
-    expect(models!.some((m) => m.id.includes("claude"))).toBe(true);
-  });
-
-  it("returns null for custom provider", () => {
-    expect(getModelsForProvider("custom")).toBeNull();
   });
 });
 
@@ -340,56 +317,3 @@ describe("fetchCustomModels", () => {
   });
 });
 
-describe("isAIConfigured", () => {
-  function settingsWith(overrides: Partial<AISettings>): AISettings {
-    return { ...DEFAULT_AI_SETTINGS, ...overrides };
-  }
-
-  it("returns false for openai with blank apiKey", () => {
-    expect(isAIConfigured(settingsWith({ activeProvider: "openai" }))).toBe(false);
-  });
-
-  it("returns true for openai with an apiKey set", () => {
-    const s = settingsWith({
-      activeProvider: "openai",
-      providers: {
-        ...DEFAULT_AI_SETTINGS.providers,
-        openai: { ...DEFAULT_AI_SETTINGS.providers.openai, apiKey: "sk-abc" },
-      },
-    });
-    expect(isAIConfigured(s)).toBe(true);
-  });
-
-  it("returns true for custom with baseUrl + model, blank apiKey", () => {
-    const s = settingsWith({
-      activeProvider: "custom",
-      providers: {
-        ...DEFAULT_AI_SETTINGS.providers,
-        custom: { apiKey: "", model: "llama3", baseUrl: "http://127.0.0.1:8080/v1" },
-      },
-    });
-    expect(isAIConfigured(s)).toBe(true);
-  });
-
-  it("returns false for custom with empty model", () => {
-    const s = settingsWith({
-      activeProvider: "custom",
-      providers: {
-        ...DEFAULT_AI_SETTINGS.providers,
-        custom: { apiKey: "", model: "", baseUrl: "http://127.0.0.1:8080/v1" },
-      },
-    });
-    expect(isAIConfigured(s)).toBe(false);
-  });
-
-  it("returns false for custom with empty baseUrl", () => {
-    const s = settingsWith({
-      activeProvider: "custom",
-      providers: {
-        ...DEFAULT_AI_SETTINGS.providers,
-        custom: { apiKey: "", model: "llama3", baseUrl: "" },
-      },
-    });
-    expect(isAIConfigured(s)).toBe(false);
-  });
-});

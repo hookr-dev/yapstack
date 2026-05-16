@@ -66,11 +66,12 @@ import { findBranchConflicts, buildFolderTree, buildChildMap, type FolderTreeNod
 import type { DbSession, DbSegment, DbFolder, DbAudioPart } from "@/lib/db";
 import type { SessionPartReadyEvent } from "@/lib/events";
 import { toast } from "sonner";
-import { DEFAULT_AI_SETTINGS, DEFAULT_AI_CONFIG } from "@/lib/ai";
+import { DEFAULT_AI_CONFIG } from "@/lib/ai";
 import { buildVocabularyHints } from "@/lib/transcription";
-import type { AISettings, AIConfig } from "@/lib/ai";
+import type { AIConfig } from "@/lib/ai";
 import {
   migrateLegacyAISettings,
+  type LegacyAISettings,
   type LegacyDictationSlot,
 } from "@/lib/ai-config";
 import {
@@ -98,14 +99,6 @@ export interface DictationSlot {
   id: string;
   name: string;
   enabled: boolean;
-  /**
-   * @deprecated Legacy boolean gate kept for backward compatibility during
-   * the AI Connection/Profile migration. The active gate is `profileId`:
-   * null means "no AI cleanup", non-null means "run cleanup through that
-   * Profile". `aiEnabled` is removed in Commit 11 once every consumer has
-   * migrated.
-   */
-  aiEnabled: boolean;
   /** Profile to use for AI cleanup. null = no cleanup. */
   profileId: string | null;
   prompt: string;
@@ -213,7 +206,6 @@ export const DEFAULT_DICTATION_SLOTS: DictationSlot[] = [
     id: "1",
     name: "Raw Dictation",
     enabled: true,
-    aiEnabled: false,
     profileId: null,
     prompt: "",
     outputAction: "paste",
@@ -223,7 +215,6 @@ export const DEFAULT_DICTATION_SLOTS: DictationSlot[] = [
     id: "2",
     name: "Clean & Focus",
     enabled: true,
-    aiEnabled: true,
     profileId: null,
     prompt: CLEAN_FOCUS_PROMPT,
     outputAction: "paste",
@@ -233,7 +224,6 @@ export const DEFAULT_DICTATION_SLOTS: DictationSlot[] = [
     id: "3",
     name: "Engineer",
     enabled: true,
-    aiEnabled: true,
     profileId: null,
     prompt: ENGINEER_PROMPT,
     outputAction: "paste",
@@ -272,20 +262,14 @@ export interface Settings {
   promptDecaySilenceSeconds: number;
   theme: ThemeMode;
   sidebarCollapsed: boolean;
-  /**
-   * @deprecated Legacy single-active-provider settings, kept for backward
-   * compatibility during the AI Connection/Profile migration. Active state
-   * lives on `aiConfig`; consumers migrate commit-by-commit; this field is
-   * removed in Commit 11. See plan: ~/.claude/plans/skip-the-linear-steps-groovy-pearl.md.
-   */
-  ai: AISettings;
-  /** New AI shape — Connections + Profiles + per-feature Assignments. */
+  /** AI Connection + Profile config (replaces the pre-refactor single-provider shape). */
   aiConfig: AIConfig;
   /**
-   * One-shot snapshot of the legacy `ai` shape captured at the v25 migration,
-   * kept for one release as a safety net. Removed in a follow-up commit.
+   * One-shot snapshot of the pre-refactor `ai` shape captured at the v25
+   * migration, kept for one stable release as a safety net. Removed in a
+   * follow-up commit after the release window. Opaque to the live app.
    */
-  _legacyAi?: AISettings;
+  _legacyAi?: unknown;
   shortcutBindings: Record<string, string>;
   audioSaveLocation: string | null;
   audioExportFormat: "wav" | "mp3";
@@ -620,7 +604,6 @@ const defaultSettings: Settings = {
   promptDecaySilenceSeconds: 5,
   theme: "system",
   sidebarCollapsed: false,
-  ai: DEFAULT_AI_SETTINGS,
   aiConfig: DEFAULT_AI_CONFIG,
   shortcutBindings: {},
   audioSaveLocation: null,
@@ -2582,12 +2565,12 @@ function createAppStore() {
           }
           delete old.backfillSeconds;
         }
-        if (version < 8 && state.settings) {
-          const old = state.settings as Record<string, unknown>;
-          if (old.ai === undefined) {
-            old.ai = DEFAULT_AI_SETTINGS;
-          }
-        }
+        // (v8 originally backfilled state.settings.ai with DEFAULT_AI_SETTINGS.
+        // After the Connection/Profile refactor the legacy `ai` field is no
+        // longer read; v25 below populates `aiConfig` from whatever `ai`
+        // value exists, falling back to DEFAULT_AI_CONFIG when absent.
+        // Pre-v8 users therefore start the new AI flow empty, which is the
+        // greenfield default — they were on a years-old persisted state.)
         if (version < 9 && state.settings) {
           const old = state.settings as Record<string, unknown>;
           if (old.shortcutBindings === undefined) {
@@ -2725,7 +2708,7 @@ function createAppStore() {
           // Snapshot of the legacy ai shape lives on `_legacyAi` as a safety
           // net for one release window, then is deleted in a follow-up.
           const old = state.settings as Record<string, unknown>;
-          const legacy = old.ai as AISettings | undefined;
+          const legacy = old.ai as LegacyAISettings | undefined;
           const dict = old.dictation as
             | { slots?: LegacyDictationSlot[] }
             | undefined;

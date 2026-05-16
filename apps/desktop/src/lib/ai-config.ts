@@ -5,15 +5,34 @@
  * exercised in unit tests and called from the persist `migrate` block
  * in stores/appStore.ts.
  */
-import { DEFAULT_AI_SETTINGS } from "./ai";
 import type {
   AIConfig,
-  AIProvider,
-  AIProviderConfig,
   Connection,
-  LegacyAISettings,
   Profile,
 } from "./ai";
+
+/**
+ * Legacy AI settings shape — used only by the v25 migration to read the
+ * pre-refactor `state.settings.ai` value. Kept here (not in lib/ai.ts) so
+ * the live AI surface area doesn't grow this dead type back. The default
+ * baseUrl is inlined to support the "custom configured if baseUrl
+ * differs from default" heuristic in isProviderConfigured.
+ */
+type LegacyAIProvider = "openai" | "openrouter" | "custom";
+
+interface LegacyAIProviderConfig {
+  apiKey: string;
+  model: string;
+  baseUrl: string;
+  fetchedModels?: string[];
+}
+
+export interface LegacyAISettings {
+  activeProvider: LegacyAIProvider;
+  providers: Record<LegacyAIProvider, LegacyAIProviderConfig>;
+}
+
+const LEGACY_CUSTOM_DEFAULT_BASE_URL = "http://127.0.0.1:8080/v1";
 
 /**
  * Pre-Commit-4 DictationSlot shape (carried `aiEnabled: boolean`, no
@@ -50,18 +69,21 @@ export interface MigrationResult {
   updatedSlots: MigratedDictationSlot[];
 }
 
-const KIND_DISPLAY: Record<AIProvider, string> = {
+const KIND_DISPLAY: Record<LegacyAIProvider, string> = {
   openai: "OpenAI",
   openrouter: "OpenRouter",
   custom: "Custom",
 };
 
-function isProviderConfigured(kind: AIProvider, cfg: AIProviderConfig): boolean {
+function isProviderConfigured(
+  kind: LegacyAIProvider,
+  cfg: LegacyAIProviderConfig,
+): boolean {
   if (kind === "custom") {
     // Custom is considered configured if either the apiKey is set OR the
     // user has changed baseUrl from the default — covers local servers
     // that don't require a key (llama.cpp, LM Studio).
-    return cfg.apiKey !== "" || cfg.baseUrl !== DEFAULT_AI_SETTINGS.providers.custom.baseUrl;
+    return cfg.apiKey !== "" || cfg.baseUrl !== LEGACY_CUSTOM_DEFAULT_BASE_URL;
   }
   return cfg.apiKey !== "";
 }
@@ -87,7 +109,7 @@ export function migrateLegacyAISettings(
   const profiles: Profile[] = [];
   let activeProfileId: string | null = null;
 
-  for (const kind of Object.keys(legacy.providers) as AIProvider[]) {
+  for (const kind of Object.keys(legacy.providers) as LegacyAIProvider[]) {
     const cfg = legacy.providers[kind];
     if (!isProviderConfigured(kind, cfg)) continue;
 

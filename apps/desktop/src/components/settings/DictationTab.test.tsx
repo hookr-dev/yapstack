@@ -26,7 +26,6 @@ const TEST_SLOT = {
   id: "test-slot-1",
   name: "Test Dictation",
   enabled: true,
-  aiEnabled: false,
   profileId: null,
   prompt: "",
   outputAction: "paste" as const,

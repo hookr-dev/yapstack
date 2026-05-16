@@ -26,8 +26,6 @@ import {
   trackShortcutUsed,
   trackModelDownloaded,
   trackEngineError,
-  trackAIProviderChanged,
-  trackAIConnectionTested,
   trackSettingChanged,
   trackSegmentEdited,
   trackSessionMovedToFolder,
@@ -45,7 +43,7 @@ describe("analytics", () => {
       dictation_enabled: 1,
       dictation_slot_count: 2,
       theme: "dark",
-      ai_provider: "openai",
+      ai_connection_count: 1,
     });
     expect(mockTrackEvent).toHaveBeenCalledWith("app_launched", {
       capture_source: "Mixed",
@@ -53,7 +51,7 @@ describe("analytics", () => {
       dictation_enabled: 1,
       dictation_slot_count: 2,
       theme: "dark",
-      ai_provider: "openai",
+      ai_connection_count: 1,
     });
   });
 
@@ -184,19 +182,6 @@ describe("analytics", () => {
     trackEngineError({ error: longError, phase: "initializing" });
     const calledProps = mockTrackEvent.mock.calls[0][1] as { error: string };
     expect(calledProps.error.length).toBe(100);
-  });
-
-  it("trackAIProviderChanged sends provider", () => {
-    trackAIProviderChanged({ provider: "openrouter" });
-    expect(mockTrackEvent).toHaveBeenCalledWith("ai_provider_changed", { provider: "openrouter" });
-  });
-
-  it("trackAIConnectionTested sends success flag", () => {
-    trackAIConnectionTested({ provider: "openai", success: 1 });
-    expect(mockTrackEvent).toHaveBeenCalledWith("ai_connection_tested", {
-      provider: "openai",
-      success: 1,
-    });
   });
 
   it("trackSettingChanged sends setting name and value", () => {

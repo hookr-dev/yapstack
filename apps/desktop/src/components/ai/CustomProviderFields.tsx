@@ -11,7 +11,6 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Loader2 } from "lucide-react";
-import type { AIProviderConfig } from "@/lib/ai";
 import { fetchCustomModels } from "@/lib/ai";
 
 const CUSTOM_URL_PRESETS: { label: string; url: string }[] = [
@@ -22,18 +21,18 @@ const CUSTOM_URL_PRESETS: { label: string; url: string }[] = [
 ];
 
 export function CustomBaseUrlField({
-  config,
-  onUpdate,
+  baseUrl,
+  onChange,
 }: {
-  config: AIProviderConfig;
-  onUpdate: (updates: Partial<AIProviderConfig>) => void;
+  baseUrl: string;
+  onChange: (next: string) => void;
 }) {
   return (
     <div className="space-y-2">
       <Label className="text-xs text-muted-foreground">Base URL</Label>
       <Input
-        value={config.baseUrl}
-        onChange={(e) => onUpdate({ baseUrl: e.target.value })}
+        value={baseUrl}
+        onChange={(e) => onChange(e.target.value)}
         placeholder="http://127.0.0.1:8080/v1"
         className="h-8 text-xs"
       />
@@ -42,9 +41,9 @@ export function CustomBaseUrlField({
           <button
             key={p.url}
             type="button"
-            onClick={() => onUpdate({ baseUrl: p.url })}
+            onClick={() => onChange(p.url)}
             className={`text-[10px] px-2 py-0.5 rounded border transition-colors ${
-              config.baseUrl === p.url
+              baseUrl === p.url
                 ? "bg-muted border-border text-foreground"
                 : "border-border/50 text-muted-foreground hover:bg-muted hover:text-foreground"
             }`}
@@ -58,26 +57,30 @@ export function CustomBaseUrlField({
 }
 
 export function CustomModelField({
-  config,
-  onUpdate,
+  baseUrl,
+  model,
+  fetchedModels,
+  onModelChange,
+  onFetchedModelsChange,
 }: {
-  config: AIProviderConfig;
-  onUpdate: (updates: Partial<AIProviderConfig>) => void;
+  baseUrl: string;
+  model: string;
+  fetchedModels?: string[];
+  onModelChange: (next: string) => void;
+  onFetchedModelsChange: (next: string[]) => void;
 }) {
   const [fetching, setFetching] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const fetchedModels = config.fetchedModels ?? null;
 
   async function handleFetch() {
     setFetching(true);
     setError(null);
     try {
-      const ids = await fetchCustomModels(config.baseUrl);
-      const updates: Partial<AIProviderConfig> = { fetchedModels: ids };
-      if (ids.length > 0 && !ids.includes(config.model)) {
-        updates.model = ids[0];
+      const ids = await fetchCustomModels(baseUrl);
+      onFetchedModelsChange(ids);
+      if (ids.length > 0 && !ids.includes(model)) {
+        onModelChange(ids[0]!);
       }
-      onUpdate(updates);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     }
@@ -92,15 +95,15 @@ export function CustomModelField({
         variant="outline"
         className="w-full text-xs"
         onClick={handleFetch}
-        disabled={fetching || !config.baseUrl}
+        disabled={fetching || !baseUrl}
       >
         {fetching && <Loader2 className="mr-1.5 h-3 w-3 animate-spin" />}
         {fetchedModels ? "Refresh Models" : "Fetch Models from Server"}
       </Button>
       {fetchedModels && fetchedModels.length > 0 && (
         <Select
-          value={fetchedModels.includes(config.model) ? config.model : ""}
-          onValueChange={(v) => onUpdate({ model: v })}
+          value={fetchedModels.includes(model) ? model : ""}
+          onValueChange={(v) => onModelChange(v)}
         >
           <SelectTrigger className="h-8 w-full text-xs">
             <SelectValue placeholder="Pick a fetched model..." />
@@ -115,8 +118,8 @@ export function CustomModelField({
         </Select>
       )}
       <Input
-        value={config.model}
-        onChange={(e) => onUpdate({ model: e.target.value })}
+        value={model}
+        onChange={(e) => onModelChange(e.target.value)}
         placeholder="model-name"
         className="h-8 text-xs"
       />

@@ -248,7 +248,7 @@ export function useDictation() {
       trackDictationStarted({
         slot_id: slot.id,
         slot_name: slot.name,
-        ai_enabled: slot.aiEnabled ? 1 : 0,
+        ai_enabled: slot.profileId !== null ? 1 : 0,
         has_prompt: slot.prompt ? 1 : 0,
         output_action: slot.outputAction ?? "paste",
       });
@@ -539,7 +539,7 @@ export function useDictation() {
           slot_id: slotIdRef.current,
           duration_ms: Date.now() - startTimeRef.current,
           transcription_length: text.length,
-          ai_processed: slot.aiEnabled && slot.prompt ? 1 : 0,
+          ai_processed: slot.profileId !== null && slot.prompt ? 1 : 0,
           output_action: action,
         });
 
@@ -558,8 +558,8 @@ export function useDictation() {
             slot_name: slot.name,
             input_text: inputText,
             output_text: text,
-            ai_enabled: slot.aiEnabled && slot.prompt ? 1 : 0,
-            ai_prompt: slot.aiEnabled ? slot.prompt : null,
+            ai_enabled: slot.profileId !== null && slot.prompt ? 1 : 0,
+            ai_prompt: slot.profileId !== null ? slot.prompt : null,
             output_action: action,
             wav_file_path: wavInfoRef.current?.path ?? null,
             wav_duration_seconds: wavInfoRef.current?.duration ?? null,

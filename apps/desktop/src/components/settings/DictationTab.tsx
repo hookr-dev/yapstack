@@ -336,7 +336,6 @@ export function DictationTab() {
       id: crypto.randomUUID(),
       name: `Slot ${dictation.slots.length + 1}`,
       enabled: true,
-      aiEnabled: false,
       profileId: null,
       prompt: "",
       outputAction: "paste",
