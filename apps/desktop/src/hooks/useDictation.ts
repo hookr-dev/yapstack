@@ -6,7 +6,7 @@ import { register as registerGlobalShortcut, unregister as unregisterGlobalShort
 import { useAppStore } from "@/stores/appStore";
 import { commands } from "@/lib/tauri";
 import { EVENTS, WINDOWS, listenEvent, emitEvent, type BubbleState } from "@/lib/events";
-import { createAIClient, getActiveConfig, isAIConfigured, markdownToBasicHtml } from "@/lib/ai";
+import { resolveAndCreateClient, markdownToBasicHtml } from "@/lib/ai";
 import { buildVocabularyHints } from "@/lib/transcription";
 import { createManualSession as dbCreateManualSession, saveNote, insertDictationHistory, listFolders, listTags } from "@/lib/db";
 import { toast } from "sonner";
@@ -456,39 +456,39 @@ export function useDictation() {
           return;
         }
 
-        // AI processing
-        if (slot.aiEnabled && slot.prompt) {
+        // AI processing — gated on the slot having a Profile assigned and a
+        // prompt to apply. resolveAndCreateClient throws when the Profile
+        // can't be resolved (deleted, points at a deleted Connection, etc.);
+        // we catch and fall through to the raw transcription so the user
+        // always gets *something* delivered, with the error logged. This
+        // matches the prior behaviour where a misconfigured provider quietly
+        // delivered raw text rather than failing the dictation outright.
+        if (slot.profileId !== null && slot.prompt) {
           stateRef.current = "processing";
           emitBubbleState("processing", slot.name);
 
-          const aiSettings = s.settings.ai;
-          const config = getActiveConfig(aiSettings);
-
-          if (!isAIConfigured(aiSettings)) {
-            // AI not configured for this provider — fall through to raw transcription.
-            // For custom providers a blank apiKey is valid (local servers), so we
-            // check both baseUrl + model presence via isAIConfigured.
-          } else {
-            try {
-              const client = createAIClient(aiSettings);
-              const response = await client.chat.completions.create(
-                {
-                  model: config.model,
-                  messages: [
-                    { role: "system", content: slot.prompt },
-                    { role: "user", content: text },
-                  ],
-                },
-                { signal: abort.signal },
-              );
-              const processed = response.choices[0]?.message?.content;
-              if (processed) {
-                text = processed.trim();
-              }
-            } catch (aiErr) {
-              if (abort.signal.aborted) return;
-              console.error("AI processing failed, using raw text:", aiErr);
+          try {
+            const { client, model } = resolveAndCreateClient(
+              s.settings.aiConfig,
+              slot.profileId,
+            );
+            const response = await client.chat.completions.create(
+              {
+                model,
+                messages: [
+                  { role: "system", content: slot.prompt },
+                  { role: "user", content: text },
+                ],
+              },
+              { signal: abort.signal },
+            );
+            const processed = response.choices[0]?.message?.content;
+            if (processed) {
+              text = processed.trim();
             }
+          } catch (aiErr) {
+            if (abort.signal.aborted) return;
+            console.error("AI processing failed, using raw text:", aiErr);
           }
         }
 
