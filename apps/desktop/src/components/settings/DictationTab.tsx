@@ -332,6 +332,7 @@ export function DictationTab() {
       name: `Slot ${dictation.slots.length + 1}`,
       enabled: true,
       aiEnabled: false,
+      profileId: null,
       prompt: "",
       outputAction: "paste",
     };

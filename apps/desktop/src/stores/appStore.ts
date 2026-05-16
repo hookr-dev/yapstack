@@ -66,9 +66,13 @@ import { findBranchConflicts, buildFolderTree, buildChildMap, type FolderTreeNod
 import type { DbSession, DbSegment, DbFolder, DbAudioPart } from "@/lib/db";
 import type { SessionPartReadyEvent } from "@/lib/events";
 import { toast } from "sonner";
-import { DEFAULT_AI_SETTINGS } from "@/lib/ai";
+import { DEFAULT_AI_SETTINGS, DEFAULT_AI_CONFIG } from "@/lib/ai";
 import { buildVocabularyHints } from "@/lib/transcription";
-import type { AISettings } from "@/lib/ai";
+import type { AISettings, AIConfig } from "@/lib/ai";
+import {
+  migrateLegacyAISettings,
+  type LegacyDictationSlot,
+} from "@/lib/ai-config";
 import {
   trackSessionCreated,
   trackSessionStopped,
@@ -94,7 +98,16 @@ export interface DictationSlot {
   id: string;
   name: string;
   enabled: boolean;
+  /**
+   * @deprecated Legacy boolean gate kept for backward compatibility during
+   * the AI Connection/Profile migration. The active gate is `profileId`:
+   * null means "no AI cleanup", non-null means "run cleanup through that
+   * Profile". `aiEnabled` is removed in Commit 11 once every consumer has
+   * migrated.
+   */
   aiEnabled: boolean;
+  /** Profile to use for AI cleanup. null = no cleanup. */
+  profileId: string | null;
   prompt: string;
   outputAction: DictationOutputAction;
   defaultBinding?: string;
@@ -201,6 +214,7 @@ export const DEFAULT_DICTATION_SLOTS: DictationSlot[] = [
     name: "Raw Dictation",
     enabled: true,
     aiEnabled: false,
+    profileId: null,
     prompt: "",
     outputAction: "paste",
     defaultBinding: "Control+Shift+D",
@@ -210,6 +224,7 @@ export const DEFAULT_DICTATION_SLOTS: DictationSlot[] = [
     name: "Clean & Focus",
     enabled: true,
     aiEnabled: true,
+    profileId: null,
     prompt: CLEAN_FOCUS_PROMPT,
     outputAction: "paste",
     defaultBinding: "Control+Shift+C",
@@ -219,6 +234,7 @@ export const DEFAULT_DICTATION_SLOTS: DictationSlot[] = [
     name: "Engineer",
     enabled: true,
     aiEnabled: true,
+    profileId: null,
     prompt: ENGINEER_PROMPT,
     outputAction: "paste",
     defaultBinding: "Control+Shift+X",
@@ -256,7 +272,20 @@ export interface Settings {
   promptDecaySilenceSeconds: number;
   theme: ThemeMode;
   sidebarCollapsed: boolean;
+  /**
+   * @deprecated Legacy single-active-provider settings, kept for backward
+   * compatibility during the AI Connection/Profile migration. Active state
+   * lives on `aiConfig`; consumers migrate commit-by-commit; this field is
+   * removed in Commit 11. See plan: ~/.claude/plans/skip-the-linear-steps-groovy-pearl.md.
+   */
   ai: AISettings;
+  /** New AI shape — Connections + Profiles + per-feature Assignments. */
+  aiConfig: AIConfig;
+  /**
+   * One-shot snapshot of the legacy `ai` shape captured at the v25 migration,
+   * kept for one release as a safety net. Removed in a follow-up commit.
+   */
+  _legacyAi?: AISettings;
   shortcutBindings: Record<string, string>;
   audioSaveLocation: string | null;
   audioExportFormat: "wav" | "mp3";
@@ -584,6 +613,7 @@ const defaultSettings: Settings = {
   theme: "system",
   sidebarCollapsed: false,
   ai: DEFAULT_AI_SETTINGS,
+  aiConfig: DEFAULT_AI_CONFIG,
   shortcutBindings: {},
   audioSaveLocation: null,
   audioExportFormat: "mp3",
@@ -2449,7 +2479,7 @@ function createAppStore() {
     }),
     {
       name: "yapstack-settings",
-      version: 24,
+      version: 25,
       partialize: (state) => ({
         settings: state.settings,
       }),
@@ -2666,6 +2696,42 @@ function createAppStore() {
             old.dictationDuckEnabled = false;
           if (old.dictationDuckTarget === undefined)
             old.dictationDuckTarget = 0.2;
+        }
+        if (version < 25 && state.settings) {
+          // AI Connection/Profile migration. Transforms the legacy
+          // single-active-provider AISettings into the new multi-Connection
+          // AIConfig + per-feature Assignments shape. Per locked design
+          // decision #6, only the active provider becomes a Profile; other
+          // configured providers migrate as Connections so their keys aren't
+          // lost. Per decision #12, dictation slots with aiEnabled=true point
+          // at the active Profile; aiEnabled=false slots get profileId=null.
+          //
+          // Additive only — legacy `ai` and `aiEnabled` fields stay in place
+          // until Commit 11 finishes the consumer migration.
+          //
+          // Snapshot of the legacy ai shape lives on `_legacyAi` as a safety
+          // net for one release window, then is deleted in a follow-up.
+          const old = state.settings as Record<string, unknown>;
+          const legacy = old.ai as AISettings | undefined;
+          const dict = old.dictation as
+            | { slots?: LegacyDictationSlot[] }
+            | undefined;
+          if (legacy && dict?.slots) {
+            const { config, updatedSlots } = migrateLegacyAISettings(
+              legacy,
+              dict.slots,
+            );
+            old.aiConfig = config;
+            old._legacyAi = legacy;
+            // Mutate each slot in place to add `profileId` while leaving the
+            // legacy `aiEnabled` field intact (consumers swap in Commit 6).
+            dict.slots = dict.slots.map((s, i) => ({
+              ...s,
+              profileId: updatedSlots[i]?.profileId ?? null,
+            }));
+          } else if (!old.aiConfig) {
+            old.aiConfig = DEFAULT_AI_CONFIG;
+          }
         }
         return state as unknown as { settings: Settings };
       },

@@ -93,6 +93,15 @@ export interface AIConfig {
 
 export type LegacyAISettings = AISettings;
 
+export const DEFAULT_AI_CONFIG: AIConfig = {
+  connections: [],
+  profiles: [],
+  assignments: {
+    chatProfileId: null,
+    aiActionsProfileId: null,
+  },
+};
+
 export type ToolExecutionStatus = "running" | "done" | "error";
 
 export interface ToolExecution {
