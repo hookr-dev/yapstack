@@ -247,6 +247,12 @@ export function getAllModelsGrouped(
 
 // ----- Client -----
 
+/**
+ * @deprecated Legacy single-active-provider client construction. Kept for
+ * backward compatibility during the AI Connection/Profile migration. New
+ * call sites should use `createAIClientForConnection` or the higher-level
+ * `resolveAndCreateClient(config, profileId)` helper. Removed in commit 11.
+ */
 export function createAIClient(settings: AISettings): OpenAI {
   const config = settings.providers[settings.activeProvider];
 
@@ -270,6 +276,71 @@ export function createAIClient(settings: AISettings): OpenAI {
     defaultHeaders: Object.keys(headers).length > 0 ? headers : undefined,
     fetch: tauriFetch,
   });
+}
+
+/**
+ * Construct an OpenAI client from a Connection. The companion to the
+ * legacy `createAIClient(settings)` for the new Connection/Profile shape.
+ * Local OpenAI-compatible servers (custom kind) accept a blank apiKey;
+ * the placeholder satisfies the SDK constructor without misleading the
+ * remote server.
+ */
+export function createAIClientForConnection(connection: Connection): OpenAI {
+  const headers: Record<string, string> = {};
+  if (connection.kind === "openrouter") {
+    headers["HTTP-Referer"] = "https://yapstack.app";
+    headers["X-Title"] = "YapStack";
+  }
+  const apiKey =
+    connection.kind === "custom" && !connection.apiKey
+      ? "sk-no-key-required"
+      : connection.apiKey;
+  return new OpenAI({
+    apiKey,
+    baseURL: connection.baseUrl,
+    dangerouslyAllowBrowser: true,
+    defaultHeaders: Object.keys(headers).length > 0 ? headers : undefined,
+    fetch: tauriFetch,
+  });
+}
+
+/**
+ * Resolve a Profile reference into a usable (client, model) pair. Throws
+ * if the profileId can't be resolved (missing Profile, missing Connection,
+ * or null input) — per locked design decision #8, AI feature consumers
+ * surface this error rather than silently retrying through another Profile.
+ *
+ * Error message is actionable so the feature can route the user to fix
+ * the underlying configuration.
+ */
+export function resolveAndCreateClient(
+  config: AIConfig,
+  profileId: string | null,
+): { client: OpenAI; model: string; connection: Connection } {
+  if (!profileId) {
+    throw new Error(
+      "No AI Profile assigned. Open Settings → AI to set one up.",
+    );
+  }
+  const profile = config.profiles.find((p) => p.id === profileId);
+  if (!profile) {
+    throw new Error(
+      `AI Profile "${profileId}" not found. Open Settings → AI to reassign.`,
+    );
+  }
+  const connection = config.connections.find(
+    (c) => c.id === profile.connectionId,
+  );
+  if (!connection) {
+    throw new Error(
+      `Profile "${profile.name}" points at a deleted Connection. Open Settings → AI to fix.`,
+    );
+  }
+  return {
+    client: createAIClientForConnection(connection),
+    model: profile.model,
+    connection,
+  };
 }
 
 export async function fetchCustomModels(baseUrl: string): Promise<string[]> {
