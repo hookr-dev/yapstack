@@ -388,10 +388,7 @@ impl DictationOwnsMic {
     /// dictation is actively owning the mic — the runtime's
     /// in-progress transcription continues uninterrupted, just in
     /// the new buffer's coordinate space.
-    pub fn rebase_for_mic_buffer_replacement(
-        &self,
-        new_open_start: u64,
-    ) -> DictationRebaseResult {
+    pub fn rebase_for_mic_buffer_replacement(&self, new_open_start: u64) -> DictationRebaseResult {
         let mut s = self.state.lock().expect("dictation-owns-mic poisoned");
         let dropped_closed: std::collections::VecDeque<MicWindow> = std::mem::take(&mut s.closed);
         let prior_open = s.open;

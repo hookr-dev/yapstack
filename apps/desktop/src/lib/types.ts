@@ -423,12 +423,12 @@ async revealLogDir() : Promise<Result<null, CommandError>> {
  * Forward a frontend log event into the unified `tracing` subscriber so it
  * lands on stderr, the rolling daily log file, AND the in-memory ring
  * buffer (and therefore the LogsPanel + any saved-machine-log archive).
- * 
+ *
  * `module` is an optional sub-target (e.g. "console", "window.error",
  * "heap"); it is rendered as a bracketed prefix on the message. We keep
  * `target` fixed at `frontend` so the subscriber filter (`frontend=debug`)
  * is a single knob.
- * 
+ *
  * Best-effort by contract — the JS caller fires-and-forgets and we never
  * surface a failure that would itself produce an error during error
  * reporting. Capping the message length prevents a runaway stack trace

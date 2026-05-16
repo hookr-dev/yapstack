@@ -8436,7 +8436,7 @@ dependencies = [
 
 [[package]]
 name = "yapstack-desktop"
-version = "1.0.0-alpha.10"
+version = "1.0.0-alpha.11"
 dependencies = [
  "chrono",
  "coreaudio-sys",
