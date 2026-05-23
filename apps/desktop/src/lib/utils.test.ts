@@ -189,6 +189,18 @@ describe("formatRelativeTime", () => {
     const result = formatRelativeTime("2025-06-05T12:00:00");
     expect(result).toMatch(/\w+ \d+/);
   });
+
+  // Regression: connection.fetchedAt is `new Date().toISOString()` which
+  // already ends in `Z`. Appending a second `Z` produces "Invalid Date".
+  it("handles ISO strings that already carry a `Z` suffix", () => {
+    expect(formatRelativeTime("2025-06-15T11:55:00.000Z")).toBe("5m ago");
+  });
+
+  it("handles ISO strings with a numeric timezone offset", () => {
+    // 11:55+00:00 == 12:55 UTC; system time is 12:00 UTC, so this is "future"
+    // by 55 minutes. Use a past offset instead: 13:55+02:00 == 11:55 UTC.
+    expect(formatRelativeTime("2025-06-15T13:55:00+02:00")).toBe("5m ago");
+  });
 });
 
 describe("getDayLabel", () => {

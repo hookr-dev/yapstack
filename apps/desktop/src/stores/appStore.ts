@@ -67,6 +67,12 @@ import type { DbSession, DbSegment, DbFolder, DbAudioPart } from "@/lib/db";
 import type { SessionPartReadyEvent } from "@/lib/events";
 import { toast } from "sonner";
 import { DEFAULT_AI_CONFIG } from "@/lib/ai";
+import {
+  DEFAULT_INSIGHTS_SETTINGS,
+  type InsightsSettings,
+  type LiveInsightResult,
+  type LiveInsightStatus,
+} from "@/lib/insights";
 import { buildVocabularyHints } from "@/lib/transcription";
 import type { AIConfig } from "@/lib/ai";
 import {
@@ -275,6 +281,8 @@ export interface Settings {
   audioExportFormat: "wav" | "mp3";
   mp3Bitrate: number;
   dictation: DictationSettings;
+  /** Live insights — overlay-driven LLM extractions on a heartbeat. */
+  insights: InsightsSettings;
   showRecordingIndicator: boolean;
   /// Lower the system output volume during the recording phase of a
   /// dictation, so the user can hear themselves over earphone playback.
@@ -376,6 +384,24 @@ interface AppState {
   // Dictation history (runtime, loaded from SQLite)
   dictationHistory: DbDictationHistory[];
 
+  // Live insights (runtime, not persisted — cleared on session end and on
+  // active-insight change). See lib/insights.ts and the Insight engine hook.
+  liveInsightResult: LiveInsightResult | null;
+  liveInsightStatus: LiveInsightStatus;
+  liveInsightError: string | null;
+  setLiveInsightResult: (result: LiveInsightResult | null) => void;
+  setLiveInsightStatus: (status: LiveInsightStatus) => void;
+  setLiveInsightError: (error: string | null) => void;
+  /** The Current Insight: the slot whose output is rendering in the overlay
+   *  right now. Distinct from `settings.insights.defaultInsightId` — the
+   *  Default is persisted and drives session-start; Current is ephemeral
+   *  and mutated only by overlay interactions (header dropdown picks,
+   *  × button). Initialized from the Default at session start; cleared on
+   *  session end. Setting to `null` mid-session hides the overlay for that
+   *  session only — Default is untouched. */
+  currentInsightId: string | null;
+  setCurrentInsightId: (id: string | null) => void;
+
   // Update availability (runtime, not persisted)
   updateAvailable: { version: string; body: string | undefined } | null;
   updateDismissedVersion: string | null;
@@ -431,7 +457,7 @@ interface AppState {
   ) => void;
   /**
    * One-shot signal from anywhere in the app to land the user on a specific
-   * Settings location. Consumed by SettingsPanel + AITab + ConnectionsSubTab
+   * Settings location. Consumed by SettingsPanel + AITab + ConnectionsSection
    * on mount, then cleared. Single-value rather than a queue — only the most
    * recent intent matters. Cleared after consumption.
    */
@@ -610,6 +636,7 @@ const defaultSettings: Settings = {
   audioExportFormat: "mp3",
   mp3Bitrate: 64,
   dictation: DEFAULT_DICTATION_SETTINGS,
+  insights: DEFAULT_INSIGHTS_SETTINGS,
   showRecordingIndicator: true,
   dictationDuckEnabled: false,
   dictationDuckAmount: 0.8,
@@ -693,6 +720,14 @@ function createAppStore() {
       tags: [],
       sessionTagMap: {},
       dictationHistory: [],
+      liveInsightResult: null,
+      liveInsightStatus: "idle",
+      liveInsightError: null,
+      currentInsightId: null,
+      setLiveInsightResult: (result) => set({ liveInsightResult: result }),
+      setLiveInsightStatus: (status) => set({ liveInsightStatus: status }),
+      setLiveInsightError: (error) => set({ liveInsightError: error }),
+      setCurrentInsightId: (id) => set({ currentInsightId: id }),
       updateAvailable: null,
       updateDismissedVersion: null,
       settings: defaultSettings,
@@ -746,6 +781,14 @@ function createAppStore() {
                 activeSessionStartTime: null,
                 liveTranscriptionActive: false,
                 livePhase: null,
+                // Live-insights runtime is session-scoped; clear when the
+                // session ends so a future session doesn't render stale
+                // output. `currentInsightId` is re-initialized from
+                // `settings.insights.defaultInsightId` at next session start.
+                liveInsightResult: null,
+                liveInsightStatus: "idle",
+                liveInsightError: null,
+                currentInsightId: null,
                 backfillActive: false,
                 backfillBoundarySeconds: null,
                 sessionStopping: false,
@@ -964,6 +1007,11 @@ function createAppStore() {
             liveTranscriptionActive: true,
             activeSessionStartTime: effectiveStartEpochMs
               ?? (session ? new Date(session.created_at + "Z").getTime() : Date.now()),
+            // Initialize the Current Insight from the persisted Default at
+            // session start. Mid-session changes to the Default in Settings
+            // do not retroactively update this — Settings affects future
+            // sessions only.
+            currentInsightId: get().settings.insights.defaultInsightId,
           });
 
           if (session) {
@@ -1157,6 +1205,9 @@ function createAppStore() {
           livePhase: "Running",
           currentView: "note-detail",
           selectedSessionId: sessionId,
+          // Initialize Current Insight from the persisted Default at session
+          // start. See `recoverActiveSession` for the same pattern.
+          currentInsightId: get().settings.insights.defaultInsightId,
           // backfillActive intentionally omitted — pre-set before the await
           // (and listener-driven thereafter) so a fast `backfill-complete`
           // event arriving during the await isn't overwritten back to true.
@@ -1278,6 +1329,9 @@ function createAppStore() {
           currentView: "note-detail",
           selectedSessionId: sessionId,
           sessionStopping: false,
+          // Initialize Current Insight from the persisted Default at session
+          // resume. See `recoverActiveSession` for the same pattern.
+          currentInsightId: get().settings.insights.defaultInsightId,
           backfillActive: false,
           backfillBoundarySeconds: null,
         });
@@ -2475,7 +2529,7 @@ function createAppStore() {
     }),
     {
       name: "yapstack-settings",
-      version: 25,
+      version: 27,
       partialize: (state) => ({
         settings: state.settings,
       }),
@@ -2727,6 +2781,30 @@ function createAppStore() {
             }));
           } else if (!old.aiConfig) {
             old.aiConfig = DEFAULT_AI_CONFIG;
+          }
+        }
+        if (version < 26 && state.settings) {
+          // Live insights are a brand-new feature — seed with the empty default
+          // for any existing user. Additive, no field renames.
+          const old = state.settings as Record<string, unknown>;
+          if (old.insights === undefined) {
+            // Clone — assigning the module-level constant by reference would
+            // share its `slots: []` array with a live persisted-state object,
+            // so any future in-place mutation would corrupt the default.
+            old.insights = structuredClone(DEFAULT_INSIGHTS_SETTINGS);
+          }
+        }
+        if (version < 27 && state.settings) {
+          // Insights rename: `activeInsightId` (persisted, mid-session edits
+          // leaked into defaults) → `defaultInsightId` (persisted, drives
+          // session-start only). The mid-session "what's running right now"
+          // role is now a runtime-only field (`currentInsightId`) initialized
+          // from `defaultInsightId` at session start.
+          const insights = (state.settings as Record<string, unknown>)
+            .insights as Record<string, unknown> | undefined;
+          if (insights && "activeInsightId" in insights) {
+            insights.defaultInsightId = insights.activeInsightId;
+            delete insights.activeInsightId;
           }
         }
         return state as unknown as { settings: Settings };

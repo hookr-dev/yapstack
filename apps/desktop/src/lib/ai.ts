@@ -173,15 +173,63 @@ export function resolveAndCreateClient(
   };
 }
 
-export async function fetchCustomModels(baseUrl: string): Promise<string[]> {
+/**
+ * Fetch the `/models` catalog from an OpenAI-compatible endpoint.
+ *
+ * OpenAI requires `Authorization: Bearer <key>` on this endpoint (returns
+ * 401 without it). OpenRouter accepts the same header but works unauthed.
+ * Local OpenAI-compatible servers (Ollama, llama.cpp, LM Studio, vLLM)
+ * typically don't require auth — passing the header is a no-op for them.
+ * Send it whenever the caller has a key; omit otherwise.
+ */
+export async function fetchCustomModels(
+  baseUrl: string,
+  apiKey?: string,
+): Promise<string[]> {
   const url = baseUrl.replace(/\/$/, "") + "/models";
-  const res = await tauriFetch(url);
+  const trimmedKey = apiKey?.trim();
+  const res = trimmedKey
+    ? await tauriFetch(url, {
+        headers: { Authorization: `Bearer ${trimmedKey}` },
+      })
+    : await tauriFetch(url);
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const json = (await res.json()) as { data?: Array<{ id?: unknown }> };
   if (!Array.isArray(json.data)) throw new Error("Unexpected response shape");
   return json.data
     .map((m) => (typeof m.id === "string" ? m.id : null))
     .filter((id): id is string => !!id);
+}
+
+/**
+ * Decide whether the Connection editor should kick off a background model
+ * re-fetch when the dialog is saved.
+ *
+ *  - On create: refresh only if the user hasn't already fetched a catalog in
+ *    the dialog (otherwise we'd duplicate the fetch they just ran).
+ *  - On edit: refresh when the endpoint OR the credentials changed since the
+ *    dialog opened — a corrected API key must re-validate just like a changed
+ *    base URL, otherwise a stale `fetchError` / model list sticks around. A
+ *    manual "Refresh" inside the dialog moves the baseline forward (the caller
+ *    resets the baseline to the just-fetched values), so this returns false
+ *    and we don't fire a redundant second fetch on save.
+ *  - Never while a fetch is already in flight.
+ */
+export function shouldAutoRefreshModels(params: {
+  mode: "create" | "edit";
+  hasLocalModels: boolean;
+  fetching: boolean;
+  baseUrl: string;
+  baseUrlBaseline: string;
+  apiKey: string;
+  apiKeyBaseline: string;
+}): boolean {
+  if (params.fetching) return false;
+  if (params.mode === "create") return !params.hasLocalModels;
+  return (
+    params.baseUrl !== params.baseUrlBaseline ||
+    params.apiKey !== params.apiKeyBaseline
+  );
 }
 
 // ----- Context Assembly -----

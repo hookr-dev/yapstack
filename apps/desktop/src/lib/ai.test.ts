@@ -21,6 +21,7 @@ import {
   formatSegmentSpeaker,
   markdownToBasicHtml,
   fetchCustomModels,
+  shouldAutoRefreshModels,
   type ChatContext,
 } from "./ai";
 import type { DbSegment } from "./db";
@@ -314,6 +315,108 @@ describe("fetchCustomModels", () => {
 
     const ids = await fetchCustomModels("http://x/v1");
     expect(ids).toEqual(["a", "b"]);
+  });
+
+  it("sends Bearer auth header when apiKey is provided (required by OpenAI)", async () => {
+    mockFetch.mockResolvedValue({
+      ok: true,
+      json: async () => ({ data: [{ id: "gpt-4o-mini" }] }),
+    } as unknown as Response);
+
+    await fetchCustomModels("https://api.openai.com/v1", "sk-test-key");
+    expect(mockFetch).toHaveBeenCalledWith(
+      "https://api.openai.com/v1/models",
+      { headers: { Authorization: "Bearer sk-test-key" } },
+    );
+  });
+
+  it("treats whitespace-only apiKey as no auth", async () => {
+    mockFetch.mockResolvedValue({
+      ok: true,
+      json: async () => ({ data: [] }),
+    } as unknown as Response);
+
+    await fetchCustomModels("http://x/v1", "   ");
+    expect(mockFetch).toHaveBeenCalledWith("http://x/v1/models");
+  });
+});
+
+describe("shouldAutoRefreshModels", () => {
+  const base = {
+    baseUrl: "https://api.openai.com/v1",
+    baseUrlBaseline: "https://api.openai.com/v1",
+    apiKey: "sk-key",
+    apiKeyBaseline: "sk-key",
+  };
+
+  it("never refreshes while a fetch is already in flight", () => {
+    expect(
+      shouldAutoRefreshModels({
+        ...base,
+        mode: "create",
+        hasLocalModels: false,
+        fetching: true,
+      }),
+    ).toBe(false);
+  });
+
+  it("on create, refreshes only when no catalog was fetched in the dialog", () => {
+    expect(
+      shouldAutoRefreshModels({
+        ...base,
+        mode: "create",
+        hasLocalModels: false,
+        fetching: false,
+      }),
+    ).toBe(true);
+    expect(
+      shouldAutoRefreshModels({
+        ...base,
+        mode: "create",
+        hasLocalModels: true,
+        fetching: false,
+      }),
+    ).toBe(false);
+  });
+
+  it("on edit, refreshes when the base URL changed", () => {
+    expect(
+      shouldAutoRefreshModels({
+        ...base,
+        mode: "edit",
+        hasLocalModels: true,
+        fetching: false,
+        baseUrl: "http://localhost:1234/v1",
+      }),
+    ).toBe(true);
+  });
+
+  // Regression: fixing only the API key (base URL unchanged) must still
+  // re-validate, otherwise a stale fetchError / model list sticks around.
+  it("on edit, refreshes when only the API key changed", () => {
+    expect(
+      shouldAutoRefreshModels({
+        ...base,
+        mode: "edit",
+        hasLocalModels: true,
+        fetching: false,
+        apiKey: "sk-corrected-key",
+      }),
+    ).toBe(true);
+  });
+
+  // Regression: a manual Refresh in the dialog moves the baselines forward, so
+  // saving must NOT fire a redundant second fetch (which on a flaky endpoint
+  // could overwrite the just-fetched good catalog with an error).
+  it("on edit, does not refresh when nothing changed since the baseline", () => {
+    expect(
+      shouldAutoRefreshModels({
+        ...base,
+        mode: "edit",
+        hasLocalModels: true,
+        fetching: false,
+      }),
+    ).toBe(false);
   });
 });
 

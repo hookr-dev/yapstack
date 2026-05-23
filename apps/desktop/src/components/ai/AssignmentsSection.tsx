@@ -1,4 +1,5 @@
 import { useAppStore } from "@/stores/appStore";
+import { Label } from "@/components/ui/label";
 import { MessageSquare, Sparkles } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import { ProfilePicker } from "./ProfilePicker";
@@ -14,11 +15,11 @@ const ROWS: { key: "chat" | "aiActions"; label: string; icon: LucideIcon; helper
     key: "aiActions",
     label: "AI actions",
     icon: Sparkles,
-    helper: "Profile used by Summarize, Key Points, Action Items, Meeting Minutes.",
+    helper: "Summarize, Key Points, Action Items, Meeting Minutes.",
   },
 ];
 
-export function AssignmentsSummary() {
+export function AssignmentsSection() {
   const aiConfig = useAppStore((s) => s.settings.aiConfig);
   const updateSettings = useAppStore((s) => s.updateSettings);
 
@@ -37,14 +38,16 @@ export function AssignmentsSummary() {
   }
 
   return (
-    <div className="rounded-md border border-border bg-card">
-      <div className="border-b border-border px-3 py-2.5">
-        <h3 className="text-sm font-medium">Assignments</h3>
-        <p className="mt-0.5 text-[11px] text-muted-foreground">
+    <div className="space-y-3">
+      <div className="space-y-0.5">
+        <h4 className="text-[11px] font-medium uppercase text-muted-foreground">
+          Assignments
+        </h4>
+        <p className="text-[10px] text-muted-foreground">
           Which Profile each AI feature uses by default.
         </p>
       </div>
-      <div className="divide-y divide-border">
+      <div className="space-y-3">
         {ROWS.map((row) => {
           const value =
             row.key === "chat"
@@ -54,20 +57,18 @@ export function AssignmentsSummary() {
           return (
             <div
               key={row.key}
-              className="grid grid-cols-[auto,1fr,minmax(180px,260px)] items-center gap-3 px-3 py-2.5"
+              className="flex items-center justify-between gap-3"
             >
-              <Icon className="h-4 w-4 text-muted-foreground" />
-              <div className="min-w-0">
-                <div className="text-sm font-medium">{row.label}</div>
-                {value === null ? (
-                  <div className="mt-0.5 text-[11px] text-muted-foreground">
-                    No profile assigned — AI feature disabled.
-                  </div>
-                ) : (
-                  <div className="mt-0.5 text-[11px] text-muted-foreground">
-                    {row.helper}
-                  </div>
-                )}
+              <div className="flex min-w-0 items-center gap-2">
+                <Icon className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                <div className="min-w-0 space-y-0.5">
+                  <Label className="text-xs">{row.label}</Label>
+                  <p className="text-[10px] text-muted-foreground">
+                    {value === null
+                      ? "No Profile assigned — AI feature disabled."
+                      : row.helper}
+                  </p>
+                </div>
               </div>
               <ProfilePicker
                 profiles={aiConfig.profiles}
@@ -76,7 +77,7 @@ export function AssignmentsSummary() {
                 onChange={(next) => setAssignment(row.key, next)}
                 allowNone
                 noneLabel="None — disable for this feature"
-                variant="inline"
+                variant="pill"
               />
             </div>
           );

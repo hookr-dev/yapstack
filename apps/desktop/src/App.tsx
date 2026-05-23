@@ -7,9 +7,12 @@ import type { ThemeMode } from "@/stores/appStore";
 import { useGlobalShortcuts } from "@/hooks/useGlobalShortcuts";
 import { useDictation } from "@/hooks/useDictation";
 import { useRecordingIndicator } from "@/hooks/useRecordingIndicator";
+import { useInsightEngine } from "@/hooks/useInsightEngine";
+import { useInsightOverlayController } from "@/hooks/useInsightOverlayController";
 import { useUpdateCheck } from "@/hooks/useUpdateCheck";
 import { DictationBubble } from "@/components/DictationBubble";
 import { RecordingIndicator } from "@/components/RecordingIndicator";
+import { InsightOverlay } from "@/components/InsightOverlay";
 import { WINDOWS } from "@/lib/events";
 
 const WINDOW_POS_KEY = "yapstack-window-position";
@@ -44,6 +47,8 @@ function MainApp() {
   useGlobalShortcuts();
   useDictation();
   useRecordingIndicator();
+  useInsightEngine();
+  useInsightOverlayController();
   useUpdateCheck();
 
   // Apply theme on mount and when setting changes
@@ -125,6 +130,7 @@ function MainApp() {
 function App() {
   if (windowType === WINDOWS.DICTATION) return <DictationBubble />;
   if (windowType === WINDOWS.RECORDING_INDICATOR) return <RecordingIndicator />;
+  if (windowType === WINDOWS.INSIGHT) return <InsightOverlay />;
   return <MainApp />;
 }
 

@@ -58,12 +58,14 @@ export function CustomBaseUrlField({
 
 export function CustomModelField({
   baseUrl,
+  apiKey,
   model,
   fetchedModels,
   onModelChange,
   onFetchedModelsChange,
 }: {
   baseUrl: string;
+  apiKey?: string;
   model: string;
   fetchedModels?: string[];
   onModelChange: (next: string) => void;
@@ -76,7 +78,7 @@ export function CustomModelField({
     setFetching(true);
     setError(null);
     try {
-      const ids = await fetchCustomModels(baseUrl);
+      const ids = await fetchCustomModels(baseUrl, apiKey);
       onFetchedModelsChange(ids);
       if (ids.length > 0 && !ids.includes(model)) {
         onModelChange(ids[0]!);

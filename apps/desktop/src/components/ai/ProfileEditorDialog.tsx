@@ -215,8 +215,8 @@ export function ProfileEditorDialog({
               <p className="text-[10px] text-muted-foreground leading-relaxed">
                 No model catalog cached for this Connection. Type the model
                 identifier the server expects (e.g. <code>llama3</code>,{" "}
-                <code>qwen2.5</code>). Refresh from the Connection editor to
-                fetch the catalog.
+                <code>qwen2.5</code>), or use the refresh button next to the
+                Connection above to fetch the catalog.
               </p>
             )}
           </div>

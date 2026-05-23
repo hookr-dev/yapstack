@@ -444,7 +444,7 @@ function AIStep({
     let available: string[] | undefined = fetchedModels;
     if (available === undefined) {
       try {
-        available = await fetchCustomModels(baseUrl);
+        available = await fetchCustomModels(baseUrl, apiKey);
       } catch {
         available = undefined;
       }
@@ -576,6 +576,7 @@ function AIStep({
             <CustomBaseUrlField baseUrl={baseUrl} onChange={setBaseUrl} />
             <CustomModelField
               baseUrl={baseUrl}
+              apiKey={apiKey}
               model={model}
               fetchedModels={fetchedModels}
               onModelChange={setModel}

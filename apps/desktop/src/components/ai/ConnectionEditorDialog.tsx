@@ -10,7 +10,6 @@ import {
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Button } from "@/components/ui/button";
-import { Badge } from "@/components/ui/badge";
 import {
   Select,
   SelectContent,
@@ -18,14 +17,24 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { Eye, EyeOff, ExternalLink, Loader2 } from "lucide-react";
+import {
+  AlertTriangle,
+  Eye,
+  EyeOff,
+  ExternalLink,
+  Loader2,
+  RefreshCw,
+} from "lucide-react";
 import { toast } from "sonner";
 import {
   fetchCustomModels,
+  shouldAutoRefreshModels,
   type AIProviderKind,
   type Connection,
 } from "@/lib/ai";
+import { formatRelativeTime } from "@/lib/utils";
 import { CustomBaseUrlField } from "./CustomProviderFields";
+import { useRefreshConnectionModels } from "@/hooks/useRefreshConnectionModels";
 
 const KIND_LABELS: Record<AIProviderKind, string> = {
   openai: "OpenAI",
@@ -70,58 +79,75 @@ export function ConnectionEditorDialog({
   const [apiKey, setApiKey] = useState("");
   const [baseUrl, setBaseUrl] = useState(DEFAULT_BASE_URLS.openai);
   const [showKey, setShowKey] = useState(false);
+
+  // Local model-catalog state. Seeded from `initial` on open. Mutated by
+  // explicit refresh in the dialog; committed to the Connection on save.
+  const [localModels, setLocalModels] = useState<string[] | undefined>(undefined);
+  const [localFetchedAt, setLocalFetchedAt] = useState<string | undefined>(undefined);
+  const [localFetchError, setLocalFetchError] = useState<string | undefined>(undefined);
   const [fetching, setFetching] = useState(false);
 
-  // Re-seed local state whenever the dialog opens. Doing it on `open`
-  // (not on `initial` identity) avoids tearing if the caller passes a
-  // freshly-constructed object on every render.
+  // Baselines for "has the user changed something that invalidates the cached
+  // model catalog?" Seeded when the dialog opens and moved forward by a manual
+  // Refresh (which re-validates the current values). Drives the background
+  // refresh-on-save decision in handleSubmit.
+  const [baseUrlAtOpen, setBaseUrlAtOpen] = useState("");
+  const [apiKeyAtOpen, setApiKeyAtOpen] = useState("");
+
+  const { refresh: refreshPersistedConnection } = useRefreshConnectionModels();
+
   useEffect(() => {
     if (!open) return;
     setName(initial?.name ?? "");
     setKind(initial?.kind ?? "openai");
     setApiKey(initial?.apiKey ?? "");
-    setBaseUrl(initial?.baseUrl ?? DEFAULT_BASE_URLS[initial?.kind ?? "openai"]);
+    const seedBaseUrl = initial?.baseUrl ?? DEFAULT_BASE_URLS[initial?.kind ?? "openai"];
+    setBaseUrl(seedBaseUrl);
+    setBaseUrlAtOpen(seedBaseUrl);
+    setApiKeyAtOpen(initial?.apiKey ?? "");
     setShowKey(false);
+    setLocalModels(initial?.availableModels);
+    setLocalFetchedAt(initial?.fetchedAt);
+    setLocalFetchError(initial?.fetchError);
+    setFetching(false);
   }, [open, initial]);
 
   function handleKindChange(next: AIProviderKind) {
     setKind(next);
-    // Reset baseUrl to the kind's default when switching kinds, so a user
-    // who picked Custom and typed a localhost URL doesn't carry it into
-    // OpenAI by accident. For Custom we still seed the default rather
-    // than leaving blank — most local servers run on 8080.
     setBaseUrl(DEFAULT_BASE_URLS[next]);
   }
 
-  async function handleSubmit() {
-    const trimmedName = name.trim() || KIND_LABELS[kind].split(" ")[0]!;
-    const id = initial?.id ?? crypto.randomUUID();
-
-    // Fetch models so the Profile picker has something to show. Failures
-    // are non-blocking — the Connection still saves with `fetchError`
-    // set, and the user can refresh from the edit dialog later or just
-    // type a model name manually in the Profile editor.
-    let availableModels: string[] | undefined;
-    let fetchError: string | undefined;
+  async function handleRefresh() {
+    if (!baseUrl.trim()) return;
     setFetching(true);
+    setLocalFetchError(undefined);
     try {
-      availableModels = await fetchCustomModels(baseUrl);
-      if (availableModels.length === 0) {
-        // Empty list isn't a failure — some servers expose nothing on
-        // /models. Keep the response so we don't re-fetch on every open,
-        // and let the toast hint that the user may need to type manually.
+      const models = await fetchCustomModels(baseUrl, apiKey);
+      setLocalModels(models);
+      setLocalFetchedAt(new Date().toISOString());
+      // We just validated the current endpoint + key, so move the baselines
+      // forward. Saving now won't fire a redundant background re-fetch.
+      setBaseUrlAtOpen(baseUrl);
+      setApiKeyAtOpen(apiKey);
+      if (models.length === 0) {
         toast.warning(
-          `Connected to ${trimmedName}, but the server reported no models. You can type a model name manually when creating a Profile.`,
+          "Server reported no models. You can still type a model name manually in a Profile.",
         );
+      } else {
+        toast.success(`Cached ${models.length} model${models.length === 1 ? "" : "s"}.`);
       }
     } catch (e) {
-      fetchError = e instanceof Error ? e.message : String(e);
-      toast.warning(
-        `Saved ${trimmedName}, but couldn't fetch models: ${fetchError}. Refresh from the edit dialog once the server is reachable, or type a model name manually.`,
-      );
+      const message = e instanceof Error ? e.message : String(e);
+      setLocalFetchError(message);
+      toast.error(`Couldn't fetch models: ${message}`);
     } finally {
       setFetching(false);
     }
+  }
+
+  function handleSubmit() {
+    const trimmedName = name.trim() || KIND_LABELS[kind].split(" ")[0]!;
+    const id = initial?.id ?? crypto.randomUUID();
 
     const next: Connection = {
       id,
@@ -129,12 +155,33 @@ export function ConnectionEditorDialog({
       kind,
       baseUrl,
       apiKey: apiKey.trim(),
-      ...(availableModels !== undefined && { availableModels }),
-      ...(availableModels !== undefined && { fetchedAt: new Date().toISOString() }),
-      ...(fetchError !== undefined && { fetchError }),
+      ...(localModels !== undefined && { availableModels: localModels }),
+      ...(localFetchedAt !== undefined && { fetchedAt: localFetchedAt }),
+      ...(localFetchError !== undefined && { fetchError: localFetchError }),
     };
     onSubmit(next);
     onOpenChange(false);
+
+    // Background refresh: on create with no fetched catalog, OR on edit when
+    // the endpoint or the API key changed since the dialog opened (a corrected
+    // key must re-validate too — otherwise a stale fetchError sticks). A manual
+    // Refresh moves the baselines forward, so this won't double-fetch.
+    // Fire-and-forget so the dialog closes immediately; the hook toasts on done.
+    const shouldAutoRefresh = shouldAutoRefreshModels({
+      mode,
+      hasLocalModels: localModels !== undefined,
+      fetching,
+      baseUrl,
+      baseUrlBaseline: baseUrlAtOpen,
+      apiKey,
+      apiKeyBaseline: apiKeyAtOpen,
+    });
+    if (shouldAutoRefresh) {
+      // Defer one tick so the store update lands before the hook reads it.
+      queueMicrotask(() => {
+        refreshPersistedConnection(id);
+      });
+    }
   }
 
   const apiKeyOptional = kind === "custom";
@@ -239,12 +286,14 @@ export function ConnectionEditorDialog({
             </div>
           )}
 
-          {initial?.availableModels !== undefined && (
-            <Badge variant="secondary" className="text-[10px]">
-              {initial.availableModels.length} model
-              {initial.availableModels.length === 1 ? "" : "s"} cached
-            </Badge>
-          )}
+          <ModelsPanel
+            fetching={fetching}
+            localModels={localModels}
+            localFetchedAt={localFetchedAt}
+            localFetchError={localFetchError}
+            onRefresh={handleRefresh}
+            disabled={!baseUrl.trim()}
+          />
         </div>
 
         <DialogFooter>
@@ -252,11 +301,111 @@ export function ConnectionEditorDialog({
             Cancel
           </Button>
           <Button size="sm" onClick={handleSubmit} disabled={!canSubmit}>
-            {fetching && <Loader2 className="mr-1.5 h-3 w-3 animate-spin" />}
             {mode === "create" ? "Add Connection" : "Save"}
           </Button>
         </DialogFooter>
       </DialogContent>
     </Dialog>
+  );
+}
+
+function ModelsPanel({
+  fetching,
+  localModels,
+  localFetchedAt,
+  localFetchError,
+  onRefresh,
+  disabled,
+}: {
+  fetching: boolean;
+  localModels?: string[];
+  localFetchedAt?: string;
+  localFetchError?: string;
+  onRefresh: () => void;
+  disabled: boolean;
+}) {
+  const count = localModels?.length;
+  const buttonLabel = localModels === undefined ? "Fetch models" : "Refresh";
+
+  return (
+    <div className="space-y-2">
+      <Label className="text-xs text-muted-foreground">Models</Label>
+      <div className="flex items-center justify-between gap-3 rounded-md border border-border bg-muted/30 px-3 py-2">
+        <ModelsPanelStatus
+          fetching={fetching}
+          fetchError={localFetchError}
+          count={count}
+          fetchedAt={localFetchedAt}
+        />
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={onRefresh}
+          disabled={fetching || disabled}
+          className="shrink-0 text-xs"
+        >
+          {fetching ? (
+            <Loader2 className="mr-1.5 h-3 w-3 animate-spin" />
+          ) : (
+            <RefreshCw className="mr-1.5 h-3 w-3" />
+          )}
+          {buttonLabel}
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+function ModelsPanelStatus({
+  fetching,
+  fetchError,
+  count,
+  fetchedAt,
+}: {
+  fetching: boolean;
+  fetchError?: string;
+  count: number | undefined;
+  fetchedAt?: string;
+}) {
+  if (fetching) {
+    return (
+      <span className="text-[11px] text-muted-foreground">
+        Fetching from server…
+      </span>
+    );
+  }
+  if (fetchError) {
+    return (
+      <span className="flex min-w-0 items-center gap-1 text-[11px] text-destructive">
+        <AlertTriangle className="h-3 w-3 shrink-0" />
+        <span className="truncate" title={fetchError}>
+          {fetchError}
+        </span>
+      </span>
+    );
+  }
+  if (count === undefined) {
+    return (
+      <span className="text-[11px] text-muted-foreground">
+        No models fetched yet.
+      </span>
+    );
+  }
+  if (count === 0) {
+    return (
+      <span className="text-[11px] text-muted-foreground">
+        Server reported no models.
+      </span>
+    );
+  }
+  return (
+    <span className="text-[11px] text-muted-foreground">
+      {count} cached
+      {fetchedAt && (
+        <span title={new Date(fetchedAt).toLocaleString()}>
+          {" · "}fetched {formatRelativeTime(fetchedAt).toLowerCase()}
+        </span>
+      )}
+    </span>
   );
 }

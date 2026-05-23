@@ -54,9 +54,15 @@ export function formatElapsed(ms: number): string {
   return `${mm}:${ss}`;
 }
 
+// SQLite writes naive timestamps (no timezone marker) but stores UTC; we
+// append `Z` so JS parses them as UTC rather than local. ISO strings from
+// `toISOString()` already end in `Z` (or an offset like `+02:00`) — appending
+// a second `Z` to those would yield `Invalid Date`.
+const HAS_TZ = /Z$|[+-]\d{2}:?\d{2}$/;
+
 /** Format a date string to a relative time label (e.g. "Just now", "5m ago", "2d ago"). */
 export function formatRelativeTime(dateStr: string): string {
-  const date = new Date(dateStr + "Z");
+  const date = new Date(HAS_TZ.test(dateStr) ? dateStr : dateStr + "Z");
   const diff = Date.now() - date.getTime();
   const seconds = Math.floor(diff / 1000);
   if (seconds < 60) return "Just now";
@@ -74,7 +80,7 @@ export function formatRelativeTime(dateStr: string): string {
 
 /** Get a human-readable day label for a date string (e.g. "Today", "Yesterday"). */
 export function getDayLabel(dateStr: string): string {
-  const date = new Date(dateStr + "Z");
+  const date = new Date(HAS_TZ.test(dateStr) ? dateStr : dateStr + "Z");
   const now = new Date();
   const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
   const sessionDay = new Date(

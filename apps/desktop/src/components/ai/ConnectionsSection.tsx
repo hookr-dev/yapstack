@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 import { useAppStore } from "@/stores/appStore";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -12,18 +12,30 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
-import { Network, Pencil, Plus, Server, Sparkles, Trash2 } from "lucide-react";
+import {
+  AlertTriangle,
+  Loader2,
+  Network,
+  Pencil,
+  Plus,
+  RefreshCw,
+  Server,
+  Sparkles,
+  Trash2,
+} from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import type {
   AIConfig,
   AIProviderKind,
   Connection,
 } from "@/lib/ai";
+import { formatRelativeTime } from "@/lib/utils";
 import { ConnectionEditorDialog } from "./ConnectionEditorDialog";
 import {
   clearChatContextProfile,
   getChatContextProfileId,
 } from "@/lib/db";
+import { useRefreshConnectionModels } from "@/hooks/useRefreshConnectionModels";
 
 const KIND_ICON: Record<AIProviderKind, LucideIcon> = {
   openai: Sparkles,
@@ -48,11 +60,11 @@ interface DeleteState {
   connection: Connection;
   dependentProfileIds: string[];
   dependentProfileNames: string[];
-  affectedAssignments: string[]; // human-readable labels
+  affectedAssignments: string[];
   affectedSlotNames: string[];
 }
 
-export function ConnectionsSubTab({
+export function ConnectionsSection({
   autoOpenEditor = false,
   onAutoOpenConsumed,
 }: {
@@ -62,6 +74,7 @@ export function ConnectionsSubTab({
   const aiConfig = useAppStore((s) => s.settings.aiConfig);
   const dictation = useAppStore((s) => s.settings.dictation);
   const updateSettings = useAppStore((s) => s.updateSettings);
+  const { refresh, refreshingId } = useRefreshConnectionModels();
 
   const [editState, setEditState] = useState<EditState>({
     open: false,
@@ -69,17 +82,16 @@ export function ConnectionsSubTab({
   });
   const [deleteState, setDeleteState] = useState<DeleteState | null>(null);
 
-  // Honor the one-shot autoOpenEditor signal exactly once on mount.
   useEffect(() => {
     if (autoOpenEditor) {
       setEditState({ open: true, mode: "create" });
       onAutoOpenConsumed?.();
     }
-    // Intentional: only fire on mount.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const connections = aiConfig.connections;
+  const hasConnections = connections.length > 0;
 
   const handleCreate = () => {
     setEditState({ open: true, mode: "create" });
@@ -164,12 +176,6 @@ export function ConnectionsSubTab({
         : s,
     );
 
-    // Clear per-chat overrides that pointed at deleted Profiles. We don't
-    // have an index of which contexts had which profile, so we walk the
-    // known assignment slots and clear any chat context settings whose
-    // profile_id ended up dangling. resolveProfile already tolerates
-    // dangling references at read time, but proactively clearing keeps
-    // the table tidy.
     for (const pid of dependentProfileIds) {
       const current = await getChatContextProfileId(pid).catch(() => null);
       if (current === pid) {
@@ -185,34 +191,39 @@ export function ConnectionsSubTab({
   };
 
   return (
-    <div className="space-y-3">
-      <div className="flex items-center justify-between">
-        <p className="text-xs text-muted-foreground">
-          {connections.length === 0
-            ? "Connect an AI provider to get started."
-            : `${connections.length} connection${connections.length === 1 ? "" : "s"}`}
-        </p>
-        {connections.length > 0 && (
-          <Button size="sm" variant="outline" onClick={handleCreate} className="text-xs">
+    <div className="space-y-2">
+      <div className="flex items-center justify-between gap-3">
+        <h4 className="text-[11px] font-medium uppercase text-muted-foreground">
+          Connections
+        </h4>
+        {hasConnections && (
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={handleCreate}
+            className="shrink-0 text-xs"
+          >
             <Plus className="mr-1 h-3 w-3" />
             Add Connection
           </Button>
         )}
       </div>
 
-      {connections.length === 0 ? (
-        <EmptyState onAdd={handleCreate} />
-      ) : (
-        <div className="rounded-md border border-border bg-card divide-y divide-border">
+      {hasConnections ? (
+        <div className="divide-y divide-border rounded-md border border-border bg-card">
           {connections.map((c) => (
             <ConnectionRow
               key={c.id}
               connection={c}
+              refreshing={refreshingId === c.id}
+              onRefresh={() => refresh(c.id)}
               onEdit={() => handleEdit(c)}
               onDelete={() => handleRequestDelete(c)}
             />
           ))}
         </div>
+      ) : (
+        <EmptyState onAdd={handleCreate} />
       )}
 
       <ConnectionEditorDialog
@@ -294,39 +305,46 @@ export function ConnectionsSubTab({
 
 function ConnectionRow({
   connection,
+  refreshing,
+  onRefresh,
   onEdit,
   onDelete,
 }: {
   connection: Connection;
+  refreshing: boolean;
+  onRefresh: () => void;
   onEdit: () => void;
   onDelete: () => void;
 }) {
   const Icon = KIND_ICON[connection.kind];
-  const modelCount = connection.availableModels?.length;
-  const modelStatus = useMemo(() => {
-    if (connection.fetchError) return "Could not fetch models";
-    if (modelCount === undefined) return "Models not fetched";
-    if (modelCount === 0) return "No models reported";
-    return `${modelCount} model${modelCount === 1 ? "" : "s"}`;
-  }, [connection.fetchError, modelCount]);
 
   return (
-    <div className="flex items-center gap-3 px-3 py-2.5">
-      <Icon className="h-4 w-4 shrink-0 text-muted-foreground" />
+    <div className="flex items-center gap-2.5 px-3 py-2">
+      <Icon className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
       <div className="min-w-0 flex-1">
-        <div className="flex items-center gap-2">
-          <span className="truncate text-sm font-medium">{connection.name}</span>
-          <Badge variant="secondary" className="text-[10px] px-1.5 py-0">
+        <div className="flex items-center gap-1.5">
+          <span className="truncate text-xs font-medium">{connection.name}</span>
+          <Badge variant="secondary" className="px-1.5 py-0 text-[10px]">
             {KIND_LABEL[connection.kind]}
           </Badge>
         </div>
-        <div className="mt-0.5 truncate text-[11px] text-muted-foreground">
-          {connection.baseUrl}
-        </div>
-        <div className="mt-0.5 text-[10px] text-muted-foreground">
-          {modelStatus}
-        </div>
+        <SecondaryLine connection={connection} refreshing={refreshing} />
       </div>
+      <Button
+        variant="ghost"
+        size="icon-sm"
+        className="text-muted-foreground hover:text-foreground"
+        onClick={onRefresh}
+        disabled={refreshing}
+        aria-label={`Refresh models for ${connection.name}`}
+        title="Refresh models"
+      >
+        {refreshing ? (
+          <Loader2 className="h-3 w-3 animate-spin" />
+        ) : (
+          <RefreshCw className="h-3 w-3" />
+        )}
+      </Button>
       <Button
         variant="ghost"
         size="icon-sm"
@@ -334,7 +352,7 @@ function ConnectionRow({
         onClick={onEdit}
         aria-label={`Edit ${connection.name}`}
       >
-        <Pencil className="h-3.5 w-3.5" />
+        <Pencil className="h-3 w-3" />
       </Button>
       <Button
         variant="ghost"
@@ -343,24 +361,85 @@ function ConnectionRow({
         onClick={onDelete}
         aria-label={`Delete ${connection.name}`}
       >
-        <Trash2 className="h-3.5 w-3.5" />
+        <Trash2 className="h-3 w-3" />
       </Button>
     </div>
   );
 }
 
+function SecondaryLine({
+  connection,
+  refreshing,
+}: {
+  connection: Connection;
+  refreshing: boolean;
+}) {
+  return (
+    <div className="mt-0.5 flex min-w-0 items-center gap-1 text-[11px] text-muted-foreground">
+      <span className="truncate">{connection.baseUrl}</span>
+      <span className="shrink-0 text-muted-foreground/50">·</span>
+      <StatusInline connection={connection} refreshing={refreshing} />
+    </div>
+  );
+}
+
+function StatusInline({
+  connection,
+  refreshing,
+}: {
+  connection: Connection;
+  refreshing: boolean;
+}) {
+  if (refreshing) {
+    return (
+      <span className="flex shrink-0 items-center gap-1">
+        <Loader2 className="h-2.5 w-2.5 animate-spin" />
+        Fetching…
+      </span>
+    );
+  }
+  if (connection.fetchError) {
+    return (
+      <span
+        className="flex shrink-0 items-center gap-1 text-destructive"
+        title={connection.fetchError}
+      >
+        <AlertTriangle className="h-2.5 w-2.5" />
+        Fetch failed
+      </span>
+    );
+  }
+  const count = connection.availableModels?.length;
+  if (count === undefined) {
+    return <span className="shrink-0">not fetched</span>;
+  }
+  if (count === 0) {
+    return <span className="shrink-0">no models</span>;
+  }
+  return (
+    <span className="shrink-0">
+      {count} model{count === 1 ? "" : "s"}
+      {connection.fetchedAt && (
+        <span title={new Date(connection.fetchedAt).toLocaleString()}>
+          {" · "}
+          {formatRelativeTime(connection.fetchedAt).toLowerCase()}
+        </span>
+      )}
+    </span>
+  );
+}
+
 function EmptyState({ onAdd }: { onAdd: () => void }) {
   return (
-    <div className="rounded-md border border-dashed border-border bg-card px-6 py-8 text-center">
-      <div className="mx-auto mb-3 flex h-9 w-9 items-center justify-center rounded-full bg-muted">
-        <Server className="h-4 w-4 text-muted-foreground" />
+    <div className="rounded-md border border-dashed border-border px-6 py-5 text-center">
+      <div className="mx-auto mb-2 flex h-7 w-7 items-center justify-center rounded-full bg-muted">
+        <Server className="h-3 w-3 text-muted-foreground" />
       </div>
-      <h3 className="text-sm font-medium">No connections yet</h3>
-      <p className="mx-auto mt-1 max-w-xs text-xs text-muted-foreground leading-relaxed">
+      <p className="mx-auto max-w-xs text-[11px] leading-relaxed text-muted-foreground">
         Connect to OpenAI, OpenRouter, or any OpenAI-compatible server to
         start using AI features like dictation cleanup and chat.
       </p>
-      <Button size="sm" onClick={onAdd} className="mt-4 text-xs">
+      <Button size="sm" onClick={onAdd} className="mt-3 text-xs">
         <Plus className="mr-1 h-3 w-3" />
         Add Connection
       </Button>

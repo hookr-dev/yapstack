@@ -9,6 +9,7 @@ import { TranscriptionTab } from "@/components/settings/TranscriptionTab";
 import { ShortcutsTab } from "@/components/settings/ShortcutsTab";
 import { AITab } from "@/components/settings/AITab";
 import { DictationTab } from "@/components/settings/DictationTab";
+import { InsightsTab } from "@/components/settings/InsightsTab";
 
 export function SettingsPanel() {
   const navigateTo = useAppStore((s) => s.navigateTo);
@@ -46,6 +47,7 @@ export function SettingsPanel() {
           <TabsTrigger value="transcription">Transcription</TabsTrigger>
           <TabsTrigger value="ai">AI</TabsTrigger>
           <TabsTrigger value="dictation">Dictation</TabsTrigger>
+          <TabsTrigger value="insights">Insights</TabsTrigger>
           <TabsTrigger value="shortcuts">Shortcuts</TabsTrigger>
         </TabsList>
 
@@ -85,6 +87,14 @@ export function SettingsPanel() {
           <ScrollArea className="h-full">
             <div className="space-y-5 p-4">
               <DictationTab />
+            </div>
+          </ScrollArea>
+        </TabsContent>
+
+        <TabsContent value="insights" className="flex-1 min-h-0">
+          <ScrollArea className="h-full">
+            <div className="space-y-5 p-4">
+              <InsightsTab />
             </div>
           </ScrollArea>
         </TabsContent>

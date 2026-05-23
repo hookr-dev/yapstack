@@ -402,6 +402,25 @@
     margin: 0.5rem 0;
   }
 
+  /* Overlay-context modifier: tighter rules tuned for the 480-px-wide
+     Insight overlay panel. Applied as a sibling class on the markdown
+     wrapper inside `InsightOverlay.tsx`. Resets first/last child margins
+     so content sits flush with the body padding, narrows list indentation
+     for the tight horizontal budget, and tightens li spacing. */
+  .ai-chat-markdown.markdown-overlay > *:first-child {
+    margin-top: 0;
+  }
+  .ai-chat-markdown.markdown-overlay > *:last-child {
+    margin-bottom: 0;
+  }
+  .ai-chat-markdown.markdown-overlay ul,
+  .ai-chat-markdown.markdown-overlay ol {
+    padding-left: 1rem;
+  }
+  .ai-chat-markdown.markdown-overlay li {
+    margin: 0.15rem 0;
+  }
+
   .keybind-display {
     font-family: -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
     letter-spacing: 0.05em;

@@ -62,6 +62,14 @@ The shared vocabulary for YapStack. Use these terms verbatim in code, docs, PRDs
 | **Prompt decay**      | Clearing prompt context after a configurable all-source silence window so stale context can't seed hallucinations.          | Prompt reset, context expiry |
 | **Hallucination filter** | The sidecar's engine-aware reject pass: drops `[BLANK_AUDIO]`, low-confidence noise (< 0.4 always; 0.4–0.6 when marginal), and known phantom phrases. Whisper uses an aggressive always-reject list ("thank you", "thanks for watching"); Parakeet demotes the same phrases to marginal-only. | Output filter, blacklist  |
 
+## Overlay windows
+
+| Term | Definition | Aliases to avoid |
+|---|---|---|
+| **Overlay window** | A small Tauri NSPanel that lives outside the main window — always-on-top, decorationless, transparent, visible across spaces, non-activating. YapStack has three: the **Recording indicator**, the **Dictation bubble**, and the **Insight overlay**. | HUD, widget, floater |
+| **Recording indicator** | The 56×120 **Overlay window** that pulses on the right edge of the screen while a session is recording *and* the main window is unfocused. Click returns to the active session. | Recording light, rec indicator |
+| **Dictation bubble** | The 220×96 **Overlay window** that appears center-bottom during a **Dictation**, showing its state (`listening` / `transcribing` / `processing` / `done` / `error`). | Dictation HUD |
+
 ## Diarization
 
 | Term             | Definition                                                                                                  | Aliases to avoid       |
@@ -121,6 +129,19 @@ The shared vocabulary for YapStack. Use these terms verbatim in code, docs, PRDs
 | **API key**           | A user-supplied secret authenticating one **Connection**. Stored on the Connection in app settings. Migrating to the OS keychain is a tracked follow-on PR; until then keys persist in plaintext alongside the rest of `AIConfig`. BYO-key per Connection. | Token, credential                                                           |
 | **Chat profile picker** | The composer-header dropdown in **Chat** that overrides the assigned **Profile** for the current chat session only. The override is persisted on the chat session, so reopening that conversation resumes with its last-chosen Profile.                  | Model switcher, profile selector                                            |
 
+## Live insights
+
+| Term | Definition | Aliases to avoid |
+|---|---|---|
+| **Insight** | A user-defined extraction unit that runs an LLM call against the live session transcript on a heartbeat and renders its output in the **Insight overlay**. Bundles `{ id, name, enabled, profileId, prompt, heartbeatSeconds }`. | Watcher, lens, recap, live profile, extraction profile |
+| **Default Insight** | The **Insight** persisted in `settings.insights.defaultInsightId` that auto-loads as the **Current Insight** at the start of every session. `null` means "no auto-start." Edited only from Settings → AI → Insights. | Active insight (legacy), preferred insight |
+| **Current Insight** | The runtime, session-scoped **Insight** producing output in the **Insight overlay** right now. Initialized from the **Default Insight** at session start; mutated only by overlay interactions (header dropdown picks, × button). Cleared on session end. Diverging from the Default mid-session does NOT update the Default. | Active insight (legacy), running insight |
+| **Insight heartbeat** | The per-Insight interval (seconds) that schedules **Insight ticks**. Stored as `heartbeatSeconds` on the Insight. Defaults to 30 s. | Tick interval, polling interval, cadence |
+| **Insight tick** | A single firing of the **Insight heartbeat**. Skipped (no LLM call) when the live segment watermark hasn't advanced since the last tick or when a prior call is still in flight. | Heartbeat fire, run, poll |
+| **Insight result** | The latest LLM response for the **Current Insight** — `{ content, generatedAt, segmentCountAtRun }`. Replaced on each successful **Insight tick**. v1 keeps latest-only (not persisted to SQLite). | Output, extraction, response |
+| **Insight overlay** | The **Overlay window** that renders the latest **Insight result** during a live session. Draggable via its header strip, hidable, auto-shown when (Insights enabled) AND (Live transcription active) AND (Current Insight set). Closing the overlay (× button) clears the Current Insight for the session only; the Default and the feature toggle are untouched. | Insight widget, HUD, summary panel |
+| **Insight backfill** | The one-time immediate run against the session-so-far transcript that fires when the **Current Insight** changes, so the overlay shows fresh output without waiting for the next **Insight tick**. | Catchup run, primer, switch backfill |
+
 ## AI chat
 
 | Term              | Definition                                                                                                                          | Aliases to avoid       |
@@ -166,6 +187,12 @@ The shared vocabulary for YapStack. Use these terms verbatim in code, docs, PRDs
 - **Dictation** produces transcribed text without creating a **Session** unless the active **Dictation slot**'s **Output action** is `new-note`. Either way it is logged in **Dictation history** (with the finalized **Session audio part**'s path on `wav_file_path`; the `session_id` FK is set only on `new-note`).
 - A **Dictation slot** owns one **Binding** (a **Global hotkey**), one **Dictation activation mode**, and a nullable **Profile** **Assignment** that controls AI cleanup (`null` = raw transcription with no AI pass; non-null = run cleanup through that Profile using the slot's **prompt**).
 - **Capture source** = `Mixed` is the only mode that consults **Mix config** (mic gain, system gain, normalize).
+- An **Insight** points to exactly one **Profile** (`Insight.profileId`). Multiple Insights can share a Profile. Deleting a Profile cascades — every Insight's `profileId` becomes `null` (same cascade semantics as **Assignments**).
+- The **Insight overlay** renders only when (a) **Live insights** is enabled, (b) **Live transcription** is active, and (c) a **Current Insight** is set. It hides automatically when any of those become false.
+- The **Current Insight** is initialized from the **Default Insight** at every session start. Mid-session edits to the Default in Settings do not retroactively update the Current — Settings affects future sessions only.
+- An **Insight tick** consumes only the segments that arrived since the last successful tick (delta), plus the prior **Insight result** in a `<your_previous_output>` block. v1 does not apply per-Insight context windows beyond this delta + previous combination.
+- An **Insight backfill** fires once per **Current Insight** change. Subsequent runs are scheduled by the **Insight heartbeat**.
+- An **Overlay window** is shown/hidden by main-window-side controller hooks (`useDictation`, `useRecordingIndicator`, `useInsightOverlayController`) via the generic `show_overlay_panel(label)` / `hide_overlay_panel(label)` Tauri commands. Cross-window state flows main → overlay via Tauri events, not shared Zustand.
 
 ## Example dialogue
 
@@ -213,6 +240,22 @@ The shared vocabulary for YapStack. Use these terms verbatim in code, docs, PRDs
 
 > **Domain expert:** "Confirmation dialog enumerates the cascade: the Connection, every Profile that referenced it, and every Assignment that pointed at those Profiles. On confirm, all three layers are removed atomically. Any feature whose Assignment became `null` will show the inline 'no profile' empty state next time it's invoked. No silent breakage, no orphans."
 
+> **Dev:** "When the user changes the **Current Insight** mid-session, do they wait for the next heartbeat?"
+>
+> **Domain expert:** "No — an **Insight backfill** fires immediately: one run against the session-so-far transcript via `assembleTranscriptContext`. The result lands in the **Insight overlay** within a tick. Then the **Insight heartbeat** for the new Current Insight takes over."
+
+> **Dev:** "If the user picks a different Insight from the overlay header during a session, does Settings reflect the change?"
+>
+> **Domain expert:** "No — the overlay only edits the **Current Insight** (runtime, ephemeral). The **Default Insight** in Settings is what drives session-start auto-load; the only way to change the Default is from Settings → AI → Insights. Mid-session switches are session-scoped by design — once the session ends, the next one starts fresh on the Default again."
+
+> **Dev:** "What does the × button on the overlay do?"
+>
+> **Domain expert:** "Clears the **Current Insight** for this session. The overlay hides because the gate fails. The feature toggle and the **Default Insight** are both untouched — when the user starts another session, the overlay returns auto-loaded with the Default."
+
+> **Dev:** "If two Insights both bind to the same OpenAI **Profile**, do they run in parallel?"
+>
+> **Domain expert:** "No. v1 is single-active — only the **Current Insight** runs. The other one is dormant, zero LLM calls. Parallel insights is a v2 engine change with no data-model migration."
+
 ## Flagged ambiguities
 
 - **"Whisper client"** (legacy, no longer in code) vs **Transcription client** (current). The engine-agnostic Rust type is `TranscriptionClient` and the Tauri managed-state alias is `TranscriptionClientState`. The legacy `WhisperClient` / `WhisperClientState` aliases have been removed; "Whisper client" is dead terminology — always say **Transcription client**.
@@ -239,3 +282,11 @@ The shared vocabulary for YapStack. Use these terms verbatim in code, docs, PRDs
 - **"Chat is per-session"** — incomplete. A **Chat** is scoped by a **Context key** that can be a session id but can also be `global`, `pinned`, `dictation`, or `folder:{id}`. Don't say "the session's chat" if you actually mean any chat keyed off something other than a session.
 - **"Sortformer is a NVIDIA model"** — true upstream, but YapStack pulls weights from the `altunenes/parakeet-rs` redistribution, not directly from NVIDIA. Don't assert NVIDIA-as-source in domain prose.
 - **"Share"** is currently a **dormant concept** — the `shares` table is defined (folder-scoped) but no app code reads or writes it. Treat it as planned future work, not a live feature, until that changes.
+- **"Profile"** vs **Insight**: a **Profile** is an *AI-routing* object (`Connection + Model`); an **Insight** is a *user-defined extraction task* that *uses* a Profile via `profileId`. Reference PRDs that call extraction units "profiles" must be translated to **Insight** in YapStack terminology — the term "Profile" is reserved.
+- **"Slot"** is reserved for **Dictation slot**. The PRD framing "Slot" for hotbar-bound extraction units was rejected; an **Insight** is its own entity and is *not* called an "Insight slot".
+- **"Backfill"** has two distinct senses, always qualified: **Backfill** (re-transcription of audio captured *before* live transcription started — see "Sessions and segments") vs **Insight backfill** (one-time LLM run against the session-so-far transcript triggered by a **Current Insight** change). Never use unqualified "backfill" in insights context.
+- **"Heartbeat"** is per-**Insight**, not global. There is no single "global heartbeat" knob — pausing the cadence is done by toggling the Insight's `enabled` or by clearing **Current Insight**.
+- **"Active Insight"** is legacy terminology. The pre-rework `activeInsightId` field on `settings.insights` conflated two distinct concepts (persisted default vs. session-scoped current). Always say **Default Insight** (the persisted Settings field) or **Current Insight** (the runtime state) so it's clear which lifetime you mean. The store field was renamed to `defaultInsightId` in persist version 27.
+- **Closing the overlay (× button)** is NOT the same as **turning the feature off**. The × clears the **Current Insight** for the session only; `settings.insights.enabled` and `settings.insights.defaultInsightId` are untouched. The feature on/off toggle lives only in Settings — there is no "off" path from inside the overlay.
+- **"Tick"** in YapStack is reserved for the **Insight** sense (an **Insight tick**). It is not generic "anything that fires on an interval"; if a new periodic mechanism is introduced for another feature, qualify it (e.g. "metrics tick"), don't reuse plain "tick".
+- **"Overlay"** alone is ambiguous; prefer **Overlay window** when referring to one of the three Tauri NSPanels and qualify with the specific window name (**Recording indicator** / **Dictation bubble** / **Insight overlay**) when context matters.
