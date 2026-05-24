@@ -281,7 +281,7 @@ export interface Settings {
   audioExportFormat: "wav" | "mp3";
   mp3Bitrate: number;
   dictation: DictationSettings;
-  /** Live insights — overlay-driven LLM extractions on a heartbeat. */
+  /** Live insights — overlay-driven LLM extractions on a cadence trigger. */
   insights: InsightsSettings;
   showRecordingIndicator: boolean;
   /// Lower the system output volume during the recording phase of a
@@ -2529,7 +2529,7 @@ function createAppStore() {
     }),
     {
       name: "yapstack-settings",
-      version: 27,
+      version: 30,
       partialize: (state) => ({
         settings: state.settings,
       }),
@@ -2805,6 +2805,69 @@ function createAppStore() {
           if (insights && "activeInsightId" in insights) {
             insights.defaultInsightId = insights.activeInsightId;
             delete insights.activeInsightId;
+          }
+        }
+        if (version < 28 && state.settings) {
+          // Insight cadence: per-slot `heartbeatSeconds` (fixed interval) →
+          // `trigger` (preset + W/P/F/M). Map the old interval to a behavior-
+          // preserving Custom tuple: threshold/settle off, floor == ceiling ==
+          // the old heartbeat, i.e. "fire every N seconds if new content".
+          const insights = (state.settings as Record<string, unknown>)
+            .insights as { slots?: Array<Record<string, unknown>> } | undefined;
+          if (insights?.slots) {
+            for (const slot of insights.slots) {
+              if (slot.trigger === undefined) {
+                const hb =
+                  typeof slot.heartbeatSeconds === "number"
+                    ? slot.heartbeatSeconds
+                    : 30;
+                slot.trigger = {
+                  preset: "custom",
+                  thresholdWords: 0,
+                  settleSeconds: 0,
+                  minIntervalSeconds: hb,
+                  maxWaitSeconds: hb,
+                };
+                delete slot.heartbeatSeconds;
+              }
+            }
+          }
+        }
+        if (version < 29 && state.settings) {
+          // Cadence presets renamed from content archetypes to tempo tiers
+          // (summary/jargon/topic → relaxed/responsive/balanced), and a `type`
+          // field was added (what the Insight extracts). Remap old preset names
+          // and default existing freeform Insights to type "custom".
+          const insights = (state.settings as Record<string, unknown>)
+            .insights as { slots?: Array<Record<string, unknown>> } | undefined;
+          const presetRemap: Record<string, string> = {
+            summary: "relaxed",
+            jargon: "responsive",
+            topic: "balanced",
+          };
+          if (insights?.slots) {
+            for (const slot of insights.slots) {
+              const trigger = slot.trigger as
+                | Record<string, unknown>
+                | undefined;
+              if (trigger && typeof trigger.preset === "string") {
+                const mapped = presetRemap[trigger.preset];
+                if (mapped) trigger.preset = mapped;
+              }
+              if (slot.type === undefined) slot.type = "custom";
+            }
+          }
+        }
+        if (version < 30 && state.settings) {
+          // Dropped the per-Insight `enabled` flag — an Insight only runs when
+          // it's the Current Insight, so the boolean was redundant. Remove the
+          // vestigial key from persisted slots.
+          const insights = (state.settings as Record<string, unknown>)
+            .insights as { slots?: Array<Record<string, unknown>> } | undefined;
+          if (insights?.slots) {
+            for (const slot of insights.slots) {
+              delete slot.enabled;
+            }
           }
         }
         return state as unknown as { settings: Settings };

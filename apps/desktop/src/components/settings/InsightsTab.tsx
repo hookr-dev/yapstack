@@ -70,7 +70,6 @@ export function InsightsTab() {
   };
 
   const hasSlots = insights.slots.length > 0;
-  const enabledSlots = insights.slots.filter((s) => s.enabled);
 
   return (
     <>
@@ -113,7 +112,7 @@ export function InsightsTab() {
                 <SelectItem value={DEFAULT_INSIGHT_NONE} className="text-xs">
                   None — no auto-start
                 </SelectItem>
-                {enabledSlots.map((s) => (
+                {insights.slots.map((s) => (
                   <SelectItem key={s.id} value={s.id} className="text-xs">
                     {s.name}
                   </SelectItem>
@@ -166,7 +165,7 @@ function EmptyState({ onAdd }: { onAdd: () => void }) {
         <Sparkles className="h-3 w-3 text-muted-foreground" />
       </div>
       <p className="mx-auto max-w-xs text-[11px] leading-relaxed text-muted-foreground">
-        No Insights yet. Each Insight bundles a system prompt and a heartbeat
+        No Insights yet. Each Insight bundles a system prompt and a cadence
         — assign one to feed the overlay during a live session.
       </p>
       <Button size="sm" onClick={onAdd} className="mt-3 text-xs">

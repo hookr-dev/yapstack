@@ -10,6 +10,18 @@ export function stripHtml(html: string): string {
   return html.replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim();
 }
 
+/** Count word-like tokens in `text`, Unicode-aware. A token is a letter run
+ *  (with internal combining marks, digits, apostrophes or hyphens) or a digit
+ *  run, so punctuation-only and whitespace-only strings count as 0. Used by the
+ *  Live Insights trigger to measure accumulated new speech.
+ *
+ *  Known limitation: scripts without spaces (e.g. CJK) under-count — a run of
+ *  ideographs counts as a single token. Acceptable for the trigger's purpose. */
+export function countWords(text: string): number {
+  const matches = text.normalize("NFC").match(/\p{L}[\p{L}\p{M}\p{N}'’-]*|\p{N}+/gu);
+  return matches ? matches.length : 0;
+}
+
 /** Format byte count to human-readable string (e.g. "142 MB", "1.5 GB"). */
 export function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;

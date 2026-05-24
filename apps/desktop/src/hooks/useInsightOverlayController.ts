@@ -27,14 +27,12 @@ export function useInsightOverlayController() {
   const liveInsightError = useAppStore((s) => s.liveInsightError);
   const setCurrentInsightId = useAppStore((s) => s.setCurrentInsightId);
 
-  // Stable string key of the enabled-slot ids + names. Used as an emit-effect
-  // dep so prompt-textarea keystrokes (which mutate the slots array) don't
-  // re-fire the emit, while genuine list changes (rename / enable / add /
-  // delete) do. Returning a flat string lets Zustand's reference-equality
-  // skip identical updates.
+  // Stable string key of the slot ids + names. Used as an emit-effect dep so
+  // prompt-textarea keystrokes (which mutate the slots array) don't re-fire the
+  // emit, while genuine list changes (rename / add / delete) do. Returning a
+  // flat string lets Zustand's reference-equality skip identical updates.
   const slotsKey = useAppStore((s) =>
     s.settings.insights.slots
-      .filter((slot) => slot.enabled)
       .map((slot) => `${slot.id}:${slot.name}`)
       .join("|"),
   );
@@ -146,9 +144,10 @@ export function useInsightOverlayController() {
     const insight = state.settings.insights.slots.find(
       (s) => s.id === state.currentInsightId,
     );
-    const enabledSlots = state.settings.insights.slots
-      .filter((s) => s.enabled)
-      .map((s) => ({ id: s.id, name: s.name }));
+    const overlaySlots = state.settings.insights.slots.map((s) => ({
+      id: s.id,
+      name: s.name,
+    }));
     void (async () => {
       try {
         const win = await WebviewWindow.getByLabel(WINDOWS.INSIGHT);
@@ -160,7 +159,7 @@ export function useInsightOverlayController() {
           generatedAt: liveInsightResult?.generatedAt ?? null,
           error: liveInsightError,
           currentInsightId: state.currentInsightId,
-          slots: enabledSlots,
+          slots: overlaySlots,
         });
         log.debug(
           `overlay: emitted state — status=${liveInsightStatus} hasContent=${!!liveInsightResult?.content} hasError=${!!liveInsightError}`,

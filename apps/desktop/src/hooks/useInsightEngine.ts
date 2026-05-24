@@ -7,7 +7,12 @@ import {
 import {
   EMPTY_RESULT_PLACEHOLDER,
   PREVIOUS_CONTEXT_MAX_CHARS,
+  evaluateTrigger,
+  resolveTriggerConfig,
+  type Insight,
 } from "@/lib/insights";
+import type { DbSegment } from "@/lib/db";
+import { countWords } from "@/lib/utils";
 import { log } from "@/lib/logger";
 
 /** Output-format guidance appended to every Insight's system prompt by the
@@ -28,21 +33,35 @@ const OUTPUT_FORMAT_GUIDANCE =
   "short bulleted lists. Avoid heading syntax (`#`); the output renders in " +
   "a small floating overlay window.";
 
+/** How often the scheduler evaluates whether to fire. Cheap (arithmetic +
+ *  getState, no LLM); the trigger config decides whether each tick actually
+ *  fires. 500 ms keeps sub-second `settle` values (e.g. the 0.8 s jargon clause
+ *  boundary) resolvable — the cost is one extra arithmetic-only getState per
+ *  second. */
+const SCHEDULER_TICK_MS = 500;
+
+/** Same visibility filter as `assembleTranscriptContext` — so the word count
+ *  and "has new content" check see exactly what the LLM would. */
+function visible(seg: DbSegment): boolean {
+  return seg.hidden !== 1 && !seg.deleted_at;
+}
+
 /**
- * Insight engine — drives the Active Insight on its heartbeat while a live
+ * Insight engine — drives the Current Insight on its trigger while a live
  * session is running. Writes results to the Zustand store; the overlay
  * controller reads from there.
  *
- * Discipline:
- *  - Skip the tick if `activeSessionSegments.length` hasn't advanced since
- *    the last successful run (no LLM call on silence).
- *  - At most one in-flight call per Active Insight; subsequent ticks are
- *    dropped (no queue).
- *  - On Active Insight change OR on Active Insight's enabled/heartbeat
- *    change, reset the interval and the watermark so the next tick acts as
- *    a backfill against the session-so-far transcript.
- *  - Errors surface to `liveInsightError`; no auto-retry, no fallback chain
- *    (per the surface-errors design memory).
+ * A fixed ~1 s scheduler tick evaluates the pure {@link evaluateTrigger}; only
+ * when it says "fire" do we make an LLM call. Discipline:
+ *  - Skip if no new (visible) segments since the last fire (no call on silence).
+ *  - Fire on threshold+settle (accumulate ~W new words, then a P-second pause),
+ *    bounded by a floor F (min interval) and ceiling M (max wait / liveness).
+ *  - At most one in-flight call; ticks during a call are dropped (no queue).
+ *  - On Current Insight change, reset the watermark + trigger clocks so the
+ *    next tick backfills against the session-so-far transcript.
+ *  - Errors surface to `liveInsightError`; after an error we retry only at the
+ *    ceiling (no per-tick spin on a broken endpoint), no fallback chain (per
+ *    the surface-errors design memory).
  */
 export function useInsightEngine() {
   const enabled = useAppStore((s) => s.settings.insights.enabled);
@@ -53,34 +72,46 @@ export function useInsightEngine() {
   const currentInsightId = useAppStore((s) => s.currentInsightId);
   const liveTranscriptionActive = useAppStore((s) => s.liveTranscriptionActive);
 
-  // Pull only the engine-relevant fields of the current insight into the dep
-  // array. Subscribing to `slots` directly would re-run the effect on every
-  // prompt keystroke; this surface (id + enabled + heartbeat) only changes
-  // when the user toggles the slot or picks a new cadence.
+  // Pull only the engine-relevant *primitives* of the current insight into the
+  // dep array. Subscribing to `slots` directly would re-run the effect on every
+  // prompt keystroke; the surface here (id + exists + enabled + preset) only
+  // changes on real lifecycle/cadence events. The four custom knobs (W/P/F/M)
+  // are intentionally NOT deps — the scheduler re-reads them fresh each tick via
+  // `resolveTriggerConfig`, so Custom slider drags take effect within ~1 s
+  // without tearing down and restarting the 1 s loop.
   const slots = useAppStore((s) => s.settings.insights.slots);
   const currentInsight = useMemo(
     () => slots.find((s) => s.id === currentInsightId) ?? null,
     [slots, currentInsightId],
   );
-  // Derive only the primitive fields the scheduler effect needs. Depending on
-  // the whole `currentInsight` object would re-run the effect (tear down +
-  // restart the interval, fire an immediate backfill tick) on every prompt
-  // keystroke while the active Insight is being edited — a new object is
-  // produced each edit even though id/enabled/heartbeat are unchanged.
   const currentInsightExists = currentInsight !== null;
-  const currentEnabled = currentInsight?.enabled ?? false;
-  const currentHeartbeatSeconds = currentInsight?.heartbeatSeconds ?? 30;
+  const currentPreset = currentInsight?.trigger.preset ?? "balanced";
 
   const inFlightRef = useRef(false);
   const abortRef = useRef<AbortController | null>(null);
   const processedCountRef = useRef(0);
+  // Trigger clocks (ms epoch). `lastFireAt` = start of the last fire (floor &
+  // ceiling measure from here, start-to-start). `lastSegmentArrivedAt` = when
+  // the segment count last grew (pause length = now − this). `prevSegLen`
+  // detects growth/shrink of the segment array.
+  const lastFireAtRef = useRef(0);
+  const lastSegmentArrivedAtRef = useRef(0);
+  const prevSegLenRef = useRef(0);
+  // Set after a failed fire; cleared on any success. While set, threshold+settle
+  // fires are suppressed so we retry only at the ceiling (M).
+  const erroredRef = useRef(false);
 
-  // Reset the watermark AND clear the previous result/status when the Current
-  // Insight changes. The next tick will run against the full session-so-far
-  // transcript (the backfill semantics) without the OLD insight's content
-  // bleeding into the new insight's prompt-context block or overlay render.
+  // Reset the watermark + trigger clocks AND clear the previous result/status
+  // when the Current Insight changes. Zeroing `lastFireAt` makes the next tick
+  // fire immediately via the ceiling (backfill against the session-so-far
+  // transcript) without the OLD insight's content bleeding into the new
+  // insight's prompt-context block or overlay render.
   useEffect(() => {
     processedCountRef.current = 0;
+    prevSegLenRef.current = 0;
+    lastSegmentArrivedAtRef.current = 0;
+    lastFireAtRef.current = 0;
+    erroredRef.current = false;
     const s = useAppStore.getState();
     s.setLiveInsightResult(null);
     s.setLiveInsightStatus("idle");
@@ -95,15 +126,11 @@ export function useInsightEngine() {
       );
       return;
     }
-    if (!currentInsightExists || !currentEnabled) {
-      log.debug(
-        `engine: current insight missing or disabled (found=${currentInsightExists}, enabled=${currentEnabled})`,
-        "insights",
-      );
+    if (!currentInsightExists) {
+      log.debug("engine: current insight missing", "insights");
       return;
     }
 
-    const heartbeatMs = Math.max(1, currentHeartbeatSeconds) * 1000;
     // Read the name fresh for the log (the effect intentionally does not
     // re-run on rename/prompt edits, so a closed-over name could be stale).
     const startName =
@@ -112,47 +139,18 @@ export function useInsightEngine() {
         .settings.insights.slots.find((s) => s.id === currentInsightId)?.name ??
       "Insight";
     log.info(
-      `engine: starting — insight="${startName}" heartbeat=${currentHeartbeatSeconds}s`,
+      `engine: starting — insight="${startName}" preset=${currentPreset}`,
       "insights",
     );
 
-    async function runTick() {
-      if (inFlightRef.current) {
-        log.debug("tick: skip — call already in flight", "insights");
-        return;
-      }
-
-      const state = useAppStore.getState();
-      if (!state.liveTranscriptionActive) {
-        log.debug("tick: skip — live transcription not active", "insights");
-        return;
-      }
-
-      const live = state.settings.insights;
-      const liveCurrentId = state.currentInsightId;
-      if (!live.enabled || liveCurrentId !== currentInsightId) {
-        log.debug(
-          `tick: skip — config changed (enabled=${live.enabled}, currentId=${liveCurrentId ?? "null"} expected=${currentInsightId})`,
-          "insights",
-        );
-        return;
-      }
-
-      const insight = live.slots.find((s) => s.id === currentInsightId);
-      if (!insight || !insight.enabled) {
-        log.debug("tick: skip — insight missing or disabled", "insights");
-        return;
-      }
-
-      const allSegments = state.activeSessionSegments;
-      if (allSegments.length === processedCountRef.current) {
-        log.debug(
-          `tick: skip — no new segments since last run (watermark=${processedCountRef.current})`,
-          "insights",
-        );
-        return;
-      }
-
+    // The LLM call. Reached only when the scheduler decides to fire. Assumes
+    // gating already passed; `state`/`insight`/`allSegments` are the snapshot
+    // the decision was made against.
+    async function fire(
+      state: ReturnType<typeof useAppStore.getState>,
+      insight: Insight,
+      allSegments: DbSegment[],
+    ) {
       let client;
       let model;
       try {
@@ -162,23 +160,27 @@ export function useInsightEngine() {
         ));
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
-        log.warn(`tick: profile resolution failed — ${msg}`, "insights");
+        log.warn(`fire: profile resolution failed — ${msg}`, "insights");
+        // Back off to the ceiling: stamp the fire clock so the floor applies
+        // and threshold fires stay suppressed until M elapses.
+        lastFireAtRef.current = Date.now();
+        erroredRef.current = true;
         state.setLiveInsightStatus("error");
         state.setLiveInsightError(msg);
         return;
       }
 
-      // Only send segments that arrived since the last successful tick.
-      // First tick (or post-switch backfill): watermark is 0, so the slice
-      // covers the whole session-so-far. Subsequent ticks send just the
-      // delta — paired with the <previous> block, the model has the
-      // anchor it needs to refine vs pivot vs append without re-processing
-      // the entire transcript every cycle.
+      // Only send segments that arrived since the last successful fire.
+      // First fire (or post-switch backfill): watermark is 0, so the slice
+      // covers the whole session-so-far. Subsequent fires send just the
+      // delta — paired with the <previous> block, the model has the anchor it
+      // needs to refine vs pivot vs append without re-processing everything.
       const newSegments = allSegments.slice(processedCountRef.current);
       const transcript = assembleTranscriptContext(newSegments);
       if (!transcript) {
+        // Backstop (the scheduler already required visible new content).
         log.debug(
-          `tick: skip — transcript empty after assembly (newSegments=${newSegments.length}, total=${allSegments.length})`,
+          `fire: skip — transcript empty after assembly (newSegments=${newSegments.length})`,
           "insights",
         );
         return;
@@ -188,8 +190,7 @@ export function useInsightEngine() {
       // decide whether the topic is continuing (refine) or has shifted
       // (start over). Filter out the empty-completion placeholder — that's
       // a UI artefact, not content worth showing the model. Also skip if
-      // the cached result is for a different insight (defensive — the
-      // active-insight effect above clears it on switch).
+      // the cached result is for a different insight (defensive).
       const prevResult = state.liveInsightResult;
       const previousContent =
         prevResult &&
@@ -205,10 +206,13 @@ export function useInsightEngine() {
       const abort = new AbortController();
       abortRef.current = abort;
       inFlightRef.current = true;
+      // Start-to-start cadence: stamp the fire clock now, before awaiting, so
+      // F/M measure from fire start (a slow model can't drift the cadence).
+      lastFireAtRef.current = Date.now();
       state.setLiveInsightStatus("running");
       state.setLiveInsightError(null);
       log.info(
-        `tick: calling LLM — model=${model} newSegments=${newSegments.length} totalSegments=${allSegments.length} transcriptChars=${transcript.length} previousChars=${previousContent?.length ?? 0}`,
+        `fire: calling LLM — model=${model} newSegments=${newSegments.length} totalSegments=${allSegments.length} transcriptChars=${transcript.length} previousChars=${previousContent?.length ?? 0}`,
         "insights",
       );
 
@@ -227,22 +231,23 @@ export function useInsightEngine() {
           { signal: abort.signal },
         );
         if (abort.signal.aborted) {
-          log.debug("tick: aborted before response landed", "insights");
+          log.debug("fire: aborted before response landed", "insights");
           return;
         }
         const rawContent = response.choices[0]?.message?.content ?? "";
         const content = rawContent.trim();
         log.info(
-          `tick: LLM result — chars=${content.length}${content.length === 0 ? " (empty)" : ""}`,
+          `fire: LLM result — chars=${content.length}${content.length === 0 ? " (empty)" : ""}`,
           "insights",
         );
         // Always advance the watermark + write a result, even when the
-        // model returns nothing. Otherwise the overlay sits at "Waiting…"
-        // forever when the prompt legitimately produces "no output" runs.
-        // Advance the watermark to the FULL segment count, not the slice
-        // length. The next tick should pick up from here — that's the
-        // whole point of "send only new segments since the last run."
+        // model returns nothing — otherwise the overlay sits at "Waiting…"
+        // when the prompt legitimately produces "no output" runs. Advance to
+        // the FULL segment count (not the slice length) so the next fire picks
+        // up from here. Empty completion is still a success → clear the error
+        // flag (else we'd stay stuck in ceiling-only backoff).
         processedCountRef.current = allSegments.length;
+        erroredRef.current = false;
         state.setLiveInsightResult({
           insightId: insight.id,
           content: content.length > 0 ? content : EMPTY_RESULT_PLACEHOLDER,
@@ -253,7 +258,8 @@ export function useInsightEngine() {
       } catch (e) {
         if (abort.signal.aborted) return;
         const msg = e instanceof Error ? e.message : String(e);
-        log.warn(`tick: LLM call failed — ${msg}`, "insights");
+        log.warn(`fire: LLM call failed — ${msg}`, "insights");
+        erroredRef.current = true;
         state.setLiveInsightStatus("error");
         state.setLiveInsightError(msg);
       } finally {
@@ -262,10 +268,71 @@ export function useInsightEngine() {
       }
     }
 
-    // Fire one tick immediately so a freshly-set Active Insight produces
-    // output without waiting for the first interval (the backfill case).
-    void runTick();
-    const intervalId = window.setInterval(runTick, heartbeatMs);
+    // Cheap evaluator. Decides whether to fire; never blocks on the LLM.
+    async function schedulerTick() {
+      if (inFlightRef.current) return; // one call at a time; drop the tick
+
+      const state = useAppStore.getState();
+      if (!state.liveTranscriptionActive) return;
+
+      const live = state.settings.insights;
+      const liveCurrentId = state.currentInsightId;
+      if (!live.enabled || liveCurrentId !== currentInsightId) return;
+
+      const insight = live.slots.find((s) => s.id === currentInsightId);
+      if (!insight) return;
+
+      const now = Date.now();
+      const allSegments = state.activeSessionSegments;
+      const segLen = allSegments.length;
+      // Stamp arrival when the segment count grows (new speech). On shrink
+      // (hide/delete edits) just clamp the watermark down — don't treat a
+      // deletion as "new speech arrived".
+      if (segLen > prevSegLenRef.current) {
+        lastSegmentArrivedAtRef.current = now;
+        prevSegLenRef.current = segLen;
+      } else if (segLen < prevSegLenRef.current) {
+        prevSegLenRef.current = segLen;
+      }
+
+      // Count only the *visible* new segments since the last fire — same filter
+      // the transcript assembly uses, so we never fire on content the LLM
+      // wouldn't see (which would then hit the empty-transcript backstop).
+      const filteredNew = allSegments
+        .slice(processedCountRef.current)
+        .filter(visible);
+      const hasNewContent = filteredNew.length > 0;
+      const newWords = hasNewContent
+        ? countWords(filteredNew.map((s) => s.text).join(" "))
+        : 0;
+
+      const config = resolveTriggerConfig(insight);
+      const decision = evaluateTrigger({
+        newWords,
+        sinceFireMs: now - lastFireAtRef.current,
+        sincePauseMs: now - lastSegmentArrivedAtRef.current,
+        hasNewContent,
+        config,
+      });
+
+      if (!decision.fire) return;
+      // Error backoff: after a failure, only the ceiling retries — suppress the
+      // responsive threshold+settle path so we don't spin on a broken endpoint.
+      if (erroredRef.current && decision.reason === "threshold-settle") return;
+
+      log.debug(
+        `tick: fire (${decision.reason}) — newWords=${newWords} sinceFire=${Math.round((now - lastFireAtRef.current) / 1000)}s`,
+        "insights",
+      );
+      await fire(state, insight, allSegments);
+    }
+
+    // Evaluate once immediately (snappy backfill on session start / switch,
+    // where lastFireAt was zeroed → ceiling fires), then on the scheduler tick.
+    // On a preset-change restart, lastFireAt is recent so the floor blocks this
+    // immediate evaluation — no surprise fire on a cadence edit.
+    void schedulerTick();
+    const intervalId = window.setInterval(schedulerTick, SCHEDULER_TICK_MS);
 
     return () => {
       window.clearInterval(intervalId);
@@ -279,8 +346,7 @@ export function useInsightEngine() {
     liveTranscriptionActive,
     currentInsightId,
     currentInsightExists,
-    currentEnabled,
-    currentHeartbeatSeconds,
+    currentPreset,
   ]);
 }
 

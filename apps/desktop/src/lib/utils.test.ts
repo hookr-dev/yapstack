@@ -8,8 +8,39 @@ import {
   formatRelativeTime,
   getDayLabel,
   groupSessionsByDay,
+  countWords,
   cn,
 } from "./utils";
+
+describe("countWords", () => {
+  it("counts whitespace-delimited words", () => {
+    expect(countWords("hello world")).toBe(2);
+    expect(countWords("  the  quick   brown fox ")).toBe(4);
+  });
+
+  it("returns 0 for empty / whitespace / punctuation-only input", () => {
+    expect(countWords("")).toBe(0);
+    expect(countWords("   ")).toBe(0);
+    expect(countWords("... !! -- ?")).toBe(0);
+  });
+
+  it("treats contractions and hyphenates as single words", () => {
+    // don't (1) worry (1) state-of-the-art (1) = 3
+    expect(countWords("don't worry — state-of-the-art")).toBe(3);
+  });
+
+  it("counts accented / non-ASCII letters", () => {
+    expect(countWords("café déjà vu")).toBe(3);
+  });
+
+  it("counts numbers as words", () => {
+    expect(countWords("we have 3 items and 42 reasons")).toBe(7);
+  });
+
+  it("splits on newlines (segments joined across lines)", () => {
+    expect(countWords("alpha\nbeta\ngamma")).toBe(3);
+  });
+});
 
 describe("formatBytes", () => {
   it("returns 0 B for zero", () => {
