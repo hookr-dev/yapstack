@@ -126,7 +126,13 @@ export function migrateLegacyAISettings(
     }
     connections.push(connection);
 
-    if (kind === legacy.activeProvider) {
+    // Only emit a Profile for the active provider when it actually has a
+    // model. A "custom" provider counts as configured on baseUrl alone (local
+    // servers may need no key), so its model can be empty — emitting a Profile
+    // with model "" would assign Chat/AI-actions a broken default on upgrade.
+    // The Connection still migrates (key preserved); the user picks a model in
+    // the new UI, leaving assignments null (greenfield) until then.
+    if (kind === legacy.activeProvider && cfg.model.trim() !== "") {
       const profileId = crypto.randomUUID();
       profiles.push({
         id: profileId,

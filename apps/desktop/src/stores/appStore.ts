@@ -270,12 +270,6 @@ export interface Settings {
   sidebarCollapsed: boolean;
   /** AI Connection + Profile config (replaces the pre-refactor single-provider shape). */
   aiConfig: AIConfig;
-  /**
-   * One-shot snapshot of the pre-refactor `ai` shape captured at the v25
-   * migration, kept for one stable release as a safety net. Removed in a
-   * follow-up commit after the release window. Opaque to the live app.
-   */
-  _legacyAi?: unknown;
   shortcutBindings: Record<string, string>;
   audioSaveLocation: string | null;
   audioExportFormat: "wav" | "mp3";
@@ -2759,8 +2753,10 @@ function createAppStore() {
           // Additive only — legacy `ai` and `aiEnabled` fields stay in place
           // until Commit 11 finishes the consumer migration.
           //
-          // Snapshot of the legacy ai shape lives on `_legacyAi` as a safety
-          // net for one release window, then is deleted in a follow-up.
+          // The original legacy `ai` object is left in place untouched (it is
+          // the safety net for any future re-migration); we deliberately do
+          // NOT write a second `_legacyAi` copy — that only duplicated the
+          // plaintext API keys into an extra persisted blob nothing reads.
           const old = state.settings as Record<string, unknown>;
           const legacy = old.ai as LegacyAISettings | undefined;
           const dict = old.dictation as
@@ -2772,7 +2768,6 @@ function createAppStore() {
               dict.slots,
             );
             old.aiConfig = config;
-            old._legacyAi = legacy;
             // Mutate each slot in place to add `profileId` while leaving the
             // legacy `aiEnabled` field intact (consumers swap in Commit 6).
             dict.slots = dict.slots.map((s, i) => ({

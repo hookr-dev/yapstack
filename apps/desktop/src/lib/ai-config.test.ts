@@ -205,6 +205,34 @@ describe("migrateLegacyAISettings", () => {
         aiActionsProfileId: null,
       });
     });
+
+    it("emits no Profile when the active custom provider has an empty model", () => {
+      // Custom counts as configured on baseUrl alone, but with no model a
+      // Profile would assign Chat/AI-actions a blank, broken model on upgrade.
+      const { config } = migrateLegacyAISettings(
+        legacy({
+          activeProvider: "custom",
+          providers: {
+            ...legacy().providers,
+            custom: {
+              apiKey: "",
+              model: "",
+              baseUrl: "http://localhost:11434/v1",
+            },
+          },
+        }),
+        [],
+      );
+      // Connection still migrates so the endpoint isn't lost...
+      expect(config.connections).toHaveLength(1);
+      expect(config.connections[0]?.kind).toBe("custom");
+      // ...but no Profile / assignment is created.
+      expect(config.profiles).toEqual([]);
+      expect(config.assignments).toEqual({
+        chatProfileId: null,
+        aiActionsProfileId: null,
+      });
+    });
   });
 
   describe("DictationSlot migration (decision #12)", () => {

@@ -387,6 +387,12 @@ async function ensureRuntimeSchema(db: Database): Promise<void> {
   // chat_context_settings — per-chat-context Profile override for the
   // AI Connection/Profile refactor. profile_id NULL means "use the live
   // default Chat Assignment"; non-null persists an explicit override.
+  //
+  // Intentionally defined here (frontend runtime schema) rather than in the
+  // Rust `migrations()` list — same as `segments.speaker_id` and the ALTERs
+  // above. Post-"ghost v11" (see db.rs), new incremental schema is added via
+  // this idempotent IF-NOT-EXISTS path because a higher-numbered sqlx
+  // migration can be silently refused on dev DBs with inconsistent history.
   await db
     .execute(
       `CREATE TABLE IF NOT EXISTS chat_context_settings (
@@ -1354,6 +1360,26 @@ export async function clearChatContextProfile(
   await db.execute(
     "DELETE FROM chat_context_settings WHERE context_key = $1",
     [contextKey],
+  );
+}
+
+/**
+ * Remove every per-chat override that points at a given Profile. Called when a
+ * Profile (or a Connection's dependent Profiles) is deleted — without this,
+ * stale overrides would keep targeting a non-existent Profile and chat would
+ * fail instead of falling back to the live Chat assignment.
+ *
+ * Note this matches on `profile_id`, not `context_key`: the rows we want are
+ * "any chat whose override IS this profile," which is the opposite column from
+ * the per-chat getters above.
+ */
+export async function clearChatContextProfilesByProfileId(
+  profileId: string,
+): Promise<void> {
+  const db = await getDb();
+  await db.execute(
+    "DELETE FROM chat_context_settings WHERE profile_id = $1",
+    [profileId],
   );
 }
 

@@ -30,10 +30,7 @@ import type {
   Connection,
 } from "@/lib/ai";
 import { ConnectionEditorDialog } from "./ConnectionEditorDialog";
-import {
-  clearChatContextProfile,
-  getChatContextProfileId,
-} from "@/lib/db";
+import { clearChatContextProfilesByProfileId } from "@/lib/db";
 import { useRefreshConnectionModels } from "@/hooks/useRefreshConnectionModels";
 
 const KIND_ICON: Record<AIProviderKind, LucideIcon> = {
@@ -61,6 +58,7 @@ interface DeleteState {
   dependentProfileNames: string[];
   affectedAssignments: string[];
   affectedSlotNames: string[];
+  affectedInsightNames: string[];
 }
 
 export function ConnectionsSection({
@@ -72,6 +70,7 @@ export function ConnectionsSection({
 } = {}) {
   const aiConfig = useAppStore((s) => s.settings.aiConfig);
   const dictation = useAppStore((s) => s.settings.dictation);
+  const insights = useAppStore((s) => s.settings.insights);
   const updateSettings = useAppStore((s) => s.updateSettings);
   const { refresh, refreshingId } = useRefreshConnectionModels();
 
@@ -137,6 +136,11 @@ export function ConnectionsSection({
         (s) => s.profileId !== null && dependentProfileIds.includes(s.profileId),
       )
       .map((s) => s.name);
+    const affectedInsightNames = insights.slots
+      .filter(
+        (s) => s.profileId !== null && dependentProfileIds.includes(s.profileId),
+      )
+      .map((s) => s.name);
 
     setDeleteState({
       open: true,
@@ -145,6 +149,7 @@ export function ConnectionsSection({
       dependentProfileNames,
       affectedAssignments,
       affectedSlotNames,
+      affectedInsightNames,
     });
   };
 
@@ -174,17 +179,22 @@ export function ConnectionsSection({
         ? { ...s, profileId: null }
         : s,
     );
+    const nextInsightSlots = insights.slots.map((s) =>
+      s.profileId !== null && dependentProfileIds.includes(s.profileId)
+        ? { ...s, profileId: null }
+        : s,
+    );
 
+    // Clear any per-chat overrides pointing at a deleted dependent Profile so
+    // chat falls back to the live Chat assignment instead of a dead Profile.
     for (const pid of dependentProfileIds) {
-      const current = await getChatContextProfileId(pid).catch(() => null);
-      if (current === pid) {
-        await clearChatContextProfile(pid).catch(() => {});
-      }
+      await clearChatContextProfilesByProfileId(pid).catch(() => {});
     }
 
     updateSettings({
       aiConfig: nextConfig,
       dictation: { ...dictation, slots: nextSlots },
+      insights: { ...insights, slots: nextInsightSlots },
     });
     setDeleteState(null);
   };
@@ -268,22 +278,27 @@ export function ConnectionsSection({
                         ))}
                       </ul>
                       {(deleteState.affectedAssignments.length > 0 ||
-                        deleteState.affectedSlotNames.length > 0) && (
-                        <p>
-                          The following features will be unassigned and stop
-                          using AI until reassigned:
-                        </p>
-                      )}
-                      {(deleteState.affectedAssignments.length > 0 ||
-                        deleteState.affectedSlotNames.length > 0) && (
-                        <ul className="list-disc pl-5 text-muted-foreground">
-                          {deleteState.affectedAssignments.map((a, i) => (
-                            <li key={`a-${i}`}>{a}</li>
-                          ))}
-                          {deleteState.affectedSlotNames.map((s, i) => (
-                            <li key={`s-${i}`}>Dictation slot &ldquo;{s}&rdquo;</li>
-                          ))}
-                        </ul>
+                        deleteState.affectedSlotNames.length > 0 ||
+                        deleteState.affectedInsightNames.length > 0) && (
+                        <>
+                          <p>
+                            The following features will be unassigned and stop
+                            using AI until reassigned:
+                          </p>
+                          <ul className="list-disc pl-5 text-muted-foreground">
+                            {deleteState.affectedAssignments.map((a, i) => (
+                              <li key={`a-${i}`}>{a}</li>
+                            ))}
+                            {deleteState.affectedSlotNames.map((s, i) => (
+                              <li key={`s-${i}`}>
+                                Dictation slot &ldquo;{s}&rdquo;
+                              </li>
+                            ))}
+                            {deleteState.affectedInsightNames.map((s, i) => (
+                              <li key={`i-${i}`}>Insight &ldquo;{s}&rdquo;</li>
+                            ))}
+                          </ul>
+                        </>
                       )}
                     </>
                   )}

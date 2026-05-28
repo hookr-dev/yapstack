@@ -89,7 +89,12 @@ export function useInsightEngine() {
 
   const inFlightRef = useRef(false);
   const abortRef = useRef<AbortController | null>(null);
-  const processedCountRef = useRef(0);
+  // Ids of segments already sent to the LLM. We track ids — NOT an array index
+  // — because `activeSessionSegments` is kept sorted by audio offset, so a
+  // late-arriving backfill row with an earlier offset is inserted *before* the
+  // current position. An index watermark would skip it (and re-send a boundary
+  // row); an id set sends exactly the unsent segments regardless of order.
+  const processedIdsRef = useRef<Set<string>>(new Set());
   // Trigger clocks (ms epoch). `lastFireAt` = start of the last fire (floor &
   // ceiling measure from here, start-to-start). `lastSegmentArrivedAt` = when
   // the segment count last grew (pause length = now − this). `prevSegLen`
@@ -107,7 +112,7 @@ export function useInsightEngine() {
   // transcript) without the OLD insight's content bleeding into the new
   // insight's prompt-context block or overlay render.
   useEffect(() => {
-    processedCountRef.current = 0;
+    processedIdsRef.current = new Set();
     prevSegLenRef.current = 0;
     lastSegmentArrivedAtRef.current = 0;
     lastFireAtRef.current = 0;
@@ -170,12 +175,14 @@ export function useInsightEngine() {
         return;
       }
 
-      // Only send segments that arrived since the last successful fire.
-      // First fire (or post-switch backfill): watermark is 0, so the slice
-      // covers the whole session-so-far. Subsequent fires send just the
-      // delta — paired with the <previous> block, the model has the anchor it
-      // needs to refine vs pivot vs append without re-processing everything.
-      const newSegments = allSegments.slice(processedCountRef.current);
+      // Only send segments not yet sent to the LLM (by id, order-independent).
+      // First fire (or post-switch backfill): nothing processed yet, so this
+      // covers the whole session-so-far. Subsequent fires send just the delta —
+      // paired with the <previous> block, the model has the anchor it needs to
+      // refine vs pivot vs append without re-processing everything.
+      const newSegments = allSegments.filter(
+        (s) => !processedIdsRef.current.has(s.id),
+      );
       const transcript = assembleTranscriptContext(newSegments);
       if (!transcript) {
         // Backstop (the scheduler already required visible new content).
@@ -242,11 +249,12 @@ export function useInsightEngine() {
         );
         // Always advance the watermark + write a result, even when the
         // model returns nothing — otherwise the overlay sits at "Waiting…"
-        // when the prompt legitimately produces "no output" runs. Advance to
-        // the FULL segment count (not the slice length) so the next fire picks
-        // up from here. Empty completion is still a success → clear the error
-        // flag (else we'd stay stuck in ceiling-only backoff).
-        processedCountRef.current = allSegments.length;
+        // when the prompt legitimately produces "no output" runs. Mark exactly
+        // the segments we sent as processed (segments that arrived during the
+        // await stay unprocessed and are picked up next fire). Empty completion
+        // is still a success → clear the error flag (else we'd stay stuck in
+        // ceiling-only backoff).
+        for (const s of newSegments) processedIdsRef.current.add(s.id);
         erroredRef.current = false;
         state.setLiveInsightResult({
           insightId: insight.id,
@@ -295,12 +303,13 @@ export function useInsightEngine() {
         prevSegLenRef.current = segLen;
       }
 
-      // Count only the *visible* new segments since the last fire — same filter
-      // the transcript assembly uses, so we never fire on content the LLM
-      // wouldn't see (which would then hit the empty-transcript backstop).
-      const filteredNew = allSegments
-        .slice(processedCountRef.current)
-        .filter(visible);
+      // Count only the *visible*, not-yet-sent segments — same id set the fire
+      // uses, and the same visibility filter the transcript assembly uses, so
+      // we never fire on content the LLM wouldn't see (which would then hit the
+      // empty-transcript backstop).
+      const filteredNew = allSegments.filter(
+        (s) => !processedIdsRef.current.has(s.id) && visible(s),
+      );
       const hasNewContent = filteredNew.length > 0;
       const newWords = hasNewContent
         ? countWords(filteredNew.map((s) => s.text).join(" "))

@@ -14,7 +14,7 @@ import {
 import { Pencil, Plus, Sliders, Trash2 } from "lucide-react";
 import type { AIConfig, Profile } from "@/lib/ai";
 import { ProfileEditorDialog } from "./ProfileEditorDialog";
-import { clearChatContextProfile } from "@/lib/db";
+import { clearChatContextProfilesByProfileId } from "@/lib/db";
 
 interface EditState {
   open: boolean;
@@ -27,11 +27,13 @@ interface DeleteState {
   profile: Profile;
   affectedAssignments: string[];
   affectedSlotNames: string[];
+  affectedInsightNames: string[];
 }
 
 export function ProfilesSection() {
   const aiConfig = useAppStore((s) => s.settings.aiConfig);
   const dictation = useAppStore((s) => s.settings.dictation);
+  const insights = useAppStore((s) => s.settings.insights);
   const updateSettings = useAppStore((s) => s.updateSettings);
 
   const [editState, setEditState] = useState<EditState>({
@@ -72,12 +74,16 @@ export function ProfilesSection() {
     const affectedSlotNames = dictation.slots
       .filter((s) => s.profileId === p.id)
       .map((s) => s.name);
+    const affectedInsightNames = insights.slots
+      .filter((s) => s.profileId === p.id)
+      .map((s) => s.name);
 
     setDeleteState({
       open: true,
       profile: p,
       affectedAssignments,
       affectedSlotNames,
+      affectedInsightNames,
     });
   };
 
@@ -103,12 +109,16 @@ export function ProfilesSection() {
     const nextSlots = dictation.slots.map((s) =>
       s.profileId === p.id ? { ...s, profileId: null } : s,
     );
+    const nextInsightSlots = insights.slots.map((s) =>
+      s.profileId === p.id ? { ...s, profileId: null } : s,
+    );
 
-    await clearChatContextProfile(p.id).catch(() => {});
+    await clearChatContextProfilesByProfileId(p.id).catch(() => {});
 
     updateSettings({
       aiConfig: nextConfig,
       dictation: { ...dictation, slots: nextSlots },
+      insights: { ...insights, slots: nextInsightSlots },
     });
     setDeleteState(null);
   };
@@ -179,7 +189,8 @@ export function ProfilesSection() {
               <AlertDialogDescription asChild>
                 <div className="space-y-2 text-xs">
                   {deleteState.affectedAssignments.length === 0 &&
-                  deleteState.affectedSlotNames.length === 0 ? (
+                  deleteState.affectedSlotNames.length === 0 &&
+                  deleteState.affectedInsightNames.length === 0 ? (
                     <p>No features depend on this Profile.</p>
                   ) : (
                     <>
@@ -193,6 +204,9 @@ export function ProfilesSection() {
                         ))}
                         {deleteState.affectedSlotNames.map((s, i) => (
                           <li key={`s-${i}`}>Dictation slot &ldquo;{s}&rdquo;</li>
+                        ))}
+                        {deleteState.affectedInsightNames.map((s, i) => (
+                          <li key={`i-${i}`}>Insight &ldquo;{s}&rdquo;</li>
                         ))}
                       </ul>
                     </>
