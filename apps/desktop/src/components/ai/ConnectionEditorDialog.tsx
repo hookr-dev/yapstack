@@ -185,7 +185,13 @@ export function ConnectionEditorDialog({
 
   const apiKeyOptional = kind === "custom";
   const apiKeyDoc = API_KEY_DOC_URLS[kind];
-  const canSubmit = !fetching && baseUrl.trim().length > 0;
+  // Custom (local) servers may need no key; OpenAI/OpenRouter always do —
+  // require one at save time so a Connection can't look configured and then
+  // only fail when a Profile actually uses it.
+  const canSubmit =
+    !fetching &&
+    baseUrl.trim().length > 0 &&
+    (apiKeyOptional || apiKey.trim().length > 0);
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>

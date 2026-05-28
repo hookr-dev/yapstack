@@ -4,7 +4,7 @@ import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { LogicalPosition } from "@tauri-apps/api/dpi";
 import { useAppStore } from "@/stores/appStore";
 import { commands } from "@/lib/tauri";
-import { EVENTS, WINDOWS, listenEvent } from "@/lib/events";
+import { EVENTS, WINDOWS, listenEvent, emitEvent } from "@/lib/events";
 import { shouldShowInsightOverlay } from "@/lib/insights";
 import { log } from "@/lib/logger";
 
@@ -110,6 +110,8 @@ export function useInsightOverlayController() {
         }
         await commands.showOverlayPanel(WINDOWS.INSIGHT);
         visibleRef.current = true;
+        // Let the overlay start its cursor-position poll now that it's shown.
+        void emitEvent(EVENTS.INSIGHT_VISIBILITY, true);
       } catch {
         // Insight window may not exist on platforms without an NSPanel build.
       }
@@ -117,6 +119,8 @@ export function useInsightOverlayController() {
 
     async function hide() {
       visibleRef.current = false;
+      // Stop the overlay's cursor poll while hidden (no IPC spam at rest).
+      void emitEvent(EVENTS.INSIGHT_VISIBILITY, false);
       try {
         await commands.hideOverlayPanel(WINDOWS.INSIGHT);
       } catch {

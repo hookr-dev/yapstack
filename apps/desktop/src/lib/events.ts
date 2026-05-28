@@ -164,6 +164,11 @@ export const EVENTS = {
   INSIGHT_STATE: "insight:state",
   INSIGHT_HIDE_REQUEST: "insight:hide-request",
   INSIGHT_CHANGE_ACTIVE: "insight:change-active",
+  /** Main → overlay: whether the overlay window is currently shown. The
+   *  overlay gates its cursor-position poll on this so the hidden window
+   *  doesn't run Tauri IPC ~17×/sec while insights are off or no session is
+   *  live (its webview is created at startup and never unmounts). */
+  INSIGHT_VISIBILITY: "insight:visibility",
 } as const;
 
 /** Payload for {@link EVENTS.INSIGHT_STATE}. Emitted by the main window's
@@ -220,6 +225,7 @@ type EventPayloadMap = {
   [EVENTS.INSIGHT_STATE]: InsightStateEvent;
   [EVENTS.INSIGHT_HIDE_REQUEST]: void;
   [EVENTS.INSIGHT_CHANGE_ACTIVE]: InsightChangeActiveEvent;
+  [EVENTS.INSIGHT_VISIBILITY]: boolean;
 };
 
 type EventName = keyof EventPayloadMap;

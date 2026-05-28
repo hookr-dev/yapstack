@@ -20,3 +20,4 @@ Don't edit accepted ADRs. To change a decision, write a new ADR that supersedes 
 ## Index
 
 - [`0001-adopt-agents-md.md`](0001-adopt-agents-md.md) — canonical AI-agent instruction file.
+- [`0002-chat-context-settings-frontend-schema.md`](0002-chat-context-settings-frontend-schema.md) — per-chat Profile override table created via frontend runtime schema, not a numbered migration.

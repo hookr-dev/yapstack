@@ -6,6 +6,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+### Added
+- **AI Connections & Profiles.** The single global provider is replaced by reusable **Connections** (a provider's API key + endpoint — OpenAI, OpenRouter, or any OpenAI-compatible server) and **Profiles** (a Connection paired with a specific model). Each AI feature (Chat, AI actions, dictation slots) is assigned a Profile, so different features can use different models. Settings → AI gains Connections / Profiles / Assignments sections with a shared profile picker, cached per-Connection model catalogs, and a Connections-first onboarding step. Existing single-provider settings migrate automatically (keys preserved as Connections). AI errors surface to the user — there is no silent fallback.
+- **Live Insights.** A floating always-on-top overlay runs a user-defined LLM extraction against the live session transcript and shows the result while you record. Each Insight has a **Type** (Rolling Summary, Glossary, Action Items, Decisions, Open Questions, Current Topic, or Custom — seeds a starter prompt) and a **Cadence** (Responsive / Balanced / Relaxed / Custom) that decides *when* it refires: it accumulates new speech (word threshold) and fires on a natural pause, bounded by a minimum interval and a maximum-wait liveness backstop. The overlay auto-fits its height to the content (no scrollbar), supports click-through over the area beneath it, and lets you switch the active Insight from its header.
+
+### Changed
+- **Per-chat model override** is now stored in a dedicated `chat_context_settings` table; clearing a Connection or Profile cascades to any chat/dictation/Insight that referenced it (with affected items listed in the delete confirmation) so nothing is left pointing at a deleted Profile.
+
 ## [1.0.0-alpha.11] - 2026-05-15
 
 ### Added

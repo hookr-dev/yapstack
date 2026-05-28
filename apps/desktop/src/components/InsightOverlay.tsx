@@ -59,11 +59,29 @@ export function InsightOverlay() {
   useOverlayStyles();
   const [state, setState] = useState<InsightStateEvent>(EMPTY);
 
-  // Receive state from main window.
+  // Whether the overlay is currently shown. The cursor-position poll below is
+  // gated on this: the overlay webview is created at startup and never unmounts,
+  // so without the gate it would run Tauri IPC ~17×/sec forever even while
+  // insights are off / no session is live. Driven by INSIGHT_VISIBILITY from
+  // the main-window controller; seeded from the live window state on mount so a
+  // mid-session reload polls correctly.
+  const pollEnabledRef = useRef(false);
+
+  // Receive state + visibility from main window.
   useEffect(() => {
-    const unlisten = listenEvent(EVENTS.INSIGHT_STATE, setState);
+    const unlistenState = listenEvent(EVENTS.INSIGHT_STATE, setState);
+    const unlistenVis = listenEvent(EVENTS.INSIGHT_VISIBILITY, (visible) => {
+      pollEnabledRef.current = visible;
+    });
+    void getCurrentWindow()
+      .isVisible()
+      .then((v) => {
+        pollEnabledRef.current = v;
+      })
+      .catch(() => {});
     return () => {
-      void unlisten.then((fn) => fn());
+      void unlistenState.then((fn) => fn());
+      void unlistenVis.then((fn) => fn());
     };
   }, []);
 
@@ -174,6 +192,10 @@ export function InsightOverlay() {
     let tickCount = 0;
     async function tick() {
       if (cancelled) return;
+      // Skip all IPC while the overlay is hidden — the dominant idle cost is
+      // these per-tick Tauri calls, not the bare timer. Re-enabled the instant
+      // the controller shows the overlay (INSIGHT_VISIBILITY).
+      if (!pollEnabledRef.current) return;
       // Polling is paused while the popover is open. The popover owns the
       // click-through state during its lifetime; the polling tick can't
       // accidentally toggle it back ON if the cursor moves into the body.

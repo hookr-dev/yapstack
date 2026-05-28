@@ -2523,7 +2523,7 @@ function createAppStore() {
     }),
     {
       name: "yapstack-settings",
-      version: 30,
+      version: 31,
       partialize: (state) => ({
         settings: state.settings,
       }),
@@ -2864,6 +2864,14 @@ function createAppStore() {
               delete slot.enabled;
             }
           }
+        }
+        if (version < 31 && state.settings) {
+          // Remove the redundant `_legacyAi` snapshot an earlier build of the
+          // AI refactor wrote at v25 (a duplicate of the legacy `ai` object,
+          // including plaintext keys, that nothing ever read). The original
+          // legacy `ai` field stays as the re-migration safety net. Without
+          // this, DBs that ran that build keep re-persisting the duplicate.
+          delete (state.settings as Record<string, unknown>)._legacyAi;
         }
         return state as unknown as { settings: Settings };
       },
