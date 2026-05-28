@@ -994,9 +994,7 @@ Settings are stored via Zustand's `persist` middleware with `localStorage`. Sche
 | `streamChat` | `async* (client, model, messages, signal?) → AsyncGenerator<string>` | Simple text streaming (no tools) |
 | `streamChatWithTools` | `async* (client, model, messages, tools, signal?) → AsyncGenerator<StreamEvent>` | Streaming with tool call accumulation |
 | `markdownToBasicHtml` | `(md: string) → string` | Converts markdown to HTML via `marked` |
-| `testConnection` | `(settings: AISettings) → Promise<{ ok, error? }>` | Tests API connectivity |
-| `getModelsForProvider` | `(provider: AIProvider) → ModelOption[] \| null` | Returns model catalog for a provider |
-| `getAllModelsGrouped` | `(activeProvider: AIProvider) → GroupedModels[]` | Returns all models grouped by provider, active provider first |
+| `testConnection` | `(connection: Connection, model: string) → Promise<{ ok, error? }>` | Issues a minimal chat completion to confirm the Connection reaches a working server with valid credentials |
 | `assembleDictationContext` | `(entries: DbDictationHistory[]) → string` | Formats dictation history entries for AI context |
 
 ### `lib/ai-actions.ts`

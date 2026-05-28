@@ -419,4 +419,3 @@ describe("shouldAutoRefreshModels", () => {
     ).toBe(false);
   });
 });
-
