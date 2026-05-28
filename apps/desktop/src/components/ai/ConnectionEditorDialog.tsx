@@ -32,7 +32,6 @@ import {
   type AIProviderKind,
   type Connection,
 } from "@/lib/ai";
-import { formatRelativeTime } from "@/lib/utils";
 import { CustomBaseUrlField } from "./CustomProviderFields";
 import { useRefreshConnectionModels } from "@/hooks/useRefreshConnectionModels";
 
@@ -289,7 +288,6 @@ export function ConnectionEditorDialog({
           <ModelsPanel
             fetching={fetching}
             localModels={localModels}
-            localFetchedAt={localFetchedAt}
             localFetchError={localFetchError}
             onRefresh={handleRefresh}
             disabled={!baseUrl.trim()}
@@ -312,14 +310,12 @@ export function ConnectionEditorDialog({
 function ModelsPanel({
   fetching,
   localModels,
-  localFetchedAt,
   localFetchError,
   onRefresh,
   disabled,
 }: {
   fetching: boolean;
   localModels?: string[];
-  localFetchedAt?: string;
   localFetchError?: string;
   onRefresh: () => void;
   disabled: boolean;
@@ -335,7 +331,6 @@ function ModelsPanel({
           fetching={fetching}
           fetchError={localFetchError}
           count={count}
-          fetchedAt={localFetchedAt}
         />
         <Button
           variant="outline"
@@ -360,12 +355,10 @@ function ModelsPanelStatus({
   fetching,
   fetchError,
   count,
-  fetchedAt,
 }: {
   fetching: boolean;
   fetchError?: string;
   count: number | undefined;
-  fetchedAt?: string;
 }) {
   if (fetching) {
     return (
@@ -399,13 +392,6 @@ function ModelsPanelStatus({
     );
   }
   return (
-    <span className="text-[11px] text-muted-foreground">
-      {count} cached
-      {fetchedAt && (
-        <span title={new Date(fetchedAt).toLocaleString()}>
-          {" · "}fetched {formatRelativeTime(fetchedAt).toLowerCase()}
-        </span>
-      )}
-    </span>
+    <span className="text-[11px] text-muted-foreground">{count} cached</span>
   );
 }

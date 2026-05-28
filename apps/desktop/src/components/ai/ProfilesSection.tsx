@@ -116,9 +116,14 @@ export function ProfilesSection() {
   return (
     <div className="space-y-2">
       <div className="flex items-center justify-between gap-3">
-        <h4 className="text-[11px] font-medium uppercase text-muted-foreground">
-          Profiles
-        </h4>
+        <div>
+          <h4 className="text-[11px] font-medium uppercase text-muted-foreground">
+            Profiles
+          </h4>
+          <p className="text-[11px] text-muted-foreground/70">
+            A connection paired with a specific model.
+          </p>
+        </div>
         {hasProfiles && (
           <Button
             size="sm"

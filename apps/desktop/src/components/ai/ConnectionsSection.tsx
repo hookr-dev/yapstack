@@ -29,7 +29,6 @@ import type {
   AIProviderKind,
   Connection,
 } from "@/lib/ai";
-import { formatRelativeTime } from "@/lib/utils";
 import { ConnectionEditorDialog } from "./ConnectionEditorDialog";
 import {
   clearChatContextProfile,
@@ -193,9 +192,14 @@ export function ConnectionsSection({
   return (
     <div className="space-y-2">
       <div className="flex items-center justify-between gap-3">
-        <h4 className="text-[11px] font-medium uppercase text-muted-foreground">
-          Connections
-        </h4>
+        <div>
+          <h4 className="text-[11px] font-medium uppercase text-muted-foreground">
+            Connections
+          </h4>
+          <p className="text-[11px] text-muted-foreground/70">
+            A provider&rsquo;s API key and endpoint.
+          </p>
+        </div>
         {hasConnections && (
           <Button
             size="sm"
@@ -419,12 +423,6 @@ function StatusInline({
   return (
     <span className="shrink-0">
       {count} model{count === 1 ? "" : "s"}
-      {connection.fetchedAt && (
-        <span title={new Date(connection.fetchedAt).toLocaleString()}>
-          {" · "}
-          {formatRelativeTime(connection.fetchedAt).toLowerCase()}
-        </span>
-      )}
     </span>
   );
 }
