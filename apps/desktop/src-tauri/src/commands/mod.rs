@@ -60,12 +60,30 @@ pub fn set_autostart_enabled(
     }
 }
 
+/// Window labels that are legitimate overlay panels. The overlay commands take
+/// a free-form `label` from the renderer; restricting it to this set keeps a
+/// bug (or a compromised renderer) from show/hide-ing or click-through-ing an
+/// arbitrary window — notably the main window, which on non-macOS would be
+/// hidden by `hide_overlay_panel("main")`.
+const OVERLAY_PANELS: [&str; 3] = ["dictation", "recording-indicator", "insight"];
+
+fn ensure_overlay_label(label: &str) -> Result<(), error::CommandError> {
+    if OVERLAY_PANELS.contains(&label) {
+        Ok(())
+    } else {
+        Err(error::CommandError::InvalidInput {
+            message: format!("'{label}' is not an overlay panel"),
+        })
+    }
+}
+
 #[tauri::command]
 #[specta::specta]
 pub async fn show_overlay_panel(
     app: tauri::AppHandle,
     label: String,
 ) -> Result<(), error::CommandError> {
+    ensure_overlay_label(&label)?;
     #[cfg(target_os = "macos")]
     {
         let app_clone = app.clone();
@@ -118,6 +136,15 @@ pub async fn set_overlay_ignore_cursor_events(
     label: String,
     ignore: bool,
 ) -> Result<(), error::CommandError> {
+    // Click-through is an insight-overlay-only affordance (region-based
+    // header/body pass-through). No other overlay toggles it.
+    if label != "insight" {
+        return Err(error::CommandError::InvalidInput {
+            message: format!(
+                "click-through is only supported on the insight overlay (got '{label}')"
+            ),
+        });
+    }
     #[cfg(target_os = "macos")]
     {
         let app_clone = app.clone();
@@ -150,6 +177,7 @@ pub async fn hide_overlay_panel(
     app: tauri::AppHandle,
     label: String,
 ) -> Result<(), error::CommandError> {
+    ensure_overlay_label(&label)?;
     #[cfg(target_os = "macos")]
     {
         let app_clone = app.clone();

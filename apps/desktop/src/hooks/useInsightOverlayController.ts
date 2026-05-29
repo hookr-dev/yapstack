@@ -16,12 +16,12 @@ import { log } from "@/lib/logger";
  * Mounted in MainApp.
  */
 export function useInsightOverlayController() {
-  const enabled = useAppStore((s) => s.settings.insights.enabled);
   // The overlay tracks the Current Insight (runtime, ephemeral) — not the
   // Default (persisted). The Default seeds Current at session start; the
-  // overlay's dropdown picks and × button only mutate Current.
+  // overlay's dropdown picks and × button only mutate Current. (The show/hide
+  // gate inputs — feature toggle + live flag — are read via the `shouldShow`
+  // selector below and from getState() in the effect, not as separate vars.)
   const currentInsightId = useAppStore((s) => s.currentInsightId);
-  const liveTranscriptionActive = useAppStore((s) => s.liveTranscriptionActive);
   const liveInsightResult = useAppStore((s) => s.liveInsightResult);
   const liveInsightStatus = useAppStore((s) => s.liveInsightStatus);
   const liveInsightError = useAppStore((s) => s.liveInsightError);
@@ -128,8 +128,13 @@ export function useInsightOverlayController() {
       }
     }
 
+    // The effect is intentionally keyed only on the resolved `shouldShow` gate
+    // (it's the sole thing that drives show/hide). Read the gate inputs fresh
+    // from the store for the log rather than adding them as deps — they're a
+    // diagnostic breakdown, not additional triggers.
+    const s = useAppStore.getState();
     log.debug(
-      `overlay: gate=${shouldShow} (enabled=${enabled}, live=${liveTranscriptionActive}, currentId=${currentInsightId ?? "null"})`,
+      `overlay: gate=${shouldShow} (enabled=${s.settings.insights.enabled}, live=${s.liveTranscriptionActive}, currentId=${s.currentInsightId ?? "null"})`,
       "insights",
     );
     if (shouldShow) void show();

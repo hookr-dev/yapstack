@@ -148,24 +148,10 @@ export function ConnectionEditorDialog({
     const trimmedName = name.trim() || KIND_LABELS[kind].split(" ")[0]!;
     const id = initial?.id ?? crypto.randomUUID();
 
-    const next: Connection = {
-      id,
-      name: trimmedName,
-      kind,
-      baseUrl,
-      apiKey: apiKey.trim(),
-      ...(localModels !== undefined && { availableModels: localModels }),
-      ...(localFetchedAt !== undefined && { fetchedAt: localFetchedAt }),
-      ...(localFetchError !== undefined && { fetchError: localFetchError }),
-    };
-    onSubmit(next);
-    onOpenChange(false);
-
     // Background refresh: on create with no fetched catalog, OR on edit when
     // the endpoint or the API key changed since the dialog opened (a corrected
     // key must re-validate too — otherwise a stale fetchError sticks). A manual
     // Refresh moves the baselines forward, so this won't double-fetch.
-    // Fire-and-forget so the dialog closes immediately; the hook toasts on done.
     const shouldAutoRefresh = shouldAutoRefreshModels({
       mode,
       hasLocalModels: localModels !== undefined,
@@ -175,6 +161,27 @@ export function ConnectionEditorDialog({
       apiKey,
       apiKeyBaseline: apiKeyAtOpen,
     });
+
+    // When a refresh is about to fire, the in-dialog catalog belongs to the
+    // OLD endpoint/key — don't persist it, or Profile creation could offer
+    // models from the previous server and a failed refresh would leave the
+    // stale list attached. Commit a clean slate; the refresh repopulates it.
+    const next: Connection = {
+      id,
+      name: trimmedName,
+      kind,
+      baseUrl,
+      apiKey: apiKey.trim(),
+      ...(!shouldAutoRefresh &&
+        localModels !== undefined && { availableModels: localModels }),
+      ...(!shouldAutoRefresh &&
+        localFetchedAt !== undefined && { fetchedAt: localFetchedAt }),
+      ...(!shouldAutoRefresh &&
+        localFetchError !== undefined && { fetchError: localFetchError }),
+    };
+    onSubmit(next);
+    onOpenChange(false);
+
     if (shouldAutoRefresh) {
       // Defer one tick so the store update lands before the hook reads it.
       queueMicrotask(() => {
