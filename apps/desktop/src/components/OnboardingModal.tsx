@@ -478,7 +478,10 @@ function AIStep({
   }
 
   const starterModels = STARTER_MODELS[kind];
-  const canTest = !!model && (kind === "custom" || !!apiKey);
+  // Match the Connection editor's guards: a base URL is always required, and a
+  // key is required for non-custom providers (custom/local servers may omit it).
+  const canTest =
+    !!model && baseUrl.trim().length > 0 && (kind === "custom" || !!apiKey);
 
   return (
     <div className="flex flex-col">

@@ -19,6 +19,7 @@ import {
   getChatMessageById,
   markToolCallsAsUndone,
   getChatContextProfileId,
+  clearChatContextProfile,
 } from "@/lib/db";
 import {
   resolveAndCreateClient,
@@ -374,7 +375,20 @@ export function useChatMessages(
           profileId = aiConfig.assignments.aiActionsProfileId;
         } else {
           const override = await getChatContextProfileId(contextKey);
-          profileId = override ?? aiConfig.assignments.chatProfileId;
+          // Self-heal a dangling override: settings (Profiles) and SQLite (this
+          // override) are separate stores with no FK, and delete-time cleanup is
+          // best-effort. If the override points at a Profile that no longer
+          // exists, ignore it — fall back to the live Chat assignment — and
+          // clear the stale row so chat doesn't keep erroring on a dead Profile.
+          const overrideValid =
+            override !== null &&
+            aiConfig.profiles.some((p) => p.id === override);
+          if (override !== null && !overrideValid) {
+            void clearChatContextProfile(contextKey).catch(() => {});
+          }
+          profileId = overrideValid
+            ? override
+            : aiConfig.assignments.chatProfileId;
         }
         const { client, model: resolvedModel } = resolveAndCreateClient(
           aiConfig,

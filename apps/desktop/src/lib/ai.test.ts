@@ -22,9 +22,57 @@ import {
   markdownToBasicHtml,
   fetchCustomModels,
   shouldAutoRefreshModels,
+  isVisibleSegment,
   type ChatContext,
 } from "./ai";
 import type { DbSegment } from "./db";
+
+function makeSegment(overrides: Partial<DbSegment> = {}): DbSegment {
+  return {
+    id: "s1",
+    session_id: "sess",
+    source: "Mic",
+    text: "hello",
+    audio_offset_seconds: 0,
+    chunk_duration_seconds: 1,
+    confidence: 0.9,
+    created_at: "",
+    chunk_index: 0,
+    original_text: null,
+    edited_at: null,
+    deleted_at: null,
+    hidden: 0,
+    speaker_id: null,
+    ...overrides,
+  };
+}
+
+describe("isVisibleSegment (the AI visibility gate)", () => {
+  it("is true for a normal segment", () => {
+    expect(isVisibleSegment(makeSegment())).toBe(true);
+  });
+
+  it("is false for a hidden segment", () => {
+    expect(isVisibleSegment(makeSegment({ hidden: 1 }))).toBe(false);
+  });
+
+  it("is false for a soft-deleted segment", () => {
+    expect(
+      isVisibleSegment(makeSegment({ deleted_at: "2026-01-01T00:00:00Z" })),
+    ).toBe(false);
+  });
+
+  it("excludes hidden/deleted segments from assembled transcript context", () => {
+    const out = assembleTranscriptContext([
+      makeSegment({ id: "a", text: "visible one" }),
+      makeSegment({ id: "b", text: "hidden one", hidden: 1 }),
+      makeSegment({ id: "c", text: "deleted one", deleted_at: "2026-01-01" }),
+    ]);
+    expect(out).toContain("visible one");
+    expect(out).not.toContain("hidden one");
+    expect(out).not.toContain("deleted one");
+  });
+});
 
 describe("chatContextKey", () => {
   it("returns sessionId for session context", () => {

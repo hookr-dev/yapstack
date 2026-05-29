@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef } from "react";
 import { useAppStore } from "@/stores/appStore";
 import {
   assembleTranscriptContext,
+  isVisibleSegment,
   resolveAndCreateClient,
 } from "@/lib/ai";
 import {
@@ -39,12 +40,6 @@ const OUTPUT_FORMAT_GUIDANCE =
  *  boundary) resolvable — the cost is one extra arithmetic-only getState per
  *  second. */
 const SCHEDULER_TICK_MS = 500;
-
-/** Same visibility filter as `assembleTranscriptContext` — so the word count
- *  and "has new content" check see exactly what the LLM would. */
-function visible(seg: DbSegment): boolean {
-  return seg.hidden !== 1 && !seg.deleted_at;
-}
 
 /**
  * Insight engine — drives the Current Insight on its trigger while a live
@@ -175,13 +170,14 @@ export function useInsightEngine() {
         return;
       }
 
-      // Only send segments not yet sent to the LLM (by id, order-independent).
-      // First fire (or post-switch backfill): nothing processed yet, so this
-      // covers the whole session-so-far. Subsequent fires send just the delta —
-      // paired with the <previous> block, the model has the anchor it needs to
-      // refine vs pivot vs append without re-processing everything.
+      // Only send *visible*, not-yet-sent segments (by id, order-independent).
+      // The `visible` filter must match what assembleTranscriptContext emits and
+      // what we mark processed below — otherwise a hidden segment included here
+      // would be marked processed without being sent, so unhiding it later would
+      // never surface it to the Insight. First fire (or post-switch backfill):
+      // nothing processed yet, so this covers the whole session-so-far.
       const newSegments = allSegments.filter(
-        (s) => !processedIdsRef.current.has(s.id),
+        (s) => !processedIdsRef.current.has(s.id) && isVisibleSegment(s),
       );
       const transcript = assembleTranscriptContext(newSegments);
       if (!transcript) {
@@ -308,7 +304,7 @@ export function useInsightEngine() {
       // we never fire on content the LLM wouldn't see (which would then hit the
       // empty-transcript backstop).
       const filteredNew = allSegments.filter(
-        (s) => !processedIdsRef.current.has(s.id) && visible(s),
+        (s) => !processedIdsRef.current.has(s.id) && isVisibleSegment(s),
       );
       const hasNewContent = filteredNew.length > 0;
       const newWords = hasNewContent

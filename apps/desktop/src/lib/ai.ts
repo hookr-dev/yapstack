@@ -265,12 +265,25 @@ export function formatSegmentSpeaker(
   return "Other";
 }
 
+/**
+ * The single visibility gate for AI processing. A segment is eligible to reach
+ * any LLM / AI feature only if it is neither hidden nor soft-deleted. Hidden is
+ * a user action meaning "keep this in the transcript UI but exclude it from AI";
+ * deleted is gone entirely. EVERY path that feeds segment text to a model
+ * (transcript context, insights, chat tools, auto-tag suggestions) must gate on
+ * this — segments are loaded unfiltered for the transcript UI (which renders and
+ * un-hides them), so exclusion happens here at the AI boundary, not at load.
+ */
+export function isVisibleSegment(seg: DbSegment): boolean {
+  return seg.hidden !== 1 && !seg.deleted_at;
+}
+
 export function assembleTranscriptContext(
   segments: DbSegment[],
   speakerNames?: Record<number, string>,
 ): string {
   return segments
-    .filter((s) => s.hidden !== 1 && !s.deleted_at)
+    .filter(isVisibleSegment)
     .map((s) => {
       const mins = Math.floor(s.audio_offset_seconds / 60);
       const secs = Math.floor(s.audio_offset_seconds % 60);
