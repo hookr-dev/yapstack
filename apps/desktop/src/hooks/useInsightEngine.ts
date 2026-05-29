@@ -106,6 +106,17 @@ export function useInsightEngine() {
   // fire immediately via the ceiling (backfill against the session-so-far
   // transcript) without the OLD insight's content bleeding into the new
   // insight's prompt-context block or overlay render.
+  //
+  // Deliberately keyed on `currentInsightId` only — NOT on prompt / profile /
+  // preset edits. Editing the active insight mid-session takes effect on the
+  // next tick (the scheduler re-reads the slot fresh), but we do NOT reset the
+  // watermark or clear the previous result: doing so on every keystroke would
+  // re-send the whole session transcript, flicker the overlay to "Waiting…",
+  // and reintroduce the edit-driven engine churn the primitive-only effect deps
+  // were designed to avoid. The cost is one transitional tick where the prior
+  // output rides along in the `<previous>` block under the new prompt — which
+  // is exactly the refine-vs-pivot signal that block exists to provide. To
+  // start an insight truly fresh after an edit, switch away and back.
   useEffect(() => {
     processedIdsRef.current = new Set();
     prevSegLenRef.current = 0;
