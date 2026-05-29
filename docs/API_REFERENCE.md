@@ -912,11 +912,14 @@ Indexes: `idx_dictation_history_created(created_at)`, `idx_dictation_history_slo
 - Sweeps stale `recording`-status sessions left by a prior crash (recomputes duration from `session_audio_parts` or `segments`, marks them `completed`).
 - Creates `audio_save_locations` table (idempotent) — every directory the app has written audio into. Used by `scan_missing_audio_parts()` on next startup to recover orphan part files if a row insert was missed.
 
-The `segments.speaker_id INTEGER` column for Parakeet+Sortformer diarization is added by the frontend's `getDb()` after migrations run, sidestepping a "ghost" v11 entry that some local dev DBs picked up from another branch.
+Additional schema is created by the **frontend's** `getDb()` (`ensureRuntimeSchema`) after migrations run, deliberately kept out of the versioned Rust list to sidestep a "ghost" v11 entry that some local dev DBs picked up from another branch (which makes sqlx silently refuse later numbered migrations). See [ADR 0002](adr/0002-chat-context-settings-frontend-schema.md):
+
+- `segments.speaker_id INTEGER` — Parakeet+Sortformer diarization.
+- `chat_context_settings` table (`context_key` PK, `profile_id` nullable, `updated_at`) — per-chat-context AI **Profile** override; `NULL`/absent means "use the live default Chat assignment". Created idempotently with `CREATE TABLE IF NOT EXISTS`.
 
 ### Settings Persistence (Zustand)
 
-Settings are stored via Zustand's `persist` middleware with `localStorage`. Schema versioned (currently **v23**).
+Settings are stored via Zustand's `persist` middleware with `localStorage`. Schema versioned (currently **v31**).
 
 | Version | Description |
 |---------|-------------|
@@ -943,6 +946,14 @@ Settings are stored via Zustand's `persist` middleware with `localStorage`. Sche
 | 20→21 | Added `audioExportFormat` (default `"mp3"`) and `mp3Bitrate` (default 64) |
 | 21→22 | Engines become first-class peers: added `selectedEngine` (default `"Whisper"`), `selectedParakeetVariant` (`"TdtV3"`), `diarizationEnabled` (`false`), `speakerNames: Record<string, Record<number, string>>` |
 | 22→23 | Force-disable `diarizationEnabled` on upgrade. Sortformer's chunk-local speaker IDs cause the same person to flip across speaker numbers across chunk boundaries; the IPC + DB + sidecar plumbing stays intact so re-enable is one line away once session-stable IDs land. |
+| 23→24 | Added dictation volume-ducking settings (`dictationDuckEnabled`, `dictationDuckTarget`; later reduce-by `dictationDuckAmount`). |
+| 24→25 | AI refactor: populate `aiConfig` (Connections / Profiles / Assignments) from the legacy single-provider `ai` shape; set each dictation slot's `profileId`. Legacy `ai` left in place as the re-migration safety net. |
+| 25→26 | Added `insights: InsightsSettings` (Live Insights) with empty defaults. |
+| 26→27 | Insights: `activeInsightId` → `defaultInsightId` (session-start default; the runtime "current" insight is non-persisted). |
+| 27→28 | Insight cadence: per-slot `heartbeatSeconds` (fixed interval) → `trigger` (threshold / settle / floor / ceiling), mapped to a behavior-preserving interval. |
+| 28→29 | Insight cadence presets renamed (`summary`/`jargon`/`topic` → tempo tiers `responsive`/`balanced`/`relaxed`); added Insight `type`. |
+| 29→30 | Dropped the redundant per-Insight `enabled` flag. |
+| 30→31 | Remove the redundant `_legacyAi` snapshot written by an early build of the AI refactor (duplicate of legacy `ai`, including plaintext keys, never read). |
 
 ---
 
@@ -950,25 +961,30 @@ Settings are stored via Zustand's `persist` middleware with `localStorage`. Sche
 
 ### `lib/ai.ts`
 
+> **Connection/Profile model** (replaces the legacy single-active-provider `AISettings`). A **Connection** is a credential+endpoint; a **Profile** binds a Connection to a model; **Assignments** map features → Profiles. The legacy `ai` shape is migrated into `aiConfig` at persist v25 (see Settings Persistence) and is no longer read by the app.
+
 **Types**
 | Type | Fields |
 |------|--------|
-| `AIProvider` | `"openai" \| "openrouter" \| "custom"` |
-| `AIProviderConfig` | `{ apiKey, model, baseUrl }` |
-| `AISettings` | `{ activeProvider, providers: Record<AIProvider, AIProviderConfig> }` |
-| `ChatMessage` | `{ id, role, content, action?: AIActionType, isStreaming? }` |
+| `AIProviderKind` | `"openai" \| "openrouter" \| "custom"` |
+| `Connection` | `{ id, name, kind: AIProviderKind, baseUrl, apiKey, availableModels?, fetchedAt?, fetchError? }` |
+| `Profile` | `{ id, name, connectionId, model }` |
+| `AIAssignments` | `{ chatProfileId: string \| null, aiActionsProfileId: string \| null }` |
+| `AIConfig` | `{ connections: Connection[], profiles: Profile[], assignments: AIAssignments }` |
+| `ChatMessage` | `{ id, role, content, action?: AIActionType, isStreaming?, toolExecutions? }` |
 | `FileAttachment` | `{ name, content }` |
 | `AIActionType` | `string` — any action ID. Built-in values: `"summarize"`, `"key-points"`, `"action-items"`, `"meeting-minutes"`, `"general"`. Extensible for custom actions. |
 | `ChatContext` | `{ type: "session", sessionId } \| { type: "folder", folderId } \| { type: "all" } \| { type: "pinned" } \| { type: "dictation" }` |
 | `StreamEvent` | `{ type: "token", content } \| { type: "tool_calls", calls: ToolCallResult[] } \| { type: "done" }` |
-| `ModelOption` | `{ id: string, label: string, recommended?: boolean }` |
-| `GroupedModels` | `{ provider: AIProvider, providerLabel: string, models: (ModelOption & { available: boolean })[] }` |
 
 **Functions**
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `createAIClient` | `(settings: AISettings) → OpenAI` | Creates OpenAI client with provider-specific headers |
-| `getActiveConfig` | `(settings: AISettings) → AIProviderConfig` | Returns current provider config |
+| `createAIClientForConnection` | `(connection: Connection) → OpenAI` | Creates an OpenAI client with kind-specific headers (blank key allowed for `custom`) |
+| `resolveProfile` | `(config: AIConfig, profileId: string \| null) → { profile, connection }` | Resolves a Profile id to its Profile + Connection (throws if missing/dangling) |
+| `resolveAndCreateClient` | `(config: AIConfig, profileId: string \| null) → { client: OpenAI, model: string }` | Resolves a Profile and builds its client + model in one call |
+| `fetchCustomModels` | `(baseUrl: string, apiKey?: string) → Promise<string[]>` | Fetches the `/models` catalog for a Connection |
+| `shouldAutoRefreshModels` | `(args) → boolean` | Whether the editor should re-fetch the catalog on save (endpoint or key changed) |
 | `chatContextKey` | `(ctx: ChatContext) → string` | Returns context identity string for chat message persistence |
 | `assembleTranscriptContext` | `(segments: DbSegment[]) → string` | Formats segments as `[seg:ID timestamp] text` lines. Filters hidden/deleted. |
 | `assembleNoteContext` | `(noteHtml: string) → string` | Strips HTML to plain text |
@@ -978,9 +994,7 @@ Settings are stored via Zustand's `persist` middleware with `localStorage`. Sche
 | `streamChat` | `async* (client, model, messages, signal?) → AsyncGenerator<string>` | Simple text streaming (no tools) |
 | `streamChatWithTools` | `async* (client, model, messages, tools, signal?) → AsyncGenerator<StreamEvent>` | Streaming with tool call accumulation |
 | `markdownToBasicHtml` | `(md: string) → string` | Converts markdown to HTML via `marked` |
-| `testConnection` | `(settings: AISettings) → Promise<{ ok, error? }>` | Tests API connectivity |
-| `getModelsForProvider` | `(provider: AIProvider) → ModelOption[] \| null` | Returns model catalog for a provider |
-| `getAllModelsGrouped` | `(activeProvider: AIProvider) → GroupedModels[]` | Returns all models grouped by provider, active provider first |
+| `testConnection` | `(connection: Connection, model: string) → Promise<{ ok, error? }>` | Issues a minimal chat completion to confirm the Connection reaches a working server with valid credentials |
 | `assembleDictationContext` | `(entries: DbDictationHistory[]) → string` | Formats dictation history entries for AI context |
 
 ### `lib/ai-actions.ts`

@@ -64,6 +64,25 @@
         "focus": false,
         "shadow": false,
         "backgroundThrottling": "disabled"
+      },
+      {
+        "label": "insight",
+        "title": "YapStack - Insight",
+        "url": "index.html?window=insight",
+        "width": 480,
+        "height": 140,
+        "minWidth": 320,
+        "minHeight": 40,
+        "visible": false,
+        "resizable": true,
+        "decorations": false,
+        "transparent": true,
+        "alwaysOnTop": true,
+        "visibleOnAllWorkspaces": true,
+        "skipTaskbar": true,
+        "focus": false,
+        "shadow": false,
+        "backgroundThrottling": "disabled"
       }
     ],
     "security": {

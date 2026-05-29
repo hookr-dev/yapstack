@@ -8,8 +8,39 @@ import {
   formatRelativeTime,
   getDayLabel,
   groupSessionsByDay,
+  countWords,
   cn,
 } from "./utils";
+
+describe("countWords", () => {
+  it("counts whitespace-delimited words", () => {
+    expect(countWords("hello world")).toBe(2);
+    expect(countWords("  the  quick   brown fox ")).toBe(4);
+  });
+
+  it("returns 0 for empty / whitespace / punctuation-only input", () => {
+    expect(countWords("")).toBe(0);
+    expect(countWords("   ")).toBe(0);
+    expect(countWords("... !! -- ?")).toBe(0);
+  });
+
+  it("treats contractions and hyphenates as single words", () => {
+    // don't (1) worry (1) state-of-the-art (1) = 3
+    expect(countWords("don't worry — state-of-the-art")).toBe(3);
+  });
+
+  it("counts accented / non-ASCII letters", () => {
+    expect(countWords("café déjà vu")).toBe(3);
+  });
+
+  it("counts numbers as words", () => {
+    expect(countWords("we have 3 items and 42 reasons")).toBe(7);
+  });
+
+  it("splits on newlines (segments joined across lines)", () => {
+    expect(countWords("alpha\nbeta\ngamma")).toBe(3);
+  });
+});
 
 describe("formatBytes", () => {
   it("returns 0 B for zero", () => {
@@ -188,6 +219,18 @@ describe("formatRelativeTime", () => {
   it("returns formatted date for >= 7 days", () => {
     const result = formatRelativeTime("2025-06-05T12:00:00");
     expect(result).toMatch(/\w+ \d+/);
+  });
+
+  // Regression: connection.fetchedAt is `new Date().toISOString()` which
+  // already ends in `Z`. Appending a second `Z` produces "Invalid Date".
+  it("handles ISO strings that already carry a `Z` suffix", () => {
+    expect(formatRelativeTime("2025-06-15T11:55:00.000Z")).toBe("5m ago");
+  });
+
+  it("handles ISO strings with a numeric timezone offset", () => {
+    // 11:55+00:00 == 12:55 UTC; system time is 12:00 UTC, so this is "future"
+    // by 55 minutes. Use a past offset instead: 13:55+02:00 == 11:55 UTC.
+    expect(formatRelativeTime("2025-06-15T13:55:00+02:00")).toBe("5m ago");
   });
 });
 

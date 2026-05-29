@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { useAppStore } from "@/stores/appStore";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
@@ -8,9 +9,17 @@ import { TranscriptionTab } from "@/components/settings/TranscriptionTab";
 import { ShortcutsTab } from "@/components/settings/ShortcutsTab";
 import { AITab } from "@/components/settings/AITab";
 import { DictationTab } from "@/components/settings/DictationTab";
+import { InsightsTab } from "@/components/settings/InsightsTab";
 
 export function SettingsPanel() {
   const navigateTo = useAppStore((s) => s.navigateTo);
+  // Seed the initial tab from a one-shot settingsRequest. AITab is responsible
+  // for clearing the request once it's consumed (so the request doesn't fire
+  // again on the next mount).
+  const initialTab = useAppStore.getState().settingsRequest === "ai-add-connection"
+    ? "ai"
+    : "general";
+  const [tab, setTab] = useState(initialTab);
 
   return (
     <div className="flex flex-1 flex-col min-h-0">
@@ -27,13 +36,18 @@ export function SettingsPanel() {
       </div>
 
       {/* Tabs */}
-      <Tabs defaultValue="general" className="flex flex-1 flex-col min-h-0">
+      <Tabs
+        value={tab}
+        onValueChange={setTab}
+        className="flex flex-1 flex-col min-h-0"
+      >
         <TabsList variant="line" className="px-4 pt-1 w-full">
           <TabsTrigger value="general">General</TabsTrigger>
           <TabsTrigger value="audio">Audio</TabsTrigger>
           <TabsTrigger value="transcription">Transcription</TabsTrigger>
           <TabsTrigger value="ai">AI</TabsTrigger>
           <TabsTrigger value="dictation">Dictation</TabsTrigger>
+          <TabsTrigger value="insights">Insights</TabsTrigger>
           <TabsTrigger value="shortcuts">Shortcuts</TabsTrigger>
         </TabsList>
 
@@ -73,6 +87,14 @@ export function SettingsPanel() {
           <ScrollArea className="h-full">
             <div className="space-y-5 p-4">
               <DictationTab />
+            </div>
+          </ScrollArea>
+        </TabsContent>
+
+        <TabsContent value="insights" className="flex-1 min-h-0">
+          <ScrollArea className="h-full">
+            <div className="space-y-5 p-4">
+              <InsightsTab />
             </div>
           </ScrollArea>
         </TabsContent>

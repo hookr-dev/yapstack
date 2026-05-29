@@ -374,6 +374,35 @@ async hideOverlayPanel(label: string) : Promise<Result<null, CommandError>> {
 }
 },
 /**
+ * Global cursor position in physical pixels, in screen coordinate space.
+ * Used by the Insight overlay to implement region-based click-through:
+ * the JS polls this and toggles click-through based on whether the cursor
+ * falls inside the overlay's header strip or its body.
+ */
+async getCursorPosition() : Promise<Result<[number, number], CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("get_cursor_position") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Toggle click-through (mouse-event pass-through) on an overlay window.
+ * On macOS we *must* call `set_ignores_mouse_events` on the underlying
+ * NSPanel — Tauri's JS `setIgnoreCursorEvents` routes through the
+ * pre-conversion NSWindow handle and silently no-ops after
+ * `tauri-nspanel` swaps in its panel subclass.
+ */
+async setOverlayIgnoreCursorEvents(label: string, ignore: boolean) : Promise<Result<null, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("set_overlay_ignore_cursor_events", { label, ignore }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Snapshot of recent entries from the in-memory ring buffer.
  * `limit` caps the number returned (default 500 = the full buffer).
  */

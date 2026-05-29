@@ -90,6 +90,7 @@ export const tauriPathMock = () => ({
 export const tauriCommandsMock = () => ({
   commands: {
     healthCheck: vi.fn().mockResolvedValue({ status: "ok", version: "0.1.0" }),
+    logFrontend: vi.fn().mockResolvedValue(undefined),
     listAudioDevices: vi.fn().mockResolvedValue({ status: "ok", data: [] }),
     getDefaultInputDevice: vi
       .fn()

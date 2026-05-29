@@ -24,7 +24,11 @@ import {
   getSessionSegments,
 } from "./db";
 import type { DbNote, DbSegment, DbFolder } from "./db";
-import { markdownToBasicHtml, formatSegmentSpeaker } from "./ai";
+import {
+  markdownToBasicHtml,
+  formatSegmentSpeaker,
+  isVisibleSegment,
+} from "./ai";
 import { formatTime, stripHtml } from "./utils";
 import { findBranchConflicts, getFolderPath } from "./folder-tree";
 import { useAppStore } from "@/stores/appStore";
@@ -1236,7 +1240,7 @@ registerTool({
 
       if (wantSegments) {
         const segs = await getSessionSegments(sid);
-        const live = segs.filter((s) => !s.deleted_at && !s.hidden);
+        const live = segs.filter(isVisibleSegment);
         if (live.length === 0) {
           lines.push("**Transcript:** (no segments)");
         } else {
@@ -1369,7 +1373,7 @@ registerTool({
     type EditPlan = { segmentId: string; previousText: string; newText: string };
     const plans: EditPlan[] = [];
     for (const seg of sctx.segments) {
-      if (seg.deleted_at || seg.hidden) continue;
+      if (!isVisibleSegment(seg)) continue;
       pattern.lastIndex = 0;
       if (!pattern.test(seg.text)) continue;
       pattern.lastIndex = 0;

@@ -2,13 +2,8 @@ import { useState, useEffect, useRef, useCallback } from "react";
 import { useAppStore } from "@/stores/appStore";
 import type { ThemeMode } from "@/stores/appStore";
 import { getActiveFlow, type StepNav } from "./onboarding-utils";
-import {
-  testConnection,
-  getModelsForProvider,
-  getAllModelsGrouped,
-  DEFAULT_AI_SETTINGS,
-} from "@/lib/ai";
-import type { AIProvider, AIProviderConfig, AISettings } from "@/lib/ai";
+import { testConnection, fetchCustomModels } from "@/lib/ai";
+import type { AIProviderKind, Connection, Profile } from "@/lib/ai";
 import {
   CustomBaseUrlField,
   CustomModelField,
@@ -37,9 +32,7 @@ import { Switch } from "@/components/ui/switch";
 import {
   Select,
   SelectContent,
-  SelectGroup,
   SelectItem,
-  SelectLabel,
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
@@ -358,10 +351,40 @@ function AudioStep({
 
 // --- Step 3: AI Assistant ---
 
-const PROVIDER_LABELS: Record<AIProvider, string> = {
+const PROVIDER_LABELS: Record<AIProviderKind, string> = {
   openai: "OpenAI",
   openrouter: "OpenRouter",
   custom: "Custom",
+};
+
+// Default baseUrls per kind. Mirrors the values used elsewhere
+// (ConnectionEditorDialog) — kept inline to avoid coupling onboarding to a
+// shared catalog that exists only for this purpose.
+const DEFAULT_BASE_URLS: Record<AIProviderKind, string> = {
+  openai: "https://api.openai.com/v1",
+  openrouter: "https://openrouter.ai/api/v1",
+  custom: "http://127.0.0.1:8080/v1",
+};
+
+// Small curated list of starter models per known kind. The catalog in
+// the editor is sourced from /v1/models at runtime; onboarding favors a
+// short, opinionated list so the user can move on without inspecting
+// hundreds of model ids.
+const STARTER_MODELS: Record<
+  AIProviderKind,
+  { id: string; label: string; recommended?: boolean }[]
+> = {
+  openai: [
+    { id: "gpt-5.4-mini", label: "GPT-5.4 Mini", recommended: true },
+    { id: "gpt-5.4", label: "GPT-5.4" },
+    { id: "gpt-4o-mini", label: "GPT-4o Mini" },
+  ],
+  openrouter: [
+    { id: "anthropic/claude-haiku-4.5", label: "Claude Haiku 4.5", recommended: true },
+    { id: "anthropic/claude-sonnet-4.5", label: "Claude Sonnet 4.5" },
+    { id: "openai/gpt-5.4-mini", label: "GPT-5.4 Mini" },
+  ],
+  custom: [],
 };
 
 function AIStep({
@@ -371,8 +394,15 @@ function AIStep({
   onNext: () => void;
   onBack: () => void;
 }) {
-  const ai = useAppStore((s) => s.settings.ai) ?? DEFAULT_AI_SETTINGS;
+  const aiConfig = useAppStore((s) => s.settings.aiConfig);
   const updateSettings = useAppStore((s) => s.updateSettings);
+  const [kind, setKind] = useState<AIProviderKind>("openai");
+  const [apiKey, setApiKey] = useState("");
+  const [baseUrl, setBaseUrl] = useState(DEFAULT_BASE_URLS.openai);
+  const [model, setModel] = useState(STARTER_MODELS.openai[0]!.id);
+  const [fetchedModels, setFetchedModels] = useState<string[] | undefined>(
+    undefined,
+  );
   const [showKey, setShowKey] = useState(false);
   const [testing, setTesting] = useState(false);
   const [testResult, setTestResult] = useState<{
@@ -380,62 +410,117 @@ function AIStep({
     error?: string;
   } | null>(null);
 
-  const provider = ai.activeProvider;
-  const config = ai.providers[provider];
-  const models = getModelsForProvider(provider);
-
-  function updateAI(partial: Partial<AISettings>) {
-    updateSettings({ ai: { ...ai, ...partial } });
-  }
-
-  function updateProviderConfig(field: string, value: string) {
-    updateProviderConfigPartial({ [field]: value });
-  }
-
-  function updateProviderConfigPartial(updates: Partial<AIProviderConfig>) {
-    updateSettings({
-      ai: {
-        ...ai,
-        providers: {
-          ...ai.providers,
-          [provider]: { ...config, ...updates },
-        },
-      },
-    });
+  function handleKindChange(next: AIProviderKind) {
+    setKind(next);
+    setBaseUrl(DEFAULT_BASE_URLS[next]);
+    setModel(STARTER_MODELS[next][0]?.id ?? "");
+    setFetchedModels(undefined);
+    setTestResult(null);
   }
 
   async function handleTestConnection() {
     setTesting(true);
     setTestResult(null);
-    const result = await testConnection(ai);
+    const probeConnection: Connection = {
+      id: "__probe__",
+      name: PROVIDER_LABELS[kind],
+      kind,
+      baseUrl,
+      apiKey,
+    };
+    const result = await testConnection(probeConnection, model);
     setTestResult(result);
     setTesting(false);
   }
+
+  async function handleNext() {
+    if (!model.trim()) {
+      onNext();
+      return;
+    }
+    // Try to fetch the model catalog so the Profile picker in Settings has
+    // something to show later. Non-blocking — failures are normal for
+    // unreachable local servers and shouldn't stop onboarding.
+    let available: string[] | undefined = fetchedModels;
+    if (available === undefined) {
+      try {
+        available = await fetchCustomModels(baseUrl, apiKey);
+      } catch {
+        available = undefined;
+      }
+    }
+    const connection: Connection = {
+      id: crypto.randomUUID(),
+      name: PROVIDER_LABELS[kind],
+      kind,
+      baseUrl,
+      apiKey: apiKey.trim(),
+      ...(available !== undefined && { availableModels: available }),
+      ...(available !== undefined && { fetchedAt: new Date().toISOString() }),
+    };
+    const profile: Profile = {
+      id: crypto.randomUUID(),
+      name: `${PROVIDER_LABELS[kind]} · ${model.trim()}`,
+      connectionId: connection.id,
+      model: model.trim(),
+    };
+    updateSettings({
+      aiConfig: {
+        connections: [...aiConfig.connections, connection],
+        profiles: [...aiConfig.profiles, profile],
+        assignments: {
+          chatProfileId: profile.id,
+          aiActionsProfileId: profile.id,
+        },
+      },
+    });
+    onNext();
+  }
+
+  const starterModels = STARTER_MODELS[kind];
+  // Match the Connection editor's guards: a base URL is always required, and a
+  // non-blank key is required for non-custom providers (custom/local servers may
+  // omit it). `.trim()` so whitespace-only input can't enable Add and then
+  // persist as an empty key (handleNext saves `apiKey.trim()`).
+  const canTest =
+    !!model &&
+    baseUrl.trim().length > 0 &&
+    (kind === "custom" || apiKey.trim().length > 0);
 
   return (
     <div className="flex flex-col">
       <div className="flex items-center gap-2 mb-0.5">
         <Sparkles className="h-5 w-5 text-primary" />
-        <h2 className="text-lg font-semibold">AI Assistant</h2>
+        <h2 className="text-lg font-semibold">Connect an AI provider</h2>
       </div>
-      <p className="text-sm text-muted-foreground mb-6">
-        Connect an AI provider for smart features like summarization and
-        dictation
+      <p className="text-sm text-muted-foreground mb-4">
+        YapStack lets you wire up multiple AI connections — a cloud account
+        for fast chat, a local server for private notes, or both at once.
+        Different features can use different providers.
       </p>
+
+      <div className="mb-5 rounded-md border border-border bg-muted/40 px-3 py-2.5">
+        <p className="text-[11px] leading-relaxed text-muted-foreground">
+          <span className="font-medium text-foreground">Your first Connection</span>
+          {" "}will be assigned to Chat and AI actions by default. Add more
+          Connections and Profiles anytime in{" "}
+          <span className="font-medium text-foreground">Settings → AI</span>.
+        </p>
+      </div>
 
       <div className="space-y-3 mb-4">
         {/* Provider */}
         <div className="space-y-1.5">
           <Label className="text-xs text-muted-foreground">Provider</Label>
           <Select
-            value={provider}
-            onValueChange={(v) => updateAI({ activeProvider: v as AIProvider })}
+            value={kind}
+            onValueChange={(v) => handleKindChange(v as AIProviderKind)}
           >
             <SelectTrigger className="h-8 text-xs">
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
-              {(Object.keys(PROVIDER_LABELS) as AIProvider[]).map((p) => (
+              {(Object.keys(PROVIDER_LABELS) as AIProviderKind[]).map((p) => (
                 <SelectItem key={p} value={p} className="text-xs">
                   {PROVIDER_LABELS[p]}
                 </SelectItem>
@@ -446,14 +531,19 @@ function AIStep({
 
         {/* API Key */}
         <div className="space-y-1.5">
-          <Label className="text-xs text-muted-foreground">API Key</Label>
+          <Label className="text-xs text-muted-foreground">
+            API Key
+            {kind === "custom" && (
+              <span className="ml-1 text-muted-foreground/60">(optional)</span>
+            )}
+          </Label>
           <div>
             <div className="relative">
               <Input
                 type={showKey ? "text" : "password"}
-                value={config.apiKey}
-                onChange={(e) => updateProviderConfig("apiKey", e.target.value)}
-                placeholder="sk-..."
+                value={apiKey}
+                onChange={(e) => setApiKey(e.target.value)}
+                placeholder={kind === "custom" ? "Leave blank if not required" : "sk-..."}
                 className="h-8 text-xs pr-8"
               />
               <button
@@ -468,18 +558,18 @@ function AIStep({
                 )}
               </button>
             </div>
-            {(provider === "openai" || provider === "openrouter") && (
+            {(kind === "openai" || kind === "openrouter") && (
               <Button variant="link" size="inline" className="mt-1" asChild>
                 <a
                   href={
-                    provider === "openai"
+                    kind === "openai"
                       ? "https://platform.openai.com/api-keys"
                       : "https://openrouter.ai/settings/keys"
                   }
                   target="_blank"
                   rel="noopener noreferrer"
                 >
-                  Get your {provider === "openai" ? "OpenAI" : "OpenRouter"} API key
+                  Get your {kind === "openai" ? "OpenAI" : "OpenRouter"} API key
                   <ExternalLink />
                 </a>
               </Button>
@@ -488,58 +578,43 @@ function AIStep({
         </div>
 
         {/* Base URL (custom only) + Model */}
-        {provider === "custom" ? (
+        {kind === "custom" ? (
           <>
-            <CustomBaseUrlField
-              config={config}
-              onUpdate={updateProviderConfigPartial}
-            />
+            <CustomBaseUrlField baseUrl={baseUrl} onChange={setBaseUrl} />
             <CustomModelField
-              config={config}
-              onUpdate={updateProviderConfigPartial}
+              baseUrl={baseUrl}
+              apiKey={apiKey}
+              model={model}
+              fetchedModels={fetchedModels}
+              onModelChange={setModel}
+              onFetchedModelsChange={setFetchedModels}
             />
           </>
         ) : (
           <div className="space-y-1.5">
             <Label className="text-xs text-muted-foreground">Model</Label>
-            {models && (
-              <Select
-                value={config.model}
-                onValueChange={(v) => updateProviderConfig("model", v)}
-              >
-                <SelectTrigger className="h-8 text-xs">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  {getAllModelsGrouped(provider, config).map((group) => (
-                    <SelectGroup key={group.provider}>
-                      <SelectLabel className="text-[9px] text-muted-foreground/50 uppercase">
-                        {group.providerLabel}
-                      </SelectLabel>
-                      {group.models.map((m) => (
-                        <SelectItem
-                          key={`${group.provider}:${m.id}`}
-                          value={m.id}
-                          className="text-xs"
+            <Select value={model} onValueChange={(v) => setModel(v)}>
+              <SelectTrigger className="h-8 text-xs">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {starterModels.map((m) => (
+                  <SelectItem key={m.id} value={m.id} className="text-xs">
+                    <span className="flex items-center gap-2">
+                      {m.label}
+                      {m.recommended && (
+                        <Badge
+                          variant="secondary"
+                          className="text-[9px] px-1 py-0"
                         >
-                          <span className="flex items-center gap-2">
-                            {m.label}
-                            {m.recommended && (
-                              <Badge
-                                variant="secondary"
-                                className="text-[9px] px-1 py-0"
-                              >
-                                Recommended
-                              </Badge>
-                            )}
-                          </span>
-                        </SelectItem>
-                      ))}
-                    </SelectGroup>
-                  ))}
-                </SelectContent>
-              </Select>
-            )}
+                          Recommended
+                        </Badge>
+                      )}
+                    </span>
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
           </div>
         )}
 
@@ -550,7 +625,7 @@ function AIStep({
             variant="outline"
             className="w-full text-xs"
             onClick={handleTestConnection}
-            disabled={testing || (provider !== "custom" && !config.apiKey)}
+            disabled={testing || !canTest}
           >
             {testing && <Loader2 className="mr-1.5 h-3 w-3 animate-spin" />}
             Test Connection
@@ -574,8 +649,8 @@ function AIStep({
           <ChevronLeft className="mr-1.5 h-4 w-4" />
           Back
         </Button>
-        <Button className="flex-1" onClick={onNext}>
-          Next
+        <Button className="flex-1" onClick={handleNext} disabled={!canTest}>
+          Add Connection
           <ChevronRight className="ml-1.5 h-4 w-4" />
         </Button>
       </div>
@@ -584,7 +659,7 @@ function AIStep({
         className="text-xs text-muted-foreground hover:text-foreground mt-3 mx-auto transition-colors"
         onClick={onNext}
       >
-        Skip for now
+        Skip — set up AI later
       </button>
     </div>
   );

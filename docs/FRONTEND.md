@@ -85,6 +85,17 @@ All 25 shadcn-style primitives live under [`apps/desktop/src/components/ui/`](..
 
 **Adding a new primitive:** prefer `npx shadcn add <name>` so the wrapper inherits the project's token conventions. Hand-rolling is fine for app-specific composites (e.g. `ContextPill`, `ModelPickerPill` under `components/chat/`) — those don't belong in `ui/`.
 
+### Settings slot cards
+
+Repeatable per-item config cards in the Settings tabs (Dictation slots, Insights) share one layout. The **canonical implementation is `SlotCard` in [`DictationTab.tsx`](../apps/desktop/src/components/settings/DictationTab.tsx)**; `InsightCard` mirrors it. New "list of configurable things" tabs should match this so the tabs feel like one family:
+
+- **Card:** `rounded-lg border p-3 space-y-2`.
+- **Row 1 — identity:** `flex items-center justify-between gap-2` → a compact name `<input>` (`h-6 text-xs font-medium rounded border border-border bg-transparent px-2 max-w-[160px]`) on the left, a `Trash2` delete button (`h-3 w-3`, muted → `hover:text-destructive`) on the right.
+- **Row 2 — controls:** `flex items-center justify-between gap-3`. Each control is its own group — `flex items-center gap-1.5 shrink-0` — with an `text-[11px] text-muted-foreground` label followed by a compact control (`Select` triggers are `!h-6 … text-[11px] px-2 py-0`; AI assignment is `<ProfilePicker variant="pill">`). **Use `justify-between` to spread the groups edge-to-edge — do not left-pack with `flex-wrap`/`gap-x-*`.** This even distribution is the signature of the pattern.
+- **Body — freeform:** a full-width `textarea` (`w-full rounded-md border bg-muted/50 px-2.5 py-1.5 text-xs resize-none`), shown always or conditionally.
+
+Tab chrome around the cards also matches: a master `Switch` header row (`flex items-center justify-between`), `Separator`s between sections, a `text-xs text-muted-foreground` section label above the card list, and a full-width outline `Button` (`Plus` icon) to add a new card.
+
 ### Tiptap + chat markdown
 
 Rich-text styling lives in `@layer components` of `index.css`:

@@ -121,6 +121,7 @@ export const WINDOWS = {
   MAIN: "main",
   DICTATION: "dictation",
   RECORDING_INDICATOR: "recording-indicator",
+  INSIGHT: "insight",
 } as const;
 
 // --- Centralized event name constants ---
@@ -158,7 +159,44 @@ export const EVENTS = {
   // Recording indicator
   RECORDING_INDICATOR_ACTIVE: "recording-indicator:active",
   RECORDING_INDICATOR_OPEN_MAIN: "recording-indicator:open-main",
+
+  // Insight overlay
+  INSIGHT_STATE: "insight:state",
+  INSIGHT_HIDE_REQUEST: "insight:hide-request",
+  INSIGHT_CHANGE_ACTIVE: "insight:change-active",
+  /** Main → overlay: whether the overlay window is currently shown. The
+   *  overlay gates its cursor-position poll on this so the hidden window
+   *  doesn't run Tauri IPC ~17×/sec while insights are off or no session is
+   *  live (its webview is created at startup and never unmounts). */
+  INSIGHT_VISIBILITY: "insight:visibility",
 } as const;
+
+/** Payload for {@link EVENTS.INSIGHT_STATE}. Emitted by the main window's
+ *  overlay controller whenever the Active Insight's runtime state changes.
+ *  The overlay window listens and renders. */
+export interface InsightStateEvent {
+  insightName: string;
+  status: "idle" | "running" | "error";
+  content: string | null;
+  generatedAt: string | null;
+  error: string | null;
+  /** Current Insight id (or `null` when no insight is running). Reflects
+   *  the runtime `currentInsightId` from the main window's store; used by
+   *  the overlay's in-header switcher to render the checked state. */
+  currentInsightId: string | null;
+  /** All currently-enabled Insight slots — populated so the overlay's
+   *  in-header switcher has a list to render without needing direct
+   *  Zustand access. */
+  slots: { id: string; name: string }[];
+}
+
+/** Payload for {@link EVENTS.INSIGHT_CHANGE_ACTIVE}. Emitted by the overlay
+ *  when the user picks a different Insight (or "None") from the in-header
+ *  switcher; the main-window controller listens and writes the change to
+ *  Zustand. `null` disables the active assignment entirely. */
+export interface InsightChangeActiveEvent {
+  insightId: string | null;
+}
 
 // --- Type-safe event payload map ---
 
@@ -184,6 +222,10 @@ type EventPayloadMap = {
   [EVENTS.DICTATION_STATE]: DictationStateEvent;
   [EVENTS.RECORDING_INDICATOR_ACTIVE]: boolean;
   [EVENTS.RECORDING_INDICATOR_OPEN_MAIN]: void;
+  [EVENTS.INSIGHT_STATE]: InsightStateEvent;
+  [EVENTS.INSIGHT_HIDE_REQUEST]: void;
+  [EVENTS.INSIGHT_CHANGE_ACTIVE]: InsightChangeActiveEvent;
+  [EVENTS.INSIGHT_VISIBILITY]: boolean;
 };
 
 type EventName = keyof EventPayloadMap;

@@ -383,6 +383,25 @@ async function ensureRuntimeSchema(db: Database): Promise<void> {
        WHERE wav_file_path IS NOT NULL`,
     )
     .catch(() => {});
+
+  // chat_context_settings — per-chat-context Profile override for the
+  // AI Connection/Profile refactor. profile_id NULL means "use the live
+  // default Chat Assignment"; non-null persists an explicit override.
+  //
+  // Intentionally defined here (frontend runtime schema) rather than in the
+  // Rust `migrations()` list — same as `segments.speaker_id` and the ALTERs
+  // above. Post-"ghost v11" (see db.rs), new incremental schema is added via
+  // this idempotent IF-NOT-EXISTS path because a higher-numbered sqlx
+  // migration can be silently refused on dev DBs with inconsistent history.
+  await db
+    .execute(
+      `CREATE TABLE IF NOT EXISTS chat_context_settings (
+         context_key TEXT PRIMARY KEY,
+         profile_id  TEXT NULL,
+         updated_at  TEXT NOT NULL
+       )`,
+    )
+    .catch(() => {});
 }
 
 // --- Session CRUD ---
@@ -1293,6 +1312,75 @@ export async function markToolCallsAsUndone(
       [JSON.stringify(next), row.id],
     );
   }
+}
+
+// --- Chat context settings (per-chat Profile override) ---
+
+/**
+ * Returns the explicit Profile override for a chat context, or null if the
+ * context has no row (in which case callers should fall back to the live
+ * Chat assignment from AIConfig).
+ */
+export async function getChatContextProfileId(
+  contextKey: string,
+): Promise<string | null> {
+  const db = await getDb();
+  const rows = await db.select<{ profile_id: string | null }[]>(
+    "SELECT profile_id FROM chat_context_settings WHERE context_key = $1 LIMIT 1",
+    [contextKey],
+  );
+  return rows[0]?.profile_id ?? null;
+}
+
+/**
+ * Persist a per-chat Profile override. Passing `null` writes a NULL row
+ * (treated as "use default" on read). Use `clearChatContextProfile` to
+ * remove the row entirely.
+ */
+export async function setChatContextProfileId(
+  contextKey: string,
+  profileId: string | null,
+): Promise<void> {
+  const db = await getDb();
+  await db.execute(
+    `INSERT INTO chat_context_settings (context_key, profile_id, updated_at)
+     VALUES ($1, $2, $3)
+     ON CONFLICT(context_key) DO UPDATE SET
+       profile_id = excluded.profile_id,
+       updated_at = excluded.updated_at`,
+    [contextKey, profileId, new Date().toISOString()],
+  );
+}
+
+/** Remove a chat's profile override entirely (reverts to the live default). */
+export async function clearChatContextProfile(
+  contextKey: string,
+): Promise<void> {
+  const db = await getDb();
+  await db.execute(
+    "DELETE FROM chat_context_settings WHERE context_key = $1",
+    [contextKey],
+  );
+}
+
+/**
+ * Remove every per-chat override that points at a given Profile. Called when a
+ * Profile (or a Connection's dependent Profiles) is deleted — without this,
+ * stale overrides would keep targeting a non-existent Profile and chat would
+ * fail instead of falling back to the live Chat assignment.
+ *
+ * Note this matches on `profile_id`, not `context_key`: the rows we want are
+ * "any chat whose override IS this profile," which is the opposite column from
+ * the per-chat getters above.
+ */
+export async function clearChatContextProfilesByProfileId(
+  profileId: string,
+): Promise<void> {
+  const db = await getDb();
+  await db.execute(
+    "DELETE FROM chat_context_settings WHERE profile_id = $1",
+    [profileId],
+  );
 }
 
 // --- Dictation history ---

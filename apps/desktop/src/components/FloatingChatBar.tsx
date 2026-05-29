@@ -21,11 +21,7 @@ import {
   getNote,
   saveNote,
 } from "@/lib/db";
-import {
-  isAIConfigured,
-  markdownToBasicHtml,
-  DEFAULT_AI_SETTINGS,
-} from "@/lib/ai";
+import { markdownToBasicHtml } from "@/lib/ai";
 import type { FileAttachment } from "@/lib/ai";
 import { toast } from "sonner";
 
@@ -44,11 +40,18 @@ export function FloatingChatBar() {
   );
   const scrollRef = useRef<HTMLDivElement | null>(null);
 
-  const aiSettings = useAppStore((s) => s.settings.ai) ?? DEFAULT_AI_SETTINGS;
+  const aiConfig = useAppStore((s) => s.settings.aiConfig);
+  const setSettingsRequest = useAppStore((s) => s.setSettingsRequest);
   const navigateTo = useAppStore((s) => s.navigateTo);
   const setPlaybackTime = useAppStore((s) => s.setPlaybackTime);
   const incrementNoteRefresh = useAppStore((s) => s.incrementNoteRefresh);
-  const aiConfigured = isAIConfigured(aiSettings);
+  // The chat composer needs at least one Connection to function. Profile
+  // assignment is a softer requirement — if a Connection exists but no
+  // Profile is assigned, we still surface the chat UI; the send error
+  // path (commit 6) explains what to do. Hard-blocking only when the user
+  // has no Connections at all keeps the empty-state focused on the
+  // first-run path.
+  const hasAnyConnection = aiConfig.connections.length > 0;
 
   const sources = useMemo(() => ctx?.sources ?? [], [ctx?.sources]);
   const toggleSource = ctx?.toggleSource;
@@ -127,21 +130,28 @@ export function FloatingChatBar() {
   // Guard: no context provided
   if (!ctx) return null;
 
-  // Compact "no API key" inline message
-  if (!aiConfigured) {
+  // Greenfield empty state: no Connections at all. Inline prompt with a
+  // CTA that deep-links into Settings → AI → Connections with the editor
+  // dialog already open, via the one-shot settingsRequest signal.
+  if (!hasAnyConnection) {
+    const startSetup = () => {
+      setSettingsRequest("ai-add-connection");
+      navigateTo("settings");
+    };
     return (
       <div className="absolute bottom-2 inset-x-2 z-10 bg-card/95 backdrop-blur-sm border rounded-xl shadow-lg">
-        <div className="flex items-center gap-2 px-2 py-2.5">
+        <div className="flex items-center gap-2 px-3 py-2.5">
           <Settings className="h-4 w-4 text-muted-foreground/60 shrink-0" />
           <span className="text-xs text-muted-foreground">
-            Configure AI in{" "}
-            <button
-              className="underline hover:text-foreground"
-              onClick={() => navigateTo("settings")}
-            >
-              Settings
-            </button>
+            Connect an AI provider to start chatting.
           </span>
+          <button
+            type="button"
+            onClick={startSetup}
+            className="ml-auto rounded-md border border-border bg-muted/50 px-2 py-1 text-[11px] font-medium hover:bg-muted transition-colors"
+          >
+            Add Connection
+          </button>
         </div>
       </div>
     );
@@ -219,6 +229,7 @@ export function FloatingChatBar() {
           messagesExist={messages.length > 0}
           isExpanded={isExpanded}
           setIsExpanded={setIsExpanded}
+          contextKey={ctx.contextKey}
         />
       </Collapsible>
     </div>

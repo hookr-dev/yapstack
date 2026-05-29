@@ -35,24 +35,47 @@ export function chatContextKey(ctx: ChatContext): string {
   }
 }
 
-// ----- Types -----
+// ----- Connection / Profile -----
 
-export type AIProvider = "openai" | "openrouter" | "custom";
+export type AIProviderKind = "openai" | "openrouter" | "custom";
 
-export interface AIProviderConfig {
-  apiKey: string;
-  model: string;
+export interface Connection {
+  id: string;
+  name: string;
+  kind: AIProviderKind;
   baseUrl: string;
-  // Populated by `fetchCustomModels` for OpenAI-compatible local/remote
-  // servers. Persisted so both Settings and the chat model-picker read
-  // from the same source. Undefined until the user fetches at least once.
-  fetchedModels?: string[];
+  apiKey: string;
+  availableModels?: string[];
+  fetchedAt?: string;
+  fetchError?: string;
 }
 
-export interface AISettings {
-  activeProvider: AIProvider;
-  providers: Record<AIProvider, AIProviderConfig>;
+export interface Profile {
+  id: string;
+  name: string;
+  connectionId: string;
+  model: string;
 }
+
+export interface AIAssignments {
+  chatProfileId: string | null;
+  aiActionsProfileId: string | null;
+}
+
+export interface AIConfig {
+  connections: Connection[];
+  profiles: Profile[];
+  assignments: AIAssignments;
+}
+
+export const DEFAULT_AI_CONFIG: AIConfig = {
+  connections: [],
+  profiles: [],
+  assignments: {
+    chatProfileId: null,
+    aiActionsProfileId: null,
+  },
+};
 
 export type ToolExecutionStatus = "running" | "done" | "error";
 
@@ -85,148 +108,91 @@ export type AIActionType = string;
 
 // ----- Defaults -----
 
-export const DEFAULT_AI_SETTINGS: AISettings = {
-  activeProvider: "openai",
-  providers: {
-    openai: {
-      apiKey: "",
-      model: "gpt-5.4-mini",
-      baseUrl: "https://api.openai.com/v1",
-    },
-    openrouter: {
-      apiKey: "",
-      model: "anthropic/claude-haiku-4.5",
-      baseUrl: "https://openrouter.ai/api/v1",
-    },
-    custom: {
-      apiKey: "",
-      model: "",
-      baseUrl: "http://127.0.0.1:8080/v1",
-    },
-  },
-};
-
-// ----- Model Catalog -----
-
-export interface ModelOption {
-  id: string;
-  label: string;
-  recommended?: boolean;
-}
-
-export const MODEL_CATALOG: Partial<Record<AIProvider, ModelOption[]>> = {
-  openai: [
-    // GPT-5.4 — current flagship family
-    { id: "gpt-5.4-mini", label: "GPT-5.4 Mini", recommended: true },
-    { id: "gpt-5.4", label: "GPT-5.4" },
-    { id: "gpt-5.4-nano", label: "GPT-5.4 Nano" },
-    { id: "gpt-5.4-pro", label: "GPT-5.4 Pro" },
-    // GPT-5.2 — reasoning/thinking
-    { id: "gpt-5.2", label: "GPT-5.2 (thinking)" },
-    // GPT-4.1 — 1M-token long context
-    { id: "gpt-4.1", label: "GPT-4.1" },
-    { id: "gpt-4.1-mini", label: "GPT-4.1 Mini" },
-    { id: "gpt-4.1-nano", label: "GPT-4.1 Nano" },
-    // o-series reasoning
-    { id: "o4-mini", label: "o4 Mini" },
-    { id: "o3", label: "o3" },
-    // Legacy — still live, kept for existing installs
-    { id: "gpt-4o", label: "GPT-4o" },
-    { id: "gpt-4o-mini", label: "GPT-4o Mini" },
-  ],
-  openrouter: [
-    // Anthropic Claude — best tool-calling quality
-    { id: "anthropic/claude-haiku-4.5", label: "Claude Haiku 4.5", recommended: true },
-    { id: "anthropic/claude-sonnet-4.5", label: "Claude Sonnet 4.5" },
-    // OpenAI via OpenRouter
-    { id: "openai/gpt-5.4", label: "GPT-5.4" },
-    { id: "openai/gpt-5.4-mini", label: "GPT-5.4 Mini" },
-    { id: "openai/gpt-5.4-nano", label: "GPT-5.4 Nano" },
-    { id: "openai/gpt-5.2", label: "GPT-5.2 (thinking)" },
-    // Google Gemini
-    { id: "google/gemini-3.1-pro", label: "Gemini 3.1 Pro" },
-    { id: "google/gemini-3.1-flash-lite", label: "Gemini 3.1 Flash Lite" },
-    // Budget frontier-class option
-    { id: "deepseek/deepseek-v3.2", label: "DeepSeek V3.2" },
-  ],
-};
-
-export function getModelsForProvider(provider: AIProvider): ModelOption[] | null {
-  return MODEL_CATALOG[provider] ?? null;
-}
-
-export interface GroupedModels {
-  provider: AIProvider;
-  providerLabel: string;
-  models: ModelOption[];
-}
-
-const PROVIDER_DISPLAY: Record<string, string> = {
-  openai: "OpenAI",
-  openrouter: "OpenRouter",
-  custom: "Custom",
-};
-
-/// Returns model groups to display for the *active* provider only. For
-/// built-in providers this reads `MODEL_CATALOG`; for `custom` it reads
-/// the persisted `config.fetchedModels`. Cross-provider models are
-/// deliberately omitted — the old greyed-out UX confused users.
-export function getAllModelsGrouped(
-  activeProvider: AIProvider,
-  activeConfig?: AIProviderConfig,
-): GroupedModels[] {
-  if (activeProvider === "custom") {
-    const fetched = activeConfig?.fetchedModels ?? [];
-    if (fetched.length === 0) return [];
-    return [
-      {
-        provider: "custom",
-        providerLabel: PROVIDER_DISPLAY.custom,
-        models: fetched.map((id) => ({ id, label: id })),
-      },
-    ];
-  }
-  const models = MODEL_CATALOG[activeProvider];
-  if (!models) return [];
-  return [
-    {
-      provider: activeProvider,
-      providerLabel: PROVIDER_DISPLAY[activeProvider] ?? activeProvider,
-      models,
-    },
-  ];
-}
-
 // ----- Client -----
 
-export function createAIClient(settings: AISettings): OpenAI {
-  const config = settings.providers[settings.activeProvider];
-
+/**
+ * Construct an OpenAI client from a Connection. Local OpenAI-compatible
+ * servers (custom kind) accept a blank apiKey; the placeholder satisfies
+ * the SDK constructor without misleading the remote server.
+ */
+export function createAIClientForConnection(connection: Connection): OpenAI {
   const headers: Record<string, string> = {};
-  if (settings.activeProvider === "openrouter") {
+  if (connection.kind === "openrouter") {
     headers["HTTP-Referer"] = "https://yapstack.app";
     headers["X-Title"] = "YapStack";
   }
-
-  // Local OpenAI-compatible servers (llama.cpp, LM Studio, Ollama) don't require a key,
-  // but the OpenAI SDK refuses to construct without one. Substitute a placeholder.
   const apiKey =
-    settings.activeProvider === "custom" && !config.apiKey
+    connection.kind === "custom" && !connection.apiKey
       ? "sk-no-key-required"
-      : config.apiKey;
-
+      : connection.apiKey;
   return new OpenAI({
     apiKey,
-    baseURL: config.baseUrl,
+    baseURL: connection.baseUrl,
     dangerouslyAllowBrowser: true,
     defaultHeaders: Object.keys(headers).length > 0 ? headers : undefined,
     fetch: tauriFetch,
   });
 }
 
-export async function fetchCustomModels(baseUrl: string): Promise<string[]> {
+/**
+ * Resolve a Profile reference into a usable (client, model) pair. Throws
+ * if the profileId can't be resolved (missing Profile, missing Connection,
+ * or null input) — per locked design decision #8, AI feature consumers
+ * surface this error rather than silently retrying through another Profile.
+ *
+ * Error message is actionable so the feature can route the user to fix
+ * the underlying configuration.
+ */
+export function resolveAndCreateClient(
+  config: AIConfig,
+  profileId: string | null,
+): { client: OpenAI; model: string; connection: Connection } {
+  if (!profileId) {
+    throw new Error(
+      "No AI Profile assigned. Open Settings → AI to set one up.",
+    );
+  }
+  const profile = config.profiles.find((p) => p.id === profileId);
+  if (!profile) {
+    throw new Error(
+      `AI Profile "${profileId}" not found. Open Settings → AI to reassign.`,
+    );
+  }
+  const connection = config.connections.find(
+    (c) => c.id === profile.connectionId,
+  );
+  if (!connection) {
+    throw new Error(
+      `Profile "${profile.name}" points at a deleted Connection. Open Settings → AI to fix.`,
+    );
+  }
+  return {
+    client: createAIClientForConnection(connection),
+    model: profile.model,
+    connection,
+  };
+}
+
+/**
+ * Fetch the `/models` catalog from an OpenAI-compatible endpoint.
+ *
+ * OpenAI requires `Authorization: Bearer <key>` on this endpoint (returns
+ * 401 without it). OpenRouter accepts the same header but works unauthed.
+ * Local OpenAI-compatible servers (Ollama, llama.cpp, LM Studio, vLLM)
+ * typically don't require auth — passing the header is a no-op for them.
+ * Send it whenever the caller has a key; omit otherwise.
+ */
+export async function fetchCustomModels(
+  baseUrl: string,
+  apiKey?: string,
+): Promise<string[]> {
   const url = baseUrl.replace(/\/$/, "") + "/models";
-  const res = await tauriFetch(url);
+  const trimmedKey = apiKey?.trim();
+  const res = trimmedKey
+    ? await tauriFetch(url, {
+        headers: { Authorization: `Bearer ${trimmedKey}` },
+      })
+    : await tauriFetch(url);
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const json = (await res.json()) as { data?: Array<{ id?: unknown }> };
   if (!Array.isArray(json.data)) throw new Error("Unexpected response shape");
@@ -235,22 +201,35 @@ export async function fetchCustomModels(baseUrl: string): Promise<string[]> {
     .filter((id): id is string => !!id);
 }
 
-export function getActiveConfig(settings: AISettings): AIProviderConfig {
-  return settings.providers[settings.activeProvider];
-}
-
 /**
- * A provider is "configured" (usable for AI features) when the server can be
- * reached and a model is named. Custom providers (local llama.cpp / LM Studio /
- * Ollama) accept a blank API key — an empty key must not count as "not set up"
- * for them, or dictation silently skips its AI cleanup step.
+ * Decide whether the Connection editor should kick off a background model
+ * re-fetch when the dialog is saved.
+ *
+ *  - On create: refresh only if the user hasn't already fetched a catalog in
+ *    the dialog (otherwise we'd duplicate the fetch they just ran).
+ *  - On edit: refresh when the endpoint OR the credentials changed since the
+ *    dialog opened — a corrected API key must re-validate just like a changed
+ *    base URL, otherwise a stale `fetchError` / model list sticks around. A
+ *    manual "Refresh" inside the dialog moves the baseline forward (the caller
+ *    resets the baseline to the just-fetched values), so this returns false
+ *    and we don't fire a redundant second fetch on save.
+ *  - Never while a fetch is already in flight.
  */
-export function isAIConfigured(settings: AISettings): boolean {
-  const config = getActiveConfig(settings);
-  if (settings.activeProvider === "custom") {
-    return !!config.baseUrl && !!config.model;
-  }
-  return !!config.apiKey;
+export function shouldAutoRefreshModels(params: {
+  mode: "create" | "edit";
+  hasLocalModels: boolean;
+  fetching: boolean;
+  baseUrl: string;
+  baseUrlBaseline: string;
+  apiKey: string;
+  apiKeyBaseline: string;
+}): boolean {
+  if (params.fetching) return false;
+  if (params.mode === "create") return !params.hasLocalModels;
+  return (
+    params.baseUrl !== params.baseUrlBaseline ||
+    params.apiKey !== params.apiKeyBaseline
+  );
 }
 
 // ----- Context Assembly -----
@@ -286,12 +265,25 @@ export function formatSegmentSpeaker(
   return "Other";
 }
 
+/**
+ * The single visibility gate for AI processing. A segment is eligible to reach
+ * any LLM / AI feature only if it is neither hidden nor soft-deleted. Hidden is
+ * a user action meaning "keep this in the transcript UI but exclude it from AI";
+ * deleted is gone entirely. EVERY path that feeds segment text to a model
+ * (transcript context, insights, chat tools, auto-tag suggestions) must gate on
+ * this — segments are loaded unfiltered for the transcript UI (which renders and
+ * un-hides them), so exclusion happens here at the AI boundary, not at load.
+ */
+export function isVisibleSegment(seg: DbSegment): boolean {
+  return seg.hidden !== 1 && !seg.deleted_at;
+}
+
 export function assembleTranscriptContext(
   segments: DbSegment[],
   speakerNames?: Record<number, string>,
 ): string {
   return segments
-    .filter((s) => s.hidden !== 1 && !s.deleted_at)
+    .filter(isVisibleSegment)
     .map((s) => {
       const mins = Math.floor(s.audio_offset_seconds / 60);
       const secs = Math.floor(s.audio_offset_seconds % 60);
@@ -525,14 +517,20 @@ export async function* streamChatWithTools(
 
 // ----- Connection Test -----
 
+/**
+ * Issue a minimal chat completion against a Connection to confirm it
+ * reaches a working server with valid credentials. Used by both the
+ * Connection editor's "Test Connection" affordance and the onboarding
+ * AI step.
+ */
 export async function testConnection(
-  settings: AISettings,
+  connection: Connection,
+  model: string,
 ): Promise<{ ok: boolean; error?: string }> {
   try {
-    const client = createAIClient(settings);
-    const config = getActiveConfig(settings);
+    const client = createAIClientForConnection(connection);
     await client.chat.completions.create({
-      model: config.model,
+      model,
       messages: [{ role: "user", content: "Hi" }],
     });
     return { ok: true };

@@ -4,6 +4,7 @@ import { useAppStore } from "@/stores/appStore";
 import type { DictationSlot, DictationOutputAction, DictationActivationMode } from "@/stores/appStore";
 import { trackDictationSlotCreated, trackDictationSlotDeleted, trackDictationSlotConfigured } from "@/lib/analytics";
 import { Switch } from "@/components/ui/switch";
+import { ProfilePicker } from "@/components/ai/ProfilePicker";
 import { Label } from "@/components/ui/label";
 import { Separator } from "@/components/ui/separator";
 import { Slider } from "@/components/ui/slider";
@@ -169,6 +170,7 @@ function SlotCard({
   onKeybindCapture: (slotId: string, binding: string) => void;
   onDelete: (id: string) => void;
 }) {
+  const aiConfig = useAppStore((s) => s.settings.aiConfig);
   return (
     <div className="rounded-lg border p-3 space-y-2">
       {/* Row 1: name input + delete */}
@@ -228,18 +230,21 @@ function SlotCard({
         </div>
         <div className="flex items-center gap-1.5 shrink-0">
           <span className="text-[11px] text-muted-foreground">AI</span>
-          <Switch
-            size="sm"
-            checked={slot.aiEnabled}
-            onCheckedChange={(checked) =>
-              onUpdate(slot.id, { aiEnabled: checked })
-            }
+          <ProfilePicker
+            profiles={aiConfig.profiles}
+            connections={aiConfig.connections}
+            value={slot.profileId}
+            onChange={(next) => onUpdate(slot.id, { profileId: next })}
+            allowNone
+            noneLabel="None — raw transcription"
+            unassignedLabel="None"
+            variant="pill"
           />
         </div>
       </div>
 
-      {/* Row 3 (conditional): AI prompt */}
-      {slot.aiEnabled && (
+      {/* Row 3 (conditional): AI prompt (shown only when a Profile is assigned) */}
+      {slot.profileId !== null && (
         <textarea
           value={slot.prompt}
           onChange={(e) => onUpdate(slot.id, { prompt: e.target.value })}
@@ -331,7 +336,7 @@ export function DictationTab() {
       id: crypto.randomUUID(),
       name: `Slot ${dictation.slots.length + 1}`,
       enabled: true,
-      aiEnabled: false,
+      profileId: null,
       prompt: "",
       outputAction: "paste",
     };

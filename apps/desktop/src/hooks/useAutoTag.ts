@@ -6,6 +6,7 @@ import {
   type FolderSuggestion,
 } from "@/lib/auto-tag";
 import { commands } from "@/lib/tauri";
+import { isVisibleSegment } from "@/lib/ai";
 import { listFolders, listTags } from "@/lib/db";
 import { buildVocabularyHints } from "@/lib/transcription";
 
@@ -70,6 +71,9 @@ export function useAutoTag(sessionId: string | null, isRecording: boolean) {
 
     let latest: FolderSuggestion[] = [];
     for (const seg of newSegments) {
+      // Hidden/deleted segments are excluded from all AI-derived processing,
+      // including the folder-suggestion heuristic (same gate as LLM context).
+      if (!isVisibleSegment(seg)) continue;
       latest = trackerRef.current.processSegment(seg.text);
     }
     setSuggestions((prev) => {

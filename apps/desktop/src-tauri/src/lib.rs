@@ -9,6 +9,8 @@ const WINDOW_MAIN: &str = "main";
 const WINDOW_DICTATION: &str = "dictation";
 #[cfg(target_os = "macos")]
 const WINDOW_RECORDING_INDICATOR: &str = "recording-indicator";
+#[cfg(target_os = "macos")]
+const WINDOW_INSIGHT: &str = "insight";
 
 use std::collections::HashSet;
 use std::io::{Read as _, Seek, SeekFrom};
@@ -305,6 +307,8 @@ pub fn run() {
             commands::set_autostart_enabled,
             commands::show_overlay_panel,
             commands::hide_overlay_panel,
+            commands::get_cursor_position,
+            commands::set_overlay_ignore_cursor_events,
             commands::logs::get_recent_logs,
             commands::logs::clear_logs,
             commands::logs::get_log_dir,
@@ -770,13 +774,24 @@ pub fn run() {
 
             // Convert overlay windows to NSPanels for fullscreen visibility
             #[cfg(target_os = "macos")]
-            for label in [WINDOW_DICTATION, WINDOW_RECORDING_INDICATOR] {
+            for label in [WINDOW_DICTATION, WINDOW_RECORDING_INDICATOR, WINDOW_INSIGHT] {
                 if let Some(window) = app.get_webview_window(label) {
                     let panel = window
                         .to_panel::<OverlayPanel>()
                         .expect("failed to convert overlay window to panel");
                     panel.set_level(PanelLevel::MainMenu.value());
-                    panel.set_style_mask(StyleMask::empty().nonactivating_panel().into());
+                    // Base panel style: non-activating so clicking it never
+                    // steals focus from the app the user is working in. The
+                    // insight overlay is additionally user-resizable (its
+                    // tauri.conf entry sets `resizable: true`); without the
+                    // Resizable mask bit here, NSPanel conversion would silently
+                    // drop that. The dictation bubble and recording indicator
+                    // are intentionally fixed-size, so they keep the bare mask.
+                    let mut style = StyleMask::empty().nonactivating_panel();
+                    if label == WINDOW_INSIGHT {
+                        style = style.resizable();
+                    }
+                    panel.set_style_mask(style.into());
                     panel.set_collection_behavior(
                         CollectionBehavior::new()
                             .can_join_all_spaces()

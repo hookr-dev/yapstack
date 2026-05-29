@@ -13,7 +13,8 @@ export function trackAppLaunched(props: {
   dictation_enabled: number;
   dictation_slot_count: number;
   theme: string;
-  ai_provider: string;
+  /** Number of AI Connections the user has configured (0 = no AI set up). */
+  ai_connection_count: number;
 }): void {
   track("app_launched", props);
 }
@@ -160,18 +161,6 @@ export function trackEngineError(props: {
   phase: string;
 }): void {
   track("engine_error", { ...props, error: props.error.slice(0, 100) });
-}
-
-// AI Provider Settings
-export function trackAIProviderChanged(props: { provider: string }): void {
-  track("ai_provider_changed", props);
-}
-
-export function trackAIConnectionTested(props: {
-  provider: string;
-  success: number;
-}): void {
-  track("ai_connection_tested", props);
 }
 
 // Settings

@@ -16,18 +16,63 @@ import { fetch as tauriFetch } from "@tauri-apps/plugin-http";
 
 import {
   chatContextKey,
-  getModelsForProvider,
   assembleTranscriptContext,
   assembleNoteContext,
   formatSegmentSpeaker,
   markdownToBasicHtml,
   fetchCustomModels,
-  isAIConfigured,
-  DEFAULT_AI_SETTINGS,
+  shouldAutoRefreshModels,
+  isVisibleSegment,
   type ChatContext,
-  type AISettings,
 } from "./ai";
 import type { DbSegment } from "./db";
+
+function makeSegment(overrides: Partial<DbSegment> = {}): DbSegment {
+  return {
+    id: "s1",
+    session_id: "sess",
+    source: "Mic",
+    text: "hello",
+    audio_offset_seconds: 0,
+    chunk_duration_seconds: 1,
+    confidence: 0.9,
+    created_at: "",
+    chunk_index: 0,
+    original_text: null,
+    edited_at: null,
+    deleted_at: null,
+    hidden: 0,
+    speaker_id: null,
+    ...overrides,
+  };
+}
+
+describe("isVisibleSegment (the AI visibility gate)", () => {
+  it("is true for a normal segment", () => {
+    expect(isVisibleSegment(makeSegment())).toBe(true);
+  });
+
+  it("is false for a hidden segment", () => {
+    expect(isVisibleSegment(makeSegment({ hidden: 1 }))).toBe(false);
+  });
+
+  it("is false for a soft-deleted segment", () => {
+    expect(
+      isVisibleSegment(makeSegment({ deleted_at: "2026-01-01T00:00:00Z" })),
+    ).toBe(false);
+  });
+
+  it("excludes hidden/deleted segments from assembled transcript context", () => {
+    const out = assembleTranscriptContext([
+      makeSegment({ id: "a", text: "visible one" }),
+      makeSegment({ id: "b", text: "hidden one", hidden: 1 }),
+      makeSegment({ id: "c", text: "deleted one", deleted_at: "2026-01-01" }),
+    ]);
+    expect(out).toContain("visible one");
+    expect(out).not.toContain("hidden one");
+    expect(out).not.toContain("deleted one");
+  });
+});
 
 describe("chatContextKey", () => {
   it("returns sessionId for session context", () => {
@@ -48,25 +93,6 @@ describe("chatContextKey", () => {
   it('returns "pinned" for pinned context', () => {
     const ctx: ChatContext = { type: "pinned" };
     expect(chatContextKey(ctx)).toBe("pinned");
-  });
-});
-
-describe("getModelsForProvider", () => {
-  it("returns models for openai", () => {
-    const models = getModelsForProvider("openai");
-    expect(models).not.toBeNull();
-    expect(models!.length).toBeGreaterThan(0);
-    expect(models!.some((m) => m.id === "gpt-4o")).toBe(true);
-  });
-
-  it("returns models for openrouter", () => {
-    const models = getModelsForProvider("openrouter");
-    expect(models).not.toBeNull();
-    expect(models!.some((m) => m.id.includes("claude"))).toBe(true);
-  });
-
-  it("returns null for custom provider", () => {
-    expect(getModelsForProvider("custom")).toBeNull();
   });
 });
 
@@ -338,58 +364,106 @@ describe("fetchCustomModels", () => {
     const ids = await fetchCustomModels("http://x/v1");
     expect(ids).toEqual(["a", "b"]);
   });
+
+  it("sends Bearer auth header when apiKey is provided (required by OpenAI)", async () => {
+    mockFetch.mockResolvedValue({
+      ok: true,
+      json: async () => ({ data: [{ id: "gpt-4o-mini" }] }),
+    } as unknown as Response);
+
+    await fetchCustomModels("https://api.openai.com/v1", "sk-test-key");
+    expect(mockFetch).toHaveBeenCalledWith(
+      "https://api.openai.com/v1/models",
+      { headers: { Authorization: "Bearer sk-test-key" } },
+    );
+  });
+
+  it("treats whitespace-only apiKey as no auth", async () => {
+    mockFetch.mockResolvedValue({
+      ok: true,
+      json: async () => ({ data: [] }),
+    } as unknown as Response);
+
+    await fetchCustomModels("http://x/v1", "   ");
+    expect(mockFetch).toHaveBeenCalledWith("http://x/v1/models");
+  });
 });
 
-describe("isAIConfigured", () => {
-  function settingsWith(overrides: Partial<AISettings>): AISettings {
-    return { ...DEFAULT_AI_SETTINGS, ...overrides };
-  }
+describe("shouldAutoRefreshModels", () => {
+  const base = {
+    baseUrl: "https://api.openai.com/v1",
+    baseUrlBaseline: "https://api.openai.com/v1",
+    apiKey: "sk-key",
+    apiKeyBaseline: "sk-key",
+  };
 
-  it("returns false for openai with blank apiKey", () => {
-    expect(isAIConfigured(settingsWith({ activeProvider: "openai" }))).toBe(false);
+  it("never refreshes while a fetch is already in flight", () => {
+    expect(
+      shouldAutoRefreshModels({
+        ...base,
+        mode: "create",
+        hasLocalModels: false,
+        fetching: true,
+      }),
+    ).toBe(false);
   });
 
-  it("returns true for openai with an apiKey set", () => {
-    const s = settingsWith({
-      activeProvider: "openai",
-      providers: {
-        ...DEFAULT_AI_SETTINGS.providers,
-        openai: { ...DEFAULT_AI_SETTINGS.providers.openai, apiKey: "sk-abc" },
-      },
-    });
-    expect(isAIConfigured(s)).toBe(true);
+  it("on create, refreshes only when no catalog was fetched in the dialog", () => {
+    expect(
+      shouldAutoRefreshModels({
+        ...base,
+        mode: "create",
+        hasLocalModels: false,
+        fetching: false,
+      }),
+    ).toBe(true);
+    expect(
+      shouldAutoRefreshModels({
+        ...base,
+        mode: "create",
+        hasLocalModels: true,
+        fetching: false,
+      }),
+    ).toBe(false);
   });
 
-  it("returns true for custom with baseUrl + model, blank apiKey", () => {
-    const s = settingsWith({
-      activeProvider: "custom",
-      providers: {
-        ...DEFAULT_AI_SETTINGS.providers,
-        custom: { apiKey: "", model: "llama3", baseUrl: "http://127.0.0.1:8080/v1" },
-      },
-    });
-    expect(isAIConfigured(s)).toBe(true);
+  it("on edit, refreshes when the base URL changed", () => {
+    expect(
+      shouldAutoRefreshModels({
+        ...base,
+        mode: "edit",
+        hasLocalModels: true,
+        fetching: false,
+        baseUrl: "http://localhost:1234/v1",
+      }),
+    ).toBe(true);
   });
 
-  it("returns false for custom with empty model", () => {
-    const s = settingsWith({
-      activeProvider: "custom",
-      providers: {
-        ...DEFAULT_AI_SETTINGS.providers,
-        custom: { apiKey: "", model: "", baseUrl: "http://127.0.0.1:8080/v1" },
-      },
-    });
-    expect(isAIConfigured(s)).toBe(false);
+  // Regression: fixing only the API key (base URL unchanged) must still
+  // re-validate, otherwise a stale fetchError / model list sticks around.
+  it("on edit, refreshes when only the API key changed", () => {
+    expect(
+      shouldAutoRefreshModels({
+        ...base,
+        mode: "edit",
+        hasLocalModels: true,
+        fetching: false,
+        apiKey: "sk-corrected-key",
+      }),
+    ).toBe(true);
   });
 
-  it("returns false for custom with empty baseUrl", () => {
-    const s = settingsWith({
-      activeProvider: "custom",
-      providers: {
-        ...DEFAULT_AI_SETTINGS.providers,
-        custom: { apiKey: "", model: "llama3", baseUrl: "" },
-      },
-    });
-    expect(isAIConfigured(s)).toBe(false);
+  // Regression: a manual Refresh in the dialog moves the baselines forward, so
+  // saving must NOT fire a redundant second fetch (which on a flaky endpoint
+  // could overwrite the just-fetched good catalog with an error).
+  it("on edit, does not refresh when nothing changed since the baseline", () => {
+    expect(
+      shouldAutoRefreshModels({
+        ...base,
+        mode: "edit",
+        hasLocalModels: true,
+        fetching: false,
+      }),
+    ).toBe(false);
   });
 });

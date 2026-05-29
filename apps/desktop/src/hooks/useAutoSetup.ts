@@ -18,7 +18,7 @@ export function useAutoSetup() {
         dictation_enabled: settings.dictation.enabled ? 1 : 0,
         dictation_slot_count: settings.dictation.slots.length,
         theme: settings.theme,
-        ai_provider: settings.ai.activeProvider,
+        ai_connection_count: settings.aiConfig.connections.length,
       });
     });
   }, [autoSetup]);

@@ -18,12 +18,13 @@ import {
   deleteChatMessages,
   getChatMessageById,
   markToolCallsAsUndone,
+  getChatContextProfileId,
+  clearChatContextProfile,
 } from "@/lib/db";
 import {
-  createAIClient,
-  getActiveConfig,
+  resolveAndCreateClient,
   streamChatWithTools,
-  DEFAULT_AI_SETTINGS,
+  DEFAULT_AI_CONFIG,
 } from "@/lib/ai";
 import { GENERAL_DIRECTIVE } from "@/lib/ai-prompts";
 import { getToolsById, executeTool, undoToolCalls, getToolKind } from "@/lib/ai-tools";
@@ -170,8 +171,7 @@ export function useChatMessages(
   // applies. The ref blocks the second call in the same tick.
   const sendingRef = useRef(false);
 
-  const aiSettings = useAppStore((s) => s.settings.ai) ?? DEFAULT_AI_SETTINGS;
-  const activeConfig = getActiveConfig(aiSettings);
+  const aiConfig = useAppStore((s) => s.settings.aiConfig) ?? DEFAULT_AI_CONFIG;
 
   const contextKey = ctx?.contextKey ?? "";
   // Memoize the empty fallback so identity is stable across renders — without
@@ -363,7 +363,37 @@ export function useChatMessages(
           status: null,
         });
 
-        const client = createAIClient(aiSettings);
+        // Resolve which Profile to use for THIS send. AI-action sends
+        // (Summarize / Key points / etc.) bind to `aiActionsProfileId`;
+        // ordinary chat sends prefer the per-chat override in
+        // chat_context_settings, falling back to `chatProfileId`. No
+        // fallback chain on resolution failure — resolveAndCreateClient
+        // throws and the outer catch surfaces the message as an in-chat
+        // error row so the user can act on it.
+        let profileId: string | null;
+        if (actionDef) {
+          profileId = aiConfig.assignments.aiActionsProfileId;
+        } else {
+          const override = await getChatContextProfileId(contextKey);
+          // Self-heal a dangling override: settings (Profiles) and SQLite (this
+          // override) are separate stores with no FK, and delete-time cleanup is
+          // best-effort. If the override points at a Profile that no longer
+          // exists, ignore it — fall back to the live Chat assignment — and
+          // clear the stale row so chat doesn't keep erroring on a dead Profile.
+          const overrideValid =
+            override !== null &&
+            aiConfig.profiles.some((p) => p.id === override);
+          if (override !== null && !overrideValid) {
+            void clearChatContextProfile(contextKey).catch(() => {});
+          }
+          profileId = overrideValid
+            ? override
+            : aiConfig.assignments.chatProfileId;
+        }
+        const { client, model: resolvedModel } = resolveAndCreateClient(
+          aiConfig,
+          profileId,
+        );
         const abort = new AbortController();
         abortRef.current = abort;
 
@@ -445,7 +475,7 @@ export function useChatMessages(
 
           for await (const event of streamChatWithTools(
             client,
-            activeConfig.model,
+            resolvedModel,
             turnMessages,
             turnTools,
             abort.signal,
@@ -823,8 +853,7 @@ export function useChatMessages(
       sources,
       ctxTools,
       attachments,
-      aiSettings,
-      activeConfig.model,
+      aiConfig,
       buildSystemPrompt,
       onToolsExecuted,
       handleUndo,

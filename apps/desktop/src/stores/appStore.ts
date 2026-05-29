@@ -66,9 +66,20 @@ import { findBranchConflicts, buildFolderTree, buildChildMap, type FolderTreeNod
 import type { DbSession, DbSegment, DbFolder, DbAudioPart } from "@/lib/db";
 import type { SessionPartReadyEvent } from "@/lib/events";
 import { toast } from "sonner";
-import { DEFAULT_AI_SETTINGS } from "@/lib/ai";
+import { DEFAULT_AI_CONFIG } from "@/lib/ai";
+import {
+  DEFAULT_INSIGHTS_SETTINGS,
+  type InsightsSettings,
+  type LiveInsightResult,
+  type LiveInsightStatus,
+} from "@/lib/insights";
 import { buildVocabularyHints } from "@/lib/transcription";
-import type { AISettings } from "@/lib/ai";
+import type { AIConfig } from "@/lib/ai";
+import {
+  migrateLegacyAISettings,
+  type LegacyAISettings,
+  type LegacyDictationSlot,
+} from "@/lib/ai-config";
 import {
   trackSessionCreated,
   trackSessionStopped,
@@ -94,7 +105,8 @@ export interface DictationSlot {
   id: string;
   name: string;
   enabled: boolean;
-  aiEnabled: boolean;
+  /** Profile to use for AI cleanup. null = no cleanup. */
+  profileId: string | null;
   prompt: string;
   outputAction: DictationOutputAction;
   defaultBinding?: string;
@@ -200,7 +212,7 @@ export const DEFAULT_DICTATION_SLOTS: DictationSlot[] = [
     id: "1",
     name: "Raw Dictation",
     enabled: true,
-    aiEnabled: false,
+    profileId: null,
     prompt: "",
     outputAction: "paste",
     defaultBinding: "Control+Shift+D",
@@ -209,7 +221,7 @@ export const DEFAULT_DICTATION_SLOTS: DictationSlot[] = [
     id: "2",
     name: "Clean & Focus",
     enabled: true,
-    aiEnabled: true,
+    profileId: null,
     prompt: CLEAN_FOCUS_PROMPT,
     outputAction: "paste",
     defaultBinding: "Control+Shift+C",
@@ -218,7 +230,7 @@ export const DEFAULT_DICTATION_SLOTS: DictationSlot[] = [
     id: "3",
     name: "Engineer",
     enabled: true,
-    aiEnabled: true,
+    profileId: null,
     prompt: ENGINEER_PROMPT,
     outputAction: "paste",
     defaultBinding: "Control+Shift+X",
@@ -256,12 +268,15 @@ export interface Settings {
   promptDecaySilenceSeconds: number;
   theme: ThemeMode;
   sidebarCollapsed: boolean;
-  ai: AISettings;
+  /** AI Connection + Profile config (replaces the pre-refactor single-provider shape). */
+  aiConfig: AIConfig;
   shortcutBindings: Record<string, string>;
   audioSaveLocation: string | null;
   audioExportFormat: "wav" | "mp3";
   mp3Bitrate: number;
   dictation: DictationSettings;
+  /** Live insights — overlay-driven LLM extractions on a cadence trigger. */
+  insights: InsightsSettings;
   showRecordingIndicator: boolean;
   /// Lower the system output volume during the recording phase of a
   /// dictation, so the user can hear themselves over earphone playback.
@@ -363,6 +378,24 @@ interface AppState {
   // Dictation history (runtime, loaded from SQLite)
   dictationHistory: DbDictationHistory[];
 
+  // Live insights (runtime, not persisted — cleared on session end and on
+  // active-insight change). See lib/insights.ts and the Insight engine hook.
+  liveInsightResult: LiveInsightResult | null;
+  liveInsightStatus: LiveInsightStatus;
+  liveInsightError: string | null;
+  setLiveInsightResult: (result: LiveInsightResult | null) => void;
+  setLiveInsightStatus: (status: LiveInsightStatus) => void;
+  setLiveInsightError: (error: string | null) => void;
+  /** The Current Insight: the slot whose output is rendering in the overlay
+   *  right now. Distinct from `settings.insights.defaultInsightId` — the
+   *  Default is persisted and drives session-start; Current is ephemeral
+   *  and mutated only by overlay interactions (header dropdown picks,
+   *  × button). Initialized from the Default at session start; cleared on
+   *  session end. Setting to `null` mid-session hides the overlay for that
+   *  session only — Default is untouched. */
+  currentInsightId: string | null;
+  setCurrentInsightId: (id: string | null) => void;
+
   // Update availability (runtime, not persisted)
   updateAvailable: { version: string; body: string | undefined } | null;
   updateDismissedVersion: string | null;
@@ -416,6 +449,14 @@ interface AppState {
     view: "note-list" | "note-detail" | "settings",
     sessionId?: string,
   ) => void;
+  /**
+   * One-shot signal from anywhere in the app to land the user on a specific
+   * Settings location. Consumed by SettingsPanel + AITab + ConnectionsSection
+   * on mount, then cleared. Single-value rather than a queue — only the most
+   * recent intent matters. Cleared after consumption.
+   */
+  settingsRequest: "ai-add-connection" | null;
+  setSettingsRequest: (request: "ai-add-connection" | null) => void;
   setListFilter: (filter: ListFilter) => void;
   refreshDevices: () => Promise<void>;
   /**
@@ -583,12 +624,13 @@ const defaultSettings: Settings = {
   promptDecaySilenceSeconds: 5,
   theme: "system",
   sidebarCollapsed: false,
-  ai: DEFAULT_AI_SETTINGS,
+  aiConfig: DEFAULT_AI_CONFIG,
   shortcutBindings: {},
   audioSaveLocation: null,
   audioExportFormat: "mp3",
   mp3Bitrate: 64,
   dictation: DEFAULT_DICTATION_SETTINGS,
+  insights: DEFAULT_INSIGHTS_SETTINGS,
   showRecordingIndicator: true,
   dictationDuckEnabled: false,
   dictationDuckAmount: 0.8,
@@ -672,6 +714,14 @@ function createAppStore() {
       tags: [],
       sessionTagMap: {},
       dictationHistory: [],
+      liveInsightResult: null,
+      liveInsightStatus: "idle",
+      liveInsightError: null,
+      currentInsightId: null,
+      setLiveInsightResult: (result) => set({ liveInsightResult: result }),
+      setLiveInsightStatus: (status) => set({ liveInsightStatus: status }),
+      setLiveInsightError: (error) => set({ liveInsightError: error }),
+      setCurrentInsightId: (id) => set({ currentInsightId: id }),
       updateAvailable: null,
       updateDismissedVersion: null,
       settings: defaultSettings,
@@ -725,6 +775,14 @@ function createAppStore() {
                 activeSessionStartTime: null,
                 liveTranscriptionActive: false,
                 livePhase: null,
+                // Live-insights runtime is session-scoped; clear when the
+                // session ends so a future session doesn't render stale
+                // output. `currentInsightId` is re-initialized from
+                // `settings.insights.defaultInsightId` at next session start.
+                liveInsightResult: null,
+                liveInsightStatus: "idle",
+                liveInsightError: null,
+                currentInsightId: null,
                 backfillActive: false,
                 backfillBoundarySeconds: null,
                 sessionStopping: false,
@@ -943,6 +1001,11 @@ function createAppStore() {
             liveTranscriptionActive: true,
             activeSessionStartTime: effectiveStartEpochMs
               ?? (session ? new Date(session.created_at + "Z").getTime() : Date.now()),
+            // Initialize the Current Insight from the persisted Default at
+            // session start. Mid-session changes to the Default in Settings
+            // do not retroactively update this — Settings affects future
+            // sessions only.
+            currentInsightId: get().settings.insights.defaultInsightId,
           });
 
           if (session) {
@@ -1136,6 +1199,9 @@ function createAppStore() {
           livePhase: "Running",
           currentView: "note-detail",
           selectedSessionId: sessionId,
+          // Initialize Current Insight from the persisted Default at session
+          // start. See `recoverActiveSession` for the same pattern.
+          currentInsightId: get().settings.insights.defaultInsightId,
           // backfillActive intentionally omitted — pre-set before the await
           // (and listener-driven thereafter) so a fast `backfill-complete`
           // event arriving during the await isn't overwritten back to true.
@@ -1257,6 +1323,9 @@ function createAppStore() {
           currentView: "note-detail",
           selectedSessionId: sessionId,
           sessionStopping: false,
+          // Initialize Current Insight from the persisted Default at session
+          // resume. See `recoverActiveSession` for the same pattern.
+          currentInsightId: get().settings.insights.defaultInsightId,
           backfillActive: false,
           backfillBoundarySeconds: null,
         });
@@ -1364,6 +1433,11 @@ function createAppStore() {
           currentView: view,
           selectedSessionId: sessionId ?? null,
         });
+      },
+
+      settingsRequest: null,
+      setSettingsRequest: (request) => {
+        set({ settingsRequest: request });
       },
 
       setListFilter: (filter) => {
@@ -2449,7 +2523,7 @@ function createAppStore() {
     }),
     {
       name: "yapstack-settings",
-      version: 24,
+      version: 31,
       partialize: (state) => ({
         settings: state.settings,
       }),
@@ -2539,12 +2613,12 @@ function createAppStore() {
           }
           delete old.backfillSeconds;
         }
-        if (version < 8 && state.settings) {
-          const old = state.settings as Record<string, unknown>;
-          if (old.ai === undefined) {
-            old.ai = DEFAULT_AI_SETTINGS;
-          }
-        }
+        // (v8 originally backfilled state.settings.ai with DEFAULT_AI_SETTINGS.
+        // After the Connection/Profile refactor the legacy `ai` field is no
+        // longer read; v25 below populates `aiConfig` from whatever `ai`
+        // value exists, falling back to DEFAULT_AI_CONFIG when absent.
+        // Pre-v8 users therefore start the new AI flow empty, which is the
+        // greenfield default — they were on a years-old persisted state.)
         if (version < 9 && state.settings) {
           const old = state.settings as Record<string, unknown>;
           if (old.shortcutBindings === undefined) {
@@ -2666,6 +2740,138 @@ function createAppStore() {
             old.dictationDuckEnabled = false;
           if (old.dictationDuckTarget === undefined)
             old.dictationDuckTarget = 0.2;
+        }
+        if (version < 25 && state.settings) {
+          // AI Connection/Profile migration. Transforms the legacy
+          // single-active-provider AISettings into the new multi-Connection
+          // AIConfig + per-feature Assignments shape. Per locked design
+          // decision #6, only the active provider becomes a Profile; other
+          // configured providers migrate as Connections so their keys aren't
+          // lost. Per decision #12, dictation slots with aiEnabled=true point
+          // at the active Profile; aiEnabled=false slots get profileId=null.
+          //
+          // Additive only — legacy `ai` and `aiEnabled` fields stay in place
+          // until Commit 11 finishes the consumer migration.
+          //
+          // The original legacy `ai` object is left in place untouched (it is
+          // the safety net for any future re-migration); we deliberately do
+          // NOT write a second `_legacyAi` copy — that only duplicated the
+          // plaintext API keys into an extra persisted blob nothing reads.
+          const old = state.settings as Record<string, unknown>;
+          const legacy = old.ai as LegacyAISettings | undefined;
+          const dict = old.dictation as
+            | { slots?: LegacyDictationSlot[] }
+            | undefined;
+          if (legacy && dict?.slots) {
+            const { config, updatedSlots } = migrateLegacyAISettings(
+              legacy,
+              dict.slots,
+            );
+            old.aiConfig = config;
+            // Mutate each slot in place to add `profileId` while leaving the
+            // legacy `aiEnabled` field intact (consumers swap in Commit 6).
+            dict.slots = dict.slots.map((s, i) => ({
+              ...s,
+              profileId: updatedSlots[i]?.profileId ?? null,
+            }));
+          } else if (!old.aiConfig) {
+            old.aiConfig = DEFAULT_AI_CONFIG;
+          }
+        }
+        if (version < 26 && state.settings) {
+          // Live insights are a brand-new feature — seed with the empty default
+          // for any existing user. Additive, no field renames.
+          const old = state.settings as Record<string, unknown>;
+          if (old.insights === undefined) {
+            // Clone — assigning the module-level constant by reference would
+            // share its `slots: []` array with a live persisted-state object,
+            // so any future in-place mutation would corrupt the default.
+            old.insights = structuredClone(DEFAULT_INSIGHTS_SETTINGS);
+          }
+        }
+        if (version < 27 && state.settings) {
+          // Insights rename: `activeInsightId` (persisted, mid-session edits
+          // leaked into defaults) → `defaultInsightId` (persisted, drives
+          // session-start only). The mid-session "what's running right now"
+          // role is now a runtime-only field (`currentInsightId`) initialized
+          // from `defaultInsightId` at session start.
+          const insights = (state.settings as Record<string, unknown>)
+            .insights as Record<string, unknown> | undefined;
+          if (insights && "activeInsightId" in insights) {
+            insights.defaultInsightId = insights.activeInsightId;
+            delete insights.activeInsightId;
+          }
+        }
+        if (version < 28 && state.settings) {
+          // Insight cadence: per-slot `heartbeatSeconds` (fixed interval) →
+          // `trigger` (preset + W/P/F/M). Map the old interval to a behavior-
+          // preserving Custom tuple: threshold/settle off, floor == ceiling ==
+          // the old heartbeat, i.e. "fire every N seconds if new content".
+          const insights = (state.settings as Record<string, unknown>)
+            .insights as { slots?: Array<Record<string, unknown>> } | undefined;
+          if (insights?.slots) {
+            for (const slot of insights.slots) {
+              if (slot.trigger === undefined) {
+                const hb =
+                  typeof slot.heartbeatSeconds === "number"
+                    ? slot.heartbeatSeconds
+                    : 30;
+                slot.trigger = {
+                  preset: "custom",
+                  thresholdWords: 0,
+                  settleSeconds: 0,
+                  minIntervalSeconds: hb,
+                  maxWaitSeconds: hb,
+                };
+                delete slot.heartbeatSeconds;
+              }
+            }
+          }
+        }
+        if (version < 29 && state.settings) {
+          // Cadence presets renamed from content archetypes to tempo tiers
+          // (summary/jargon/topic → relaxed/responsive/balanced), and a `type`
+          // field was added (what the Insight extracts). Remap old preset names
+          // and default existing freeform Insights to type "custom".
+          const insights = (state.settings as Record<string, unknown>)
+            .insights as { slots?: Array<Record<string, unknown>> } | undefined;
+          const presetRemap: Record<string, string> = {
+            summary: "relaxed",
+            jargon: "responsive",
+            topic: "balanced",
+          };
+          if (insights?.slots) {
+            for (const slot of insights.slots) {
+              const trigger = slot.trigger as
+                | Record<string, unknown>
+                | undefined;
+              if (trigger && typeof trigger.preset === "string") {
+                const mapped = presetRemap[trigger.preset];
+                if (mapped) trigger.preset = mapped;
+              }
+              if (slot.type === undefined) slot.type = "custom";
+            }
+          }
+        }
+        if (version < 30 && state.settings) {
+          // Dropped the per-Insight `enabled` flag — an Insight only runs when
+          // it's the Current Insight, so the boolean was redundant. Remove the
+          // vestigial key from persisted slots.
+          const insights = (state.settings as Record<string, unknown>)
+            .insights as { slots?: Array<Record<string, unknown>> } | undefined;
+          if (insights?.slots) {
+            for (const slot of insights.slots) {
+              delete slot.enabled;
+            }
+          }
+        }
+        if (version < 31 && state.settings) {
+          // Remove the redundant `_legacyAi` snapshot an earlier build of the
+          // AI refactor wrote at v25 (a duplicate of the legacy `ai` object,
+          // including plaintext keys, that nothing ever read). The original
+          // legacy `ai` field stays as the re-migration safety net. Without
+          // this, DBs that ran that build keep re-persisting the duplicate.
+          delete (state.settings as Record<string, unknown>)._legacyAi;
         }
         return state as unknown as { settings: Settings };
       },

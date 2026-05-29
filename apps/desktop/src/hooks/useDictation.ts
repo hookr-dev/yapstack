@@ -6,7 +6,7 @@ import { register as registerGlobalShortcut, unregister as unregisterGlobalShort
 import { useAppStore } from "@/stores/appStore";
 import { commands } from "@/lib/tauri";
 import { EVENTS, WINDOWS, listenEvent, emitEvent, type BubbleState } from "@/lib/events";
-import { createAIClient, getActiveConfig, isAIConfigured, markdownToBasicHtml } from "@/lib/ai";
+import { resolveAndCreateClient, markdownToBasicHtml } from "@/lib/ai";
 import { buildVocabularyHints } from "@/lib/transcription";
 import { createManualSession as dbCreateManualSession, saveNote, insertDictationHistory, listFolders, listTags } from "@/lib/db";
 import { toast } from "sonner";
@@ -248,7 +248,7 @@ export function useDictation() {
       trackDictationStarted({
         slot_id: slot.id,
         slot_name: slot.name,
-        ai_enabled: slot.aiEnabled ? 1 : 0,
+        ai_enabled: slot.profileId !== null ? 1 : 0,
         has_prompt: slot.prompt ? 1 : 0,
         output_action: slot.outputAction ?? "paste",
       });
@@ -456,39 +456,39 @@ export function useDictation() {
           return;
         }
 
-        // AI processing
-        if (slot.aiEnabled && slot.prompt) {
+        // AI processing — gated on the slot having a Profile assigned and a
+        // prompt to apply. resolveAndCreateClient throws when the Profile
+        // can't be resolved (deleted, points at a deleted Connection, etc.);
+        // we catch and fall through to the raw transcription so the user
+        // always gets *something* delivered, with the error logged. This
+        // matches the prior behaviour where a misconfigured provider quietly
+        // delivered raw text rather than failing the dictation outright.
+        if (slot.profileId !== null && slot.prompt) {
           stateRef.current = "processing";
           emitBubbleState("processing", slot.name);
 
-          const aiSettings = s.settings.ai;
-          const config = getActiveConfig(aiSettings);
-
-          if (!isAIConfigured(aiSettings)) {
-            // AI not configured for this provider — fall through to raw transcription.
-            // For custom providers a blank apiKey is valid (local servers), so we
-            // check both baseUrl + model presence via isAIConfigured.
-          } else {
-            try {
-              const client = createAIClient(aiSettings);
-              const response = await client.chat.completions.create(
-                {
-                  model: config.model,
-                  messages: [
-                    { role: "system", content: slot.prompt },
-                    { role: "user", content: text },
-                  ],
-                },
-                { signal: abort.signal },
-              );
-              const processed = response.choices[0]?.message?.content;
-              if (processed) {
-                text = processed.trim();
-              }
-            } catch (aiErr) {
-              if (abort.signal.aborted) return;
-              console.error("AI processing failed, using raw text:", aiErr);
+          try {
+            const { client, model } = resolveAndCreateClient(
+              s.settings.aiConfig,
+              slot.profileId,
+            );
+            const response = await client.chat.completions.create(
+              {
+                model,
+                messages: [
+                  { role: "system", content: slot.prompt },
+                  { role: "user", content: text },
+                ],
+              },
+              { signal: abort.signal },
+            );
+            const processed = response.choices[0]?.message?.content;
+            if (processed) {
+              text = processed.trim();
             }
+          } catch (aiErr) {
+            if (abort.signal.aborted) return;
+            console.error("AI processing failed, using raw text:", aiErr);
           }
         }
 
@@ -539,7 +539,7 @@ export function useDictation() {
           slot_id: slotIdRef.current,
           duration_ms: Date.now() - startTimeRef.current,
           transcription_length: text.length,
-          ai_processed: slot.aiEnabled && slot.prompt ? 1 : 0,
+          ai_processed: slot.profileId !== null && slot.prompt ? 1 : 0,
           output_action: action,
         });
 
@@ -558,8 +558,8 @@ export function useDictation() {
             slot_name: slot.name,
             input_text: inputText,
             output_text: text,
-            ai_enabled: slot.aiEnabled && slot.prompt ? 1 : 0,
-            ai_prompt: slot.aiEnabled ? slot.prompt : null,
+            ai_enabled: slot.profileId !== null && slot.prompt ? 1 : 0,
+            ai_prompt: slot.profileId !== null ? slot.prompt : null,
             output_action: action,
             wav_file_path: wavInfoRef.current?.path ?? null,
             wav_duration_seconds: wavInfoRef.current?.duration ?? null,

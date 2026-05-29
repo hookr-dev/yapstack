@@ -16,6 +16,7 @@ Fast router for humans and AI agents. One line per doc — load this file first 
 - [`ARCHITECTURE.md`](ARCHITECTURE.md) — data flow between crates, ring buffer, sidecar IPC, live transcription pipeline, AI chat tool calling, frontend component tree, analytics.
 - [`API_REFERENCE.md`](API_REFERENCE.md) — exact function signatures, struct fields, error variants, Tauri command shapes. Read before adding or modifying public APIs.
 - [`GLOSSARY.md`](GLOSSARY.md) — domain terms (session, segment, part, dictation, diarization, etc.).
+- [`SYNC_ARCHITECTURE.md`](SYNC_ARCHITECTURE.md) — decision report for the E2E sync backend: cr-sqlite on-device merge, blind encrypted relay, key management, schema-migration desync, private-link sharing. Read before any sync/backend work.
 
 ## Development
 
